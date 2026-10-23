@@ -150,6 +150,15 @@ pub fn ttm_dir() -> PathBuf {
     base
 }
 
+/// Folder with the TIPSv2-B/14 DPT files (`model.safetensors`, `config.json`).
+/// `TIPS_DIR` wins; otherwise `models/tipsv2-b14-dpt`.
+pub fn tips_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("TIPS_DIR") {
+        return PathBuf::from(p);
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("models").join("tipsv2-b14-dpt")
+}
+
 /// Where the embedded phrase vectors of the world's recogniser are kept between runs.
 pub fn bank_dir() -> PathBuf {
     runtime_dir().join("bank")

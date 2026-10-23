@@ -192,7 +192,7 @@ pub fn label_ko(world: &World, label: &str) -> String {
 }
 
 fn new_world(cfg: &RuntimeConfig) -> Result<World> {
-    World::new(WorldConfig { seed: cfg.seed, cells: cfg.cells, hand: cfg.hand }).map_err(|e| anyhow!("월드를 만들 수 없습니다: {e}"))
+    World::new(WorldConfig { seed: cfg.seed, cells: cfg.cells, hand: cfg.hand, body: cfg.body }).map_err(|e| anyhow!("월드를 만들 수 없습니다: {e}"))
 }
 
 pub struct Runtime {
@@ -214,6 +214,18 @@ pub struct Runtime {
     last_flush_tick: u64,
     /// Resource the running quest is after; only its landmarks are logged loudly.
     pub(crate) focus: Option<String>,
+    /// Test records: quest runs, ML keyframes, balance effort, success table.
+    pub(crate) db: hand_sds::TestDb,
+    /// `game` (the quest driver decides) or `ml` (the ML logic decides).
+    pub(crate) pass: String,
+    pub(crate) run_id: String,
+    pub(crate) session_id: String,
+    pub(crate) test_seq: u32,
+    pub(crate) recording: Option<crate::record::Recording>,
+    pub(crate) ml: crate::ml::MlPipeline,
+    pub(crate) ml_task: Option<crate::mldrive::MlTask>,
+    pub(crate) test: Option<crate::testrun::TestSession>,
+    pub test_cfg: crate::testrun::TestCfg,
 }
 
 impl Runtime {
@@ -222,14 +234,13 @@ impl Runtime {
     pub fn new(cfg: RuntimeConfig, lexicon_json: &str, data_dir: Option<&Path>) -> Result<Runtime> {
         let lex = Lexicon::from_json(lexicon_json)?;
         let recognizer: Box<dyn Recognizer> = Box::new(OraclePerception::new(&lex, cfg.noise.clone(), cfg.min_pixels));
+        let ml = crate::ml::MlPipeline::stand_in(&lex, cfg.seed);
         let parser = Parser::new(lex);
         let world = new_world(&cfg)?;
-        let (sds, audit) = match data_dir {
-            Some(dir) => {
-                let ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
-                (SdsStore::open(&dir.join("sds")), AuditLog::open(&dir.join("logs"), &format!("session_{ms}"), 4000)?)
-            }
-            None => (SdsStore::memory(), AuditLog::memory(4000)),
+        let ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        let (sds, audit, db) = match data_dir {
+            Some(dir) => (SdsStore::open(&dir.join("sds")), AuditLog::open(&dir.join("logs"), &format!("session_{ms}"), 4000)?, hand_sds::TestDb::open(&dir.join("db"))),
+            None => (SdsStore::memory(), AuditLog::memory(4000), hand_sds::TestDb::memory()),
         };
         let cam = cfg.camera.camera();
         let gates = PrecisionGates::new(cfg.gates.clone());
@@ -251,6 +262,16 @@ impl Runtime {
             eval: EvalCounters::default(),
             last_flush_tick: 0,
             focus: None,
+            db,
+            pass: "game".into(),
+            run_id: format!("s{ms}-live"),
+            session_id: format!("s{ms}"),
+            test_seq: 0,
+            recording: None,
+            ml,
+            ml_task: None,
+            test: None,
+            test_cfg: crate::testrun::TestCfg::default(),
         };
         let msg = format!(
             "월드 시작: seed {} · {}×{}칸 · 베이스 {:?} · 손가락 {} · 인식기 {}",
@@ -365,7 +386,35 @@ impl Runtime {
     }
 
     pub fn busy(&self) -> bool {
-        self.task.is_some() || self.quests.current_id().is_some()
+        self.task.is_some() || self.ml_task.is_some() || self.quests.current_id().is_some()
+    }
+
+    /// The ML pipeline (depth, semantic location, tracking).
+    pub fn ml_pipeline(&self) -> &crate::ml::MlPipeline {
+        &self.ml
+    }
+
+    pub fn test_db(&self) -> &hand_sds::TestDb {
+        &self.db
+    }
+
+    pub fn test_db_mut(&mut self) -> &mut hand_sds::TestDb {
+        &mut self.db
+    }
+
+    /// `game` or `ml`: who decides the running quest.
+    pub fn pass(&self) -> &str {
+        &self.pass
+    }
+
+    /// Loads TIPSv2-B/14 DPT from `dir` as the ML depth model.
+    pub fn use_tips(&mut self, dir: &Path, device: &candle_core::Device) -> Result<()> {
+        let t0 = Instant::now();
+        let m = hand_vision::TipsDepth::load(dir, device)?;
+        self.ml.depth = crate::ml::DepthEngine::Model(Box::new(m));
+        let ms = t0.elapsed().as_secs_f32() * 1000.0;
+        self.log("embed", Level::Info, format!("TIPSv2 DPT 깊이 모델 로드 ({ms:.0} ms) · {}", dir.display()), None);
+        Ok(())
     }
 
     // ----- configuration -----
@@ -397,6 +446,7 @@ impl Runtime {
     pub fn use_siglip(&mut self, model: Arc<hand_ml::Siglip2>, bank_dir: Option<&Path>) -> Result<()> {
         let t0 = Instant::now();
         let phrases = Arc::new(crate::embedding::BankedPhrases::new(Arc::clone(&model), bank_dir));
+        self.ml.locate = crate::ml::LocateEngine::Model(Box::new(hand_vision::SiglipLocator::new(Arc::clone(&model))));
         let rec = crate::embedding::EmbeddingPerception::siglip(model, self.parser.lexicon(), bank_dir, Default::default())?;
         self.attach_embedder(phrases)?;
         self.set_recognizer(Box::new(rec));
@@ -469,6 +519,7 @@ impl Runtime {
         self.cfg = next;
         self.world = world;
         self.task = None;
+        self.ml_task = None;
         self.quests.clear();
         self.gates.clear();
         self.last_scan = None;
@@ -494,6 +545,8 @@ impl Runtime {
         let events = self.world.tick();
         self.log_world_events(&events);
         self.drive(&events);
+        self.record_balance_events();
+        self.record_tick();
         if self.world.tick.saturating_sub(self.last_flush_tick) >= 600 {
             self.flush_sds();
         }

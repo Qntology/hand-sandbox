@@ -9,6 +9,7 @@
   <link rel="stylesheet" href="css/layout.css" />
   <link rel="stylesheet" href="css/components.css" />
   <link rel="stylesheet" href="css/hud.css" />
+  <link rel="stylesheet" href="css/timeline.css" />
   <script type="module" src="js/main.js"></script>
 </head>
 <body>
@@ -103,6 +104,25 @@
           </div>
           <p class="hint" id="model-files"></p>
           <p class="hint" id="dict-note"></p>
+        </div>
+
+        <!-- ⑤ 부품 프리셋 -->
+        <div class="panel-section-header" data-section="secPresets" role="button" tabindex="0" aria-expanded="true" aria-controls="secPresets">
+          <span class="sec-title"><span class="step-no">5</span><span class="sec-name">부품 프리셋</span><span class="help" tabindex="0" data-tip="머리·가슴·배·팔·다리(바퀴형이면 섀시) 부품 등급을 고릅니다. 등급은 실제 액추에이터·배터리 데이터시트 값이고(docs/research/parts.md), 질량·무게중심·관절 토크가 바뀌어 들 수 있는 물건, 속도, 경사·턱 한계, 적재량이 달라집니다. 모습은 그대로입니다.">?</span></span>
+          <span class="step-sum" id="sum-presets"></span><span class="chevron" aria-hidden="true">▼</span>
+        </div>
+        <div class="panel-section-body" id="secPresets">
+          <div class="form-group"><label for="pp-named">조합</label><select id="pp-named"></select></div>
+          <div class="form-grid">
+            <div class="form-group"><label for="pp-head">머리 (목·카메라)</label><select id="pp-head"></select></div>
+            <div class="form-group"><label for="pp-chest">가슴 (연산·배터리)</label><select id="pp-chest"></select></div>
+            <div class="form-group"><label for="pp-belly">배 (허리·골반)</label><select id="pp-belly"></select></div>
+            <div class="form-group"><label for="pp-arm">팔 (어깨·팔꿈치)</label><select id="pp-arm"></select></div>
+            <div class="form-group span-2"><label for="pp-leg">다리 / 섀시</label><select id="pp-leg"></select></div>
+          </div>
+          <label class="ct-check" for="pp-battery"><input type="checkbox" id="pp-battery" /> 배터리를 골반에 (CoM ~2 cm 낮춤, 허리 관성 감소)</label>
+          <button type="button" class="btn btn-block" id="pp-apply" style="margin-top:8px">월드에 적용</button>
+          <div class="pp-sum" id="pp-sum">계산 중…</div>
         </div>
       </div>
     </aside>
@@ -290,16 +310,19 @@
       <button type="button" class="panel-toggle-btn" data-toggle="panelBottom" title="하단 패널 접기" aria-label="하단 패널 접기" aria-expanded="true">▼</button>
       <div class="panel-section-header" data-section="secOutput" role="button" tabindex="0" aria-expanded="true" aria-controls="secOutput">
         <span class="sec-title"><span class="step-no sec-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 6h14M5 12h14M5 18h9"/></svg></span><span class="sec-name">기록</span><span class="help" tabindex="0" data-tip="로그 — 월드·퀘스트·검색·비전·SDS·시계열·임베딩·장치 로그(증분 조회)&#10;비전 점수 — 월드 인식과 이미지 분류&#10;명령 해석 — 명령이 어떻게 구조화됐는지&#10;시계열 — 예측 띠(P10~P90)&#10;합성 데이터 — Lance 기록">?</span></span>
-        <span class="step-sum">로그 · 비전 · 명령 해석 · 시계열 · 합성 데이터</span><span class="chevron" aria-hidden="true">▼</span>
+        <span class="step-sum">통합 테스트 · 로그 · 비전 · 명령 해석 · 시계열 · 합성 데이터</span><span class="chevron" aria-hidden="true">▼</span>
       </div>
       <div class="panel-section-body" id="secOutput">
         <div class="bottom-tabs" role="tablist" aria-label="기록 탭" id="bottom-tabs">
+          <button type="button" class="bottom-tab" role="tab" id="btab-test" data-tab="test" aria-selected="false" aria-controls="bpane-test" tabindex="-1">통합 테스트</button>
           <button type="button" class="bottom-tab active" role="tab" id="btab-log" data-tab="log" aria-selected="true" aria-controls="bpane-log">로그</button>
           <button type="button" class="bottom-tab" role="tab" id="btab-vision" data-tab="vision" aria-selected="false" aria-controls="bpane-vision" tabindex="-1">비전 점수</button>
           <button type="button" class="bottom-tab" role="tab" id="btab-trace" data-tab="trace" aria-selected="false" aria-controls="bpane-trace" tabindex="-1">명령 해석</button>
           <button type="button" class="bottom-tab" role="tab" id="btab-ts" data-tab="ts" aria-selected="false" aria-controls="bpane-ts" tabindex="-1">시계열</button>
           <button type="button" class="bottom-tab" role="tab" id="btab-synth" data-tab="synth" aria-selected="false" aria-controls="bpane-synth" tabindex="-1">합성 데이터</button>
         </div>
+
+        <div class="bottom-pane" id="bpane-test" role="tabpanel" aria-labelledby="btab-test" hidden></div>
 
         <div class="bottom-pane" id="bpane-log" role="tabpanel" aria-labelledby="btab-log">
           <div class="pane-toolbar">

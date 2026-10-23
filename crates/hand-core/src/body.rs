@@ -15,6 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::balance::{Coupling, JointLoad};
 use crate::base::{BaseKind, BaseSpec};
 
 /// Battery energy equals cruise power times this many seconds (assumption).
@@ -103,12 +104,50 @@ pub struct FootSummary {
     pub terrain_margin: Option<f32>,
 }
 
+/// Balance and joint load of the current posture (see `balance`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BalanceSummary {
+    /// Body preset id.
+    pub plan: String,
+    pub source: String,
+    pub source_ko: String,
+    /// Terrain and phase bucket, such as `flat|mine`.
+    pub state: String,
+    pub margin: f32,
+    pub margin_noff: f32,
+    pub trunk_lean_deg: f32,
+    pub head_tilt_deg: f32,
+    pub worst_joint: Option<String>,
+    /// Largest torque over peak rating.
+    pub worst_ratio: f32,
+    pub effort_sum: f32,
+    pub mass_kg: f32,
+    pub com_height_m: f32,
+    /// Hottest joint's heat state (above 1 the joint is derated).
+    pub heat_max: f32,
+    pub joints: Vec<JointLoad>,
+    /// The N:N cells of this state.
+    pub couplings: Vec<Coupling>,
+}
+
+/// Limits that the part presets set; without them the base's defaults apply.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BodyLimits {
+    pub battery_j: f64,
+    pub capacity_kg: f32,
+    pub max_speed_mps: f32,
+    pub max_slope_deg: f32,
+    pub max_step_m: f32,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BodyStatus {
     pub parts: Vec<BodyPart>,
     pub effects: Vec<BodyEffect>,
     pub hand: HandSummary,
     pub foot: FootSummary,
+    #[serde(default)]
+    pub balance: Option<BalanceSummary>,
 }
 
 /// Simulation variables the status is computed from.
@@ -130,6 +169,9 @@ pub struct BodyInputs {
     /// Smallest remaining margin to the base's slope or step limit on the
     /// current route segment, 0..1. `None` without a route.
     pub terrain_margin: Option<f32>,
+    /// Limits from the part presets (battery, cargo, speed, slope, step).
+    pub limits: Option<BodyLimits>,
+    pub balance: Option<BalanceSummary>,
 }
 
 fn part(id: &str, label_ko: &str, value: f32, max: f32, ratio: f32, detail: String) -> BodyPart {
@@ -147,9 +189,16 @@ fn part(id: &str, label_ko: &str, value: f32, max: f32, ratio: f32, detail: Stri
 
 /// Computes the seven zones and the active effects from `inp`.
 pub fn compute(inp: &BodyInputs) -> BodyStatus {
-    let spec = inp.base.spec();
-    let cap_j = battery_capacity_j(&spec);
-    let cap_kg = inp.base.carry_capacity_kg();
+    let mut spec = inp.base.spec();
+    let (cap_j, cap_kg, runtime_note) = match &inp.limits {
+        Some(l) => {
+            spec.max_speed_mps = l.max_speed_mps;
+            spec.max_slope_deg = l.max_slope_deg;
+            spec.max_step_m = l.max_step_m;
+            (l.battery_j, l.capacity_kg, "가슴 프리셋 배터리".to_string())
+        }
+        None => (battery_capacity_j(&spec), inp.base.carry_capacity_kg(), format!("순항 전력 × {:.0}분 가정", BATTERY_RUNTIME_S / 60.0)),
+    };
 
     // head: vision
     let head = match inp.vision_confidence {
@@ -179,12 +228,7 @@ pub fn compute(inp: &BodyInputs) -> BodyStatus {
         battery * 100.0,
         100.0,
         battery,
-        format!(
-            "잔량 {:.0} / {:.0} kJ (순항 전력 × {:.0}분 가정)",
-            (cap_j - used) / 1000.0,
-            cap_j / 1000.0,
-            BATTERY_RUNTIME_S / 60.0
-        ),
+        format!("잔량 {:.0} / {:.0} kJ ({runtime_note})", (cap_j - used) / 1000.0, cap_j / 1000.0),
     );
 
     // stomach: cargo (ratio is the remaining capacity)
@@ -294,9 +338,27 @@ pub fn compute(inp: &BodyInputs) -> BodyStatus {
         level: slip_level,
         detail: format!("지형 한계 여유 {:.0}%", slip_ratio * 100.0),
     });
-    // No thermal model exists, so there is deliberately no "heat" effect.
+    // Balance and joint strain, when the part presets are in play.
+    if let Some(b) = &inp.balance {
+        effects.push(BodyEffect {
+            id: "balance".into(),
+            label_ko: "자세 안정".into(),
+            level: BodyLevel::from_ratio(b.margin),
+            detail: format!("{} · 안정 여유 {:.0}% (피드포워드 없으면 {:.0}%)", b.source_ko, b.margin * 100.0, b.margin_noff * 100.0),
+        });
+        effects.push(BodyEffect {
+            id: "strain".into(),
+            label_ko: "관절 부하".into(),
+            level: BodyLevel::from_ratio(1.0 - b.worst_ratio),
+            detail: match &b.worst_joint {
+                Some(j) => format!("{j} 피크 대비 {:.0}% · 발열 {:.2}", b.worst_ratio * 100.0, b.heat_max),
+                None => "부하 없음".into(),
+            },
+        });
+    }
 
     BodyStatus {
+        balance: inp.balance.clone(),
         parts,
         effects,
         hand: HandSummary {
@@ -327,6 +389,8 @@ mod tests {
             joint_strikes: 0,
             speed_factor: 1.0,
             terrain_margin: None,
+            limits: None,
+            balance: None,
         }
     }
 

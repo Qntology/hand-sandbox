@@ -15,6 +15,19 @@ use crate::text::TextTower;
 use crate::tokenizer::TextTokenizer;
 use crate::vision::VisionTower;
 
+/// Per-patch output of [`Siglip2::embed_dense`].
+#[derive(Clone, Debug)]
+pub struct DenseEmbedding {
+    pub grid_h: usize,
+    pub grid_w: usize,
+    /// `grid_h * grid_w` unit vectors, row-major.
+    pub vectors: Vec<Vec<f32>>,
+    /// Pooling attention per patch (sums to one).
+    pub attention: Vec<f32>,
+    /// The whole-image embedding (unit length), same as [`Siglip2::embed_image`].
+    pub pooled: Vec<f32>,
+}
+
 pub struct Siglip2 {
     config: Siglip2Config,
     vision: VisionTower,
@@ -142,6 +155,18 @@ impl Siglip2 {
         Ok(out)
     }
 
+    /// Dense embedding of one image: a unit vector per patch in the same
+    /// space as the text embeddings, and where the pooling head looks. This is
+    /// what semantic location uses: the cosine of each patch with a label's
+    /// text vector is a heat map from one forward pass.
+    pub fn embed_dense(&self, image: &DynamicImage) -> Result<DenseEmbedding> {
+        let input = preprocess(image, &self.config);
+        let (dense, attn, pooled) = self.vision.forward_dense(&input)?;
+        let vectors = l2_normalize(&dense)?.to_vec2()?;
+        let pooled = l2_normalize(&pooled.unsqueeze(0)?)?.flatten_all()?.to_vec1()?;
+        Ok(DenseEmbedding { grid_h: input.grid_h, grid_w: input.grid_w, vectors, attention: attn.to_vec1()?, pooled })
+    }
+
     /// Unit-length embeddings of texts, in input order.
     pub fn embed_texts(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         let tokenizer = self
@@ -253,6 +278,24 @@ mod tests {
         DynamicImage::ImageRgb8(RgbImage::from_fn(w, h, |x, y| {
             Rgb([(x * 7 % 256) as u8, (y * 13 % 256) as u8, 128])
         }))
+    }
+
+    #[test]
+    fn dense_embedding_has_one_unit_vector_per_patch() {
+        let m = tiny_model();
+        let d = m.embed_dense(&test_image(32, 16)).unwrap();
+        assert_eq!(d.vectors.len(), d.grid_h * d.grid_w);
+        assert!(d.grid_w > d.grid_h, "a wide image keeps a wide grid: {}x{}", d.grid_h, d.grid_w);
+        for v in &d.vectors {
+            assert_eq!(v.len(), 32);
+            let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!((n - 1.0).abs() < 1e-4);
+        }
+        let s: f32 = d.attention.iter().sum();
+        assert!((s - 1.0).abs() < 1e-4, "attention sums to one: {s}");
+        let whole = m.embed_image(&test_image(32, 16)).unwrap();
+        let same: f32 = whole.iter().zip(&d.pooled).map(|(a, b)| a * b).sum();
+        assert!((same - 1.0).abs() < 1e-4, "the pooled vector is the image embedding");
     }
 
     #[test]

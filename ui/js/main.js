@@ -19,6 +19,8 @@ import { initCommandBar } from './command-bar.js';
 import { initLogs } from './logs.js';
 import { initAnalysis } from './analysis.js';
 import { initTimeseries } from './timeseries.js';
+import { initTestTimeline } from './test-timeline.js';
+import { initPresets } from './presets.js';
 
 const recentErrors = new Map();
 
@@ -69,10 +71,11 @@ async function main() {
   initVisionUpload();
   initAnalysis();
   initTimeseries();
+  initTestTimeline();
 
   // 손·발 프리셋이 있어야 월드 생성(HandConfig 전달)과 PiP 가 의미가 있으므로 먼저 기다린다.
   await initHandPanel().catch(() => {});
-  await Promise.allSettled([initDevice(), initDataPanel(), initLogs()]);
+  await Promise.allSettled([initDevice(), initDataPanel(), initLogs(), initPresets()]);
   await regenerate();
   setStatus(mock
     ? '모의 백엔드로 실행 중입니다. 입력줄에 "철광석 3개 캐서 베이스캠프로 가져와"를 입력해 보세요'

@@ -25,7 +25,8 @@ use serde_json::Value;
 const SHIM: &str = r#"<script>
 // 개발 서버 shim: 월드 명령은 이 서버(실제 Rust 런타임)로, 나머지는 브라우저 모의 백엔드로 보낸다.
 (() => {
-  const WORLD = new Set(['world_new','sim_step','world_frame','command_submit','quest_list','perception_scan','body_status','sds_status','ts_forecast','log_tail','models_status']);
+  const WORLD = new Set(['world_new','sim_step','world_frame','command_submit','quest_list','perception_scan','body_status','sds_status','ts_forecast','log_tail','models_status',
+    'test_start','test_step','test_status','test_keyframe','test_video','test_stats','test_cancel','body_presets','body_plan_eval','body_plan_set','world_body','test_db_mirror']);
   let mock = null;
   window.__TAURI__ = { core: { invoke: async (cmd, args) => {
     if (!WORLD.has(cmd)) {
@@ -106,9 +107,13 @@ fn handle(mut s: TcpStream, ui: &Path, rt: &Mutex<Runtime>) {
     if method == "POST" {
         if let Some(cmd) = path.strip_prefix("/invoke/") {
             let args: Value = if body.is_empty() { Value::Null } else { serde_json::from_slice(&body).unwrap_or(Value::Null) };
-            let result = match rt.lock() {
-                Ok(mut r) => r.api_call(cmd, &args),
-                Err(_) => Err("월드 잠금이 깨졌습니다".to_string()),
+            let result = if cmd == "test_db_mirror" {
+                mirror(rt)
+            } else {
+                match rt.lock() {
+                    Ok(mut r) => r.api_call(cmd, &args),
+                    Err(_) => Err("월드 잠금이 깨졌습니다".to_string()),
+                }
             };
             match result {
                 Ok(v) => respond(&mut s, "200 OK", "application/json", v.to_string().as_bytes()),
@@ -129,6 +134,26 @@ fn handle(mut s: TcpStream, ui: &Path, rt: &Mutex<Runtime>) {
         Some((p, bytes)) => respond(&mut s, "200 OK", content_type(&p), &bytes),
         None => respond(&mut s, "404 Not Found", "text/plain", b"not found"),
     }
+}
+
+/// The test records written since the last call, into the Lance store
+/// (`LANCE_DIR`, default `data/lance`), as the Tauri app does.
+fn mirror(rt: &Mutex<Runtime>) -> Result<Value, String> {
+    let (batch, stats) = {
+        let mut r = rt.lock().map_err(|_| "월드 잠금이 깨졌습니다".to_string())?;
+        let db = r.test_db_mut();
+        (db.take_mirror(), db.stats())
+    };
+    let dir = std::env::var("LANCE_DIR").map(PathBuf::from).unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/lance"));
+    let uri = dir.to_str().ok_or("저장 경로가 UTF-8 이 아닙니다")?.to_string();
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
+    let counts = rt
+        .block_on(async {
+            let store = hand_data::LanceStore::open(&uri).await?;
+            hand_data::test_tables::write_mirror(&store, &batch, &stats).await
+        })
+        .map_err(|e| format!("{e:#}"))?;
+    Ok(serde_json::json!({"store_dir": dir.display().to_string(), "written": counts}))
 }
 
 fn main() -> anyhow::Result<()> {

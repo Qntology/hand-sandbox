@@ -71,9 +71,44 @@
 | 노드 경도 | `NodeSpec::hardness` | 나무 2.0, 바위 1.5, 석탄·철 3.0 | Minecraft 관례를 따른 값. "도구 필요" 규칙은 두지 않음 |
 | 노드 드롭 수 | `NodeSpec::drop_count` | 나무 3, 바위 2, 석탄 광석 2, 철 광석 1 | 가정 |
 | 아이템 크기·질량 | `ItemSpec` | 원목 0.15 m 정육면체 2.4 kg(밀도 약 700 kg/m³), 돌 0.10 m 2.6 kg, 석탄 0.10 m 1.4 kg, 철광석 0.10 m 4.0 kg | 일반적인 밀도에서 계산한 가정값 |
-| 적재 한계 | `BaseKind::carry_capacity_kg` | 바퀴 20, 메카넘 15, 트랙 30, 사람 발 25 kg | 가정 |
-| 배터리 용량 | `BATTERY_RUNTIME_S` | 순항 전력 × 1800 s | 가정 |
+| 적재 한계 | `BaseKind::carry_capacity_kg` | 바퀴 20, 메카넘 15, 트랙 30, 사람 발 25 kg | 가정. v0.3부터는 부품 프리셋의 지지 한계(다리 연속 토크, 섀시 구조)로 더 낮아질 수 있음 |
+| 배터리 용량 | 가슴 프리셋 `battery_wh` | 보급 160, 중급 324, 고급 420 Wh | 21700 셀 팩 계산(`docs/research/parts.md` §3). 프리셋이 없을 때의 옛 가정(순항 전력 × 1800 s)은 `body::compute`에만 남음 |
 | 손 관절 내구 | `JOINT_ENDURANCE_STRIKES` | 채취 타격 400회 | 가정 |
+
+### 부품 프리셋과 밸런스 (v0.3)
+
+액추에이터·배터리·섀시 값은 데이터시트에서 왔고 출처는 [`docs/research/parts.md`](../docs/research/parts.md)에 있습니다. 사람 기준값(N:N 결합)은 [`docs/research/balance.md`](../docs/research/balance.md)에 있습니다. 아래는 그 사이를 메우는 **가정값**입니다.
+
+| 값 | 위치 | 기본값 | 근거 |
+| --- | --- | --- | --- |
+| 로봇 기하 | `parts::{HIP_M, WAIST_M, SHOULDER_M, ...}` | 고관절 0.58, 허리 0.70, 어깨 1.00 m, 위팔 0.22, 아래팔 0.20 m | 1.2 m 로봇 추정(research §5) |
+| 보폭 폭 · 섀시 폭 | `STANCE_WIDTH_M`, `CHASSIS_WIDTH_M` | 0.18 m, 0.40 m | 추정 |
+| 무릎 레버 | `KNEE_LEVER_WALK_M`, `step_knee_lever` | 걷기 0.085 m, 턱 `L·(0.10+0.40·h/L)` | 무릎 크기 규칙(research §5), 18 cm 계단 자료(Lin 2004)에서 비례 |
+| 무릎 안전계수 | `KNEE_SAFETY` | 1.5 | 연구 보고서의 크기 규칙 |
+| 반응 지연 | `REACTION_DELAY_S` | 0.10 s | 사람 전기기계 지연 80–100 ms |
+| 유지하는 안정 여유 | `MARGIN_KEEP` | 지지면 반길이의 20% | 설계 선택(로봇 ZMP 여유 표준 없음) |
+| 발목 전략 범위 | `Body::ankle_band` | 발 길이 10% (바퀴형 2 cm) | 추정(Horak & Nashner의 발목/고관절 전략을 단순화) |
+| 섀시 구조 적재 | `drive_limits` | 보급 8, 중급 30, 고급 100 kg | 고급은 AgileX Tracer 사양, 나머지는 추정 |
+| 구름 저항 · 발바닥 마찰 | `ROLLING_RESISTANCE`, `FOOT_FRICTION` | 0.03 · 0.6 | 가정 |
+| 정지 거리 | `STOP_DISTANCE_M` | 0.5 m (한 셀) | 설계값 |
+| 관절 열 시정수 | `Actuator::thermal_tau_s` | 버스 서보 200 s, QDD 600–900 s | qdd100 자료로 맞춘 추정, 서보는 공개값 없음 |
+| 두 팔 들기 시간 | `TWO_ARM_LIFT_FACTOR` | 1.5배 | 가정 |
+| 손 질량 | `parts::hand_mass_kg` | 2지 0.35 … 5지 0.60 kg | 연구 보고서의 그리퍼 질량에서 추정 |
+| 화물칸 위치 | `CARGO_X_M`, `CARGO_Z_M` | 배 앞 0.12 m, 허리 아래 0.10 m | 가정 |
+| 피드포워드 명목 모델 | `Body::nominal_shift` | 팔 = 체중 5%, CoM 53% (Winter) | 사람 비율. 로봇과 다른 만큼을 SDS `ff` 보정이 배움 |
+
+### ML 대역 모델 (가중치가 없을 때)
+
+| 값 | 위치 | 기본값 | 근거 |
+| --- | --- | --- | --- |
+| 깊이 대역 축척 | `ml::STANDIN_DEPTH_SCALE` | 0.8 | 고른 값(실내 학습 모델의 실외 축척을 모름). 삼각 측량이 이 값을 찾아야 함 |
+| 깊이 최대값 | `ml::TIPS_MAX_DEPTH_M` | 10 m | TIPSv2 DPT 구간 범위(0.001–10 m) |
+| 깊이 패치 오차 | `DepthStandIn::patch_sd` | 패치마다 곱셈 오차 6% | 가정 |
+| 의미 위치 대역 | `LocateStandIn` | 19×13 패치, 잡음 0.04, 닮은꼴 누출 35% | 가정 |
+| 프롬프트 하한 | `mlsds::default_floor` | 대역 0.35, SigLIP2 0 | 가정. SDS 기준선(평균 − 2σ)이 생기면 그것을 씀 |
+| 삼각 측량 최소 시차 | `TriCfg::min_parallax_deg` | 6° (계획은 ×1.4) | 오차 모델 `σ_r ≈ r·σθ·√2 / sin γ`에서 거리 15% 이하가 되도록 고름 |
+| 방위 잡음 | `centroid_sigma(.., 2 px)` | 마스크 중심 2 px | 가정 |
+| 가까운 거리 판단 | `DecideCfg::close_range_m` | 1.6 m | 가정(가까우면 깊이 거리로 바로 판단) |
 
 ### 정밀도 게이트의 임계값
 

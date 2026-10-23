@@ -115,6 +115,10 @@ const handlers = {
     siglip_files: { dir: '(브라우저 모의)', present: false }, ttm_files: { dir: '(브라우저 모의)', present: false },
   }),
   recognizer_use: async () => { throw '브라우저 모의 백엔드에서는 SigLIP2 를 불러올 수 없습니다. Tauri 앱에서 사용하세요'; },
+  test_status: async () => ({ active: false }),
+  test_start: async () => { throw '통합 테스트는 실제 Rust 런타임(개발 서버 또는 Tauri)에서만 동작합니다'; },
+  body_presets: async () => { throw '부품 프리셋 물리는 실제 Rust 런타임에서 계산합니다'; },
+  body_plan_eval: async () => { throw '부품 프리셋 물리는 실제 Rust 런타임에서 계산합니다'; },
   ttm_use: async () => { throw '브라우저 모의 백엔드에서는 Granite TTM 을 불러올 수 없습니다. Tauri 앱에서 사용하세요'; },
 };
 

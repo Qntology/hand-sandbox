@@ -37,6 +37,9 @@ pub fn run() {
             sim::models_status,
             sim::recognizer_use,
             sim::ttm_use,
+            sim::rt_call,
+            sim::test_db_mirror,
+            sim::tips_use,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the logistics hand simulator");

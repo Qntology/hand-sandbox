@@ -18,7 +18,11 @@ hand-search = { path = "../hand-search" }
 hand-quest = { path = "../hand-quest" }
 hand-sds = { path = "../hand-sds" }
 hand-ts = { path = "../hand-ts" }
+hand-vision = { path = "../hand-vision" }
 world-sim = { path = "../world-sim" }
 
 [dev-dependencies]
 candle-nn = { workspace = true }
+# The development server mirrors the test records into LanceDB like the app does.
+hand-data = { path = "../hand-data" }
+tokio = { workspace = true }

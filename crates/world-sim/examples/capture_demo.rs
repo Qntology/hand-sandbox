@@ -10,7 +10,7 @@ fn main() {
     let seed: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(7);
     let mut hand = HandConfig::preset(FingerCount::Five);
     hand.base = BaseKind::Track;
-    let mut w = World::new(WorldConfig { seed, cells: 64, hand }).unwrap();
+    let mut w = World::new(WorldConfig { seed, cells: 64, hand, ..WorldConfig::default() }).unwrap();
     // Look at the nearest node.
     let n = w
         .nodes

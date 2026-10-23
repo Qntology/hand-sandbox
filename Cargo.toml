@@ -9,6 +9,7 @@ members = [
     "crates/hand-ts",
     "crates/hand-search",
     "crates/hand-quest",
+    "crates/hand-vision",
     "crates/hand-runtime",
     "src-tauri",
 ]
@@ -53,6 +54,10 @@ opt-level = 3
 
 # The software renderer and the A* planner are CPU heavy; keep them fast in debug test runs.
 [profile.dev.package.world-sim]
+opt-level = 3
+
+# The ML stand-ins and the region tracker run per keyframe in the integrated test.
+[profile.dev.package.hand-vision]
 opt-level = 3
 
 [profile.release]

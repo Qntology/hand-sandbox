@@ -189,6 +189,11 @@ impl PrecisionGates {
         self.ttm = ttm;
     }
 
+    /// The attached Granite TTM, for other forecasts (the ML decision) to use.
+    pub fn ttm(&self) -> Option<Arc<TtmForecaster>> {
+        self.ttm.clone()
+    }
+
     pub fn has_ttm(&self) -> bool {
         self.ttm.is_some()
     }

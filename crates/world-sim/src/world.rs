@@ -10,12 +10,11 @@
 //! Assumptions that are not in the hand/foot models are named constants below
 //! and listed in `data/README.md`.
 
-use std::collections::HashSet;
+use std::sync::Mutex;
+use std::collections::{BTreeMap, HashSet};
 
-use hand_core::{
-    battery_capacity_j, compute_body, grasp, BodyInputs, BodyStatus, ConfigError, GraspSetup, Hand,
-    HandConfig, Payload,
-};
+use hand_core::balance::{BalanceReport, Body, DriveLimits, FeedForward, Posture, Source, GRIP_SAFETY};
+use hand_core::{compute_body, grasp, BalanceSummary, BodyInputs, BodyLimits, BodyPlan, BodyStatus, ConfigError, GraspSetup, Hand, HandConfig, Payload};
 use serde::{Deserialize, Serialize};
 
 use crate::kinds::{Ground, ItemKind, NodeKind};
@@ -50,6 +49,12 @@ const TURN_IN_PLACE_RAD: f32 = 0.6;
 const TURN_DONE_RAD: f32 = 0.2;
 /// Heading error accepted before manipulation starts, radians.
 const FACE_DONE_RAD: f32 = 0.08;
+/// A lift shared by both arms takes this much longer (est).
+pub const TWO_ARM_LIFT_FACTOR: f32 = 1.5;
+/// Time to reach cruise speed from standing, seconds (est); the first part of every move is an `accel` balance state.
+pub const ACCEL_TIME_S: f32 = 0.5;
+/// A balance state that lasts is recorded again every this many ticks.
+const BALANCE_RESAMPLE_TICKS: u64 = 50;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorldConfig {
@@ -57,12 +62,25 @@ pub struct WorldConfig {
     /// Cells per side (square world). Each cell is 0.5 m.
     pub cells: usize,
     pub hand: HandConfig,
+    /// Part presets of the robot's body (`hand_core::parts`).
+    #[serde(default)]
+    pub body: BodyPlan,
 }
 
 impl Default for WorldConfig {
     fn default() -> Self {
-        WorldConfig { seed: 7, cells: 64, hand: HandConfig::preset(hand_core::FingerCount::Five) }
+        WorldConfig { seed: 7, cells: 64, hand: HandConfig::preset(hand_core::FingerCount::Five), body: BodyPlan::default() }
     }
+}
+
+/// A balance state the robot entered (or stayed in long enough to sample again).
+#[derive(Clone, Debug)]
+pub struct BalanceEvent {
+    pub tick: u64,
+    pub time_s: f64,
+    /// Terrain and phase bucket, such as `flat|mine` or `up_hi|move`.
+    pub state: String,
+    pub report: BalanceReport,
 }
 
 #[derive(Clone, Debug)]
@@ -152,6 +170,8 @@ pub enum ActionError {
     GraspUnstable { margin: f32 },
     CapacityExceeded { carried_kg: f32, item_kg: f32, capacity_kg: f32 },
     NothingToDeliver,
+    /// The arms (or the balance) cannot lift the item: a joint over its peak, or a negative margin.
+    LiftOverload { limiting: String, margin: f32 },
 }
 
 impl ActionError {
@@ -165,6 +185,7 @@ impl ActionError {
             ActionError::GraspUnstable { .. } => "grasp_unstable",
             ActionError::CapacityExceeded { .. } => "capacity_exceeded",
             ActionError::NothingToDeliver => "nothing_to_deliver",
+            ActionError::LiftOverload { .. } => "lift_overload",
         }
     }
 }
@@ -197,12 +218,14 @@ struct MoveState {
     /// Seconds of driving done on the current edge.
     progress_s: f32,
     announced_pause: bool,
+    /// Seconds since the move started (the first part is acceleration).
+    elapsed_s: f32,
 }
 
 #[derive(Clone, Debug)]
 enum WorkKind {
     Mine { node: u32 },
-    Pick { drop: u32 },
+    Pick { drop: u32, two_arms: bool },
     Deliver { waypoint: u32, item: Option<ItemKind> },
 }
 
@@ -233,6 +256,18 @@ pub struct World {
     active: Option<(Action, Active)>,
     rng: Rng,
     next_drop: u32,
+    /// The robot's body built from the part presets.
+    pub body: Body,
+    limits: Mutex<Option<(u32, DriveLimits)>>,
+    /// Balance of the posture held right now, keyed `source|terrain|phase`.
+    pub balance: Option<(String, BalanceReport)>,
+    balance_since: u64,
+    balance_events: Vec<BalanceEvent>,
+    /// Feed-forward gains per balance source, set by the runtime from the SDS.
+    pub ff_gains: BTreeMap<Source, f32>,
+    pub ff_enabled: bool,
+    /// Heat state per joint, `(τ/τ_cont)²` low-passed with the actuator's time constant.
+    pub heat: BTreeMap<String, f32>,
 }
 
 fn wrap_angle(a: f32) -> f32 {
@@ -388,6 +423,7 @@ impl World {
             })
             .collect();
 
+        let (cfg_body, base_kind, fingers) = (cfg.body, cfg.hand.base, cfg.hand.fingers);
         Ok(World {
             cfg,
             hand,
@@ -402,6 +438,14 @@ impl World {
             active: None,
             rng,
             next_drop: 1,
+            body: Body::new(&cfg_body, base_kind, fingers),
+            limits: Mutex::new(None),
+            balance: None,
+            balance_since: 0,
+            balance_events: Vec::new(),
+            ff_gains: BTreeMap::new(),
+            ff_enabled: true,
+            heat: BTreeMap::new(),
         })
     }
 
@@ -443,12 +487,64 @@ impl World {
         self.agent.carried.iter().find(|(k, _)| *k == item).map_or(0, |e| e.1)
     }
 
+    /// Cargo limit: the base's own limit, lowered by what the legs or the
+    /// chassis can carry with this body (`Body::drive_limits`).
     pub fn capacity_kg(&self) -> f32 {
-        self.hand.base.kind.carry_capacity_kg()
+        self.limits().capacity_kg
     }
 
+    /// Battery energy of the chest preset.
     pub fn battery_capacity_j(&self) -> f64 {
-        battery_capacity_j(&self.hand.base)
+        self.body.battery_j()
+    }
+
+    /// Speed, slope, step and cargo limits for the current load (cached per load).
+    pub fn limits(&self) -> DriveLimits {
+        let key = self.carried_kg().to_bits();
+        let mut cache = self.limits.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((k, l)) = cache.as_ref() {
+            if *k == key {
+                return l.clone();
+            }
+        }
+        let l = self.body.drive_limits(&self.hand.base, self.carried_kg());
+        *cache = Some((key, l.clone()));
+        l
+    }
+
+    /// The base spec the routes and the drive use: the mechanism's spec with the
+    /// body's limits applied and the drive power scaled with the mass.
+    pub fn drive_spec(&self) -> hand_core::BaseSpec {
+        let l = self.limits();
+        hand_core::BaseSpec {
+            max_speed_mps: l.max_speed_mps,
+            max_slope_deg: l.max_slope_deg,
+            max_step_m: l.max_step_m,
+            power_w: self.hand.base.power_w * l.power_scale,
+            ..self.hand.base
+        }
+    }
+
+    /// Time to reach cruise speed: at least [`ACCEL_TIME_S`], longer when the
+    /// body's acceleration limit (ZMP inside the support) is lower.
+    pub fn accel_time_s(&self) -> f32 {
+        let l = self.limits();
+        (l.max_speed_mps / l.accel_limit_mps2.max(0.05)).max(ACCEL_TIME_S)
+    }
+
+    fn ff_for(&self, s: Source) -> FeedForward {
+        FeedForward { enabled: self.ff_enabled, gain: self.ff_gains.get(&s).copied().unwrap_or(1.0) }
+    }
+
+    /// Friction capacity of one hand for an item, newtons (from the grasp table).
+    pub fn grip_capacity_n(&self, item: ItemKind) -> f32 {
+        let g = self.grasp_info(item);
+        g.margin * item.spec().mass_kg * hand_core::balance::G * GRIP_SAFETY
+    }
+
+    /// Balance states entered since the last call.
+    pub fn take_balance_events(&mut self) -> Vec<BalanceEvent> {
+        std::mem::take(&mut self.balance_events)
     }
 
     pub fn battery_ratio(&self) -> f32 {
@@ -460,9 +556,11 @@ impl World {
     }
 
     /// Mining progress per second: a full five-finger hand works at 1.0
-    /// (assumption: proportional to the finger count).
+    /// (assumption: proportional to the finger count), slowed when the
+    /// working arm's joints run hot (heat above 1 derates by 1/heat).
     pub fn mining_rate(&self) -> f32 {
-        u8::from(self.hand.config.fingers) as f32 / 5.0
+        let hot = ["shoulder_r", "elbow_r"].iter().map(|j| self.heat.get(*j).copied().unwrap_or(0.0)).fold(0.0f32, f32::max);
+        u8::from(self.hand.config.fingers) as f32 / 5.0 / hot.max(1.0)
     }
 
     pub fn busy(&self) -> bool {
@@ -502,7 +600,7 @@ impl World {
     /// route exists.
     pub fn plan_route(&self, goal: Goal) -> Option<nav::Plan> {
         let blocked = self.blocked_cells();
-        nav::plan(&self.hand.base, &self.terrain, &|x, z| blocked.contains(&(x, z)), self.agent_cell(), goal)
+        nav::plan(&self.drive_spec(), &self.terrain, &|x, z| blocked.contains(&(x, z)), self.agent_cell(), goal)
     }
 
     // ----- commands -----
@@ -526,7 +624,7 @@ impl World {
                     Goal::Within { x: *x, z: *z, reach_m: *reach_m }
                 };
                 let plan = self.plan_route(goal).ok_or(ActionError::NoPath)?;
-                Active::Move(MoveState { edges: plan.edges, idx: 0, pause_left: 0.0, progress_s: 0.0, announced_pause: false })
+                Active::Move(MoveState { edges: plan.edges, idx: 0, pause_left: 0.0, progress_s: 0.0, announced_pause: false, elapsed_s: 0.0 })
             }
             Action::Turn { yaw_deg } => Active::Turn { target: wrap_angle(yaw_deg.to_radians()) },
             Action::Face { x, z } => Active::Turn { target: (z - self.agent.z).atan2(x - self.agent.x) },
@@ -554,7 +652,13 @@ impl World {
                         capacity_kg: self.capacity_kg(),
                     });
                 }
-                Active::Work(WorkState { kind: WorkKind::Pick { drop: *drop }, remaining_s: PICKUP_TIME_S })
+                // Can the arms lift it, and does the robot stay balanced while they do?
+                let (rep, two_arms) = self.body.lift(item_kg, self.carried_kg(), &self.ff_for(Source::ArmLift), self.grip_capacity_n(kind));
+                if !rep.feasible {
+                    return Err(ActionError::LiftOverload { limiting: rep.limiting.clone().unwrap_or_default(), margin: rep.margin });
+                }
+                let t = if two_arms { PICKUP_TIME_S * TWO_ARM_LIFT_FACTOR } else { PICKUP_TIME_S };
+                Active::Work(WorkState { kind: WorkKind::Pick { drop: *drop, two_arms }, remaining_s: t })
             }
             Action::Deliver { waypoint, item } => {
                 let w = self.waypoint(*waypoint).ok_or(ActionError::UnknownTarget)?;
@@ -607,6 +711,7 @@ impl World {
 
     /// Advances the world by `dt` seconds.
     pub fn step(&mut self, dt: f32) -> Vec<TimedEvent> {
+        self.update_balance(dt);
         let mut events = Vec::new();
         let mut remaining = dt;
         let mut guard = 0;
@@ -655,7 +760,7 @@ impl World {
                     used = 0.0;
                 } else {
                     let t = self.rotate_toward(*target, remaining);
-                    self.add_energy(self.hand.base.power_w as f64 * t as f64);
+                    self.add_energy(self.drive_spec().power_w as f64 * t as f64);
                     used = t;
                 }
             }
@@ -686,7 +791,7 @@ impl World {
         let (fx, fz) = cell_center(e.from.0, e.from.1);
         let (tx, tz) = cell_center(e.to.0, e.to.1);
         self.agent.terrain_margin = Some(e.margin);
-        let power = self.hand.base.power_w as f64;
+        let power = self.drive_spec().power_w as f64;
 
         // Curb climb pause at the start of the edge.
         if e.pause_s > 0.0 && !m.announced_pause {
@@ -717,6 +822,7 @@ impl World {
         let left = e.move_time_s - m.progress_s;
         let t = left.min(remaining);
         m.progress_s += t;
+        m.elapsed_s += t;
         self.rotate_toward(heading, t);
         let f = (m.progress_s / e.move_time_s).clamp(0.0, 1.0);
         self.agent.x = fx + (tx - fx) * f;
@@ -746,7 +852,7 @@ impl World {
                     return 0.0;
                 }
             },
-            WorkKind::Pick { drop } => match self.drop_item(drop) {
+            WorkKind::Pick { drop, .. } => match self.drop_item(drop) {
                 Some(d) => (d.x, d.z),
                 None => {
                     *done = Some((false, Some("unknown_target".into())));
@@ -790,7 +896,7 @@ impl World {
                     *done = Some((true, None));
                 }
             }
-            WorkKind::Pick { drop } => {
+            WorkKind::Pick { drop, .. } => {
                 w.remaining_s -= t;
                 if w.remaining_s <= 1e-6 {
                     self.complete_pick(drop, events);
@@ -926,6 +1032,114 @@ impl World {
         }
     }
 
+    /// The posture the current action asks for, and its terrain/phase bucket.
+    pub fn posture_now(&self) -> (Posture, String) {
+        let cargo = self.carried_kg();
+        let bucket = |deg: f32, step: f32| -> String {
+            if step > 0.0 {
+                "step".into()
+            } else if deg.abs() < 3.0 {
+                "flat".into()
+            } else {
+                format!("{}_{}", if deg > 0.0 { "up" } else { "down" }, if deg.abs() < 10.0 { "lo" } else { "hi" })
+            }
+        };
+        match &self.active {
+            Some((_, Active::Move(m))) => {
+                let Some(e) = m.edges.get(m.idx) else { return (Posture::quiet(cargo), "flat|move".into()) };
+                let rise = self.terrain.height_m(e.to.0, e.to.1) - self.terrain.height_m(e.from.0, e.from.1);
+                let slope = if rise >= 0.0 { e.slope_deg } else { -e.slope_deg };
+                let mut p = Posture { slope_deg: slope, ..Posture::quiet(cargo) };
+                let b = bucket(slope, if m.pause_left > 0.0 { e.step_m } else { 0.0 });
+                if m.pause_left > 0.0 {
+                    p.source = Source::StepUp;
+                    p.step_m = e.step_m;
+                    p.single_support = self.body.legged;
+                } else if m.elapsed_s < self.accel_time_s() {
+                    // The controller ramps up no harder than its ZMP margin allows.
+                    p.source = Source::Accel;
+                    p.accel_mps2 = self.drive_spec().max_speed_mps / self.accel_time_s();
+                } else if self.body.legged {
+                    p.source = Source::FootLift;
+                    p.single_support = true;
+                } else if slope.abs() >= 3.0 {
+                    p.source = Source::Slope;
+                }
+                (p, format!("{b}|move"))
+            }
+            Some((_, Active::Work(w))) => match &w.kind {
+                WorkKind::Mine { .. } => (Posture::arm_raise(cargo), "flat|mine".into()),
+                WorkKind::Pick { drop, two_arms } => {
+                    let kg = self.drop_item(*drop).map_or(0.0, |d| d.kind.spec().mass_kg);
+                    (Posture::arm_lift(kg, *two_arms, cargo), "flat|pick".into())
+                }
+                WorkKind::Deliver { .. } => {
+                    let kg = self.agent.carried.iter().map(|(k, _)| k.spec().mass_kg).fold(0.0f32, f32::max);
+                    (Posture::arm_lift(kg, false, (cargo - kg).max(0.0)), "flat|deliver".into())
+                }
+            },
+            _ => (Posture::quiet(cargo), "flat|idle".into()),
+        }
+    }
+
+    /// Solves the balance of the current posture, heats the joints and notes
+    /// a balance event when the state changed or lasted long enough to sample.
+    fn update_balance(&mut self, dt: f32) {
+        let (post, state) = self.posture_now();
+        let grip = match &self.active {
+            Some((_, Active::Work(WorkState { kind: WorkKind::Pick { drop, .. }, .. }))) => self.drop_item(*drop).map(|d| self.grip_capacity_n(d.kind)),
+            _ => None,
+        }
+        .unwrap_or(1e3);
+        let rep = self.body.solve(&post, &self.ff_for(post.source), grip);
+        for j in &rep.joints {
+            let tau_s = match j.joint.as_str() {
+                n if n.starts_with("shoulder") => self.body.arm.shoulder.thermal_tau_s,
+                n if n.starts_with("elbow") => self.body.arm.elbow.thermal_tau_s,
+                "waist" => self.body.belly.pitch.map_or(600.0, |a| a.thermal_tau_s),
+                "neck" => self.body.head.neck.thermal_tau_s,
+                "knee" | "hip_roll" => self.body.leg.knee.thermal_tau_s,
+                "ankle" => self.body.leg.ankle.thermal_tau_s,
+                _ => continue,
+            };
+            let h = self.heat.entry(j.joint.clone()).or_insert(0.0);
+            *h += (dt / tau_s).min(1.0) * (j.effort * j.effort - *h);
+        }
+        let key = format!("{}|{state}", post.source.id());
+        let changed = self.balance.as_ref().map_or(true, |(k, _)| *k != key);
+        if changed || self.tick.saturating_sub(self.balance_since) >= BALANCE_RESAMPLE_TICKS {
+            self.balance_since = self.tick;
+            if self.balance_events.len() < 2000 {
+                self.balance_events.push(BalanceEvent { tick: self.tick, time_s: self.time_s, state: state.clone(), report: rep.clone() });
+            }
+        }
+        self.balance = Some((key, rep));
+    }
+
+    /// Summary of the current balance for the body status.
+    pub fn balance_summary(&self) -> Option<BalanceSummary> {
+        let (key, r) = self.balance.as_ref()?;
+        let worst = r.worst();
+        Some(BalanceSummary {
+            plan: self.cfg.body.id(),
+            source: r.source.id().into(),
+            source_ko: r.source.label_ko().into(),
+            state: key.splitn(2, '|').nth(1).unwrap_or("").to_string(),
+            margin: r.margin,
+            margin_noff: r.margin_noff,
+            trunk_lean_deg: r.trunk_lean_deg,
+            head_tilt_deg: r.head_pitch_deg.abs().max(r.head_roll_deg.abs()),
+            worst_joint: worst.map(|w| w.joint.clone()),
+            worst_ratio: worst.map_or(0.0, |w| w.peak_ratio),
+            effort_sum: r.effort_sum,
+            mass_kg: r.mass_kg,
+            com_height_m: r.com[2],
+            heat_max: self.heat.values().copied().fold(0.0, f32::max),
+            joints: r.joints.clone(),
+            couplings: r.couplings.clone(),
+        })
+    }
+
     /// Inputs for the body-status display. Perception numbers come from the
     /// caller because the world does not know what the recogniser saw.
     pub fn body_inputs(&self, vision_confidence: Option<f32>, frame_ms: Option<f32>) -> BodyInputs {
@@ -938,8 +1152,13 @@ impl World {
             carried_kg: self.carried_kg(),
             grip_margin: self.agent.grip_margin,
             joint_strikes: self.agent.strikes,
-            speed_factor: (self.agent.speed_mps / self.hand.base.max_speed_mps).clamp(0.0, 1.0),
+            speed_factor: (self.agent.speed_mps / self.drive_spec().max_speed_mps).clamp(0.0, 1.0),
             terrain_margin: self.agent.terrain_margin,
+            limits: Some({
+                let l = self.limits();
+                BodyLimits { battery_j: self.battery_capacity_j(), capacity_kg: l.capacity_kg, max_speed_mps: l.max_speed_mps, max_slope_deg: l.max_slope_deg, max_step_m: l.max_step_m }
+            }),
+            balance: self.balance_summary(),
         }
     }
 
@@ -956,7 +1175,7 @@ mod tests {
     fn world(fingers: FingerCount, base: BaseKind) -> World {
         let mut hand = HandConfig::preset(fingers);
         hand.base = base;
-        World::new(WorldConfig { seed: 7, cells: 64, hand }).unwrap()
+        World::new(WorldConfig { seed: 7, cells: 64, hand, body: BodyPlan::default() }).unwrap()
     }
 
     fn run(w: &mut World, max_s: f32) -> Vec<TimedEvent> {
@@ -1229,5 +1448,65 @@ mod tests {
         w.command(Action::Face { x: w.agent.x, z: w.agent.z + 5.0 }).unwrap();
         run(&mut w, 10.0);
         assert!((w.agent.yaw - std::f32::consts::FRAC_PI_2).abs() < 0.05);
+    }
+
+    fn world_with(body: BodyPlan, base: BaseKind) -> World {
+        let mut hand = HandConfig::preset(FingerCount::Five);
+        hand.base = base;
+        World::new(WorldConfig { seed: 7, cells: 64, hand, body }).unwrap()
+    }
+
+    #[test]
+    fn the_arm_preset_decides_what_can_be_picked_up() {
+        let place = |w: &mut World, kind: ItemKind| {
+            w.drops.push(DropItem { id: 600, kind, x: w.agent.x + 0.4, z: w.agent.z });
+            w.command(Action::PickUp { drop: 600 })
+        };
+        let mut budget = world_with(BodyPlan { arm: hand_core::Tier::Budget, ..BodyPlan::default() }, BaseKind::Track);
+        match place(&mut budget, ItemKind::Log) {
+            Err(ActionError::LiftOverload { limiting, .. }) => assert!(limiting.contains("elbow"), "{limiting}"),
+            other => panic!("{other:?}"),
+        }
+        let mut mid = world_with(BodyPlan::default(), BaseKind::Track);
+        assert!(place(&mut mid, ItemKind::Log).is_ok());
+        let ev = run(&mut mid, 10.0);
+        assert!(ev.iter().any(|e| matches!(e.event, WorldEvent::ItemPicked { .. })));
+        // Iron ore needs both mid arms, which takes longer than a one-handed pick.
+        let mut iron = world_with(BodyPlan::default(), BaseKind::Track);
+        let t0 = iron.time_s;
+        place(&mut iron, ItemKind::IronOre).unwrap();
+        run(&mut iron, 10.0);
+        assert!((iron.time_s - t0) as f32 >= PICKUP_TIME_S * TWO_ARM_LIFT_FACTOR - 0.15);
+    }
+
+    #[test]
+    fn mining_records_an_arm_raise_and_a_hot_budget_arm_mines_slower() {
+        let mut w = world(FingerCount::Five, BaseKind::Track);
+        mine_nearest(&mut w, NodeKind::Tree);
+        let events = w.take_balance_events();
+        let raise = events.iter().find(|e| e.report.source == Source::ArmRaise).expect("an arm-raise state");
+        assert_eq!(raise.state, "flat|mine");
+        assert!(raise.report.couplings.iter().any(|c| c.target == hand_core::Segment::Foot));
+        let mut cold = world_with(BodyPlan { arm: hand_core::Tier::Budget, ..BodyPlan::default() }, BaseKind::Track);
+        cold.heat.insert("elbow_r".into(), 2.0);
+        assert!((cold.mining_rate() - 0.5).abs() < 1e-6, "a joint at heat 2 halves the strike rate");
+    }
+
+    #[test]
+    fn a_walking_mid_robot_carries_little_and_a_tracked_one_carries_more() {
+        let foot = world_with(BodyPlan::default(), BaseKind::HumanFoot);
+        let track = world_with(BodyPlan::default(), BaseKind::Track);
+        assert!(foot.capacity_kg() < 6.0, "mid legs hold ~24 kg in total: {}", foot.capacity_kg());
+        assert!(track.capacity_kg() > foot.capacity_kg());
+        // The chest preset sets the battery: 324 Wh for mid.
+        assert!((foot.battery_capacity_j() - 324.0 * 3600.0).abs() < 1.0);
+        // Cargo makes the base slower and uses more power.
+        let mut loaded = world_with(BodyPlan::default(), BaseKind::Track);
+        let (v0, p0) = (loaded.drive_spec().max_speed_mps, loaded.drive_spec().power_w);
+        add_stock(&mut loaded.agent.carried, ItemKind::IronOre, 3);
+        assert!(loaded.drive_spec().power_w > p0);
+        assert!(loaded.drive_spec().max_speed_mps <= v0);
+        let s = loaded.body_status(None, None);
+        assert!(s.balance.is_none() || s.balance.as_ref().unwrap().mass_kg > 0.0);
     }
 }
