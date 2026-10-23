@@ -17,6 +17,7 @@ tauri = { version = "2", features = [] }
 hand-core = { path = "../crates/hand-core" }
 hand-ml = { path = "../crates/hand-ml" }
 hand-data = { path = "../crates/hand-data" }
+hand-runtime = { path = "../crates/hand-runtime" }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -1,0 +1,177 @@
+{
+  "version": 1,
+  "format": "logis-center bias.json node format: every node is {semantic, bias, prejudice, exact_match}. bias and prejudice are comma separated phrase lists that get embedded; exact_match lists words that identify the node without any embedding. 'surface' (an addition of this project) lists complete word forms that match whole only. Vocabulary lives here, never in code.",
+  "resource": {
+    "log": {
+      "semantic": "a wooden log: the trunk piece that chopping a tree yields, used as building and fuel wood",
+      "bias": "원목, 통나무, 나무, 목재, 장작, 나무토막, 통나무토막, wooden log, log, wood, timber, lumber, firewood, tree trunk, 丸太, 木材, 原木, 木头",
+      "prejudice": "돌, 바위, 석탄, 철광석, 돌멩이, stone, rock, coal, iron ore",
+      "exact_match": ["원목", "통나무", "나무", "목재", "장작", "나무토막", "통나무토막", "log", "logs", "wood", "timber", "lumber", "firewood", "tree", "trees", "丸太", "木材", "原木", "木头"]
+    },
+    "stone": {
+      "semantic": "a piece of stone chipped from a boulder, used as building material",
+      "bias": "돌, 돌멩이, 돌덩이, 바위, 암석, 자갈, 조약돌, 석재, 돌조각, stone, stone piece, rock, boulder, pebble, cobblestone, 石, 石头, 岩, 岩石",
+      "prejudice": "원목, 나무, 석탄, 철광석, wood, log, coal, iron ore",
+      "exact_match": ["돌", "돌멩이", "돌덩이", "돌덩어리", "돌조각", "바위", "암석", "자갈", "조약돌", "석재", "stone", "stones", "rock", "rocks", "boulder", "pebble", "cobblestone", "石", "石头", "岩", "岩石"]
+    },
+    "coal": {
+      "semantic": "a black lump of coal mined from coal ore, used as fuel",
+      "bias": "석탄, 석탄덩이, coal, coal lump, black coal, lump of coal, 石炭, 煤, 煤炭",
+      "prejudice": "돌, 원목, 철광석, stone, log, iron ore",
+      "exact_match": ["석탄", "석탄덩이", "coal", "coals", "石炭", "煤", "煤炭"]
+    },
+    "iron_ore": {
+      "semantic": "a lump of raw iron ore mined from an iron vein, to be smelted into iron",
+      "bias": "철광석, 철광, 철, 원철, 생철광석, 철덩이, iron ore, raw iron, iron, iron lump, 鉄鉱石, 铁矿石, 铁矿",
+      "prejudice": "돌, 석탄, 원목, 구리, 금, stone, coal, log, copper, gold",
+      "exact_match": ["철광석", "철광", "원철", "철", "생철광석", "iron ore", "iron", "raw iron", "鉄鉱石", "铁矿石", "铁矿"]
+    }
+  },
+  "place": {
+    "base_camp": {
+      "semantic": "the base camp: the waypoint where the robot starts and where it recharges",
+      "bias": "베이스캠프, 베이스, 캠프, 기지, 본진, 거점, 출발점, base camp, base, camp, home base, starting point, ベースキャンプ, 基地, 大本营",
+      "prejudice": "창고, 보관소, warehouse, storage",
+      "exact_match": ["베이스캠프", "베이스 캠프", "베이스", "캠프", "기지", "본진", "거점", "출발점", "base camp", "basecamp", "camp", "base", "ベースキャンプ", "基地", "大本营"]
+    },
+    "warehouse": {
+      "semantic": "the warehouse: the waypoint where gathered items are stored",
+      "bias": "창고, 물류창고, 보관소, 저장소, 적재소, 하치장, warehouse, storage, depot, storehouse, stockroom, 倉庫, 仓库",
+      "prejudice": "베이스캠프, 기지, base camp, camp",
+      "exact_match": ["창고", "물류창고", "보관소", "저장소", "적재소", "하치장", "warehouse", "storage", "depot", "storehouse", "倉庫", "仓库"]
+    }
+  },
+  "verb": {
+    "harvest": {
+      "semantic": "gather a resource by cutting, mining or digging it out of the world",
+      "bias": "채굴하다, 채취하다, 벌목하다, 캐다, 베다, 자르다, 파다, 따다, 수확하다, 모으다, 구하다, mine, chop, cut down, dig, harvest, gather, collect, 採掘, 伐採, 采集, 挖, 砍",
+      "prejudice": "",
+      "exact_match": ["채굴", "채취", "벌목", "수확", "캐내", "베어내", "잘라내", "파내", "mine", "mining", "chop", "chopping", "dig", "digging", "harvest", "harvesting", "gather", "gathering", "collect", "採掘", "伐採", "采集", "砍", "挖"],
+      "surface": ["캐", "캐서", "캐와", "캐와라", "캐줘", "캐라", "캐오", "캐고", "캐자", "캐다", "캐어", "베어", "베어서", "베어와", "베어줘", "베어라", "잘라", "잘라서", "잘라와", "잘라줘", "잘라라", "자르고", "자르세요", "따서", "따와", "따줘", "파서", "파와", "파줘", "파고", "모아", "모아서", "모아와", "모아줘", "모아라", "모으고", "모으세요", "구해", "구해서", "구해와", "구해줘", "구하세요", "얻어", "얻어서", "얻어와", "얻어줘", "얻고", "얻으세요"]
+    },
+    "pickup": {
+      "semantic": "pick an item up off the ground with the hand",
+      "bias": "줍다, 집다, 집어 올리다, 주워 오다, 습득하다, pick up, pick, grab, take, lift, 拾う, 拾",
+      "prejudice": "",
+      "exact_match": ["습득", "줍기", "pick up", "pickup", "pick", "grab", "take", "lift", "拾う", "拾"],
+      "surface": ["줍", "줍고", "줍자", "줍는", "주워", "주워서", "주워와", "주워줘", "주워라", "주우세요", "주우면", "집어", "집어서", "집어와", "집어줘", "집어라", "집어올려", "집어올려줘", "집고", "집으세요"]
+    },
+    "deliver": {
+      "semantic": "carry what is in the hand to a place and put it down there",
+      "bias": "가져오다, 가져가다, 갖다 놓다, 옮기다, 운반하다, 나르다, 배달하다, 전달하다, 납품하다, 보내다, 놓다, 두다, bring, carry, deliver, move, haul, transport, fetch, drop off, put, 運ぶ, 持ってくる, 搬运, 运送, 带来",
+      "prejudice": "",
+      "exact_match": ["운반", "배달", "납품", "전달", "반입", "이동시키", "가져오", "가져가", "옮기", "나르", "bring", "carry", "deliver", "move", "haul", "transport", "fetch", "drop off", "put", "運ぶ", "搬运", "运送", "带来"],
+      "surface": ["가져와", "가져와라", "가져와줘", "가져와주세요", "가져와요", "가져와봐", "가져다", "가져다줘", "가져다놔", "가져다놔라", "가져다놓아", "가져가", "가져가서", "가져가라", "가져가줘", "갖다", "갖다놔", "갖다놔라", "갖다놓아", "갖다줘", "갖다와", "갖고와", "갖고와라", "갖고가", "갖고가서", "옮겨", "옮겨서", "옮겨줘", "옮겨라", "옮겨놔", "옮겨와", "이동시켜", "이동시켜줘", "날라", "날라서", "날라줘", "날라와", "놓아", "놔", "놔둬", "두고", "둬", "내려놔", "내려놓아", "보내", "보내줘", "넣어", "넣어줘"]
+    },
+    "go": {
+      "semantic": "walk to a place without carrying anything",
+      "bias": "가다, 이동하다, 향하다, 걸어가다, 돌아가다, 복귀하다, 돌아오다, go, go to, walk to, head to, return, travel, 行く, 去",
+      "prejudice": "",
+      "exact_match": ["이동", "복귀", "귀환", "go", "goto", "walk", "head", "return", "向かう", "行く", "去"],
+      "surface": ["가", "가라", "가줘", "가자", "가세요", "가서", "가봐", "가보자", "돌아가", "돌아가라", "돌아가줘", "돌아와", "돌아와라", "걸어가", "걸어가서", "향해", "향하세요"]
+    },
+    "stop": {
+      "semantic": "stop what the robot is doing",
+      "bias": "멈추다, 정지하다, 중지하다, 그만두다, 취소하다, stop, halt, cancel, abort, stand still",
+      "prejudice": "",
+      "exact_match": ["정지", "중지", "취소", "중단", "stop", "halt", "cancel", "abort"],
+      "surface": ["멈춰", "멈춰라", "멈춰줘", "멈춰요", "멈추", "멈추세요", "멈춤", "그만", "그만해", "그만둬"]
+    }
+  },
+  "filler": {
+    "semantic": "politeness, urgency and connecting words that carry no object or place",
+    "bias": "please, quickly, now, then, and",
+    "prejudice": "",
+    "exact_match": ["좀", "빨리", "얼른", "제발", "어서", "그리고", "그럼", "그냥", "한번", "일단", "꼭", "다시", "저기", "음", "자", "해줘", "해주세요", "주세요", "줘", "해라", "해", "그", "이", "저", "please", "pls", "the", "a", "an", "some", "and", "then", "now", "quickly", "hey", "ok", "okay"]
+  },
+  "negation": {
+    "semantic": "words that rule the neighbouring noun out",
+    "bias": "말고, 빼고, 제외, except, without, not",
+    "prejudice": "",
+    "exact_match": ["말고", "빼고", "제외", "제외하고", "아니고", "아닌", "except", "without", "not", "excluding", "instead of"]
+  },
+  "preposition": {
+    "direction": ["to", "into", "towards", "toward", "at", "onto", "near", "beside"],
+    "source": ["from", "out of"]
+  },
+  "quantity": {
+    "counters": ["개", "조각", "덩이", "덩어리", "그루", "토막", "알", "개씩", "묶음", "stack", "stacks", "piece", "pieces", "pcs", "pc", "ea"],
+    "native_units": {"한": 1, "하나": 1, "두": 2, "둘": 2, "세": 3, "셋": 3, "석": 3, "네": 4, "넷": 4, "넉": 4, "다섯": 5, "여섯": 6, "일곱": 7, "여덟": 8, "아홉": 9},
+    "native_tens": {"열": 10, "스물": 20, "스무": 20, "서른": 30, "마흔": 40, "쉰": 50},
+    "sino_digits": {"일": 1, "이": 2, "삼": 3, "사": 4, "오": 5, "육": 6, "칠": 7, "팔": 8, "구": 9},
+    "sino_tens": {"십": 10},
+    "words": {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+  },
+  "vision": {
+    "tree": {
+      "kind": "source",
+      "link": "log",
+      "semantic": "a tree standing in the world: a brown blocky trunk with a green crown",
+      "bias": "a tree, a blocky tree with a brown trunk and green leaves, a voxel tree, a minecraft oak tree, a tree trunk with green foliage",
+      "prejudice": "a grey boulder, a green bush, a grass field, a wooden log lying on the ground, a house"
+    },
+    "boulder": {
+      "kind": "source",
+      "link": "stone",
+      "semantic": "a grey boulder: a big blocky rock",
+      "bias": "a grey boulder, a big grey rock, a blocky stone block, a voxel rock, a minecraft stone block",
+      "prejudice": "a tree, a coal ore block, an iron ore block, a gravel path"
+    },
+    "coal_ore": {
+      "kind": "source",
+      "link": "coal",
+      "semantic": "a dark stone block with black coal spots",
+      "bias": "a coal ore block, a dark grey stone block with black dots, black coal spots on stone, minecraft coal ore",
+      "prejudice": "a plain grey boulder, an iron ore block, a tree"
+    },
+    "iron_ore_node": {
+      "kind": "source",
+      "link": "iron_ore",
+      "semantic": "a stone block with orange-brown iron spots",
+      "bias": "an iron ore block, a stone block with orange brown dots, rusty iron spots on stone, minecraft iron ore",
+      "prejudice": "a plain grey boulder, a coal ore block, a tree"
+    },
+    "log": {
+      "kind": "drop",
+      "link": "log",
+      "semantic": "a small wooden log lying on the ground",
+      "bias": "a small wooden log lying on the ground, a brown log item, a short piece of wood",
+      "prejudice": "a standing tree, a grey stone piece, a lump of coal"
+    },
+    "stone": {
+      "kind": "drop",
+      "link": "stone",
+      "semantic": "a small grey stone piece lying on the ground",
+      "bias": "a small grey stone on the ground, a stone piece, a cobblestone item",
+      "prejudice": "a wooden log, a lump of coal, a big boulder"
+    },
+    "coal": {
+      "kind": "drop",
+      "link": "coal",
+      "semantic": "a small black lump of coal lying on the ground",
+      "bias": "a small black lump of coal on the ground, a coal item, a black rock piece",
+      "prejudice": "a grey stone piece, a wooden log, raw iron"
+    },
+    "iron_ore": {
+      "kind": "drop",
+      "link": "iron_ore",
+      "semantic": "a small lump of raw iron ore lying on the ground",
+      "bias": "a small piece of raw iron ore on the ground, an orange brown iron lump, a raw iron item",
+      "prejudice": "a grey stone piece, a lump of coal, a wooden log"
+    },
+    "base_camp": {
+      "kind": "waypoint",
+      "link": "base_camp",
+      "semantic": "the base camp waypoint: an orange flag on a thin white pole",
+      "bias": "an orange flag on a thin white pole, a small orange banner on a post, an orange marker flag",
+      "prejudice": "a blue flag on a pole, a tree, a grey boulder"
+    },
+    "warehouse": {
+      "kind": "waypoint",
+      "link": "warehouse",
+      "semantic": "the warehouse waypoint: a blue flag on a thin white pole",
+      "bias": "a blue flag on a thin white pole, a small blue banner on a post, a blue marker flag",
+      "prejudice": "an orange flag on a pole, a tree, a grey boulder"
+    }
+  }
+}

@@ -1,0 +1,71 @@
+/* 디자인 토큰 — 화면 틀은 무채색(zinc) 단계만 쓰고, 색은 상태(정상·주의·위험)와 데이터 표시에만 남긴다.
+   캔버스도 이 토큰을 읽는다(UI 객체). */
+:root {
+  color-scheme: dark;
+  --bg-darkest: #09090b;
+  --bg-dark: #0c0c0e;
+  --bg-panel: #111113;
+  --bg-card: #161618;
+  --bg-input: #0d0d0f;
+  --bg-hover: #1b1b1e;
+  --bg-active: #232326;
+  --bg-active-hover: #2b2b2f;
+  --bg-plot: #060607;
+  --plot-grid: #18181b;
+  --plot-grid-strong: #27272a;
+  --path: #6b7280;   /* 뷰포트에서 깎인 경로 — 밝은 강조색으로 칠하면 덩어리져 보여 중간 회색 */
+  --border: #1d1d20;
+  --border-cell: #232326;
+  --border-light: #2b2b2f;
+  --border-strong: #3a3a3f;
+  --border-hover: #4a4a50;
+  --accent: #d4d4d8;
+  --accent-strong: #71717a;
+  --accent-dim: rgba(255, 255, 255, 0.07);
+  --accent-glow: rgba(255, 255, 255, 0.07);
+  --accent-text: #fafafa;
+  --signal: #a1a1aa;
+  --text-bright: #fafafa;
+  --text: #d4d4d8;
+  --text-dim: #a1a1aa;
+  --text-muted: #71717a;
+  --danger: #e06c6c;
+  --alert: #d9924f;
+  --warning: #d6b65e;
+  --success: #5fb98c;
+  --violet: #a08fd6;
+  --log-debug: #c4c4cc;
+  --font-sans: 'Inter', 'Pretendard', 'Segoe UI Variable Text', 'Segoe UI', 'Malgun Gothic', 'Noto Sans KR', sans-serif;
+  --font-mono: 'JetBrains Mono', 'Geist Mono', 'Cascadia Mono', 'Consolas', monospace;
+  --radius-card: 10px;
+  --radius: 6px;
+  --radius-sm: 4px;
+  --track-caps: 0.1em;
+  --panel-header-h: 36px;
+  --statusbar-h: 28px;
+  --rail-w: 56px;
+  --bar-h: 38px;
+  --left-min: 220px;
+  --left-w: 280px;
+  --right-min: 260px;
+  --right-w: 320px;
+  --bottom-min: 140px;
+  --bottom-h: 220px;
+  --resizer-size: 8px;
+  --panel-transition: 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* 앱 전용 확장 토큰 — 2D 측면도 캔버스(손·발·물체)와 상태 수준 색.
+   endmill 토큰은 위 블록을 그대로 두고, 이 앱에서만 쓰는 값은 여기에 추가한다. */
+:root {
+  --cv-palm: #2b2b2f;
+  --cv-finger: #7aa7d9;
+  --cv-thumb: #e0a35f;
+  --cv-object: #b8925a;
+  --lv-ok: var(--success);
+  --lv-warn: var(--warning);
+  --lv-bad: var(--alert);
+  --lv-crit: var(--danger);
+  --glass: rgba(17, 17, 19, 0.86);
+  --glass-strong: rgba(17, 17, 19, 0.95);
+}

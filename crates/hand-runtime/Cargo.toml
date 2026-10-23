@@ -1,0 +1,24 @@
+[package]
+name = "hand-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Runs the simulated robot: recognise, gate with SDS and time series, carry out quests, log everything. No UI dependency."
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+image = { workspace = true }
+base64 = "0.22"
+candle-core = { workspace = true }
+hand-core = { path = "../hand-core" }
+hand-ml = { path = "../hand-ml" }
+hand-search = { path = "../hand-search" }
+hand-quest = { path = "../hand-quest" }
+hand-sds = { path = "../hand-sds" }
+hand-ts = { path = "../hand-ts" }
+world-sim = { path = "../world-sim" }
+
+[dev-dependencies]
+candle-nn = { workspace = true }

@@ -1,7 +1,8 @@
-//! Logistics robot hand simulator: Tauri shell over `hand-core`, `hand-ml`
-//! and `hand-data`.
+//! Logistics robot hand simulator: Tauri shell over `hand-core`, `hand-ml`,
+//! `hand-data` and the simulated world (`hand-runtime`).
 
 pub mod commands;
+pub mod sim;
 pub mod state;
 pub mod views;
 
@@ -23,6 +24,19 @@ pub fn run() {
             commands::synthesize,
             commands::load_dictionary,
             commands::dataset_summary,
+            sim::world_new,
+            sim::sim_step,
+            sim::world_frame,
+            sim::command_submit,
+            sim::quest_list,
+            sim::perception_scan,
+            sim::body_status,
+            sim::sds_status,
+            sim::ts_forecast,
+            sim::log_tail,
+            sim::models_status,
+            sim::recognizer_use,
+            sim::ttm_use,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the logistics hand simulator");

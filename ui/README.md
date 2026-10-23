@@ -1,0 +1,87 @@
+# Hand Sandbox UI
+
+Tauri 2 데스크톱 앱의 프런트엔드입니다. 빌드 단계와 npm 패키지 없이 정적 파일(HTML · CSS · ES 모듈)만으로 동작하며,
+디자인 토큰과 레이아웃(떠 있는 카드 4개, 8px 간격 리사이저, 28px 상태줄)은 `endmill-sandbox` 를 따릅니다.
+
+## 구조
+
+```
+ui/
+├─ index.html            골격: 왼쪽 · 가운데 · 오른쪽 · 하단 카드와 상태줄 (인라인 스크립트·핸들러 없음)
+├─ css/
+│  ├─ tokens.css         endmill :root 토큰 그대로 + 앱 전용 토큰(--lv-*, --cv-*, --glass)
+│  ├─ layout.css         카드·리사이저·접기·탭 줄·상태줄
+│  ├─ components.css     아코디언·폼·버튼·뱃지·표·로그·퀘스트 카드
+│  └─ hud.css            월드 화면 위 오버레이(신체 HUD·퀘스트 트래커·명령줄·PiP·범례)
+└─ js/
+   ├─ main.js            시작 순서 조립
+   ├─ api.js             invoke 래퍼 (Tauri 가 없으면 모의 백엔드로 자동 전환)
+   ├─ state.js util.js toast.js layout.js
+   ├─ sim.js world-view.js world-map.js world-panel.js     월드 · 시뮬레이션 · 프레임 폴링
+   ├─ body-hud.js quest-panel.js command-bar.js            오버레이와 오른쪽 패널
+   ├─ hand-canvas.js hand-panel.js vision-upload.js        손·발 측면도와 파지 시험
+   ├─ logs.js analysis.js timeseries.js data-panel.js device.js
+   └─ mock-*.js          브라우저 전용 모의 백엔드 (mock-backend.js 가 진입점)
+```
+
+## 브라우저에서 모의 백엔드로 실행
+
+`window.__TAURI__` 가 없으면 `api.js` 가 `mock-backend.js` 를 불러와 모든 명령을 흉내 냅니다.
+상태줄에 "모의 백엔드" 뱃지가 표시됩니다.
+
+```sh
+cd ui
+python3 -m http.server 8765
+# 브라우저에서 http://127.0.0.1:8765/ 열기
+```
+
+월드 프레임은 가짜 3D(WebP)이고, 퀘스트는 작은 상태기계(탐색 → 접근 → 채취 → 줍기 → 운반 → 인도)로 진행됩니다.
+입력줄에 `철광석 3개 캐서 베이스캠프로 가져와` 를 입력하고 Enter 를 누르면 됩니다.
+모의 값은 UI 개발용이며 실제 시뮬레이션 결과가 아닙니다.
+
+## 실제 Rust 런타임으로 브라우저에서 실행
+
+모의 백엔드 대신 실제 월드 런타임을 보려면 개발용 서버를 씁니다. 서버는 `ui/`를 내려 주고, `index.html`에 `window.__TAURI__.core.invoke` shim을 끼워 넣어 월드 명령 11개를 `POST /invoke/<명령>`으로 런타임에 보냅니다. 나머지 명령(손·발 구성, 파지 시험 등)은 브라우저 모의 백엔드로 갑니다.
+
+```sh
+cargo run --release -p hand-runtime --example serve [포트] [ui 폴더]   # 기본 http://127.0.0.1:8787/
+```
+
+127.0.0.1에서만 받고 인증이 없으니 자기 컴퓨터에서 보는 용도로만 쓰세요. 로그와 SDS 원장은 `RUNTIME_DIR`(기본 `data/runtime`)에 저장됩니다.
+`recognizer_use`·`ttm_use`는 Tauri 앱에서만 실제로 동작합니다(서버에서는 모의 백엔드가 이유를 알려 줍니다).
+
+## 명령 계약
+
+호출은 모두 `api.js` 의 `call(명령, 인자)` 를 거칩니다. 인자는 camelCase, 응답은 snake_case 입니다.
+오류는 문자열로 던져지며 상태줄과 토스트에 표시됩니다.
+
+| 명령 | 인자 | 용도 |
+| --- | --- | --- |
+| `world_new` | `seed, size, config, base` | 월드 생성(손·발 구성 반영) |
+| `sim_step` | `ticks` | 시뮬레이션 전진 |
+| `world_frame` | `width, height, quality, view` | WebP 프레임과 탐지 상자 |
+| `command_submit` | `text` | 자연어 명령 → 퀘스트 |
+| `quest_list` / `body_status` | 없음 | 퀘스트 · 신체 상태 |
+| `perception_scan` | `topK` | 비전 점수 |
+| `sds_status` / `ts_forecast` | `scope, axis` | SDS 원장 · 시계열 예측 (`axis`는 score · score_all · margin) |
+| `log_tail` | `afterSeq, limit, category` | 증분 로그 (시각은 UTC ISO 8601) |
+| `models_status` | 없음 | 인식기·TTM 연결 상태, 모델 폴더와 파일 유무 |
+| `recognizer_use` | `mode` (`embedding` \| `oracle`) | SigLIP2 인식 켜기·끄기 (Tauri 전용) |
+| `ttm_use` | `enabled` | Granite TTM 켜기·끄기 (Tauri 전용) |
+
+기존 명령(`presets`, `hand_geometry`, `grasp_test`, `drive_courses`, `dictionary`, `devices`, `select_device`,
+`classify_image`, `default_paths`, `synthesize`, `load_dictionary`, `dataset_summary`)도 그대로 호출합니다.
+
+Tauri 이벤트는 쓰지 않고 `setInterval` 로 폴링합니다: `world_frame` 약 6fps, `sim_step` 125ms, `log_tail` 1.2초.
+
+## 새 명령 추가하기
+
+1. `js/mock-backend.js` 의 핸들러 표에 모의 구현을 추가합니다.
+2. 화면 모듈에서 `call('새_명령', { camelCase 인자 })` 로 부릅니다.
+3. 응답 필드는 snake_case 로 읽습니다.
+
+## 제약
+
+- CSP: `script-src 'self'`, 이미지는 `self` · `data:` · `blob:` 만 허용합니다. 원격 글꼴·CDN·인라인 스크립트는 쓰지 않습니다.
+- 동적 문자열은 `textContent` 와 DOM 생성으로만 넣습니다(`innerHTML` 미사용).
+- 파일 하나는 약 600줄 이하로 유지합니다.

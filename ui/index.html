@@ -4,129 +4,392 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>물류 로봇 손 시뮬레이터</title>
-  <link rel="stylesheet" href="style.css" />
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="css/tokens.css" />
+  <link rel="stylesheet" href="css/layout.css" />
+  <link rel="stylesheet" href="css/components.css" />
+  <link rel="stylesheet" href="css/hud.css" />
+  <script type="module" src="js/main.js"></script>
 </head>
 <body>
-  <header class="topbar">
-    <div>
-      <h1>물류 로봇 손 시뮬레이터</h1>
-      <p class="sub">손가락 수 · 관절 옵션 · 발(이동 베이스) · SigLIP2 분류 · Lance 합성 데이터</p>
-    </div>
-    <div class="top-right">
-      <select id="device-select" aria-label="연산 장치"></select>
-      <div class="chip" id="device-chip">장치 확인 중…</div>
-    </div>
-  </header>
+  <div class="app-layout" id="appLayout">
 
-  <main class="layout">
-    <!-- 왼쪽: 손 구성 -->
-    <section class="panel" aria-labelledby="hand-h">
-      <h2 id="hand-h">손 구성</h2>
+    <!-- ── 왼쪽: 화면 전환 + 구성(①~④) ───────────────────────── -->
+    <aside class="panel-left" id="panelLeft" aria-label="구성 패널">
+      <div class="sidebar-head">
+        <button type="button" class="panel-toggle-btn" data-toggle="panelLeft" title="좌측 패널 접기" aria-label="좌측 패널 접기" aria-expanded="true">◀</button>
+        <span class="brand">Hand Sandbox</span>
+      </div>
+      <div class="panel-scroll">
+        <nav class="menu-group" aria-label="화면 전환">
+          <button type="button" class="menu-btn active" data-view="world" data-tip-title="월드" data-tip="월드 프레임과 신체 상태·퀘스트·명령 입력을 보는 기본 화면입니다.">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.6 2.4 3.8 5.2 3.8 8.5s-1.2 6.1-3.8 8.5c-2.6-2.4-3.8-5.2-3.8-8.5s1.2-6.1 3.8-8.5z"/></svg><span>월드</span>
+          </button>
+          <button type="button" class="menu-btn" data-view="side" data-tip-title="손·발" data-tip="손가락·관절·발(이동 베이스)을 2D 측면도로 보고 물체 파지를 시험합니다.">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 13V6.5a1.5 1.5 0 0 1 3 0V12M11 11V4.5a1.5 1.5 0 0 1 3 0V12M14 11V6a1.5 1.5 0 0 1 3 0v8.5a6 6 0 0 1-6 6h-.5a5 5 0 0 1-4-2L4.5 15a1.5 1.5 0 0 1 2.4-1.8L8 14.5"/></svg><span>손·발</span>
+          </button>
+          <button type="button" class="menu-btn" data-view="analysis" data-tip-title="분석" data-tip="비전 점수, 명령 해석 과정, SDS(통계 원장) 상태를 표로 봅니다.">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4v16h16"/><path d="M8 15l3.5-4 3 2.5L19 8"/></svg><span>분석</span>
+          </button>
+        </nav>
+        <div class="group-label">구성 · 무엇으로 움직일지<span class="help" tabindex="0" data-tip="① → ④ 순서로 손·발·월드·모델을 정합니다. 손·발을 바꾸면 '월드 재생성' 때 새 월드에 적용됩니다.">?</span></div>
 
-      <fieldset>
-        <legend>손가락 수 (프리셋)</legend>
-        <div class="seg" id="finger-count"></div>
-        <p class="hint" id="finger-desc"></p>
-      </fieldset>
+        <!-- ① 손 구성 -->
+        <div class="panel-section-header" data-section="secHand" role="button" tabindex="0" aria-expanded="true" aria-controls="secHand">
+          <span class="sec-title"><span class="step-no">1</span><span class="sec-name">손 구성</span><span class="help" tabindex="0" data-tip="손가락 수, 관절 개수·종류, 구동 방식을 정합니다. 바꾸면 2D 측면도와 파지 결과가 바로 갱신됩니다.">?</span></span>
+          <span class="step-sum" id="sum-hand"></span><span class="chevron" aria-hidden="true">▼</span>
+        </div>
+        <div class="panel-section-body" id="secHand">
+          <div class="form-group">
+            <span class="form-label" id="finger-label">손가락 수 (프리셋)</span>
+            <div class="seg" id="finger-count" role="group" aria-labelledby="finger-label"></div>
+            <p class="hint" id="finger-desc"></p>
+          </div>
+          <div class="form-grid">
+            <div class="form-group"><label for="segments">관절 개수 (손가락당)</label>
+              <select id="segments"><option value="2">2 관절</option><option value="3">3 관절</option><option value="4">4 관절</option></select></div>
+            <div class="form-group"><label for="actuation">구동 방식</label>
+              <select id="actuation"><option value="direct">직접 구동 (관절마다 액추에이터)</option><option value="coupled">결합 구동 (힘줄 방식)</option></select></div>
+            <div class="form-group"><label for="base-kind">근위(뿌리) 관절</label><select id="base-kind"></select></div>
+            <div class="form-group"><label for="distal-kind">원위 관절</label><select id="distal-kind"></select></div>
+            <div class="form-group span-2" id="ratio-row"><label for="ratio">결합 비율 <output id="ratio-out" for="ratio">0.67</output></label>
+              <input type="range" id="ratio" min="0.3" max="1" step="0.01" value="0.67" /></div>
+          </div>
+        </div>
 
-      <label>관절 개수 (손가락당)
-        <select id="segments">
-          <option value="2">2 관절</option>
-          <option value="3">3 관절</option>
-          <option value="4">4 관절</option>
-        </select>
-      </label>
-      <label>근위(뿌리) 관절
-        <select id="base-kind"></select>
-      </label>
-      <label>원위 관절
-        <select id="distal-kind"></select>
-      </label>
-      <label>구동 방식
-        <select id="actuation">
-          <option value="direct">직접 구동 (관절마다 액추에이터)</option>
-          <option value="coupled">결합 구동 (힘줄 방식)</option>
-        </select>
-      </label>
-      <label id="ratio-row">결합 비율 <output id="ratio-out">0.67</output>
-        <input type="range" id="ratio" min="0.3" max="1" step="0.01" value="0.67" />
-      </label>
+        <!-- ② 발 -->
+        <div class="panel-section-header" data-section="secFoot" role="button" tabindex="0" aria-expanded="true" aria-controls="secFoot">
+          <span class="sec-title"><span class="step-no">2</span><span class="sec-name">발 (이동 베이스)</span><span class="help" tabindex="0" data-tip="바퀴·메카넘·트랙·사람 발 중 하나를 고릅니다. 발에 따라 통과할 수 있는 지형과 속도가 달라집니다. 비교표는 오른쪽 '발별 주행 비교'에 있습니다.">?</span></span>
+          <span class="step-sum" id="sum-foot"></span><span class="chevron" aria-hidden="true">▼</span>
+        </div>
+        <div class="panel-section-body" id="secFoot">
+          <div id="base-choices" role="radiogroup" aria-label="발 (이동 베이스)"></div>
+        </div>
 
-      <fieldset>
-        <legend>발 (이동 베이스)</legend>
-        <div class="stack" id="base-choices"></div>
-      </fieldset>
+        <!-- ③ 월드 -->
+        <div class="panel-section-header collapsed" data-section="secWorld" role="button" tabindex="0" aria-expanded="false" aria-controls="secWorld">
+          <span class="sec-title"><span class="step-no">3</span><span class="sec-name">월드</span><span class="help" tabindex="0" data-tip="시드와 크기로 월드를 만듭니다. 같은 시드는 같은 지형을 만듭니다. 위에서 고른 손·발 구성이 이 월드의 로봇에 적용됩니다.">?</span></span>
+          <span class="step-sum" id="sum-world"></span><span class="chevron" aria-hidden="true">▼</span>
+        </div>
+        <div class="panel-section-body collapsed" id="secWorld">
+          <div class="form-grid">
+            <div class="form-group"><label for="world-seed">시드</label><input type="number" id="world-seed" min="0" step="1" value="1" /></div>
+            <div class="form-group"><label for="world-size">크기 (셀, 0.5 m)</label>
+              <select id="world-size"><option value="32">32 × 32</option><option value="48">48 × 48</option><option value="64" selected>64 × 64</option><option value="96">96 × 96</option><option value="128">128 × 128</option></select></div>
+          </div>
+          <button type="button" class="btn btn-block" id="world-new">월드 재생성</button>
+          <p class="hint err" id="world-dirty" hidden>손·발 구성이 현재 월드와 다릅니다. 재생성하면 적용됩니다.</p>
+          <div id="world-info" class="pv-kv"></div>
+        </div>
+
+        <!-- ④ 사전·모델 -->
+        <div class="panel-section-header collapsed" data-section="secModel" role="button" tabindex="0" aria-expanded="false" aria-controls="secModel">
+          <span class="sec-title"><span class="step-no">4</span><span class="sec-name">사전 · 모델</span><span class="help" tabindex="0" data-tip="연산 장치를 고르고 SigLIP2·TTM·명령 임베더가 어떤 모드로 도는지 봅니다. 모드는 인식 실행·시계열 조회·명령 실행 때 갱신됩니다.">?</span></span>
+          <span class="step-sum" id="sum-model"></span><span class="chevron" aria-hidden="true">▼</span>
+        </div>
+        <div class="panel-section-body collapsed" id="secModel">
+          <div class="form-group"><label for="device-select">연산 장치</label><select id="device-select" aria-label="연산 장치"></select></div>
+          <div class="status-line"><span class="k">SigLIP2 (비전)</span><span class="v" id="model-siglip">미확인</span></div>
+          <div class="status-line"><span class="k">TTM (시계열)</span><span class="v" id="model-ttm">미확인</span></div>
+          <div class="status-line"><span class="k">명령 임베더</span><span class="v" id="model-embed">미확인</span></div>
+          <div class="status-line"><span class="k">SDS 레시피</span><span class="v" id="model-sds">미확인</span></div>
+          <div class="btn-row">
+            <button type="button" class="btn btn-sm btn-outline" id="model-siglip-toggle" aria-pressed="false" title="월드 스크린샷 타일을 SigLIP2 로 임베딩해 인식합니다. 처음에는 모델을 불러오고 사전 문구를 임베딩하느라 시간이 걸립니다.">SigLIP2 인식 켜기</button>
+            <button type="button" class="btn btn-sm btn-outline" id="model-ttm-toggle" aria-pressed="false" title="시계열 예측 융합에 Granite TTM 을 더합니다. 가중치 폴더가 필요합니다.">TTM 켜기</button>
+          </div>
+          <div class="btn-row">
+            <button type="button" class="btn btn-sm btn-outline" id="model-refresh">상태 확인</button>
+            <button type="button" class="btn btn-sm btn-outline" id="load-dict">사전 적재</button>
+          </div>
+          <p class="hint" id="model-files"></p>
+          <p class="hint" id="dict-note"></p>
+        </div>
+      </div>
+    </aside>
+
+    <div class="resizer resizer-v left" id="resizerLeft" role="separator" aria-orientation="vertical" aria-label="왼쪽 패널 너비 (드래그, 방향키, 더블클릭 초기화)" tabindex="0"></div>
+
+    <!-- ── 가운데: 툴바 · 탭 · 화면 ───────────────────────────── -->
+    <main class="panel-center" id="panelCenter">
+      <div class="viewport-toolbar">
+        <div class="vt-row">
+          <button type="button" class="vt-btn vt-primary" id="sim-play" aria-pressed="false">⏵ 재생</button>
+          <button type="button" class="vt-btn" id="sim-step" title="한 스텝만 진행" aria-label="한 스텝 진행">⏭ 1스텝</button>
+          <label class="vt-label" for="sim-speed">속도</label>
+          <select id="sim-speed" title="sim_step 한 번에 진행하는 틱 수">
+            <option value="1">×1</option><option value="2">×2</option><option value="4">×4</option><option value="8">×8</option><option value="16">×16</option>
+          </select>
+          <span class="vt-time" id="sim-time" role="status" aria-label="현재 틱">틱 0 · 0.0 s</span>
+          <span class="vp-state" id="sim-state"><i></i><span>정지</span></span>
+          <button type="button" class="vt-btn vt-reopen" id="reopen-right" data-tip-title="퀘스트 패널 펼치기" data-tip="접어 둔 오른쪽 패널(퀘스트 · 인벤토리 · 파지 결과 · 발별 주행 비교)을 다시 엽니다.">◀ 퀘스트</button>
+        </div>
+        <div class="vt-row world-only" id="world-tools">
+          <span class="vt-label">표시</span>
+          <span class="help" tabindex="0" data-tip="월드 화면에 겹쳐 볼 항목입니다.&#10;탐지 박스 — world_frame 의 탐지(bbox)를 프레임 위에 그림&#10;경로 — 지나온 경로와 웨이포인트를 미니맵으로 표시&#10;정답 ID(오라클) — 박스·범례에 label_id 와 판정 사유를 함께 표시&#10;신체·퀘스트·PiP — 각 오버레이 켜기/끄기">?</span>
+          <button type="button" class="vt-btn active" id="tg-boxes" aria-pressed="true">탐지 박스</button>
+          <button type="button" class="vt-btn active" id="tg-path" aria-pressed="true">경로</button>
+          <button type="button" class="vt-btn" id="tg-oracle" aria-pressed="false">정답 ID(오라클)</button>
+          <button type="button" class="vt-btn active" id="tg-body" aria-pressed="true">신체</button>
+          <button type="button" class="vt-btn active" id="tg-quest" aria-pressed="true">퀘스트</button>
+          <button type="button" class="vt-btn active" id="tg-pip" aria-pressed="true">PiP</button>
+          <div class="vt-sep"></div>
+          <label class="vt-label" for="view-select">시점</label>
+          <select id="view-select"><option value="agent">에이전트 시점</option><option value="top">탑뷰</option></select>
+          <label class="vt-label" for="frame-preset">프레임</label>
+          <select id="frame-preset" title="WebP 해상도 · 품질">
+            <option value="384x256x60">384×256 · q60</option>
+            <option value="480x320x75" selected>480×320 · q75</option>
+            <option value="640x427x80">640×427 · q80</option>
+            <option value="768x512x90">768×512 · q90</option>
+          </select>
+          <span class="vt-info" id="frame-info">프레임 대기 중</span>
+        </div>
+      </div>
+
+      <div class="bottom-tabs center-tabs" role="tablist" aria-label="가운데 화면" id="center-tabs">
+        <button type="button" class="bottom-tab active" role="tab" id="ctab-world" data-tab="world" aria-selected="true" aria-controls="cpane-world">월드</button>
+        <button type="button" class="bottom-tab" role="tab" id="ctab-side" data-tab="side" aria-selected="false" aria-controls="cpane-side" tabindex="-1">손·발 측면도</button>
+        <button type="button" class="bottom-tab" role="tab" id="ctab-analysis" data-tab="analysis" aria-selected="false" aria-controls="cpane-analysis" tabindex="-1">분석</button>
+      </div>
+
+      <!-- 월드 -->
+      <div class="center-pane" id="cpane-world" role="tabpanel" aria-labelledby="ctab-world">
+        <div class="viewport-canvas-wrap" id="world-wrap" data-w="wide" data-h="tall">
+          <div class="frame-box" id="frame-box">
+            <canvas id="world-canvas" width="480" height="320" aria-label="월드 프레임"></canvas>
+            <div class="det-layer" id="det-layer" aria-hidden="true"></div>
+          </div>
+          <div class="world-empty" id="world-empty" role="status">월드를 만드는 중입니다…</div>
+
+          <div class="vp-left-stack">
+            <section class="vp-glass body-hud" id="body-hud" aria-label="로봇 신체 상태">
+              <div class="bh-head">
+                <span class="bh-title">신체 상태</span>
+                <button type="button" class="bh-toggle" id="bh-toggle" aria-expanded="true" aria-label="신체 상태 접기">▾</button>
+              </div>
+              <div class="bh-body">
+                <svg id="body-svg" viewBox="0 0 150 240" role="group" aria-label="신체 부위별 상태 (머리 비전, 가슴 배터리, 배 적재, 손 파지·관절, 발 구동·지형)"></svg>
+                <ul class="bh-list" id="body-list" aria-label="부위별 수치"></ul>
+              </div>
+              <ul class="bh-effects" id="body-effects" aria-label="상태 효과"></ul>
+              <div class="bh-meta" id="body-meta"></div>
+              <p class="bh-note">로봇의 손은 1개입니다. 양쪽 팔 영역은 해부학적 좌우가 아니라 손의 두 지표(파지·관절)입니다.</p>
+            </section>
+          </div>
+
+          <div class="vp-right-stack">
+            <div class="vp-glass quest-tracker" id="quest-tracker" role="button" tabindex="0" aria-label="퀘스트 트래커 — 누르면 퀘스트 목록으로 이동">
+              <div class="qt-head"><span class="qt-label">퀘스트</span><span class="badge badge-dim" id="qt-state">없음</span></div>
+              <div class="qt-title" id="qt-title">진행 중인 퀘스트 없음</div>
+              <div class="qt-step" id="qt-step">아래 입력줄에 명령을 입력하세요.</div>
+              <div class="bar-pill" aria-hidden="true"><span id="qt-bar"></span></div>
+            </div>
+            <div class="vp-glass vp-minimap" id="vp-minimap">
+              <canvas id="minimap" width="148" height="148" aria-label="미니맵 (경로·웨이포인트)"></canvas>
+              <div class="mm-cap"><span id="mm-left">0.0 × 0.0 m</span><span id="mm-right"></span></div>
+            </div>
+          </div>
+
+          <button type="button" class="vp-glass pip" id="pip" aria-label="손·발 측면도 — 누르면 큰 화면으로 전환" data-tip-title="손·발 측면도" data-tip="누르면 가운데 화면을 '손·발 측면도' 탭으로 바꿉니다.">
+            <canvas id="pip-canvas" aria-hidden="true"></canvas><span class="pip-label">손·발 측면도</span>
+          </button>
+
+          <section class="vp-glass vp-legend" id="vp-legend" aria-label="탐지 목록">
+            <div class="lg-head"><b>탐지</b><span id="lg-count"></span></div>
+            <ul class="lg-list" id="lg-list"></ul>
+          </section>
+
+          <form class="vp-glass command-bar" id="command-bar" autocomplete="off">
+            <div class="cmd-toast" id="cmd-toast" role="status" aria-live="polite" hidden></div>
+            <span class="cmd-prompt" aria-hidden="true">›</span>
+            <label class="sr-only" for="command-input">명령 입력</label>
+            <input type="text" id="command-input" placeholder="명령 입력 후 Enter (예: 철광석 3개 캐서 베이스캠프로 가져와)" maxlength="200" spellcheck="false" />
+            <button type="submit" class="btn btn-sm" id="command-send">실행</button>
+          </form>
+        </div>
+      </div>
+
+      <!-- 손·발 측면도 -->
+      <div class="center-pane" id="cpane-side" role="tabpanel" aria-labelledby="ctab-side" hidden>
+        <div class="side-stage">
+          <div class="side-canvas-wrap"><canvas id="hand-canvas" aria-label="손 측면도"></canvas></div>
+          <div class="side-controls">
+            <div class="form-grid cols-3">
+              <div class="form-group"><label class="ct-check" for="show-grasp"><input type="checkbox" id="show-grasp" /> 물체 파지 시뮬레이션</label></div>
+              <div class="form-group"><label for="closure">손가락 닫힘 <output id="closure-out" for="closure">0.00</output></label>
+                <input type="range" id="closure" min="0" max="1" step="0.01" value="0" /></div>
+              <div class="form-group"><label for="label">물류 대상 (사전)</label><select id="label"></select></div>
+              <div class="form-group"><label for="mass">질량 (kg) <output id="mass-out" for="mass">1.00</output></label>
+                <input type="range" id="mass" min="0.1" max="5" step="0.05" value="1" /></div>
+              <div class="form-group"><label for="friction">마찰 계수 <output id="friction-out" for="friction">0.50</output></label>
+                <input type="range" id="friction" min="0.2" max="1" step="0.01" value="0.5" /></div>
+              <div class="form-group"><label for="zoff">배치 z 오프셋 (m) <output id="zoff-out" for="zoff">0.000</output></label>
+                <input type="range" id="zoff" min="-0.02" max="0.02" step="0.001" value="0" /></div>
+            </div>
+            <p class="hint" id="size-note"></p>
+            <p class="hint" id="geom-note"></p>
+          </div>
+        </div>
+      </div>
+
+      <!-- 분석 -->
+      <div class="center-pane analysis-pane" id="cpane-analysis" role="tabpanel" aria-labelledby="ctab-analysis" hidden>
+        <div class="pv-grid">
+          <div class="pv-card"><h4><span class="grow">비전 점수 (perception_scan)</span><button type="button" class="btn btn-sm btn-outline" id="an-scan">인식 실행</button></h4>
+            <div id="an-vision-meta" class="hint"></div><div id="an-vision"></div></div>
+          <div class="pv-card"><h4><span class="grow">명령 해석 (trace)</span></h4><div id="an-trace"></div></div>
+          <div class="pv-card" style="grid-column: 1 / -1"><h4><span class="grow">SDS 상태 (sds_status)</span><button type="button" class="btn btn-sm btn-outline" id="an-sds-refresh">새로고침</button></h4><div id="an-sds"></div></div>
+        </div>
+      </div>
+    </main>
+
+    <div class="resizer resizer-v right" id="resizerRight" role="separator" aria-orientation="vertical" aria-label="오른쪽 패널 너비 (드래그, 방향키, 더블클릭 초기화)" tabindex="0"></div>
+
+    <!-- ── 오른쪽: 퀘스트 · 인벤토리 · 파지 결과 · 발별 주행 비교 ── -->
+    <aside class="panel-right" id="panelRight" aria-label="퀘스트 패널">
+      <button type="button" class="panel-toggle-btn" data-toggle="panelRight" title="우측 패널 접기" aria-label="우측 패널 접기" aria-expanded="true">▶</button>
+      <div class="panel-title"><b>작업</b><small>퀘스트 · 인벤토리 · 시험 결과</small></div>
+      <div class="panel-scroll">
+        <div class="panel-section-header" data-section="secQuests" role="button" tabindex="0" aria-expanded="true" aria-controls="secQuests">
+          <span class="sec-title"><span class="step-no sec-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M6 4h12v16l-6-3.5L6 20z"/></svg></span><span class="sec-name">퀘스트</span><span class="help" tabindex="0" data-tip="명령을 입력하면 탐색 → 접근 → 채취 → 줍기 → 운반 → 인도 단계의 퀘스트가 만들어집니다. 단계별 상태와 진행률이 여기에 보입니다. 완료하면 소요 틱·에너지·정밀도 요약이 남습니다.">?</span></span>
+          <span class="step-sum" id="sum-quests"></span><span class="chevron" aria-hidden="true">▼</span>
+        </div>
+        <div class="panel-section-body" id="secQuests"><div class="quest-list" id="quest-list"></div></div>
+
+        <div class="panel-section-header" data-section="secInventory" role="button" tabindex="0" aria-expanded="true" aria-controls="secInventory">
+          <span class="sec-title"><span class="step-no sec-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 8h14l-1 12H6z"/><path d="M9 8V6a3 3 0 0 1 6 0v2"/></svg></span><span class="sec-name">인벤토리</span></span>
+          <span class="step-sum" id="sum-inventory"></span><span class="chevron" aria-hidden="true">▼</span>
+        </div>
+        <div class="panel-section-body" id="secInventory">
+          <ul class="inv-list" id="inv-list"></ul>
+          <div class="pv-kv" style="margin-top:8px"><span class="k">적재량</span><span class="v" id="inv-load">—</span></div>
+          <div class="bar-pill" style="margin-top:5px" aria-hidden="true"><span id="inv-bar"></span></div>
+        </div>
+
+        <div class="panel-section-header collapsed" data-section="secGrasp" role="button" tabindex="0" aria-expanded="false" aria-controls="secGrasp">
+          <span class="sec-title"><span class="step-no sec-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M8 13V6.5a1.5 1.5 0 0 1 3 0V12M11 11V4.5a1.5 1.5 0 0 1 3 0V12M14 11V6a1.5 1.5 0 0 1 3 0v8.5a6 6 0 0 1-6 6h-.5a5 5 0 0 1-4-2L4.5 15"/></svg></span><span class="sec-name">파지 결과</span></span>
+          <span class="step-sum" id="sum-grasp"></span><span class="chevron" aria-hidden="true">▼</span>
+        </div>
+        <div class="panel-section-body collapsed" id="secGrasp"><div id="grasp-results"></div></div>
+
+        <div class="panel-section-header collapsed" data-section="secDrive" role="button" tabindex="0" aria-expanded="false" aria-controls="secDrive">
+          <span class="sec-title"><span class="step-no sec-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="7" cy="17" r="2.5"/><circle cx="17" cy="17" r="2.5"/><path d="M4 17V9h9l3 4h4v4"/></svg></span><span class="sec-name">발별 주행 비교</span></span>
+          <span class="step-sum" id="sum-drive"></span><span class="chevron" aria-hidden="true">▼</span>
+        </div>
+        <div class="panel-section-body collapsed" id="secDrive">
+          <p class="hint">기본 경로: 평지 10m → 10° 경사 5m → 5cm 턱 → 20° 경사 5m → 15cm 계단 → 평지 5m</p>
+          <div class="table-scroll"><table class="pv-table" id="drive-table"></table></div>
+        </div>
+      </div>
+    </aside>
+
+    <div class="resizer resizer-h" id="resizerBottom" role="separator" aria-orientation="horizontal" aria-label="하단 패널 높이 (드래그, 방향키, 더블클릭 초기화)" tabindex="0"></div>
+
+    <!-- ── 하단: 로그 · 비전 · 명령 해석 · 시계열 · 합성 데이터 ── -->
+    <section class="panel-bottom" id="panelBottom" aria-label="기록 패널">
+      <button type="button" class="panel-toggle-btn" data-toggle="panelBottom" title="하단 패널 접기" aria-label="하단 패널 접기" aria-expanded="true">▼</button>
+      <div class="panel-section-header" data-section="secOutput" role="button" tabindex="0" aria-expanded="true" aria-controls="secOutput">
+        <span class="sec-title"><span class="step-no sec-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 6h14M5 12h14M5 18h9"/></svg></span><span class="sec-name">기록</span><span class="help" tabindex="0" data-tip="로그 — 월드·퀘스트·검색·비전·SDS·시계열·임베딩·장치 로그(증분 조회)&#10;비전 점수 — 월드 인식과 이미지 분류&#10;명령 해석 — 명령이 어떻게 구조화됐는지&#10;시계열 — 예측 띠(P10~P90)&#10;합성 데이터 — Lance 기록">?</span></span>
+        <span class="step-sum">로그 · 비전 · 명령 해석 · 시계열 · 합성 데이터</span><span class="chevron" aria-hidden="true">▼</span>
+      </div>
+      <div class="panel-section-body" id="secOutput">
+        <div class="bottom-tabs" role="tablist" aria-label="기록 탭" id="bottom-tabs">
+          <button type="button" class="bottom-tab active" role="tab" id="btab-log" data-tab="log" aria-selected="true" aria-controls="bpane-log">로그</button>
+          <button type="button" class="bottom-tab" role="tab" id="btab-vision" data-tab="vision" aria-selected="false" aria-controls="bpane-vision" tabindex="-1">비전 점수</button>
+          <button type="button" class="bottom-tab" role="tab" id="btab-trace" data-tab="trace" aria-selected="false" aria-controls="bpane-trace" tabindex="-1">명령 해석</button>
+          <button type="button" class="bottom-tab" role="tab" id="btab-ts" data-tab="ts" aria-selected="false" aria-controls="bpane-ts" tabindex="-1">시계열</button>
+          <button type="button" class="bottom-tab" role="tab" id="btab-synth" data-tab="synth" aria-selected="false" aria-controls="bpane-synth" tabindex="-1">합성 데이터</button>
+        </div>
+
+        <div class="bottom-pane" id="bpane-log" role="tabpanel" aria-labelledby="btab-log">
+          <div class="pane-toolbar">
+            <span class="vt-label">범주</span>
+            <div id="log-chips" role="group" aria-label="로그 범주 필터" style="display:flex;gap:4px;flex-wrap:wrap"></div>
+            <button type="button" class="link-btn" id="log-all">전체</button>
+            <span style="margin-left:auto;display:flex;gap:10px;align-items:center">
+              <span class="vt-info" id="log-count" style="font-family:var(--font-mono);font-size:.62rem;color:var(--text-muted)"></span>
+              <label class="ct-check" for="log-debug" title="동작 시작·끝, 해석 단계 같은 자세한 줄"><input type="checkbox" id="log-debug" /> 디버그</label>
+              <label class="ct-check" for="log-auto"><input type="checkbox" id="log-auto" checked /> 자동 스크롤</label>
+              <button type="button" class="vt-btn" id="log-clear">지우기</button>
+            </span>
+          </div>
+          <div class="gcode-console" id="log-view" role="log" aria-live="off" tabindex="0" aria-label="로그"></div>
+        </div>
+
+        <div class="bottom-pane" id="bpane-vision" role="tabpanel" aria-labelledby="btab-vision" hidden>
+          <div class="pane-scroll two-col">
+            <div>
+              <div class="ct-sec">월드 인식 (perception_scan)</div>
+              <div class="pv-row" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+                <button type="button" class="btn btn-sm" id="scan-run">인식 실행</button>
+                <label class="ct-check" for="scan-auto"><input type="checkbox" id="scan-auto" /> 재생 중 자동 (4초)</label>
+              </div>
+              <p class="hint" id="scan-meta">아직 실행하지 않았습니다.</p>
+              <div id="vision-bars"></div>
+            </div>
+            <div>
+              <div class="ct-sec">이미지 분류 (SigLIP2)</div>
+              <input type="file" id="image-file" accept="image/*" aria-label="분류할 이미지 선택" />
+              <div class="preview-wrap" id="preview-wrap" hidden><img id="preview" alt="입력 이미지 미리보기" /></div>
+              <ol class="score-list" id="scores" style="margin-top:8px"></ol>
+              <button type="button" class="btn btn-sm btn-outline" id="use-top" disabled style="margin-top:8px">최상위 라벨을 물체로 설정</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="bottom-pane" id="bpane-trace" role="tabpanel" aria-labelledby="btab-trace" hidden>
+          <div class="pane-scroll" id="trace-view"></div>
+        </div>
+
+        <div class="bottom-pane" id="bpane-ts" role="tabpanel" aria-labelledby="btab-ts" hidden>
+          <div class="pane-toolbar">
+            <label class="vt-label" for="ts-scope">범위</label><select id="ts-scope" style="min-height:26px;font-size:.7rem"></select>
+            <label class="vt-label" for="ts-axis">축</label><select id="ts-axis" style="min-height:26px;font-size:.7rem"></select>
+            <button type="button" class="vt-btn" id="ts-refresh">새로고침</button>
+            <span class="vt-info" id="ts-info" style="margin-left:auto;font-family:var(--font-mono);font-size:.62rem;color:var(--text-muted)"></span>
+          </div>
+          <div style="flex:1;min-height:0;position:relative;background:var(--bg-plot)">
+            <canvas id="ts-canvas" aria-label="시계열 예측 차트: 이력, P50, P10~P90 띠" style="position:absolute;inset:0;width:100%;height:100%"></canvas>
+          </div>
+        </div>
+
+        <div class="bottom-pane" id="bpane-synth" role="tabpanel" aria-labelledby="btab-synth" hidden>
+          <div class="pane-scroll two-col">
+            <div>
+              <div class="ct-sec">합성 데이터 (Lance)</div>
+              <div class="form-grid">
+                <div class="form-group"><label for="count">에피소드 수</label><input type="number" id="count" min="1" max="5000" value="200" /></div>
+                <div class="form-group"><label for="synth-seed">시드</label><input type="number" id="synth-seed" min="0" value="1" /></div>
+              </div>
+              <div class="btn-row">
+                <button type="button" class="btn btn-sm btn-outline" id="load-dict-synth">사전 적재</button>
+                <button type="button" class="btn btn-sm" id="synth">합성 데이터 생성</button>
+              </div>
+              <p class="hint" id="store-note"></p>
+            </div>
+            <div><div class="ct-sec">테이블 상태</div><table class="pv-table" id="table-status"></table></div>
+          </div>
+        </div>
+      </div>
     </section>
+  </div>
 
-    <!-- 가운데: 손 그림과 파지 -->
-    <section class="panel stage" aria-labelledby="stage-h">
-      <div class="stage-head">
-        <h2 id="stage-h">측면도</h2>
-        <label class="inline">
-          <input type="checkbox" id="show-grasp" /> 물체 파지 시뮬레이션
-        </label>
-      </div>
-      <canvas id="hand-canvas" width="860" height="520" aria-label="손 측면도"></canvas>
-      <label>손가락 닫힘 <output id="closure-out">0.00</output>
-        <input type="range" id="closure" min="0" max="1" step="0.01" value="0" />
-      </label>
-      <p class="hint" id="geom-note"></p>
-    </section>
-
-    <!-- 오른쪽: 물체, 결과, 데이터 -->
-    <section class="panel" aria-labelledby="obj-h">
-      <h2 id="obj-h">물체</h2>
-      <label>물류 대상 (사전)
-        <select id="label"></select>
-      </label>
-      <div class="grid2">
-        <label>질량 (kg) <output id="mass-out">1.00</output>
-          <input type="range" id="mass" min="0.1" max="5" step="0.05" value="1" />
-        </label>
-        <label>마찰 계수 <output id="friction-out">0.50</output>
-          <input type="range" id="friction" min="0.2" max="1" step="0.01" value="0.5" />
-        </label>
-        <label>배치 z 오프셋 (m) <output id="zoff-out">0.000</output>
-          <input type="range" id="zoff" min="-0.02" max="0.02" step="0.001" value="0" />
-        </label>
-      </div>
-      <p class="hint" id="size-note"></p>
-
-      <h3>파지 결과</h3>
-      <dl class="results" id="grasp-results"></dl>
-
-      <h3>발별 주행 비교</h3>
-      <p class="hint">기본 경로: 평지 10m → 5° 완만한 경사 → 5cm 턱 → 20° 경사 → 15cm 계단 → 평지 5m</p>
-      <table class="drive" id="drive-table"></table>
-
-      <h3>비전 분류 (SigLIP2)</h3>
-      <input type="file" id="image-file" accept="image/*" />
-      <div id="preview-wrap" hidden><img id="preview" alt="입력 이미지 미리보기" /></div>
-      <ol class="scores" id="scores"></ol>
-      <button id="use-top" type="button" disabled>최상위 라벨을 물체로 설정</button>
-
-      <h3>합성 데이터 (Lance)</h3>
-      <div class="grid2">
-        <label>에피소드 수
-          <input type="number" id="count" min="1" max="5000" value="200" />
-        </label>
-        <label>시드
-          <input type="number" id="seed" min="0" value="1" />
-        </label>
-      </div>
-      <div class="row">
-        <button id="load-dict" type="button">사전 적재</button>
-        <button id="synth" type="button" class="primary">합성 데이터 생성</button>
-      </div>
-      <table class="drive" id="table-status"></table>
-      <p class="hint" id="store-note"></p>
-    </section>
-  </main>
-
-  <footer class="statusbar">
-    <span id="status" role="status">준비됨</span>
+  <footer class="status-bar" role="contentinfo">
+    <div class="sb-item"><button type="button" class="sb-device" id="sb-device" title="연산 장치 — 누르면 사전·모델 설정으로 이동">장치 확인 중…</button></div>
+    <div class="sb-sep"></div>
+    <div class="sb-item">시드: <strong id="sb-seed">-</strong></div>
+    <div class="sb-sep"></div>
+    <div class="sb-item">틱: <strong id="sb-tick">-</strong></div>
+    <div class="sb-sep"></div>
+    <div class="sb-item">프레임 WebP: <strong id="sb-frame">-</strong></div>
+    <div class="sb-sep sb-opt"></div>
+    <div class="sb-item sb-opt">SDS: <strong id="sb-sds">-</strong></div>
+    <div class="sb-sep sb-opt"></div>
+    <div class="sb-item sb-opt">임베더: <strong id="sb-embed">-</strong></div>
+    <div class="sb-sep sb-opt"></div>
+    <div class="sb-item sb-opt">TTM: <strong id="sb-ttm">-</strong></div>
+    <div class="sb-msg" id="sb-msg" role="status" aria-live="polite">준비 중</div>
+    <div class="sb-item"><span class="sb-mock" id="sb-mock" hidden title="Tauri 없이 브라우저에서 열려 가짜 데이터로 동작 중입니다">모의 백엔드</span><span id="sb-version">v0.2.0</span></div>
   </footer>
-
-  <script src="app.js"></script>
 </body>
 </html>

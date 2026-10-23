@@ -9,7 +9,8 @@ use candle_nn::VarBuilder;
 use image::DynamicImage;
 
 use crate::config::Siglip2Config;
-use crate::preprocess::preprocess;
+use crate::parallel::{fnv1a, FNV_OFFSET};
+use crate::preprocess::{preprocess, NaflexInput};
 use crate::text::TextTower;
 use crate::tokenizer::TextTokenizer;
 use crate::vision::VisionTower;
@@ -22,6 +23,8 @@ pub struct Siglip2 {
     logit_scale: f32,
     logit_bias: f32,
     device: Device,
+    /// Identifies the checkpoint, so cached text vectors never cross models.
+    fingerprint: u64,
 }
 
 impl Siglip2 {
@@ -49,7 +52,9 @@ impl Siglip2 {
             config.text_pad_id,
             config.text_max_len,
         )?;
-        Self::from_var_builder(config, vb, device, Some(tokenizer))
+        let mut model = Self::from_var_builder(config, vb, device, Some(tokenizer))?;
+        model.fingerprint = checkpoint_fingerprint(dir, &model.config);
+        Ok(model)
     }
 
     /// Builds the model from any `VarBuilder`. Tests use a `VarMap` with random weights.
@@ -63,6 +68,7 @@ impl Siglip2 {
         let text = TextTower::new(&config, vb.pp("text_model"))?;
         let logit_scale = read_scalar(&vb, "logit_scale").unwrap_or(0.0);
         let logit_bias = read_scalar(&vb, "logit_bias").unwrap_or(0.0);
+        let fingerprint = fnv1a(FNV_OFFSET, format!("{config:?}").as_bytes());
         Ok(Siglip2 {
             config,
             vision,
@@ -71,6 +77,7 @@ impl Siglip2 {
             logit_scale,
             logit_bias,
             device: device.clone(),
+            fingerprint,
         })
     }
 
@@ -87,11 +94,52 @@ impl Siglip2 {
         &self.device
     }
 
+    /// Hash of the config, weight file size and modification time. Two
+    /// checkpoints that differ in any of these never share cached vectors.
+    pub fn fingerprint(&self) -> u64 {
+        self.fingerprint
+    }
+
+    /// Image-text pair probability for a cosine similarity.
+    pub fn pair_probability(&self, cosine: f32) -> f32 {
+        sigmoid(self.logit_scale.exp() * cosine + self.logit_bias)
+    }
+
     /// Unit-length embedding of one image.
     pub fn embed_image(&self, image: &DynamicImage) -> Result<Vec<f32>> {
         let input = preprocess(image, &self.config);
         let emb = self.vision.forward(&input)?;
         Ok(l2_normalize(&emb)?.flatten_all()?.to_vec1()?)
+    }
+
+    /// Unit-length embeddings of many images. Images are preprocessed in
+    /// parallel, grouped by patch grid, and each group runs through the vision
+    /// tower in micro-batches of at most `max_batch` images. Output order
+    /// matches the input order.
+    pub fn embed_images(&self, images: &[DynamicImage], max_batch: usize) -> Result<Vec<Vec<f32>>> {
+        use rayon::prelude::*;
+        use std::collections::BTreeMap;
+
+        let inputs: Vec<NaflexInput> = images
+            .par_iter()
+            .map(|image| preprocess(image, &self.config))
+            .collect();
+        let mut groups: BTreeMap<(usize, usize), Vec<usize>> = BTreeMap::new();
+        for (i, input) in inputs.iter().enumerate() {
+            groups.entry((input.grid_h, input.grid_w)).or_default().push(i);
+        }
+        let mut out: Vec<Vec<f32>> = vec![Vec::new(); images.len()];
+        for indices in groups.values() {
+            for chunk in indices.chunks(max_batch.max(1)) {
+                let refs: Vec<&NaflexInput> = chunk.iter().map(|&i| &inputs[i]).collect();
+                let emb = l2_normalize(&self.vision.forward_batch(&refs)?)?;
+                let rows: Vec<Vec<f32>> = emb.to_vec2()?;
+                for (row, &i) in rows.into_iter().zip(chunk) {
+                    out[i] = row;
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Unit-length embeddings of texts, in input order.
@@ -128,6 +176,26 @@ impl Siglip2 {
             })
             .collect()
     }
+}
+
+fn checkpoint_fingerprint(dir: &Path, config: &Siglip2Config) -> u64 {
+    let mut h = fnv1a(FNV_OFFSET, format!("{config:?}").as_bytes());
+    for name in ["model.safetensors", "tokenizer.json", "config.json"] {
+        match std::fs::metadata(dir.join(name)) {
+            Ok(meta) => {
+                h = fnv1a(h, name.as_bytes());
+                h = fnv1a(h, &meta.len().to_le_bytes());
+                if let Ok(d) = meta.modified().and_then(|t| {
+                    t.duration_since(std::time::UNIX_EPOCH)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                }) {
+                    h = fnv1a(h, &d.as_nanos().to_le_bytes());
+                }
+            }
+            Err(_) => h = fnv1a(h, b"<missing>"),
+        }
+    }
+    h
 }
 
 fn sigmoid(x: f32) -> f32 {
@@ -224,6 +292,35 @@ mod tests {
             let norm: f32 = row.iter().map(|v| v * v).sum::<f32>().sqrt();
             assert!((norm - 1.0).abs() < 1e-4);
         }
+    }
+
+    #[test]
+    fn batched_image_embeddings_match_one_by_one_in_input_order() {
+        let m = tiny_model();
+        // Two shapes, interleaved, so grouping by patch grid has to restore the order.
+        let images = vec![test_image(64, 32), test_image(32, 32), test_image(64, 32), test_image(32, 32)];
+        let batched = m.embed_images(&images, 2).unwrap();
+        assert_eq!(batched.len(), 4);
+        for (img, row) in images.iter().zip(&batched) {
+            let single = m.embed_image(img).unwrap();
+            for (a, b) in single.iter().zip(row) {
+                assert!((a - b).abs() < 1e-4, "batched row differs from single: {a} vs {b}");
+            }
+        }
+        assert!(m.embed_images(&[], 4).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fingerprint_depends_on_the_config() {
+        let a = tiny_model();
+        let mut cfg = tiny_config();
+        cfg.text_layers = 3;
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let b = Siglip2::from_var_builder(cfg, vb, &dev, None).unwrap();
+        assert_ne!(a.fingerprint(), b.fingerprint());
+        assert_eq!(a.fingerprint(), tiny_model().fingerprint());
     }
 
     #[test]

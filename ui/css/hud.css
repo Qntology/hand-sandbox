@@ -1,0 +1,117 @@
+/* 월드 화면 위에 얹는 HUD — endmill .vp-hud 와 같은 유리 패널(rgba(17,17,19,.84~.95) + blur 6px).
+   배치: 좌상단 신체 상태 · 우상단 퀘스트 트래커(+미니맵) · 하단 중앙 명령 입력 · 좌하단 측면도 PiP · 우하단 탐지 범례.
+   가운데 폭이 900px 미만이면 PiP·범례를 명령 줄 위로 올려 겹치지 않게 한다(data-w), 높이가 낮으면 일부를 접는다(data-h). */
+.viewport-canvas-wrap { flex: 1; position: relative; overflow: hidden; background: var(--bg-plot); min-height: 0; }
+.vp-glass { background: var(--glass); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); border: 1px solid var(--border-light); border-radius: 8px; }
+
+.frame-box { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
+.frame-box canvas { width: 100%; height: 100%; display: block; background: var(--bg-plot); }
+.det-layer { position: absolute; inset: 0; pointer-events: none; }
+.det-box { position: absolute; border: 1.5px solid var(--success); border-radius: 2px; box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45); }
+.det-box.hold { border-style: dashed; border-color: var(--warning); }
+.det-tag { position: absolute; left: -1.5px; top: -1.5px; transform: translateY(-100%); font-family: var(--font-mono); font-size: 0.58rem; line-height: 1.5; background: rgba(9, 9, 11, 0.82); color: var(--text-bright); padding: 0 5px; white-space: nowrap; border-radius: 3px 3px 0 0; }
+.det-box.hold .det-tag { color: var(--warning); }
+.det-box.edge .det-tag { transform: none; top: 0; border-radius: 0 0 3px 0; }
+.world-empty { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; text-align: center; padding: 20px; color: var(--text-muted); font-size: 0.76rem; line-height: 1.6; }
+.world-empty.err { color: var(--danger); }
+
+.vp-left-stack, .vp-right-stack { position: absolute; top: 10px; z-index: 7; display: flex; flex-direction: column; gap: 8px; pointer-events: none; }
+.vp-left-stack { left: 10px; align-items: flex-start; }
+.vp-right-stack { right: 10px; align-items: flex-end; }
+.vp-left-stack > *, .vp-right-stack > * { pointer-events: auto; }
+
+/* ── (a) 신체 상태 HUD ─────────────────────────────────────────── */
+.body-hud { padding: 7px 10px 8px; width: max-content; max-width: 260px; }
+.bh-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 4px; }
+.bh-title { font-size: 0.58rem; font-weight: 600; letter-spacing: var(--track-caps); color: var(--text-muted); text-transform: uppercase; }
+.bh-toggle { width: 20px; height: 20px; display: inline-flex; align-items: center; justify-content: center; background: transparent; border: 1px solid var(--border-light); border-radius: var(--radius-sm); color: var(--text-dim); font-size: 9px; cursor: pointer; }
+.bh-toggle:hover { background: var(--bg-hover); color: var(--text-bright); }
+.body-hud.folded .bh-body, .body-hud.folded .bh-effects, .body-hud.folded .bh-meta, .body-hud.folded .bh-note { display: none; }
+.bh-body { display: flex; gap: 10px; align-items: flex-start; }
+#body-svg { width: 128px; height: auto; flex-shrink: 0; display: block; overflow: visible; }
+.bh-list { list-style: none; display: flex; flex-direction: column; gap: 3px; min-width: 108px; padding-top: 4px; }
+.bh-list li { display: grid; grid-template-columns: 8px minmax(0, 1fr) auto; gap: 6px; align-items: center; font-size: 0.68rem; color: var(--text-dim); padding: 2px 4px; border-radius: 3px; cursor: help; white-space: nowrap; }
+.bh-list li:hover, .bh-list li.hl { background: var(--bg-hover); color: var(--text-bright); }
+.bh-list .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--zc, var(--text-muted)); }
+.bh-list .val { font-family: var(--font-mono); font-size: 0.62rem; color: var(--text-bright); }
+.bh-list li[data-group="hand"] .nm::before { content: '손 '; color: var(--text-muted); }
+.bh-list li[data-group="foot"] .nm::before { content: '발 '; color: var(--text-muted); }
+[data-level="ok"] { --zc: var(--lv-ok); }
+[data-level="warn"] { --zc: var(--lv-warn); }
+[data-level="bad"] { --zc: var(--lv-bad); }
+[data-level="crit"] { --zc: var(--lv-crit); }
+.zone { --zc: var(--text-muted); cursor: help; outline: none; }
+.zone .z-base { fill: var(--zc); fill-opacity: 0.12; stroke: var(--zc); stroke-width: 1.2; transition: fill-opacity 0.15s; }
+.zone .z-fill { fill: var(--zc); fill-opacity: 0.42; transition: y 0.3s, height 0.3s; }
+.zone .z-val { fill: var(--text-bright); font: 600 10px var(--font-mono); text-anchor: middle; dominant-baseline: central; pointer-events: none; paint-order: stroke; stroke: rgba(0, 0, 0, 0.6); stroke-width: 2px; }
+.zone .z-cap { fill: var(--text-dim); font: 600 7px var(--font-sans); text-anchor: middle; pointer-events: none; }
+.zone:hover .z-base, .zone.hl .z-base, .zone:focus-visible .z-base { fill-opacity: 0.3; stroke-width: 2; }
+.zone:focus-visible .z-base { stroke-dasharray: 3 2; }
+.zone[data-level="crit"] .z-base { animation: pulse 1s ease-in-out infinite; }
+.sil-line { fill: none; stroke: var(--border-strong); stroke-width: 1; }
+.bh-effects { list-style: none; display: flex; flex-wrap: wrap; gap: 4px; margin-top: 7px; }
+.fx-chip { font-size: 0.6rem; line-height: 1.5; padding: 0 8px; border-radius: 999px; border: 1px solid var(--border-light); color: var(--text-muted); cursor: help; }
+.fx-chip[data-level="warn"], .fx-chip[data-level="bad"], .fx-chip[data-level="crit"] { color: var(--zc); border-color: var(--zc); background: rgba(255, 255, 255, 0.03); }
+.fx-chip[data-level="ok"] { opacity: 0.7; }
+.bh-meta { font-family: var(--font-mono); font-size: 0.56rem; color: var(--text-muted); margin-top: 6px; line-height: 1.5; }
+.bh-note { font-size: 0.56rem; color: var(--text-muted); margin-top: 3px; line-height: 1.45; max-width: 230px; white-space: normal; }
+
+/* ── (b) 퀘스트 트래커 + 미니맵 ───────────────────────────────── */
+.quest-tracker { width: 236px; padding: 8px 10px 9px; cursor: pointer; text-align: left; }
+.quest-tracker:hover { border-color: var(--border-strong); }
+.qt-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 3px; }
+.qt-label { font-size: 0.58rem; font-weight: 600; letter-spacing: var(--track-caps); color: var(--text-muted); text-transform: uppercase; }
+.qt-title { font-size: 0.76rem; font-weight: 600; color: var(--text-bright); line-height: 1.35; overflow-wrap: anywhere; }
+.qt-step { font-size: 0.66rem; color: var(--text-dim); margin: 2px 0 6px; overflow-wrap: anywhere; }
+.qt-idle { font-size: 0.68rem; color: var(--text-muted); }
+.vp-minimap { padding: 6px; }
+.vp-minimap canvas { display: block; width: 148px; height: 148px; border-radius: 5px; background: var(--bg-plot); }
+.vp-minimap .mm-cap { font-family: var(--font-mono); font-size: 0.56rem; color: var(--text-muted); margin-top: 4px; display: flex; justify-content: space-between; gap: 8px; }
+
+/* ── (c) 명령 입력 ─────────────────────────────────────────────── */
+.command-bar { position: absolute; left: 50%; bottom: 10px; transform: translateX(-50%); width: min(640px, calc(100% - 20px)); z-index: 8; display: flex; align-items: center; gap: 8px; padding: 5px 6px 5px 12px; background: var(--glass-strong); transition: border-color 0.15s; }
+.command-bar:focus-within { border-color: var(--border-hover); }
+.cmd-prompt { color: var(--text-muted); font-family: var(--font-mono); font-size: 0.9rem; }
+.command-bar input[type=text] { flex: 1; min-width: 0; background: transparent; border: none; box-shadow: none; min-height: 30px; font-size: 0.78rem; color: var(--text-bright); padding: 0 2px; }
+.command-bar input[type=text]:focus { box-shadow: none; }
+.command-bar .kbd-hint { font-family: var(--font-mono); font-size: 0.56rem; color: var(--text-muted); border: 1px solid var(--border-light); border-radius: 3px; padding: 0 4px; }
+.cmd-toast { position: absolute; left: 0; right: 0; bottom: calc(100% + 6px); padding: 6px 12px; font-size: 0.7rem; line-height: 1.45; color: var(--text); background: var(--glass-strong); border: 1px solid var(--border-light); border-left: 3px solid var(--accent-strong); border-radius: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cmd-toast.ok { border-left-color: var(--success); }
+.cmd-toast.err { border-left-color: var(--danger); color: #f0a5a5; }
+.cmd-toast.info { border-left-color: var(--warning); }
+
+/* ── (d) 측면도 PiP · (e) 탐지 범례 ───────────────────────────── */
+.pip { position: absolute; left: 10px; bottom: 10px; z-index: 6; width: 200px; height: 140px; padding: 0; overflow: hidden; cursor: pointer; color: var(--text-dim); }
+.pip:hover { border-color: var(--border-hover); }
+.pip canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.pip .pip-label { position: absolute; left: 6px; top: 4px; font-size: 0.56rem; font-weight: 600; letter-spacing: var(--track-caps); color: var(--text-muted); pointer-events: none; }
+.vp-legend { position: absolute; right: 10px; bottom: 10px; z-index: 6; width: 232px; max-height: 45%; overflow-y: auto; padding: 8px 10px; font-size: 0.64rem; color: var(--text-dim); line-height: 1.5; }
+.lg-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 4px; }
+.lg-head b { font-size: 0.58rem; letter-spacing: var(--track-caps); text-transform: uppercase; color: var(--text-muted); }
+.lg-list { list-style: none; display: flex; flex-direction: column; gap: 2px; }
+.lg-list li { display: grid; grid-template-columns: 8px minmax(0, 1fr) auto auto; gap: 6px; align-items: center; }
+.lg-list .sw { width: 8px; height: 8px; border-radius: 2px; background: var(--success); }
+.lg-list li.hold .sw { background: transparent; border: 1px dashed var(--warning); }
+.lg-list .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.lg-list .sc { font-family: var(--font-mono); font-size: 0.6rem; color: var(--text-dim); }
+.lg-list li.lg-empty { display: block; color: var(--text-muted); white-space: nowrap; }
+
+/* 크기에 따른 배치: wide ≥ 900px(한 줄 배치), narrow 620~899px(PiP·범례를 명령줄 위로), tiny < 620px(신체 목록도 숨김) */
+.viewport-canvas-wrap[data-w="wide"] .command-bar { width: min(640px, calc(100% - 484px)); }
+.viewport-canvas-wrap[data-w="narrow"] .pip, .viewport-canvas-wrap[data-w="narrow"] .vp-legend,
+.viewport-canvas-wrap[data-w="tiny"] .pip, .viewport-canvas-wrap[data-w="tiny"] .vp-legend { bottom: 58px; }
+.viewport-canvas-wrap[data-w="narrow"] .vp-legend, .viewport-canvas-wrap[data-w="tiny"] .vp-legend { width: 200px; max-height: 32%; }
+.viewport-canvas-wrap[data-w="tiny"] .bh-list { display: none; }
+/* 높이: tall ≥ 520px 전부 표시 · mid 380~519px 축소(주석·메타 숨김) · short < 380px 보조 패널 숨김 */
+.viewport-canvas-wrap[data-h="mid"] #body-svg { width: 112px; }
+.viewport-canvas-wrap[data-h="mid"] .bh-note, .viewport-canvas-wrap[data-h="mid"] .bh-meta { display: none; }
+.viewport-canvas-wrap[data-h="mid"] .vp-minimap canvas { width: 104px; height: 104px; }
+.viewport-canvas-wrap[data-h="mid"] .pip { width: 160px; height: 100px; }
+.viewport-canvas-wrap[data-h="mid"] .vp-legend { max-height: 28%; width: 200px; }
+.viewport-canvas-wrap[data-h="short"] .pip, .viewport-canvas-wrap[data-h="short"] .vp-minimap,
+.viewport-canvas-wrap[data-h="short"] .bh-note, .viewport-canvas-wrap[data-h="short"] .bh-meta,
+.viewport-canvas-wrap[data-h="short"] .bh-list { display: none; }
+.viewport-canvas-wrap[data-h="short"] #body-svg { width: 84px; }
+.viewport-canvas-wrap[data-h="short"] .vp-legend { max-height: 40%; width: 200px; bottom: 58px; }
+.viewport-canvas-wrap[data-h="short"] .quest-tracker { width: 200px; }
+@media (prefers-reduced-motion: reduce) { .zone[data-level="crit"] .z-base { animation: none; } }
