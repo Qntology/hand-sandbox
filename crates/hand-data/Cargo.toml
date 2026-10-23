@@ -1,0 +1,15 @@
+[package]
+name = "hand-data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Layered synthetic dataset for the robot hand (vision, tactile, material) stored in LanceDB"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hand-core = { path = "../hand-core" }
+lancedb = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }

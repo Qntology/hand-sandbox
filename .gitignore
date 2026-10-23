@@ -1,0 +1,8 @@
+/target
+/models
+/src-tauri/gen
+node_modules/
+*.safetensors
+
+# Lance dataset written by the app
+/data/lance
