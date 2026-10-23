@@ -1,0 +1,9 @@
+[package]
+name = "hand-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Robot hand model (2-5 fingers, joint options, locomotion bases) and grasp simulation for logistics robots"
+
+[dependencies]
+serde = { workspace = true }
