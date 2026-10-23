@@ -2,7 +2,7 @@
 //! from the UI or a config file; none of the thresholds has been tuned on real
 //! SigLIP2 scores (see `docs/PLAN.md`, section on what is unverified).
 
-use hand_core::{FingerCount, HandConfig};
+use hand_core::{BodyPlan, FingerCount, HandConfig};
 use serde::{Deserialize, Serialize};
 use world_sim::Camera;
 
@@ -93,6 +93,9 @@ pub struct RuntimeConfig {
     /// Hand and base the robot has in the world.
     #[serde(default = "default_hand")]
     pub hand: HandConfig,
+    /// Part presets of the body (`hand_core::parts`).
+    #[serde(default)]
+    pub body: BodyPlan,
     pub camera: CameraCfg,
     pub gates: GateCfg,
     pub noise: NoiseCfg,
@@ -121,6 +124,7 @@ impl Default for RuntimeConfig {
             seed: 7,
             cells: 64,
             hand: default_hand(),
+            body: BodyPlan::default(),
             camera: CameraCfg::default(),
             gates: GateCfg::default(),
             noise: NoiseCfg::demo(),

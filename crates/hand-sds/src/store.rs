@@ -123,6 +123,27 @@ pub struct ConfusionStatus {
     pub mean_margin: f64,
 }
 
+/// A value tracked against a reference (see [`SdsStore::record_reference`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceReport {
+    /// Scope key that answered (secondary, primary or global).
+    pub scope: String,
+    pub n: u64,
+    pub mean: f64,
+    pub sd: f64,
+    /// Mean deviation from the reference in tolerance units.
+    pub mean_dev: f64,
+    /// Same over the ring of recent observations.
+    pub recent_dev: f64,
+    /// Share of observations inside the reference band.
+    pub in_band_rate: f64,
+    /// Mean of the references the observations were compared with, and of their tolerances.
+    #[serde(default)]
+    pub mean_ref: f64,
+    #[serde(default)]
+    pub mean_tol: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SdsStatus {
     pub dir: String,
@@ -339,6 +360,28 @@ impl SdsStore {
         });
     }
 
+    /// Records a value next to a reference value from the literature or a
+    /// physical formula. Three things go into one observation: the value
+    /// itself (`axis`), its deviation in tolerance units (`axis:dev`, that is
+    /// `(value - reference) / tolerance`) and whether it stayed inside the band
+    /// (`axis:in_band`, an agreement). [`reference_report`](Self::reference_report)
+    /// reads them back.
+    pub fn record_reference(&mut self, scope: &Scope, axis: &str, value: f64, reference: f64, tolerance: f64) {
+        if !value.is_finite() || !reference.is_finite() || !tolerance.is_finite() || tolerance <= 0.0 {
+            return;
+        }
+        let dev = (value - reference) / tolerance;
+        let (a, ad, ab, ar, at) = (axis.to_string(), format!("{axis}:dev"), format!("{axis}:in_band"), format!("{axis}:ref"), format!("{axis}:tol"));
+        self.with_scopes(scope, move |s, ring| {
+            s.baseline.entry(a.clone()).or_default().push(value, ring);
+            s.baseline.entry(ad.clone()).or_default().push(dev, ring);
+            // The reference can depend on the situation (a load, a slope); keep its mean too.
+            s.baseline.entry(ar.clone()).or_default().push(reference, ring);
+            s.baseline.entry(at.clone()).or_default().push(tolerance, ring);
+            s.agreement.entry(ab.clone()).or_default().push(if dev.abs() <= 1.0 { 1.0 } else { 0.0 }, ring);
+        });
+    }
+
     pub fn record_transition(&mut self, scope: &Scope, from: &str, to: &str) {
         if from.is_empty() || to.is_empty() {
             return;
@@ -473,6 +516,41 @@ impl SdsStore {
             st.confusion.get(&key).map(|c| ((c.ties as f64 / total.max(1) as f64, c.ties), total))
         })
         .map(|v| v.0)
+    }
+
+    /// What [`record_reference`](Self::record_reference) collected for an axis,
+    /// from the first scope level with enough observations.
+    pub fn reference_report(&self, scope: &Scope, axis: &str) -> Option<ReferenceReport> {
+        let (ad, ab, ar) = (format!("{axis}:dev"), format!("{axis}:in_band"), format!("{axis}:ref"));
+        self.resolve(scope, |st| {
+            let v = st.baseline.get(axis)?;
+            let d = st.baseline.get(&ad)?;
+            let b = st.agreement.get(&ab)?;
+            let r = st.baseline.get(&ar).map_or(f64::NAN, |w| w.mean);
+            let t = st.baseline.get(&format!("{axis}:tol")).map_or(f64::NAN, |w| w.mean);
+            Some(((v.mean, v.sd(), d.mean, d.recent_mean(), b.mean, v.n, r, t), v.n))
+        })
+        .map(|((mean, sd, mean_dev, recent_dev, in_band_rate, n, mean_ref, mean_tol), scope_key)| ReferenceReport { scope: scope_key, n, mean, sd, mean_dev, recent_dev, in_band_rate, mean_ref, mean_tol })
+    }
+
+    /// `(mean, sd, n)` of a baseline axis at exactly one scope (no backoff).
+    /// For tables that show each scope on its own; decisions use the backoff.
+    pub fn exact_baseline(&self, scope: &Scope, axis: &str) -> Option<(f64, f64, u64)> {
+        let key = if scope.secondary.is_empty() { scope.key_primary() } else { scope.key_secondary() };
+        let st = self.merged_scope(scope.track.ledger(), &key)?;
+        st.baseline.get(axis).filter(|w| w.n > 0).map(|w| (w.mean, w.sd(), w.n))
+    }
+
+    /// [`reference_report`](Self::reference_report) at exactly one scope (no backoff, any count).
+    pub fn exact_reference(&self, scope: &Scope, axis: &str) -> Option<ReferenceReport> {
+        let key = if scope.secondary.is_empty() { scope.key_primary() } else { scope.key_secondary() };
+        let st = self.merged_scope(scope.track.ledger(), &key)?;
+        let v = st.baseline.get(axis).filter(|w| w.n > 0)?;
+        let d = st.baseline.get(&format!("{axis}:dev"))?;
+        let b = st.agreement.get(&format!("{axis}:in_band"))?;
+        let mean_ref = st.baseline.get(&format!("{axis}:ref")).map_or(f64::NAN, |w| w.mean);
+        let mean_tol = st.baseline.get(&format!("{axis}:tol")).map_or(f64::NAN, |w| w.mean);
+        Some(ReferenceReport { scope: key, n: v.n, mean: v.mean, sd: v.sd(), mean_dev: d.mean, recent_dev: d.recent_mean(), in_band_rate: b.mean, mean_ref, mean_tol })
     }
 
     /// Past mean squared error of a forecasting method (see `hand-ts` fusion).
@@ -1027,5 +1105,29 @@ mod tests {
         let axes = s.axes_of(&Scope::new(Track::Vision, "tree", ""), "sc");
         assert_eq!(axes.len(), 1);
         assert_eq!(axes[0].kind, "baseline");
+    }
+
+    #[test]
+    fn reference_axes_report_deviation_and_band_share() {
+        let mut s = SdsStore::memory();
+        let scope = Scope::new(Track::Balance, "arm_raise>belly", "flat");
+        // Reference 2.0 ± 0.5: values 2.0, 2.25 and 3.0 are 0, 0.5 and 2 tolerances off.
+        for _ in 0..4 {
+            for v in [2.0, 2.25, 3.0] {
+                s.record_reference(&scope, "comp_deg", v, 2.0, 0.5);
+            }
+        }
+        let r = s.reference_report(&scope, "comp_deg").expect("12 observations reach the secondary minimum of 8");
+        assert_eq!(r.scope, "balance|arm_raise>belly|flat");
+        assert_eq!(r.n, 12);
+        assert!((r.mean_dev - (0.0 + 0.5 + 2.0) / 3.0).abs() < 1e-9, "{r:?}");
+        assert!((r.in_band_rate - 2.0 / 3.0).abs() < 1e-9);
+        assert!((r.mean_ref - 2.0).abs() < 1e-12 && (r.mean_tol - 0.5).abs() < 1e-12);
+        // A bad tolerance is ignored rather than dividing by zero.
+        s.record_reference(&scope, "comp_deg", 9.0, 2.0, 0.0);
+        assert_eq!(s.reference_report(&scope, "comp_deg").unwrap().n, 12);
+        // The new tracks land in their own ledgers.
+        assert!(s.status(10).ledgers.iter().any(|l| l.ledger == "body" && l.observations > 0));
+        assert_eq!(Track::Depth.ledger(), Ledger::Ml);
     }
 }

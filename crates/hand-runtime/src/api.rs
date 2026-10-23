@@ -33,7 +33,7 @@ pub const MIN_CELLS: usize = 32;
 pub const MAX_CELLS: usize = 160;
 
 /// Names of the commands [`Runtime::api_call`] answers.
-pub const COMMANDS: [&str; 11] = [
+pub const COMMANDS: [&str; 22] = [
     "world_new",
     "sim_step",
     "world_frame",
@@ -45,6 +45,17 @@ pub const COMMANDS: [&str; 11] = [
     "ts_forecast",
     "log_tail",
     "models_status",
+    "test_start",
+    "test_step",
+    "test_status",
+    "test_keyframe",
+    "test_video",
+    "test_stats",
+    "test_cancel",
+    "body_presets",
+    "body_plan_eval",
+    "body_plan_set",
+    "world_body",
 ];
 
 /// How many steps ahead the time-series tab forecasts.
@@ -296,12 +307,27 @@ fn text<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 }
 
 impl Runtime {
+    /// The integrated test drives the world itself; stepping it or adding
+    /// quests from outside would mix into the recording.
+    fn refuse_during_test(&self) -> Result<(), String> {
+        match self.test_session().map(|t| t.phase) {
+            Some(crate::TestPhase::Game) | Some(crate::TestPhase::Perceive) | Some(crate::TestPhase::Decide) => {
+                Err("통합 테스트가 진행 중입니다. 끝나거나 중지한 뒤에 진행하세요".into())
+            }
+            _ => Ok(()),
+        }
+    }
+
     // ----- the ten commands -----
 
     /// `world_new({seed, size, config, base})`: a fresh world, and its snapshot.
     pub fn api_world_new(&mut self, seed: u64, size: usize, config: Option<HandConfig>, base: Option<&str>) -> Result<Value, String> {
         if !(MIN_CELLS..=MAX_CELLS).contains(&size) {
             return Err(format!("size 는 {MIN_CELLS}~{MAX_CELLS} 셀이어야 합니다 (받은 값 {size})"));
+        }
+        // A new world ends any integrated test that was running.
+        if self.test_session().is_some() {
+            let _ = self.api_test_call("test_cancel", &Value::Null);
         }
         let mut hand = config;
         if let Some(b) = base.filter(|b| !b.is_empty()) {
@@ -316,6 +342,7 @@ impl Runtime {
 
     /// `sim_step({ticks})`: runs ticks, answers the new state and the notable log lines.
     pub fn api_sim_step(&mut self, ticks: u32) -> Result<Value, String> {
+        self.refuse_during_test()?;
         let lines = self.step(ticks.clamp(1, 200));
         let notable: Vec<&LogLine> = lines.iter().filter(|l| l.level != hand_sds::Level::Debug).collect();
         let events: Vec<Value> = notable[notable.len().saturating_sub(50)..].iter().map(|l| log_json(l)).collect();
@@ -355,6 +382,7 @@ impl Runtime {
 
     /// `command_submit({text})`: parses a typed command and queues its quest.
     pub fn api_command_submit(&mut self, input: &str) -> Result<Value, String> {
+        self.refuse_during_test()?;
         let s = self.submit(input);
         Ok(submission_json(self, input, &s))
     }
@@ -470,7 +498,14 @@ impl Runtime {
     }
 
     pub fn api_call(&mut self, cmd: &str, args: &Value) -> Result<Value, String> {
+        if let Some(r) = self.api_test_call(cmd, args) {
+            return r;
+        }
         match cmd {
+            "world_body" => Ok(json!({"plan": self.cfg.body, "id": self.cfg.body.id(), "balance": self.world().balance_summary(), "limits": {
+                "capacity_kg": self.world().capacity_kg(), "battery_wh": self.world().battery_capacity_j() / 3600.0,
+                "max_speed_mps": self.world().drive_spec().max_speed_mps, "max_slope_deg": self.world().drive_spec().max_slope_deg, "max_step_m": self.world().drive_spec().max_step_m,
+            }, "heat": self.world().heat, "ff_gains": self.world().ff_gains.iter().map(|(k, v)| (k.id().to_string(), *v)).collect::<std::collections::BTreeMap<_, _>>()})),
             "world_new" => {
                 let seed = num(args, "seed").filter(|s| *s >= 0.0).ok_or("seed 는 0 이상의 숫자여야 합니다")? as u64;
                 let size = num(args, "size").ok_or("size 가 필요합니다")?.max(0.0) as usize;
@@ -478,6 +513,9 @@ impl Runtime {
                     Some(c) if !c.is_null() => Some(serde_json::from_value::<HandConfig>(c.clone()).map_err(|e| format!("config(HandConfig)를 읽을 수 없습니다: {e}"))?),
                     _ => None,
                 };
+                if let Some(body) = crate::api_test::plan_from(args)? {
+                    self.cfg.body = body;
+                }
                 self.api_world_new(seed, size, config, text(args, "base"))
             }
             "sim_step" => self.api_sim_step(num(args, "ticks").unwrap_or(1.0).max(1.0) as u32),

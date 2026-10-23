@@ -105,6 +105,8 @@ pub(crate) struct Task {
     pub pick_retry: bool,
     // delivering
     pub deliver_idx: usize,
+    /// Times each quest step was entered (index as in the quest).
+    pub attempts: Vec<u32>,
     // result
     pub touch_ok: u32,
     pub touch_miss: u32,
@@ -137,6 +139,11 @@ impl Task {
             }
         }
         let phase = if kind == "goto" { Phase::Goto } else { Phase::Locate };
+        let n_steps = match kind {
+            "fetch" => 4 * targets.len() + 2,
+            "collect" => 4 * targets.len(),
+            _ => 1,
+        };
         Ok(Task {
             quest: quest.to_string(),
             kind,
@@ -167,6 +174,11 @@ impl Task {
             rounds: 0,
             pick_retry: false,
             deliver_idx: 0,
+            attempts: {
+                let mut a = vec![0u32; n_steps];
+                a[0] = 1;
+                a
+            },
             touch_ok: 0,
             touch_miss: 0,
             wasted: 0,
@@ -222,6 +234,7 @@ pub(crate) fn action_error_ko(e: &ActionError) -> String {
             format!("적재 한도를 넘습니다 (실은 {carried_kg:.1} kg + {item_kg:.1} kg > {capacity_kg:.1} kg)")
         }
         ActionError::NothingToDeliver => "인도할 물건이 없습니다".into(),
+        ActionError::LiftOverload { limiting, margin } => format!("팔·자세가 들 수 없습니다 ({limiting}, 균형 여유 {margin:.2})"),
     }
 }
 
@@ -264,6 +277,10 @@ impl Runtime {
 
     /// One tick of the driver. Called after the world has stepped.
     pub(crate) fn drive(&mut self, events: &[TimedEvent]) {
+        if self.pass == "ml" {
+            self.ml_drive(events);
+            return;
+        }
         if self.task.is_none() {
             self.begin_next();
         }
@@ -328,6 +345,11 @@ impl Runtime {
                 let _ = q.rewind(to_idx, note);
             } else if !note.is_empty() {
                 let _ = q.set_progress(to_idx, 0.0, Some(note.to_string()));
+            }
+        }
+        if from_idx != to_idx {
+            if let Some(a) = t.attempts.get_mut(to_idx) {
+                *a += 1;
             }
         }
         if !note.is_empty() || from_idx != to_idx {
@@ -923,6 +945,7 @@ impl Runtime {
         self.sds.record_baseline(&scope, "duration_s", r.time_s);
         self.sds.record_baseline(&scope, "energy_j", r.energy_j);
         self.log("quest", Level::Info, format!("퀘스트 {} 완료: {}", t.quest, r.summary), Some(json!({"quest": t.quest, "tick": tick, "result": r})));
+        self.record_quest_run(&t.quest, &t.attempts);
         self.flush_sds();
     }
 
@@ -936,11 +959,15 @@ impl Runtime {
             let _ = q.fail(code, msg, Some(r.clone()));
         }
         self.log("quest", Level::Warn, format!("퀘스트 {} 실패 [{code}]: {msg}", t.quest), Some(json!({"quest": t.quest, "code": code, "result": r})));
+        self.record_quest_run(&t.quest, &t.attempts);
         self.flush_sds();
     }
 
     /// Stops the running quest and drops the queue.
     pub fn cancel(&mut self) {
+        if let Some(m) = self.ml_task.take() {
+            self.ml_end(m, Some(("cancelled".into(), "사용자가 중지했습니다".into())));
+        }
         let t = self.task.take();
         if self.world.busy() {
             let ev = self.world.cancel();

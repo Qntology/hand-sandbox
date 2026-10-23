@@ -6,6 +6,8 @@
 //! * [`scene`] draws episodes with domain randomization from a seed.
 //! * [`generate`] runs the grasp simulation and produces Arrow rows.
 //! * [`store`] writes those rows to LanceDB, the ML-native columnar format.
+//! * [`test_tables`] holds the integrated test's records (quest runs and steps,
+//!   success table, ML keyframes, balance effort).
 
 pub mod dictionary;
 pub mod generate;
@@ -13,6 +15,7 @@ pub mod layers;
 pub mod scene;
 pub mod schema;
 pub mod store;
+pub mod test_tables;
 
 pub use dictionary::dictionary_batch;
 pub use generate::{simulate_scene, SampleRows, RECORDED_LAYERS};

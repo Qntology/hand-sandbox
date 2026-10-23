@@ -629,7 +629,7 @@ mod tests {
     fn world() -> World {
         let mut hand = HandConfig::preset(FingerCount::Five);
         hand.base = BaseKind::Track;
-        World::new(WorldConfig { seed: 7, cells: 64, hand }).unwrap()
+        World::new(WorldConfig { seed: 7, cells: 64, hand, ..WorldConfig::default() }).unwrap()
     }
 
     fn small() -> Camera {

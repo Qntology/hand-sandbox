@@ -3473,6 +3473,7 @@ dependencies = [
  "anyhow",
  "futures",
  "hand-core",
+ "hand-sds",
  "lancedb",
  "serde",
  "serde_json",
@@ -3512,14 +3513,17 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "hand-core",
+ "hand-data",
  "hand-ml",
  "hand-quest",
  "hand-sds",
  "hand-search",
  "hand-ts",
+ "hand-vision",
  "image",
  "serde",
  "serde_json",
+ "tokio",
  "world-sim",
 ]
 
@@ -3565,6 +3569,21 @@ version = "0.1.0"
 dependencies = [
  "candle-core",
  "candle-nn",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "hand-vision"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "candle-nn",
+ "hand-ml",
+ "hand-ts",
+ "image",
+ "rayon",
  "serde",
  "serde_json",
 ]

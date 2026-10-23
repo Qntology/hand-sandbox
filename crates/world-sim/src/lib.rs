@@ -25,4 +25,4 @@ pub use capture::{decode_webp, encode_webp, Encoded};
 pub use kinds::{Ground, ItemKind, ItemSpec, NodeKind, NodeSpec};
 pub use render::{Camera, Frame, ObjectClass, VisibleObject};
 pub use snapshot::{GraspInfo, TerrainGrid, WorldSnapshot};
-pub use world::{Action, ActionError, TimedEvent, World, WorldConfig, WorldEvent, TICK_S};
+pub use world::{Action, ActionError, BalanceEvent, TimedEvent, World, WorldConfig, WorldEvent, TICK_S};

@@ -76,6 +76,40 @@ impl MapHead {
         let pooled = (&attended + self.mlp.forward(&normed)?)?;
         pooled.reshape((b, d))
     }
+
+    /// Every patch token mapped into the image-text space on its own:
+    /// the value projection, output projection and MLP of the head, as if the
+    /// probe attended to that one token (the MaskCLIP trick for an attention
+    /// pool). `tokens` is `(b, n, hidden)`; returns `(b, n, hidden)`.
+    fn dense(&self, tokens: &Tensor) -> Result<Tensor> {
+        let d = self.hidden;
+        let v = tokens
+            .broadcast_matmul(&self.in_w.narrow(0, 2 * d, d)?.t()?.contiguous()?)?
+            .broadcast_add(&self.in_b.narrow(0, 2 * d, d)?)?;
+        let attended = self.out.forward(&v)?;
+        let normed = self.ln.forward(&attended)?;
+        &attended + self.mlp.forward(&normed)?
+    }
+
+    /// The probe's attention over the patch tokens, averaged over heads:
+    /// `(b, n)`, each row sums to one.
+    fn attention(&self, tokens: &Tensor) -> Result<Tensor> {
+        let d = self.hidden;
+        let (b, n, _) = tokens.dims3()?;
+        let hd = d / self.heads;
+        let probe = self.probe.broadcast_as((b, 1, d))?;
+        let q = probe
+            .broadcast_matmul(&self.in_w.narrow(0, 0, d)?.t()?.contiguous()?)?
+            .broadcast_add(&self.in_b.narrow(0, 0, d)?)?;
+        let k = tokens
+            .broadcast_matmul(&self.in_w.narrow(0, d, d)?.t()?.contiguous()?)?
+            .broadcast_add(&self.in_b.narrow(0, d, d)?)?;
+        let q = q.reshape((b, 1, self.heads, hd))?.transpose(1, 2)?.contiguous()?;
+        let k = k.reshape((b, n, self.heads, hd))?.transpose(1, 2)?.contiguous()?;
+        let scores = q.matmul(&k.transpose(2, 3)?)?.affine((hd as f64).powf(-0.5), 0.0)?;
+        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+        probs.mean(1)?.reshape((b, n))
+    }
 }
 
 pub struct VisionTower {
@@ -137,6 +171,30 @@ impl VisionTower {
             .permute((1, 2, 0))?
             .contiguous()?
             .reshape((1, grid_h * grid_w, d))
+    }
+
+    /// Patch tokens after the encoder and the final layer norm, `(1, n, hidden)`.
+    fn tokens(&self, input: &NaflexInput) -> Result<Tensor> {
+        let (gh, gw, pd) = (input.grid_h, input.grid_w, input.patch_dim);
+        let patches = Tensor::from_slice(&input.patches, (1, gh * gw, pd), &self.device)?;
+        let mut x = self.patch_proj.forward(&patches)?;
+        x = x.broadcast_add(&self.positions(gh, gw)?)?;
+        for layer in &self.layers {
+            x = layer.forward(&x, None)?;
+        }
+        self.post_ln.forward(&x)
+    }
+
+    /// Dense output for one image: per-patch embeddings in the image-text
+    /// space `(n, hidden)` before normalization, the pooling head's attention
+    /// over the patches `(n,)`, and the pooled image embedding `(hidden,)`.
+    /// Patches are row-major on the `grid_h x grid_w` grid of `input`.
+    pub fn forward_dense(&self, input: &NaflexInput) -> Result<(Tensor, Tensor, Tensor)> {
+        let x = self.tokens(input)?;
+        let dense = self.head.dense(&x)?.squeeze(0)?;
+        let attn = self.head.attention(&x)?.squeeze(0)?;
+        let pooled = self.head.forward(&x)?.squeeze(0)?;
+        Ok((dense, attn, pooled))
     }
 
     /// Image embedding `(1, hidden)` before normalization.

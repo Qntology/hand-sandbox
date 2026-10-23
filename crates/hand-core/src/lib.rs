@@ -6,21 +6,27 @@
 //! * [`sim`] animates the hand and runs a quasi-static grasp test on a
 //!   [`sim::Payload`]. [`base::simulate_drive`] checks a route for the base.
 //! * [`body`] turns simulation variables into a body-part status display.
+//! * [`parts`] holds researched part presets (head, chest, belly, arm, leg or
+//!   chassis) and [`balance`] the whole-body balance and joint effort they give.
 //!
 //! Units: metres, seconds, kilograms, newtons, and radians inside the model
 //! (degrees only appear in the UI).
 
+pub mod balance;
 pub mod base;
 pub mod body;
 pub mod finger;
 pub mod hand;
 pub mod joint;
 pub mod math;
+pub mod parts;
 pub mod sim;
 
+pub use balance::{reference, Body, BalanceReport, Coupling, DriveLimits, FeedForward, JointLoad, Posture, RefCtx, Reference, Source};
+pub use parts::{BodyPlan, Segment, Tier};
 pub use base::{simulate_drive, BaseKind, BaseSpec, DriveReport, Terrain};
 pub use body::{
-    battery_capacity_j, compute as compute_body, BodyEffect, BodyInputs, BodyLevel, BodyPart,
+    battery_capacity_j, compute as compute_body, BalanceSummary, BodyEffect, BodyInputs, BodyLevel, BodyLimits, BodyPart,
     BodyStatus, JOINT_ENDURANCE_STRIKES,
 };
 pub use finger::FingerSpec;

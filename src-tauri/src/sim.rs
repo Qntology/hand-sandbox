@@ -7,18 +7,66 @@
 
 use std::sync::Arc;
 
-use hand_core::HandConfig;
+use hand_core::{BodyPlan, HandConfig};
 use hand_runtime::Runtime;
 use serde_json::{json, Value};
 use tauri::State;
 
-use crate::state::{bank_dir, model_dir, ttm_dir, AppState};
+use crate::state::{bank_dir, default_store_dir, model_dir, tips_dir, ttm_dir, AppState};
 
 type App<'a> = State<'a, Arc<AppState>>;
 
 #[tauri::command]
-pub async fn world_new(state: App<'_>, seed: u64, size: usize, config: Option<HandConfig>, base: Option<String>) -> Result<Value, String> {
-    state.with_world(|rt| rt.api_world_new(seed, size, config, base.as_deref()))
+pub async fn world_new(state: App<'_>, seed: u64, size: usize, config: Option<HandConfig>, base: Option<String>, body: Option<BodyPlan>) -> Result<Value, String> {
+    state.with_world(|rt| {
+        if let Some(b) = body {
+            rt.cfg.body = b;
+        }
+        rt.api_world_new(seed, size, config, base.as_deref())
+    })
+}
+
+/// The runtime's other JSON calls (integrated test, part presets) by name, with
+/// the arguments the UI sends. Runs off the window's thread: a test step can
+/// render and analyse several keyframes.
+#[tauri::command]
+pub async fn rt_call(state: App<'_>, cmd: String, args: Option<Value>) -> Result<Value, String> {
+    let shared: Arc<AppState> = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || shared.with_world(|rt| rt.api_call(&cmd, &args.unwrap_or(Value::Null))))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Copies the test records written since the last call into the Lance store
+/// (`quest_runs`, `quest_steps`, `quest_stats`, `ml_keyframes`, `balance_effort`).
+#[tauri::command]
+pub async fn test_db_mirror(state: App<'_>, store_dir: Option<String>) -> Result<Value, String> {
+    let (batch, stats) = state.with_world(|rt| {
+        let db = rt.test_db_mut();
+        Ok((db.take_mirror(), db.stats()))
+    })?;
+    let dir = store_dir.filter(|s| !s.trim().is_empty()).map(std::path::PathBuf::from).unwrap_or_else(default_store_dir);
+    let store = hand_data::LanceStore::open(dir.to_str().ok_or("저장 경로가 UTF-8 이 아닙니다")?).await.map_err(|e| format!("{e:#}"))?;
+    let counts = hand_data::test_tables::write_mirror(&store, &batch, &stats).await.map_err(|e| format!("{e:#}"))?;
+    Ok(json!({"store_dir": dir.display().to_string(), "written": counts}))
+}
+
+/// Loads TIPSv2-B/14 DPT from [`tips_dir`] onto the selected device as the
+/// ML depth model.
+#[tauri::command]
+pub async fn tips_use(state: App<'_>) -> Result<Value, String> {
+    let shared: Arc<AppState> = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
+        let (backend, ordinal) = shared.selected();
+        let device = backend.open(ordinal).map_err(|e| format!("{} 장치를 열 수 없습니다: {e:#}", backend.name()))?;
+        let dir = tips_dir();
+        shared.with_world(|rt| {
+            rt.use_tips(&dir, &device).map_err(|e| format!("{e:#}"))?;
+            models_json(&shared, rt)
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -77,6 +125,10 @@ fn models_json(state: &AppState, rt: &Runtime) -> Result<Value, String> {
     v["device"] = json!({"backend": backend.name(), "ordinal": ordinal});
     v["siglip_files"] = json!({"dir": siglip.display().to_string(), "present": siglip.join("config.json").is_file()});
     v["ttm_files"] = json!({"dir": ttm.display().to_string(), "present": ttm.join("config.json").is_file()});
+    let tips = tips_dir();
+    v["tips_files"] = json!({"dir": tips.display().to_string(), "present": tips.join("model.safetensors").is_file()});
+    let ml = rt.ml_pipeline();
+    v["ml"] = json!({"depth": ml.depth_mode(), "locate": ml.locate_mode(), "track": ml.track_mode()});
     Ok(v)
 }
 

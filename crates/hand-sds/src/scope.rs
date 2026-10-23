@@ -19,10 +19,42 @@ pub enum Track {
     Motion,
     /// Forecast errors of each time-series predictor.
     Forecast,
+    /// ML keyframe track 1: monocular depth (TIPSv2 DPT or its stand-in) against the renderer's depth.
+    Depth,
+    /// ML keyframe track 2: SigLIP2 semantic location (heat-map peak) against the true object.
+    Locate,
+    /// ML keyframe track 3: mask tracking seeded by the semantic location (SAM 3.1 or its stand-in).
+    Tracker,
+    /// ML keyframe track 4: the time-series decision (forecast, move, look again) and its residuals.
+    Decide,
+    /// Features that mix the ML tracks (depth at the semantic peak, peak inside the mask, ...).
+    Fusion,
+    /// N:N posture balance: how much one segment's action asks of another, against research references.
+    Balance,
+    /// Joint effort (torque over the actuator's continuous rating) per segment and state.
+    Effort,
+    /// Quest and quest-step outcomes per pass (game logic or ML logic).
+    Quest,
 }
 
 impl Track {
-    pub const ALL: [Track; 4] = [Track::Vision, Track::Search, Track::Motion, Track::Forecast];
+    pub const ALL: [Track; 12] = [
+        Track::Vision,
+        Track::Search,
+        Track::Motion,
+        Track::Forecast,
+        Track::Depth,
+        Track::Locate,
+        Track::Tracker,
+        Track::Decide,
+        Track::Fusion,
+        Track::Balance,
+        Track::Effort,
+        Track::Quest,
+    ];
+
+    /// The four ML keyframe tracks, in pipeline order.
+    pub const ML: [Track; 4] = [Track::Depth, Track::Locate, Track::Tracker, Track::Decide];
 
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -30,6 +62,14 @@ impl Track {
             Track::Search => "search",
             Track::Motion => "motion",
             Track::Forecast => "forecast",
+            Track::Depth => "depth",
+            Track::Locate => "locate",
+            Track::Tracker => "tracker",
+            Track::Decide => "decide",
+            Track::Fusion => "fusion",
+            Track::Balance => "balance",
+            Track::Effort => "effort",
+            Track::Quest => "quest",
         }
     }
 
@@ -44,6 +84,13 @@ impl Track {
             Track::Search => (20, 8, 30),
             Track::Motion => (6, 4, 8),
             Track::Forecast => (4, 3, 6),
+            // One observation per keyframe: a test run gives tens, not hundreds.
+            Track::Depth | Track::Locate | Track::Tracker | Track::Fusion => (12, 6, 20),
+            Track::Decide => (8, 4, 12),
+            // One observation per balance event or keyframe and segment pair.
+            Track::Balance | Track::Effort => (8, 4, 12),
+            // One observation per quest step: few, so trust a scope early.
+            Track::Quest => (4, 3, 6),
         }
     }
 
@@ -56,7 +103,9 @@ impl Track {
         match self {
             Track::Vision => Ledger::Perception,
             Track::Search => Ledger::Command,
-            Track::Motion | Track::Forecast => Ledger::Task,
+            Track::Motion | Track::Forecast | Track::Quest => Ledger::Task,
+            Track::Depth | Track::Locate | Track::Tracker | Track::Decide | Track::Fusion => Ledger::Ml,
+            Track::Balance | Track::Effort => Ledger::Body,
         }
     }
 }
@@ -68,16 +117,22 @@ pub enum Ledger {
     Perception,
     Command,
     Task,
+    /// The ML keyframe tracks and their mixed features.
+    Ml,
+    /// Posture balance and joint effort.
+    Body,
 }
 
 impl Ledger {
-    pub const ALL: [Ledger; 3] = [Ledger::Perception, Ledger::Command, Ledger::Task];
+    pub const ALL: [Ledger; 5] = [Ledger::Perception, Ledger::Command, Ledger::Task, Ledger::Ml, Ledger::Body];
 
     pub fn as_str(&self) -> &'static str {
         match self {
             Ledger::Perception => "perception",
             Ledger::Command => "command",
             Ledger::Task => "task",
+            Ledger::Ml => "ml",
+            Ledger::Body => "body",
         }
     }
 

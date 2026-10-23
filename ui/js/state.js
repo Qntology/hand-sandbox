@@ -35,7 +35,8 @@ export const state = {
   // 월드
   snapshot: null,
   quests: [],
-  body: null,
+  body: null, // body_status (신체 상태 HUD)
+  bodyPlan: null, // 부품 프리셋 BodyPlan (world_new · test_start 에 그대로 전달)
   detections: [],
   frame: null, // {bytes, encode_ms, tick, width, height}
   worldConfigKey: null, // 현재 월드를 만들 때 쓴 손·발 구성(JSON)

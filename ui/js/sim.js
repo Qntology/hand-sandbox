@@ -46,7 +46,7 @@ export async function refreshBody() {
 export async function newWorld(seed, size) {
   setPlaying(false);
   try {
-    const snap = await call('world_new', { seed, size, config: state.config, base: state.config.base });
+    const snap = await call('world_new', { seed, size, config: state.config, base: state.config.base, body: state.bodyPlan ?? null });
     state.worldConfigKey = JSON.stringify(state.config);
     state.detections = [];
     applySnapshot(snap, true);
@@ -115,5 +115,7 @@ export function initSim() {
     }
   });
   $('sim-speed').addEventListener('change', (e) => { state.speed = Number(e.target.value); });
+  // 통합 테스트는 월드를 직접 진행시킨다. 재생 루프가 끼어들지 않게 멈춘다.
+  bus.on('test-start', () => setPlaying(false));
   state.speed = Number($('sim-speed').value);
 }

@@ -1,0 +1,924 @@
+//! TIPSv2-B/14 DPT depth on candle: the depth path of `google/tipsv2-b14-dpt`,
+//! ported from the official PyTorch code (`image_encoder.py` for the ViT,
+//! `dpt_head.py` for the decoder). Only `vision_encoder.*` and `depth_head.*`
+//! are read from the checkpoint; the normals and segmentation heads that share
+//! the file are never loaded.
+//!
+//! The pipeline, with the shapes of a 384x256 keyframe:
+//!
+//! 1. The image is resized to a whole number of 14 px patches (504x336, a
+//!    36x24 grid; see [`InputGrid`]) and scaled to `[0, 1]`. TIPS takes raw
+//!    `ToTensor()` pixels: there is no mean/std normalisation.
+//! 2. A DINOv2-style ViT-B/14 (12 blocks, LayerScale, one register token)
+//!    runs over `[cls, register, patches]`. The learned positions belong to
+//!    the 448x448 training grid (32x32) and are resized to the input grid with
+//!    PyTorch's antialiased bilinear filter, because that is what the
+//!    reference does and a 24-row grid is a downsample of the 32-row table.
+//! 3. Blocks 3, 6, 9 and 12 (counting from one; [`TipsConfig::tap_blocks`]
+//!    is 0-based) are tapped, each through the final LayerNorm, as
+//!    (cls, patch) pairs. DPT reassembles them at 4x, 2x, 1x and 1/2x of the
+//!    patch grid, fuses them coarse to fine (each fusion block doubles the
+//!    size) and ends at 8x the patch grid.
+//! 4. A linear classifier gives 256 logits per pixel over depth bins spaced
+//!    evenly between 0.001 and 10 m. The depth is the expectation over the
+//!    bins, so it can never leave that range, which is why the model reports
+//!    [`DepthModel::max_depth_m`] and the decision step must triangulate
+//!    anything farther.
+//! 5. The map is resized bilinearly to the keyframe's own size.
+//!
+//! Numerics follow the Python line by line (exact-erf GELU everywhere, the
+//! align-corners upsample inside the fusion blocks, the skip resized to the
+//! upsampled path when their sizes differ). They have not been compared with
+//! PyTorch outputs on the real weights.
+
+use std::path::Path;
+
+use anyhow::{bail, Context};
+use candle_core::{DType, Device, Module, Tensor, D};
+use candle_nn::{
+    conv2d, conv2d_no_bias, conv_transpose2d, layer_norm, linear, Conv2d, Conv2dConfig, ConvTranspose2d,
+    ConvTranspose2dConfig, LayerNorm, Linear, VarBuilder,
+};
+
+use crate::depth::{clamp_metric, DepthModel};
+use crate::frame::{DepthKind, DepthMap, Rgb};
+
+/// Name reported by [`DepthModel::mode`].
+pub const MODE: &str = "tipsv2-b14-dpt";
+/// Folder the caller loads from when [`DIR_ENV`] is not set.
+pub const DEFAULT_DIR: &str = "models/tipsv2-b14-dpt";
+/// Environment variable that overrides [`DEFAULT_DIR`]. The caller resolves
+/// it; [`TipsDepth::load`] only ever sees the final folder.
+pub const DIR_ENV: &str = "TIPS_DIR";
+/// The checkpoint inside the model folder.
+pub const WEIGHTS_FILE: &str = "model.safetensors";
+/// Optional configuration inside the model folder.
+pub const CONFIG_FILE: &str = "config.json";
+
+/// Patches along the shorter image side by default. 24 patches (336 px) turn
+/// the 384x256 keyframes into 504x336, a 36x24 grid that keeps the 3:2 aspect
+/// exactly and stays under the 32x32 = 1024 tokens of the training
+/// resolution, so the position table is only mildly resampled.
+pub const DEFAULT_SHORT_SIDE_PATCHES: usize = 24;
+
+/// Number of ViT blocks the DPT decoder taps.
+const DPT_LEVELS: usize = 4;
+/// Every fusion block ends with a 2x bilinear upsample.
+const FUSION_UPSAMPLE: usize = 2;
+/// Kernel of the stride-2 conv that halves the deepest level.
+const DOWN_KERNEL: usize = 3;
+/// 3x3 convs keep their size with one pixel of padding.
+const SAME_PAD_3X3: usize = 1;
+
+/// How `ReassembleBlocks` resamples each tapped level relative to the patch
+/// grid, in tap order: 4x and 2x up with transposed convs whose kernel equals
+/// the stride (every patch becomes a block of pixels), unchanged, and 2x down
+/// with a 3x3 stride-2 conv. With the 2x of the last fusion block the depth
+/// map lands at 8x the patch grid.
+#[derive(Clone, Copy, Debug)]
+enum LevelScale {
+    Up(usize),
+    Keep,
+    Down(usize),
+}
+
+const LEVEL_SCALES: [LevelScale; DPT_LEVELS] = [LevelScale::Up(4), LevelScale::Up(2), LevelScale::Keep, LevelScale::Down(2)];
+
+/// Architecture of the checkpoint. Defaults match `google/tipsv2-b14-dpt`
+/// (and every shape in its safetensors header).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TipsConfig {
+    pub hidden: usize,
+    pub layers: usize,
+    pub heads: usize,
+    pub mlp_hidden: usize,
+    pub patch_size: usize,
+    /// Training resolution. `image_size / patch_size` is the side of the
+    /// square position table (448 / 14 = 32).
+    pub image_size: usize,
+    /// Extra cls-like tokens without a position, placed right after cls.
+    pub register_tokens: usize,
+    pub layer_norm_eps: f64,
+    /// 0-based ViT blocks whose (normed) output feeds the DPT levels, shallow first.
+    pub tap_blocks: [usize; DPT_LEVELS],
+    /// Channels of the four reassembled levels.
+    pub post_process_channels: [usize; DPT_LEVELS],
+    /// Channels inside the fusion stage.
+    pub dpt_channels: usize,
+    pub depth_bins: usize,
+    /// Centre of the first bin, metres. The decoder also adds it to every
+    /// rectified logit, so no bin ever has zero weight.
+    pub min_depth: f32,
+    /// Centre of the last bin, metres: the farthest the model can answer.
+    pub max_depth: f32,
+}
+
+impl Default for TipsConfig {
+    fn default() -> Self {
+        TipsConfig {
+            hidden: 768,
+            layers: 12,
+            heads: 12,
+            mlp_hidden: 3072,
+            patch_size: 14,
+            image_size: 448,
+            register_tokens: 1,
+            layer_norm_eps: 1e-6,
+            tap_blocks: [2, 5, 8, 11],
+            post_process_channels: [96, 192, 384, 768],
+            dpt_channels: 256,
+            depth_bins: 256,
+            min_depth: 1e-3,
+            max_depth: 10.0,
+        }
+    }
+}
+
+impl TipsConfig {
+    /// Reads a `config.json`. Missing fields keep their defaults.
+    pub fn from_file(path: &Path) -> anyhow::Result<Self> {
+        let raw = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        Self::from_json(&raw).with_context(|| format!("parsing {}", path.display()))
+    }
+
+    /// Field names follow the Python constructors (`embed_dim`, `img_size`,
+    /// `post_process_channels`, `num_depth_bins`, ...) with the Hugging Face
+    /// spellings as aliases. The layout of the published `config.json` is not
+    /// pinned down, so unknown fields are ignored and the defaults, which match
+    /// the checkpoint, fill the gaps. `out_indices` uses the Hugging Face
+    /// backbone convention where stage 0 is the patch embedding, so
+    /// `[3, 6, 9, 12]` means blocks 2, 5, 8 and 11.
+    pub fn from_json(raw: &str) -> anyhow::Result<Self> {
+        let v: serde_json::Value = serde_json::from_str(raw)?;
+        if let Some(f) = v["vision_fn"].as_str() {
+            if f != "vit_base" {
+                bail!("only the ViT-B/14 backbone (vision_fn \"vit_base\") is ported, the config asks for {f:?}");
+            }
+        }
+        if let Some(f) = v["ffn_layer"].as_str() {
+            if f != "mlp" {
+                bail!("only the GELU MLP feed-forward is ported, the config asks for {f:?}");
+            }
+        }
+        let d = TipsConfig::default();
+        let us = |keys: &[&str], fallback: usize| keys.iter().find_map(|k| v[*k].as_u64()).map_or(fallback, |x| x as usize);
+        let fl = |keys: &[&str], fallback: f64| keys.iter().find_map(|k| v[*k].as_f64()).unwrap_or(fallback);
+        let levels = |key: &str| -> anyhow::Result<Option<[usize; DPT_LEVELS]>> {
+            let Some(a) = v[key].as_array() else { return Ok(None) };
+            let n: Vec<usize> = a.iter().filter_map(|x| x.as_u64()).map(|x| x as usize).collect();
+            match <[usize; DPT_LEVELS]>::try_from(n) {
+                Ok(n) if n.len() == a.len() => Ok(Some(n)),
+                _ => bail!("{key} must hold {DPT_LEVELS} non-negative integers"),
+            }
+        };
+        let hidden = us(&["embed_dim", "hidden_size"], d.hidden);
+        let mlp_hidden = match v["mlp_ratio"].as_f64() {
+            Some(r) => (hidden as f64 * r) as usize,
+            None => us(&["intermediate_size"], d.mlp_hidden),
+        };
+        let tap_blocks = match levels("out_indices")? {
+            Some(stages) if stages.contains(&0) => bail!("out_indices counts stages from the patch embedding (0); DPT needs block outputs (1 and up)"),
+            Some(stages) => stages.map(|s| s - 1),
+            None => d.tap_blocks,
+        };
+        Ok(TipsConfig {
+            hidden,
+            layers: us(&["num_layers", "num_hidden_layers"], d.layers),
+            heads: us(&["num_heads", "num_attention_heads"], d.heads),
+            mlp_hidden,
+            patch_size: us(&["patch_size"], d.patch_size),
+            image_size: us(&["img_size", "image_size"], d.image_size),
+            register_tokens: us(&["num_register_tokens"], d.register_tokens),
+            layer_norm_eps: fl(&["layer_norm_eps"], d.layer_norm_eps),
+            tap_blocks,
+            post_process_channels: levels("post_process_channels")?.unwrap_or(d.post_process_channels),
+            dpt_channels: us(&["channels", "dpt_channels"], d.dpt_channels),
+            depth_bins: us(&["num_depth_bins"], d.depth_bins),
+            min_depth: fl(&["min_depth"], d.min_depth as f64) as f32,
+            max_depth: fl(&["max_depth"], d.max_depth as f64) as f32,
+        })
+    }
+
+    /// Side of the square position table.
+    pub fn position_side(&self) -> usize {
+        self.image_size / self.patch_size
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.heads == 0 || !self.hidden.is_multiple_of(self.heads) {
+            bail!("hidden size {} does not split into {} heads", self.hidden, self.heads);
+        }
+        if self.patch_size == 0 || !self.image_size.is_multiple_of(self.patch_size) {
+            bail!("training size {} is not a whole number of {} px patches", self.image_size, self.patch_size);
+        }
+        if !self.tap_blocks.windows(2).all(|w| w[0] < w[1]) || self.tap_blocks[DPT_LEVELS - 1] >= self.layers {
+            bail!("tap blocks {:?} must increase and stay below {} layers", self.tap_blocks, self.layers);
+        }
+        if self.depth_bins < 2 || !(self.min_depth > 0.0 && self.min_depth < self.max_depth) {
+            bail!("depth bins need at least two centres with 0 < min < max, got {} in {}..{}", self.depth_bins, self.min_depth, self.max_depth);
+        }
+        Ok(())
+    }
+}
+
+/// Patch grid a keyframe is resized to before the ViT. The model accepts any
+/// grid; more patches mean finer depth (8 px of output per patch) at a
+/// quadratic attention cost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputGrid {
+    /// The shorter image side becomes this many patches, the longer side the
+    /// nearest count that keeps the aspect ratio.
+    ShortSide(usize),
+    /// Always this grid, whatever the image aspect.
+    Fixed { cols: usize, rows: usize },
+}
+
+impl Default for InputGrid {
+    fn default() -> Self {
+        InputGrid::ShortSide(DEFAULT_SHORT_SIDE_PATCHES)
+    }
+}
+
+impl InputGrid {
+    /// `(cols, rows)` for an image of `width x height` pixels, at least one patch each way.
+    pub fn grid_for(self, width: u32, height: u32) -> (usize, usize) {
+        match self {
+            InputGrid::Fixed { cols, rows } => (cols.max(1), rows.max(1)),
+            InputGrid::ShortSide(n) => {
+                let n = n.max(1) as f64;
+                let (w, h) = (width.max(1) as f64, height.max(1) as f64);
+                let long = |a: f64, b: f64| ((n * a / b).round() as usize).max(1);
+                if width <= height {
+                    (n as usize, long(h, w))
+                } else {
+                    (long(w, h), n as usize)
+                }
+            }
+        }
+    }
+}
+
+/// Self-attention with the fused `qkv` projection of DINOv2.
+struct Attention {
+    qkv: Linear,
+    proj: Linear,
+    heads: usize,
+    head_dim: usize,
+}
+
+impl Attention {
+    fn new(cfg: &TipsConfig, vb: VarBuilder) -> candle_core::Result<Self> {
+        let d = cfg.hidden;
+        Ok(Attention { qkv: linear(d, 3 * d, vb.pp("qkv"))?, proj: linear(d, d, vb.pp("proj"))?, heads: cfg.heads, head_dim: d / cfg.heads })
+    }
+
+    /// `x` is `(batch, tokens, hidden)`.
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        let (b, n, d) = x.dims3()?;
+        let qkv = self.qkv.forward(x)?;
+        // The Python reshapes to (b, n, 3, heads, head_dim): q, k and v are the
+        // three consecutive `hidden`-wide slices of the projection.
+        let split = |i: usize| -> candle_core::Result<Tensor> {
+            qkv.narrow(D::Minus1, i * d, d)?.reshape((b, n, self.heads, self.head_dim))?.transpose(1, 2)?.contiguous()
+        };
+        let (q, k, v) = (split(0)?, split(1)?, split(2)?);
+        let scores = (q.matmul(&k.transpose(2, 3)?)? * (self.head_dim as f64).powf(-0.5))?;
+        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+        let ctx = probs.matmul(&v)?.transpose(1, 2)?.contiguous()?.reshape((b, n, d))?;
+        self.proj.forward(&ctx)
+    }
+}
+
+/// Pre-norm transformer block with LayerScale on both residual branches.
+struct Block {
+    norm1: LayerNorm,
+    attn: Attention,
+    ls1: Tensor,
+    norm2: LayerNorm,
+    fc1: Linear,
+    fc2: Linear,
+    ls2: Tensor,
+}
+
+impl Block {
+    fn new(cfg: &TipsConfig, vb: VarBuilder) -> candle_core::Result<Self> {
+        let (d, eps) = (cfg.hidden, cfg.layer_norm_eps);
+        let mlp = vb.pp("mlp");
+        Ok(Block {
+            norm1: layer_norm(d, eps, vb.pp("norm1"))?,
+            attn: Attention::new(cfg, vb.pp("attn"))?,
+            ls1: vb.pp("ls1").get(d, "gamma")?,
+            norm2: layer_norm(d, eps, vb.pp("norm2"))?,
+            fc1: linear(d, cfg.mlp_hidden, mlp.pp("fc1"))?,
+            fc2: linear(cfg.mlp_hidden, d, mlp.pp("fc2"))?,
+            ls2: vb.pp("ls2").get(d, "gamma")?,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        let x = (x + self.attn.forward(&self.norm1.forward(x)?)?.broadcast_mul(&self.ls1)?)?;
+        // `nn.GELU()` defaults to the exact erf form, not the tanh approximation.
+        let mlp = self.fc2.forward(&self.fc1.forward(&self.norm2.forward(&x)?)?.gelu_erf()?)?;
+        &x + mlp.broadcast_mul(&self.ls2)?
+    }
+}
+
+/// One tapped block output after the final norm.
+struct Tap {
+    /// `(batch, hidden)`.
+    cls: Tensor,
+    /// `(batch, rows * cols, hidden)`, row-major over the patch grid.
+    patches: Tensor,
+    rows: usize,
+    cols: usize,
+}
+
+/// The TIPSv2 image encoder (`vision_encoder.*`), up to the last tapped block.
+struct Encoder {
+    patch_embed: Conv2d,
+    cls_token: Tensor,
+    register_tokens: Option<Tensor>,
+    /// `(1, 1 + side * side, hidden)`: the cls position, then the square grid.
+    pos_embed: Tensor,
+    blocks: Vec<Block>,
+    norm: LayerNorm,
+    side: usize,
+    hidden: usize,
+    patch_size: usize,
+    tap_blocks: [usize; DPT_LEVELS],
+}
+
+impl Encoder {
+    fn new(cfg: &TipsConfig, vb: VarBuilder) -> candle_core::Result<Self> {
+        let (d, side) = (cfg.hidden, cfg.position_side());
+        let patch_cfg = Conv2dConfig { stride: cfg.patch_size, ..Default::default() };
+        let register_tokens = match cfg.register_tokens {
+            0 => None,
+            r => Some(vb.get((1, r, d), "register_tokens")?),
+        };
+        // `mask_token` is only substituted for masked patches during
+        // pre-training (`prepare_tokens_with_masks` with masks), never at inference.
+        Ok(Encoder {
+            patch_embed: conv2d(3, d, cfg.patch_size, patch_cfg, vb.pp("patch_embed").pp("proj"))?,
+            cls_token: vb.get((1, 1, d), "cls_token")?,
+            register_tokens,
+            pos_embed: vb.get((1, 1 + side * side, d), "pos_embed")?,
+            blocks: (0..cfg.layers).map(|i| Block::new(cfg, vb.pp(format!("blocks.{i}")))).collect::<candle_core::Result<_>>()?,
+            norm: layer_norm(d, cfg.layer_norm_eps, vb.pp("norm"))?,
+            side,
+            hidden: d,
+            patch_size: cfg.patch_size,
+            tap_blocks: cfg.tap_blocks,
+        })
+    }
+
+    /// Positions for a `rows x cols` grid, `(1, 1 + rows * cols, hidden)`.
+    /// `interpolate_pos_encoding` resizes the patch table with
+    /// `F.interpolate(size=..., mode="bilinear", antialias=True)`; the filter
+    /// is separable, so it is two small matrix products here.
+    fn positions(&self, rows: usize, cols: usize) -> candle_core::Result<Tensor> {
+        let (side, d) = (self.side, self.hidden);
+        if (rows, cols) == (side, side) {
+            return Ok(self.pos_embed.clone());
+        }
+        let dev = self.pos_embed.device();
+        let wy = Tensor::from_vec(antialias_bilinear_weights(side, rows), (rows, side), dev)?;
+        let wx = Tensor::from_vec(antialias_bilinear_weights(side, cols), (cols, side), dev)?;
+        let table = self.pos_embed.narrow(1, 1, side * side)?.reshape((side, side * d))?;
+        let by_rows = wy.matmul(&table)?.reshape((rows, side, d))?;
+        let grid = wx.broadcast_matmul(&by_rows)?.reshape((1, rows * cols, d))?;
+        Tensor::cat(&[&self.pos_embed.narrow(1, 0, 1)?, &grid], 1)
+    }
+
+    /// `pixels` is `(batch, 3, h, w)` in `[0, 1]` with `h` and `w` multiples of
+    /// the patch size. Returns the tapped blocks, shallow first.
+    fn taps(&self, pixels: &Tensor) -> candle_core::Result<Vec<Tap>> {
+        let (b, _, h, w) = pixels.dims4()?;
+        let (rows, cols, d) = (h / self.patch_size, w / self.patch_size, self.hidden);
+        let n = rows * cols;
+        let patches = self.patch_embed.forward(pixels)?.flatten_from(2)?.transpose(1, 2)?;
+        let cls = self.cls_token.broadcast_as((b, 1, d))?;
+        // Positions go on [cls, patches]; registers are inserted afterwards and get none.
+        let mut x = Tensor::cat(&[&cls, &patches], 1)?.broadcast_add(&self.positions(rows, cols)?)?;
+        let registers = match &self.register_tokens {
+            Some(r) => {
+                let r = r.broadcast_as((b, r.dim(1)?, d))?;
+                x = Tensor::cat(&[&x.narrow(1, 0, 1)?, &r, &x.narrow(1, 1, n)?], 1)?;
+                r.dim(1)?
+            }
+            None => 0,
+        };
+        let last = self.tap_blocks[DPT_LEVELS - 1];
+        let mut taps = Vec::with_capacity(DPT_LEVELS);
+        for (i, block) in self.blocks.iter().enumerate().take(last + 1) {
+            x = block.forward(&x)?;
+            if self.tap_blocks.contains(&i) {
+                // `get_intermediate_layers(norm=True)`: every tap goes through the final norm.
+                let normed = self.norm.forward(&x)?;
+                taps.push(Tap {
+                    cls: normed.narrow(1, 0, 1)?.squeeze(1)?,
+                    patches: normed.narrow(1, 1 + registers, n)?,
+                    rows,
+                    cols,
+                });
+            }
+        }
+        Ok(taps)
+    }
+}
+
+/// Weights of PyTorch's antialiased bilinear resize along one axis
+/// (`_compute_indices_min_size_weights_aa` with `align_corners=False`), as a
+/// row-major `dst x src` matrix. Upsampling reduces to ordinary bilinear with
+/// half-pixel centres; downsampling widens the triangle to the scale factor so
+/// every input sample contributes.
+fn antialias_bilinear_weights(src: usize, dst: usize) -> Vec<f32> {
+    let scale = src as f64 / dst as f64;
+    let (support, inv_scale) = if scale >= 1.0 { (scale, 1.0 / scale) } else { (1.0, 1.0) };
+    let triangle = |x: f64| (1.0 - x.abs()).max(0.0);
+    let mut weights = vec![0f32; dst * src];
+    for o in 0..dst {
+        let center = scale * (o as f64 + 0.5);
+        // `as i64` truncates toward zero like the C++ `static_cast<int64_t>`.
+        let lo = ((center - support + 0.5) as i64).max(0) as usize;
+        let hi = ((center + support + 0.5) as i64).min(src as i64).max(lo as i64) as usize;
+        let taps: Vec<f64> = (lo..hi).map(|j| triangle((j as f64 - center + 0.5) * inv_scale)).collect();
+        let total: f64 = taps.iter().sum();
+        if total > 0.0 {
+            for (k, t) in taps.iter().enumerate() {
+                weights[o * src + lo + k] = (t / total) as f32;
+            }
+        }
+    }
+    weights
+}
+
+/// `ReassembleBlocks` with the `project` readout for one level.
+struct ReassembleLevel {
+    readout: Linear,
+    out_projection: Conv2d,
+    resize: Resize,
+}
+
+enum Resize {
+    Up(ConvTranspose2d),
+    Keep,
+    Down(Conv2d),
+}
+
+impl ReassembleLevel {
+    fn new(level: usize, cfg: &TipsConfig, vb: VarBuilder) -> candle_core::Result<Self> {
+        let (d, ch) = (cfg.hidden, cfg.post_process_channels[level]);
+        let resize_vb = vb.pp("resize_layers").pp(level);
+        let resize = match LEVEL_SCALES[level] {
+            LevelScale::Up(s) => Resize::Up(conv_transpose2d(ch, ch, s, ConvTranspose2dConfig { stride: s, ..Default::default() }, resize_vb)?),
+            LevelScale::Keep => Resize::Keep,
+            LevelScale::Down(s) => {
+                let down = Conv2dConfig { stride: s, padding: SAME_PAD_3X3, ..Default::default() };
+                Resize::Down(conv2d(ch, ch, DOWN_KERNEL, down, resize_vb)?)
+            }
+        };
+        Ok(ReassembleLevel {
+            readout: linear(2 * d, d, vb.pp("readout_projects").pp(level))?,
+            out_projection: conv2d(d, ch, 1, Conv2dConfig::default(), vb.pp("out_projections").pp(level))?,
+            resize,
+        })
+    }
+
+    /// Every patch sees the cls token through `concat[patch, cls] -> Linear -> GELU`,
+    /// then a 1x1 conv sets the level's channels and the resize its scale.
+    fn forward(&self, tap: &Tap) -> candle_core::Result<Tensor> {
+        let (b, n, d) = tap.patches.dims3()?;
+        let readout = tap.cls.unsqueeze(1)?.broadcast_as((b, n, d))?;
+        let x = self.readout.forward(&Tensor::cat(&[&tap.patches, &readout], 2)?.contiguous()?)?.gelu_erf()?;
+        let x = x.transpose(1, 2)?.contiguous()?.reshape((b, d, tap.rows, tap.cols))?;
+        let x = self.out_projection.forward(&x)?;
+        match &self.resize {
+            Resize::Up(up) => up.forward(&x),
+            Resize::Keep => Ok(x),
+            Resize::Down(down) => down.forward(&x),
+        }
+    }
+}
+
+/// `PreActResidualConvUnit`: `x + conv2(relu(conv1(relu(x))))`, both convs without bias.
+struct ResidualUnit {
+    conv1: Conv2d,
+    conv2: Conv2d,
+}
+
+impl ResidualUnit {
+    fn new(ch: usize, vb: VarBuilder) -> candle_core::Result<Self> {
+        let same = Conv2dConfig { padding: SAME_PAD_3X3, ..Default::default() };
+        Ok(ResidualUnit { conv1: conv2d_no_bias(ch, ch, 3, same, vb.pp("conv1"))?, conv2: conv2d_no_bias(ch, ch, 3, same, vb.pp("conv2"))? })
+    }
+
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        let y = self.conv2.forward(&self.conv1.forward(&x.relu()?)?.relu()?)?;
+        x + y
+    }
+}
+
+/// `FeatureFusionBlock`: add the refined skip (if any), refine, upsample 2x, 1x1 conv.
+struct FusionBlock {
+    residual_unit: Option<ResidualUnit>,
+    main_unit: ResidualUnit,
+    out_conv: Conv2d,
+}
+
+impl FusionBlock {
+    fn new(ch: usize, has_skip: bool, vb: VarBuilder) -> candle_core::Result<Self> {
+        Ok(FusionBlock {
+            residual_unit: if has_skip { Some(ResidualUnit::new(ch, vb.pp("residual_unit"))?) } else { None },
+            main_unit: ResidualUnit::new(ch, vb.pp("main_unit"))?,
+            out_conv: conv2d(ch, ch, 1, Conv2dConfig::default(), vb.pp("out_conv"))?,
+        })
+    }
+
+    fn forward(&self, x: &Tensor, skip: Option<&Tensor>) -> candle_core::Result<Tensor> {
+        let mut x = x.clone();
+        if let (Some(unit), Some(skip)) = (&self.residual_unit, skip) {
+            let (_, _, h, w) = x.dims4()?;
+            // On grids with an odd side the halved deepest level rounds up, so
+            // the upsampled path can outgrow the skip; the Python resizes the
+            // skip to it (plain bilinear, half-pixel centres).
+            let skip = if skip.dims() != x.dims() { skip.upsample_bilinear2d(h, w, false)? } else { skip.clone() };
+            x = (x + unit.forward(&skip)?)?;
+        }
+        let x = self.main_unit.forward(&x)?;
+        let (_, _, h, w) = x.dims4()?;
+        // The Scenic reference upsamples with align_corners=True here.
+        let x = x.upsample_bilinear2d(h * FUSION_UPSAMPLE, w * FUSION_UPSAMPLE, true)?;
+        self.out_conv.forward(&x)
+    }
+}
+
+/// `DPTDepthHead` (`depth_head.*`).
+struct DepthHead {
+    reassemble: Vec<ReassembleLevel>,
+    convs: Vec<Conv2d>,
+    fusion: Vec<FusionBlock>,
+    project: Conv2d,
+    classifier: Linear,
+    /// `(bins,)` bin centres in metres.
+    centers: Tensor,
+    min_depth: f64,
+}
+
+impl DepthHead {
+    fn new(cfg: &TipsConfig, vb: VarBuilder) -> candle_core::Result<Self> {
+        let ch = cfg.dpt_channels;
+        let same = Conv2dConfig { padding: SAME_PAD_3X3, ..Default::default() };
+        let reassemble = (0..DPT_LEVELS).map(|i| ReassembleLevel::new(i, cfg, vb.pp("reassemble"))).collect::<candle_core::Result<_>>()?;
+        let convs = (0..DPT_LEVELS)
+            .map(|i| conv2d_no_bias(cfg.post_process_channels[i], ch, 3, same, vb.pp("convs").pp(i)))
+            .collect::<candle_core::Result<_>>()?;
+        // The first block starts from the deepest level alone; the others add a skip.
+        let fusion = (0..DPT_LEVELS).map(|i| FusionBlock::new(ch, i > 0, vb.pp("fusion_blocks").pp(i))).collect::<candle_core::Result<_>>()?;
+        Ok(DepthHead {
+            reassemble,
+            convs,
+            fusion,
+            project: conv2d(ch, ch, 3, same, vb.pp("project"))?,
+            classifier: linear(ch, cfg.depth_bins, vb.pp("depth_head"))?,
+            centers: bin_centers(cfg.min_depth, cfg.max_depth, cfg.depth_bins, vb.device())?,
+            min_depth: cfg.min_depth as f64,
+        })
+    }
+
+    /// Depth in metres, `(batch, 1, 8 * rows, 8 * cols)` (rounded up on odd grids).
+    fn forward(&self, taps: &[Tap]) -> candle_core::Result<Tensor> {
+        let levels: Vec<Tensor> = taps
+            .iter()
+            .zip(&self.reassemble)
+            .zip(&self.convs)
+            .map(|((tap, level), conv)| conv.forward(&level.forward(tap)?))
+            .collect::<candle_core::Result<_>>()?;
+        // Coarse to fine: block 0 takes the deepest level, block i adds level 3 - i.
+        let mut out = self.fusion[0].forward(&levels[DPT_LEVELS - 1], None)?;
+        for (i, block) in self.fusion.iter().enumerate().skip(1) {
+            out = block.forward(&out, Some(&levels[DPT_LEVELS - 1 - i]))?;
+        }
+        let out = self.project.forward(&out)?.relu()?;
+        let logits = self.classifier.forward(&out.permute((0, 2, 3, 1))?.contiguous()?)?;
+        decode_bins(&logits, &self.centers, self.min_depth)?.unsqueeze(1)
+    }
+}
+
+/// `torch.linspace(min, max, bins)` on `device`.
+fn bin_centers(min: f32, max: f32, bins: usize, device: &Device) -> candle_core::Result<Tensor> {
+    let step = (max as f64 - min as f64) / (bins - 1) as f64;
+    let centers: Vec<f32> = (0..bins).map(|i| (min as f64 + step * i as f64) as f32).collect();
+    Tensor::from_vec(centers, bins, device)
+}
+
+/// Metric depth from bin logits `(..., bins)` -> `(...)`, as `DPTDepthHead`
+/// does it: rectify, add `min_depth` so every bin keeps some weight, normalise
+/// to a distribution and take the expected bin centre. The result is a convex
+/// combination of the centres, so it always lies in `[min_depth, max_depth]`.
+fn decode_bins(logits: &Tensor, centers: &Tensor, min_depth: f64) -> candle_core::Result<Tensor> {
+    let p = (logits.relu()? + min_depth)?;
+    let p = p.broadcast_div(&p.sum_keepdim(D::Minus1)?)?;
+    p.broadcast_mul(centers)?.sum(D::Minus1)
+}
+
+/// `google/tipsv2-b14-dpt` metric depth.
+pub struct TipsDepth {
+    cfg: TipsConfig,
+    encoder: Encoder,
+    head: DepthHead,
+    device: Device,
+    /// Patch grid keyframes are resized to; see [`InputGrid`].
+    pub input_grid: InputGrid,
+}
+
+impl TipsDepth {
+    /// Loads `model.safetensors` (memory-mapped, F32) and, when present,
+    /// `config.json` from `dir`. The caller picks `dir`: `$TIPS_DIR` when set,
+    /// otherwise [`DEFAULT_DIR`].
+    pub fn load(dir: &Path, device: &Device) -> anyhow::Result<Self> {
+        let weights = dir.join(WEIGHTS_FILE);
+        if !weights.exists() {
+            bail!(
+                "TIPSv2 DPT weights not found at {}. Download google/tipsv2-b14-dpt ({WEIGHTS_FILE}, optionally \
+                 {CONFIG_FILE}) into that folder, or point ${DIR_ENV} at the folder that has them (default {DEFAULT_DIR}).",
+                weights.display()
+            );
+        }
+        let config_path = dir.join(CONFIG_FILE);
+        let cfg = if config_path.exists() { TipsConfig::from_file(&config_path)? } else { TipsConfig::default() };
+        // SAFETY: the file is only read, and the mapping lives as long as the model.
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[&weights], DType::F32, device)? };
+        Self::from_var_builder(cfg, vb, device).with_context(|| format!("loading {}", weights.display()))
+    }
+
+    /// Builds the model from any `VarBuilder` rooted at the checkpoint (it
+    /// reads `vision_encoder.*` and `depth_head.*`). Tests use synthetic tensors.
+    pub fn from_var_builder(cfg: TipsConfig, vb: VarBuilder, device: &Device) -> anyhow::Result<Self> {
+        cfg.validate()?;
+        let encoder = Encoder::new(&cfg, vb.pp("vision_encoder"))?;
+        let head = DepthHead::new(&cfg, vb.pp("depth_head"))?;
+        Ok(TipsDepth { cfg, encoder, head, device: device.clone(), input_grid: InputGrid::default() })
+    }
+
+    pub fn config(&self) -> &TipsConfig {
+        &self.cfg
+    }
+
+    /// Metric depth at the keyframe's size. Takes `&self` so one loaded model
+    /// can serve several callers.
+    pub fn predict(&self, rgb: &Rgb) -> anyhow::Result<DepthMap> {
+        if rgb.width == 0 || rgb.height == 0 {
+            bail!("empty keyframe ({}x{})", rgb.width, rgb.height);
+        }
+        let (cols, rows) = self.input_grid.grid_for(rgb.width, rgb.height);
+        let p = self.cfg.patch_size;
+        let pixels = model_input(rgb, (cols * p) as u32, (rows * p) as u32, &self.device)?;
+        let taps = self.encoder.taps(&pixels)?;
+        let depth = self.head.forward(&taps)?.upsample_bilinear2d(rgb.height as usize, rgb.width as usize, false)?;
+        let mut map = DepthMap { width: rgb.width, height: rgb.height, kind: DepthKind::Metric, data: depth.flatten_all()?.to_vec1()? };
+        // The expectation cannot leave the bin range; this only removes float
+        // rounding past the last centre.
+        clamp_metric(&mut map, self.cfg.max_depth);
+        Ok(map)
+    }
+}
+
+/// `(1, 3, height, width)` in `[0, 1]`. Resizing uses the triangle (bilinear)
+/// filter, which also antialiases when the keyframe is larger than the input.
+fn model_input(rgb: &Rgb, width: u32, height: u32, device: &Device) -> anyhow::Result<Tensor> {
+    let resized;
+    let data: &[u8] = if (rgb.width, rgb.height) == (width, height) {
+        &rgb.data
+    } else {
+        let src = image::RgbImage::from_raw(rgb.width, rgb.height, rgb.data.clone()).context("RGB buffer does not match its size")?;
+        resized = image::imageops::resize(&src, width, height, image::imageops::FilterType::Triangle);
+        resized.as_raw()
+    };
+    let plane = (width * height) as usize;
+    let mut chw = vec![0f32; 3 * plane];
+    for (i, px) in data.chunks_exact(3).enumerate() {
+        for c in 0..3 {
+            chw[c * plane + i] = px[c] as f32 / 255.0;
+        }
+    }
+    Ok(Tensor::from_vec(chw, (1, 3, height as usize, width as usize), device)?)
+}
+
+impl DepthModel for TipsDepth {
+    fn mode(&self) -> &str {
+        MODE
+    }
+
+    fn device(&self) -> String {
+        format!("{:?}", self.device).to_lowercase()
+    }
+
+    fn max_depth_m(&self) -> Option<f32> {
+        Some(self.cfg.max_depth)
+    }
+
+    fn infer(&mut self, rgb: &Rgb) -> anyhow::Result<DepthMap> {
+        self.predict(rgb)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::{Arc, Mutex};
+
+    use candle_core::Shape;
+    use candle_nn::var_builder::SimpleBackend;
+
+    use super::*;
+
+    /// Prefixes of the checkpoint the depth path may read.
+    const DEPTH_PREFIXES: [&str; 2] = ["vision_encoder.", "depth_head."];
+    /// In the checkpoint but deliberately unread: the masked-patch token of pre-training.
+    const UNUSED_AT_INFERENCE: [&str; 1] = ["vision_encoder.mask_token"];
+    /// Synthetic weights are uniform in `[-WEIGHT_RANGE, WEIGHT_RANGE]`, small
+    /// enough that 12 blocks keep the activations tame.
+    const WEIGHT_RANGE: f32 = 0.05;
+
+    /// Tensor name -> shape.
+    type Shapes = BTreeMap<String, Vec<usize>>;
+    /// Names the model asked the backend for, shared with the test after the
+    /// `VarBuilder` has taken the backend.
+    type Requested = Arc<Mutex<BTreeSet<String>>>;
+
+    /// Names and shapes of `google/tipsv2-b14-dpt/model.safetensors`, read
+    /// from its header (data offsets dropped; every tensor is F32).
+    fn checkpoint_shapes() -> Shapes {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/tipsv2_b14_dpt_header.json");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let header: BTreeMap<String, serde_json::Value> = serde_json::from_str(&raw).unwrap();
+        header
+            .into_iter()
+            .map(|(name, meta)| {
+                assert_eq!(meta["dtype"], "F32", "{name}");
+                let shape = meta["shape"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as usize).collect();
+                (name, shape)
+            })
+            .collect()
+    }
+
+    #[derive(Clone, Copy)]
+    enum Fill {
+        /// Small random values, for running the model.
+        Random,
+        /// One broadcast zero per tensor: no memory, for construction only.
+        Zero,
+    }
+
+    /// Serves exactly the depth-path tensors of the real header, refuses any
+    /// other name or shape, and records what the model asked for.
+    struct HeaderBackend {
+        shapes: Shapes,
+        fill: Fill,
+        requested: Requested,
+    }
+
+    impl HeaderBackend {
+        fn tensor(&self, name: &str, want: Option<&Shape>, dtype: DType, dev: &Device) -> candle_core::Result<Tensor> {
+            let Some(shape) = self.shapes.get(name) else { candle_core::bail!("{name} is not a depth-path tensor of the checkpoint") };
+            if let Some(want) = want {
+                if want.dims() != shape.as_slice() {
+                    candle_core::bail!("{name}: the port asks for {:?}, the checkpoint has {shape:?}", want.dims());
+                }
+            }
+            self.requested.lock().unwrap().insert(name.to_string());
+            match self.fill {
+                Fill::Random => Tensor::rand(-WEIGHT_RANGE, WEIGHT_RANGE, shape.as_slice(), dev)?.to_dtype(dtype),
+                Fill::Zero => Tensor::zeros((), dtype, dev)?.broadcast_as(shape.as_slice()),
+            }
+        }
+    }
+
+    impl SimpleBackend for HeaderBackend {
+        fn get(&self, s: Shape, name: &str, _: candle_nn::Init, dtype: DType, dev: &Device) -> candle_core::Result<Tensor> {
+            self.tensor(name, Some(&s), dtype, dev)
+        }
+
+        fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> candle_core::Result<Tensor> {
+            self.tensor(name, None, dtype, dev)
+        }
+
+        fn contains_tensor(&self, name: &str) -> bool {
+            self.shapes.contains_key(name)
+        }
+    }
+
+    fn header_model(fill: Fill) -> (TipsDepth, Shapes, Requested) {
+        let shapes: Shapes = checkpoint_shapes().into_iter().filter(|(n, _)| DEPTH_PREFIXES.iter().any(|p| n.starts_with(p))).collect();
+        let requested = Arc::new(Mutex::new(BTreeSet::new()));
+        let backend = HeaderBackend { shapes: shapes.clone(), fill, requested: requested.clone() };
+        let vb = VarBuilder::from_backend(Box::new(backend), DType::F32, Device::Cpu);
+        let model = TipsDepth::from_var_builder(TipsConfig::default(), vb, &Device::Cpu).unwrap();
+        (model, shapes, requested)
+    }
+
+    fn gradient(width: u32, height: u32) -> Rgb {
+        let mut data = Vec::with_capacity((width * height * 3) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                data.extend_from_slice(&[(x * 255 / width) as u8, (y * 255 / height) as u8, ((x + y) * 7 % 256) as u8]);
+            }
+        }
+        Rgb::new(width, height, data)
+    }
+
+    #[test]
+    fn runs_on_every_name_and_shape_of_the_real_checkpoint() {
+        let (mut model, _, _) = header_model(Fill::Random);
+        // 4x3 patches: the odd row count also drives the skip resize in the fusion blocks.
+        model.input_grid = InputGrid::Fixed { cols: 4, rows: 3 };
+        let cfg = model.config().clone();
+        let map = model.infer(&gradient(50, 37)).unwrap();
+        assert_eq!((map.width, map.height), (50, 37));
+        assert_eq!(map.kind, DepthKind::Metric);
+        assert_eq!(map.data.len(), 50 * 37);
+        assert!(map.data.iter().all(|d| d.is_finite() && (cfg.min_depth..=cfg.max_depth).contains(d)), "depth outside the bins");
+        assert_eq!(model.mode(), "tipsv2-b14-dpt");
+        assert_eq!(model.max_depth_m(), Some(10.0));
+        assert_eq!(model.device(), "cpu");
+    }
+
+    #[test]
+    fn every_depth_path_tensor_of_the_checkpoint_is_read() {
+        let (_model, shapes, requested) = header_model(Fill::Zero);
+        let requested = requested.lock().unwrap();
+        let expected: BTreeSet<String> = shapes.keys().filter(|n| !UNUSED_AT_INFERENCE.contains(&n.as_str())).cloned().collect();
+        let unread: Vec<&String> = expected.difference(&requested).collect();
+        assert!(unread.is_empty(), "checkpoint tensors the port ignores: {unread:?}");
+        assert!(requested.iter().all(|n| expected.contains(n)), "the port read a tensor it documents as unused");
+        assert_eq!(requested.len(), 175 + 52, "176 encoder tensors minus mask_token, 52 depth-head tensors");
+    }
+
+    #[test]
+    fn bins_decode_to_metres() {
+        let cfg = TipsConfig::default();
+        let (m, n) = (cfg.min_depth as f64, cfg.depth_bins);
+        let centers = bin_centers(cfg.min_depth, cfg.max_depth, n, &Device::Cpu).unwrap();
+        let c = centers.to_vec1::<f32>().unwrap();
+        assert!((c[0] as f64 - 0.001).abs() < 1e-7 && (c[n - 1] as f64 - 10.0).abs() < 1e-6);
+        let sum_c: f64 = c.iter().map(|&x| x as f64).sum();
+
+        let (big, k) = (1000.0f32, 200usize);
+        let mut logits = vec![-3.0f32; n]; // all rectified away: uniform over the bins
+        let mut peaked = vec![0.0f32; n];
+        peaked[k] = big;
+        logits.extend(peaked);
+        let t = Tensor::from_vec(logits, (1, 2, n), &Device::Cpu).unwrap();
+        let depth = decode_bins(&t, &centers, m).unwrap().to_vec2::<f32>().unwrap();
+
+        let uniform = sum_c / n as f64;
+        assert!((uniform - (0.001 + 10.0) / 2.0).abs() < 1e-5);
+        assert!((depth[0][0] as f64 - uniform).abs() < 1e-4, "{} vs {uniform}", depth[0][0]);
+        // One bin at `big`, every bin at `m` on top: (m * sum(c) + big * c_k) / (n * m + big).
+        let expected = (m * sum_c + big as f64 * c[k] as f64) / (n as f64 * m + big as f64);
+        assert!((depth[0][1] as f64 - expected).abs() < 1e-4, "{} vs {expected}", depth[0][1]);
+        assert!((depth[0][1] - c[k]).abs() < 0.01, "a confident bin dominates");
+    }
+
+    #[test]
+    fn position_resampling_matches_torch_antialias() {
+        let w = |src, dst| antialias_bilinear_weights(src, dst);
+        // Same size is the identity.
+        assert_eq!(w(3, 3), vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+        // Upsampling is plain bilinear with half-pixel centres.
+        assert_eq!(w(2, 4), vec![1.0, 0.0, 0.75, 0.25, 0.25, 0.75, 0.0, 1.0]);
+        // 4 -> 2 widens the triangle: F.interpolate([0, 1, 2, 3], size=2, antialias=True) = [5/7, 16/7].
+        let down = w(4, 2);
+        let expect = [3.0 / 7.0, 3.0 / 7.0, 1.0 / 7.0, 0.0, 0.0, 1.0 / 7.0, 3.0 / 7.0, 3.0 / 7.0];
+        assert!(down.iter().zip(expect).all(|(a, b)| (a - b).abs() < 1e-6), "{down:?}");
+        // Rows of the real 32 -> 24 resize are distributions.
+        for row in w(32, 24).chunks(32) {
+            assert!((row.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn default_grid_turns_keyframes_into_504_by_336() {
+        assert_eq!(InputGrid::default().grid_for(384, 256), (36, 24));
+        assert_eq!(InputGrid::ShortSide(24).grid_for(256, 384), (24, 36));
+        assert_eq!(InputGrid::Fixed { cols: 4, rows: 3 }.grid_for(1000, 10), (4, 3));
+    }
+
+    #[test]
+    fn config_reads_python_names_and_backbone_stages() {
+        let c = TipsConfig::from_json(r#"{"out_indices": [3, 6, 9, 12], "num_depth_bins": 128, "img_size": 448}"#).unwrap();
+        assert_eq!(c.tap_blocks, [2, 5, 8, 11]);
+        assert_eq!(c.depth_bins, 128);
+        assert_eq!(c.hidden, 768);
+        assert!(TipsConfig::from_json(r#"{"vision_fn": "vit_large"}"#).is_err());
+        assert!(TipsConfig::from_json(r#"{"out_indices": [0, 6, 9, 12]}"#).is_err());
+    }
+
+    #[test]
+    fn missing_weights_name_the_folder_and_files() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/no-such-model");
+        let err = TipsDepth::load(&dir, &Device::Cpu).err().unwrap().to_string();
+        assert!(err.contains("model.safetensors") && err.contains("no-such-model") && err.contains("TIPS_DIR"), "{err}");
+    }
+}
