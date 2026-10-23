@@ -1,6 +1,17 @@
 [workspace]
 resolver = "2"
-members = ["crates/hand-core", "crates/hand-ml", "crates/hand-data", "src-tauri"]
+members = [
+    "crates/hand-core",
+    "crates/hand-ml",
+    "crates/hand-data",
+    "crates/world-sim",
+    "crates/hand-sds",
+    "crates/hand-ts",
+    "crates/hand-search",
+    "crates/hand-quest",
+    "crates/hand-runtime",
+    "src-tauri",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,13 +21,18 @@ license = "Apache-2.0"
 [workspace.dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# float_roundtrip: parsing a float must give back the exact value that was written, or the
+# audit log's hash chain cannot be verified when a line carries a score such as 0.98f32.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 tokenizers = "0.22"
 # LanceDB: ML-native columnar store for synthetic samples, embeddings and dictionaries.
 lancedb = { version = "0.31.0", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 futures = "0.3"
+rayon = "1"
+# libwebp bindings: lossy WebP encoding (the pure-Rust `image-webp` encoder is lossless only).
+webp = "0.3"
 # candle ML framework. The Qntology fork adds ROCm (HIP) and Vulkan backends on top of
 # candle 0.11.0 and is pinned to one commit so every backend builds against the same core.
 candle-core = "0.11.0"
@@ -33,6 +49,10 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.tokenizers]
+opt-level = 3
+
+# The software renderer and the A* planner are CPU heavy; keep them fast in debug test runs.
+[profile.dev.package.world-sim]
 opt-level = 3
 
 [profile.release]

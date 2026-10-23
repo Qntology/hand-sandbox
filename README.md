@@ -4,6 +4,8 @@
 
 손가락 수(2–5)와 관절 옵션, 발(바퀴·메카넘·트랙·사람 발)을 바꿔 보며 파지와 주행을 시뮬레이션합니다. SigLIP2로 물류 물체를 분류하고, 합성 데이터를 LanceDB에 기록합니다.
 
+v0.2부터는 **오픈월드 자원 채취 테스트베드**가 있습니다. 마인크래프트식 격자 월드(나무·바위·석탄·철광석)에서 로봇이 "철광석 2개 캐서 창고로 가져와"라는 명령을 받아 퀘스트(탐색 → 접근 → 채취 → 줍기 → 운반 → 인도)로 수행합니다. 렌더한 프레임을 WebP로 압축해 SigLIP2로 인식하고, SDS와 Granite TTM으로 인식 결과를 걸러 내며, 모든 판단을 해시 체인 로그로 남깁니다. 설계 근거와 logis-center·endmill-sandbox와의 대조는 [`docs/PLAN.md`](docs/PLAN.md)에 있습니다.
+
 ### 구성
 
 | 경로 | 역할 |
@@ -11,6 +13,12 @@
 | `crates/hand-core` | 손 모델: 손가락 프리셋, 관절 옵션, 발(이동 베이스), 순기구학, 파지 시뮬레이션, 주행 모델 |
 | `crates/hand-ml` | candle 기반 SigLIP2(NaFlex) 임베딩, 사전 기반 제로샷 분류, 장치 선택 (CPU, CUDA, Metal, Vulkan, ROCm) |
 | `crates/hand-data` | 합성 데이터 계층 정의, 도메인 무작위화, LanceDB 저장 |
+| `crates/world-sim` | 오픈월드: 격자 지형, 자원 노드, 아이템, 소프트웨어 레이캐스트 프레임(RGB·ID·깊이), WebP 캡처 |
+| `crates/hand-search` | 자연어 명령 해석: 단어사전, 조사 분리, 어휘 일치 + 임베딩 보강, 해석 과정(trace) |
+| `crates/hand-quest` | 퀘스트 모델(탐색·접근·채취·줍기·운반·인도)과 진행 상태 |
+| `crates/hand-sds` | SDS 통계 원장(스코프 폴백, 원자적 저장)과 해시 체인 감사 로그 |
+| `crates/hand-ts` | 시계열 예측: Granite TTM-R3, last/ewma/holt, 홀드아웃 융합, 시간 일관성 판정 |
+| `crates/hand-runtime` | 위를 엮는 실행기: 인식(오라클·SigLIP2 임베딩), 정밀도 게이트, 퀘스트 실행, UI용 JSON API |
 | `src-tauri` | Tauri 커맨드. 위 크레이트를 UI에 연결 |
 | `ui` | 정적 HTML·JS (빌드 단계 없음) |
 | `data` | 물류 어휘 사전(JSON)과 데이터 출처 문서 |
@@ -56,6 +64,16 @@ export CUDA_COMPUTE_CAP=86
 
 ROCm과 Vulkan은 [Qntology/candle-rocm-vulkan](https://github.com/Qntology/candle-rocm-vulkan)의 candle 포크를 씁니다. 커밋 `2191c7ad`로 고정되어 있습니다(루트 `Cargo.toml`).
 
+### 월드 시뮬레이터
+
+월드는 Tauri 앱의 명령(`world_new`, `sim_step`, `command_submit` 등)으로 쓰며, 입력줄에 명령을 치고 Enter를 누르면 퀘스트가 만들어집니다. Tauri 없이 브라우저에서 실제 Rust 런타임과 UI를 보려면 개발용 서버를 씁니다(127.0.0.1에서만 받습니다).
+
+```bash
+cargo run --release -p hand-runtime --example serve   # http://127.0.0.1:8787/
+```
+
+로그와 SDS 원장은 `data/runtime`(또는 `RUNTIME_DIR`)에 쌓입니다. 기본 인식기는 정답 ID 버퍼를 쓰는 대역(오라클)이며, 왼쪽 ④ "사전 · 모델"에서 **SigLIP2 인식 켜기**와 **TTM 켜기**로 바꿉니다(Tauri 앱에서만 동작, 가중치 필요). 시뮬레이터의 숫자는 대부분 가정값이니 `data/README.md` §7을 먼저 보세요.
+
 ### SigLIP2 가중치
 
 가중치는 저장소에 넣지 않습니다. 아래 위치에 받아 두면 앱이 자동으로 읽습니다. 다른 위치는 `SIGLIP2_DIR`로 지정합니다.
@@ -65,6 +83,10 @@ huggingface-cli download google/siglip2-base-patch16-naflex --local-dir models/s
 ```
 
 필요한 파일은 `config.json`, `tokenizer.json`, `model.safetensors`입니다.
+
+### Granite TTM 가중치
+
+시계열 예측에 쓰는 Granite TTM-R3는 `models/granite-timeseries-ttm-r3`(또는 그 아래 `52-16-dec-52-r3`)에서 읽으며, 다른 위치는 `TTM_DIR`로 지정합니다. `config.json`과 safetensors가 필요합니다. 파일이 없으면 last/ewma/holt 융합만 쓰고, ④ "사전 · 모델"에서 이유를 보여 줍니다.
 
 ### 합성 데이터 (LanceDB)
 
@@ -82,3 +104,8 @@ huggingface-cli download google/siglip2-base-patch16-naflex --local-dir models/s
 - 파지는 키네마틱 모델입니다. 물리 엔진이 아니며, 접촉은 물체가 손바닥 위에 놓인 상태에서 손가락이 처음 닿는 지점으로 계산합니다.
 - 발(베이스)의 속도·경사·턱 한계는 모델링 가정값입니다. 출처와 검증 항목은 `data/README.md`에 있습니다.
 - 가중치 파일이 없으면 분류 기능은 명확한 오류 메시지를 보여 줍니다.
+- 월드의 SigLIP2 인식과 Granite TTM은 실제 가중치로 정확도를 재 본 적이 없습니다. 테스트는 가짜 임베더와 0·무작위 가중치로 연결만 확인했고, 정밀도 게이트의 임계값과 "게이트 전/후" 수치는 모의 오류 모델에서 나온 값입니다.
+- 월드는 소프트웨어 레이캐스터로 그려서 SigLIP2의 학습 분포와 많이 다릅니다. 제로샷 정확도는 가중치로 측정한 뒤에 판단해야 합니다.
+- GPU 경로(CUDA·Metal·Vulkan·ROCm)는 이 개발 환경에 GPU가 없어 컴파일 여부만 확인했습니다.
+- 한국어 명령은 어휘 사전 일치가 1차 경로입니다. 사전에 없는 표현의 임베딩 보강은 SigLIP2 텍스트 타워의 한국어 품질에 달려 있습니다.
+- Tauri 창에서 직접 돌려 보지는 않았습니다. UI는 개발용 서버 위에서 헤드리스 브라우저로 확인했습니다. 로그 시각은 UTC입니다.

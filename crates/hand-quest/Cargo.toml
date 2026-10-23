@@ -1,0 +1,13 @@
+[package]
+name = "hand-quest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Game-style quests: a command plan becomes steps that move through pending, active, done or failed"
+
+[dependencies]
+hand-search = { path = "../hand-search" }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -141,10 +141,32 @@ impl VisionTower {
 
     /// Image embedding `(1, hidden)` before normalization.
     pub fn forward(&self, input: &NaflexInput) -> Result<Tensor> {
-        let n = input.grid_h * input.grid_w;
-        let patches = Tensor::from_slice(&input.patches, (1, n, input.patch_dim), &self.device)?;
+        self.forward_batch(&[input])
+    }
+
+    /// Embeddings `(batch, hidden)` before normalization for images that share
+    /// one patch grid. Rows are independent: attention never mixes images.
+    pub fn forward_batch(&self, inputs: &[&NaflexInput]) -> Result<Tensor> {
+        let first = match inputs.first() {
+            Some(f) => f,
+            None => candle_core::bail!("forward_batch needs at least one image"),
+        };
+        let (gh, gw, pd) = (first.grid_h, first.grid_w, first.patch_dim);
+        let n = gh * gw;
+        let mut flat: Vec<f32> = Vec::with_capacity(inputs.len() * n * pd);
+        for i in inputs {
+            if (i.grid_h, i.grid_w, i.patch_dim) != (gh, gw, pd) {
+                candle_core::bail!(
+                    "forward_batch images must share one patch grid ({gh}x{gw}), got {}x{}",
+                    i.grid_h,
+                    i.grid_w
+                );
+            }
+            flat.extend_from_slice(&i.patches);
+        }
+        let patches = Tensor::from_vec(flat, (inputs.len(), n, pd), &self.device)?;
         let mut x = self.patch_proj.forward(&patches)?;
-        x = x.broadcast_add(&self.positions(input.grid_h, input.grid_w)?)?;
+        x = x.broadcast_add(&self.positions(gh, gw)?)?;
         for layer in &self.layers {
             x = layer.forward(&x, None)?;
         }

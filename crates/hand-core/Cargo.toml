@@ -7,3 +7,6 @@ description = "Robot hand model (2-5 fingers, joint options, locomotion bases) a
 
 [dependencies]
 serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

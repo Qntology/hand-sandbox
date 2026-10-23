@@ -1,0 +1,1031 @@
+//! The score-dynamics store: per-scope online statistics in ledger files.
+//!
+//! Logic follows logis-center `score_dynamics.rs` (original) and its adapted
+//! copy in endmill-sandbox `src/sds.rs`:
+//! * writes go to the global, primary and secondary scope of a track;
+//! * reads back off secondary -> primary -> global and only trust a scope
+//!   once it has the track's minimum observation count;
+//! * each process run writes its own run file and is merged into the ledger on
+//!   close, so a crash loses at most the current run's tail;
+//! * a ledger whose recipe string differs from [`SDS_RECIPE`] is discarded;
+//! * ledgers are written to a temporary file and renamed (logis-center
+//!   `write_atomic`), which endmill-sandbox did not do;
+//! * a ledger over the size cap drops its least observed scopes first.
+//!
+//! The store never decides anything on its own. Callers ask for a learned
+//! value and fall back to their fixed default when the answer is `None`
+//! (cold start), exactly like the original.
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use serde::{Deserialize, Serialize};
+
+use crate::scope::{ring_for_key, Ledger, Scope, Track};
+use crate::stats::{decay_shape, ConfusionStat, GateStat, ScopeStat, Welford};
+
+pub const SDS_RECIPE: &str = "hand-sds-v1:welford+ring/hier-write/ledger-split/calib-shrink/atomic";
+
+const AUTO_FLUSH_EVERY: u32 = 8;
+const AUTO_FLUSH_MIN_GAP_MS: u128 = 5_000;
+const DEFAULT_CAP_BYTES: usize = 2 * 1024 * 1024;
+/// Pseudo-observations pulling a calibration factor toward 1.0.
+const CALIBRATION_SHRINK_K: f64 = 5.0;
+
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Writes through a temporary file and renames it over the target, so a crash
+/// never leaves a half-written ledger.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    match std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, path)) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SdsFile {
+    pub recipe: String,
+    pub updated_at: i64,
+    #[serde(default)]
+    pub scopes: HashMap<String, ScopeStat>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct RunFile {
+    recipe: String,
+    ledger: String,
+    label: String,
+    started_at: i64,
+    updated_at: i64,
+    observations: u64,
+    scopes: HashMap<String, ScopeStat>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RunBuf {
+    label: String,
+    file: String,
+    started_ms: i64,
+    observations: u64,
+    scopes: HashMap<String, ScopeStat>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerStatus {
+    pub ledger: String,
+    pub scopes: usize,
+    pub observations: u64,
+    pub run_observations: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AxisStatus {
+    pub scope: String,
+    pub axis: String,
+    pub kind: String,
+    pub n: u64,
+    pub mean: f64,
+    pub sd: f64,
+    pub recent: f64,
+    pub drift_z: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GateRate {
+    pub scope: String,
+    pub gate: String,
+    pub evaluated: u64,
+    pub blocked_rate: f64,
+    pub sole_rate: f64,
+    pub mean_severity: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfusionStatus {
+    pub scope: String,
+    pub pair: String,
+    pub ties: u64,
+    pub a_wins: u64,
+    pub b_wins: u64,
+    pub mean_margin: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SdsStatus {
+    pub dir: String,
+    pub recipe: String,
+    pub ledgers: Vec<LedgerStatus>,
+    pub axes: Vec<AxisStatus>,
+    pub confusions: Vec<ConfusionStatus>,
+    pub log: Vec<String>,
+}
+
+fn sanitize_label(raw: &str) -> String {
+    let s: String = raw.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+    let s = s.trim_matches('_').to_string();
+    if s.is_empty() {
+        "run".into()
+    } else {
+        s.chars().take(40).collect()
+    }
+}
+
+pub struct SdsStore {
+    dir: Option<PathBuf>,
+    bases: HashMap<Ledger, SdsFile>,
+    runs: HashMap<Ledger, RunBuf>,
+    dirty: HashSet<Ledger>,
+    write_tick: u32,
+    last_flush: Option<Instant>,
+    log: Vec<String>,
+    cap_bytes: usize,
+}
+
+impl SdsStore {
+    /// A store that lives only in memory (tests, mock backends).
+    pub fn memory() -> Self {
+        let mut s = SdsStore {
+            dir: None,
+            bases: HashMap::new(),
+            runs: HashMap::new(),
+            dirty: HashSet::new(),
+            write_tick: 0,
+            last_flush: None,
+            log: Vec::new(),
+            cap_bytes: DEFAULT_CAP_BYTES,
+        };
+        for l in Ledger::ALL {
+            s.bases.insert(l, fresh_file());
+        }
+        s.log.push("[SDS] 메모리 전용 저장소 (디스크에 쓰지 않음)".into());
+        s
+    }
+
+    /// Opens (and creates) a ledger directory. A missing, unreadable or
+    /// recipe-mismatched ledger starts empty and says why in the log.
+    pub fn open(dir: &Path) -> Self {
+        let mut store = SdsStore::memory();
+        store.dir = Some(dir.to_path_buf());
+        store.log.clear();
+        let _ = std::fs::create_dir_all(dir);
+        let mut loaded = 0usize;
+        for l in Ledger::ALL {
+            let path = dir.join(l.file_name());
+            let mut file = fresh_file();
+            if path.exists() {
+                match std::fs::read_to_string(&path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|t| serde_json::from_str::<SdsFile>(&t).map_err(|e| e.to_string()))
+                {
+                    Ok(f) if f.recipe == SDS_RECIPE => {
+                        loaded += 1;
+                        file = f;
+                    }
+                    Ok(f) => store.log.push(format!(
+                        "[SDS] [{}] 레시피 세대 불일치 ('{}' vs '{}') — 원장을 폐기하고 새로 시작합니다",
+                        l.as_str(),
+                        f.recipe,
+                        SDS_RECIPE
+                    )),
+                    Err(e) => store.log.push(format!("[SDS] [{}] 원장 읽기/파싱 실패({}) — 새로 시작합니다", l.as_str(), e)),
+                }
+            }
+            store.bases.insert(l, file);
+        }
+        store.log.push(if loaded == 0 {
+            "[SDS] 저장된 원장이 없어 냉간 시작합니다 (보정 미개입, 고정 기본값 사용)".into()
+        } else {
+            format!("[SDS] 원장 {}종을 불러왔습니다", loaded)
+        });
+        store
+    }
+
+    pub fn dir(&self) -> Option<&Path> {
+        self.dir.as_deref()
+    }
+
+    pub fn set_cap_bytes(&mut self, cap: usize) {
+        self.cap_bytes = cap;
+    }
+
+    pub fn log_lines(&self) -> &[String] {
+        &self.log
+    }
+
+    fn push_log(&mut self, line: String) {
+        if self.log.len() >= 200 {
+            self.log.drain(0..100);
+        }
+        self.log.push(line);
+    }
+
+    // ----- writing -----
+
+    fn open_run(&mut self, l: Ledger, label: &str) -> &mut RunBuf {
+        let dir = self.dir.clone();
+        self.runs.entry(l).or_insert_with(|| {
+            let stamp = now_ms();
+            let lab = sanitize_label(label);
+            let mut file = format!("{}_{}.json", stamp, lab);
+            if let Some(dir) = &dir {
+                let mut i = 2;
+                while dir.join("runs").join(l.as_str()).join(&file).exists() {
+                    file = format!("{}_{}_{}.json", stamp, lab, i);
+                    i += 1;
+                }
+            }
+            RunBuf { label: lab, file, started_ms: stamp, observations: 0, scopes: HashMap::new() }
+        })
+    }
+
+    fn with_scopes<F: Fn(&mut ScopeStat, usize)>(&mut self, scope: &Scope, f: F) {
+        let ledger = scope.track.ledger();
+        let ring = scope.track.ring_len();
+        let keys = scope.write_keys();
+        let run = self.open_run(ledger, scope.track.as_str());
+        run.observations = run.observations.saturating_add(1);
+        for k in keys {
+            let e = run.scopes.entry(k).or_default();
+            f(e, ring);
+            e.updated_at = now_ms();
+        }
+        self.dirty.insert(ledger);
+        self.write_tick = self.write_tick.saturating_add(1);
+        let gap_ok = self.last_flush.map(|t| t.elapsed().as_millis() >= AUTO_FLUSH_MIN_GAP_MS).unwrap_or(true);
+        if self.dir.is_some() && self.write_tick >= AUTO_FLUSH_EVERY && gap_ok {
+            self.flush();
+        }
+    }
+
+    /// Records one value of a named axis (a score, a duration, an error).
+    pub fn record_baseline(&mut self, scope: &Scope, axis: &str, value: f64) {
+        if !value.is_finite() {
+            return;
+        }
+        let a = axis.to_string();
+        self.with_scopes(scope, move |s, ring| {
+            s.baseline.entry(a.clone()).or_default().push(value, ring);
+        });
+    }
+
+    /// Records measured / predicted for an axis (clamped to 0.05..20).
+    pub fn record_calibration(&mut self, scope: &Scope, axis: &str, measured: f64, predicted: f64) {
+        if !measured.is_finite() || !predicted.is_finite() || predicted.abs() < 1e-9 {
+            return;
+        }
+        let ratio = (measured / predicted).clamp(0.05, 20.0);
+        let a = axis.to_string();
+        self.with_scopes(scope, move |s, ring| {
+            s.calibration.entry(a.clone()).or_default().push(ratio, ring);
+        });
+    }
+
+    /// Records the decay shape of a score list (how clear the winner was).
+    pub fn record_decay(&mut self, scope: &Scope, axis: &str, scores: &[f32]) {
+        let Some(shape) = decay_shape(scores) else { return };
+        let a = axis.to_string();
+        self.with_scopes(scope, move |s, ring| {
+            let d = s.decay.entry(a.clone()).or_default();
+            d.margin.push(shape.margin, ring);
+            d.top_gap_ratio.push(shape.top_gap_ratio, ring);
+            d.tail_flatness.push(shape.tail_flatness, ring);
+            d.entropy_norm.push(shape.entropy_norm, ring);
+        });
+    }
+
+    /// Records that `winner` was chosen over `loser` with a margin.
+    pub fn record_confusion(&mut self, scope: &Scope, winner: &str, loser: &str, margin: f64) {
+        if winner.is_empty() || loser.is_empty() || winner == loser {
+            return;
+        }
+        let (a, b, a_won) = if winner <= loser {
+            (winner.to_string(), loser.to_string(), true)
+        } else {
+            (loser.to_string(), winner.to_string(), false)
+        };
+        let key = format!("{}|{}", a, b);
+        self.with_scopes(scope, move |s, ring| {
+            let e: &mut ConfusionStat = s.confusion.entry(key.clone()).or_default();
+            e.ties += 1;
+            if a_won {
+                e.a_wins += 1;
+            } else {
+                e.b_wins += 1;
+            }
+            if margin.is_finite() {
+                e.margin.push(margin, ring);
+            }
+        });
+    }
+
+    /// Records whether a prediction agreed with what later turned out true.
+    pub fn record_agreement(&mut self, scope: &Scope, axis: &str, agreed: bool) {
+        let a = axis.to_string();
+        self.with_scopes(scope, move |s, ring| {
+            s.agreement.entry(a.clone()).or_default().push(if agreed { 1.0 } else { 0.0 }, ring);
+        });
+    }
+
+    pub fn record_transition(&mut self, scope: &Scope, from: &str, to: &str) {
+        if from.is_empty() || to.is_empty() {
+            return;
+        }
+        let key = format!("{}>{}", from, to);
+        self.with_scopes(scope, move |s, _| {
+            *s.transition.entry(key.clone()).or_insert(0) += 1;
+        });
+    }
+
+    /// Records gate outcomes: `(gate id, severity, blocked, sole blocker)`.
+    pub fn record_gates(&mut self, scope: &Scope, items: &[(String, u8, bool, bool)]) {
+        if items.is_empty() {
+            return;
+        }
+        let list = items.to_vec();
+        self.with_scopes(scope, move |s, ring| {
+            for (id, sev, blocked, sole) in list.iter() {
+                let g: &mut GateStat = s.gates.entry(id.clone()).or_default();
+                g.evaluated += 1;
+                if *blocked {
+                    g.blocked += 1;
+                }
+                if *sole {
+                    g.sole += 1;
+                }
+                g.severity.push(*sev as f64, ring);
+            }
+        });
+    }
+
+    // ----- reading -----
+
+    fn merged_scope(&self, l: Ledger, key: &str) -> Option<ScopeStat> {
+        let base = self.bases.get(&l).and_then(|f| f.scopes.get(key).cloned());
+        let run = self.runs.get(&l).and_then(|r| r.scopes.get(key).cloned());
+        match (base, run) {
+            (Some(mut b), Some(r)) => {
+                b.absorb(r, ring_for_key(key), now_ms());
+                Some(b)
+            }
+            (Some(b), None) => Some(b),
+            (None, Some(r)) => Some(r),
+            (None, None) => None,
+        }
+    }
+
+    /// Backoff: the first of secondary, primary, global whose statistic has at
+    /// least the track's minimum observation count. Also names the scope used.
+    fn resolve<T, F: Fn(&ScopeStat) -> Option<(T, u64)>>(&self, scope: &Scope, pick: F) -> Option<(T, String)> {
+        let (m2, m1, mg) = scope.track.min_obs();
+        let l = scope.track.ledger();
+        for (key, need) in [(scope.key_secondary(), m2), (scope.key_primary(), m1), (scope.key_global(), mg)] {
+            if need == 0 {
+                continue;
+            }
+            if let Some(st) = self.merged_scope(l, &key) {
+                if let Some((v, n)) = pick(&st) {
+                    if n >= need {
+                        return Some((v, key));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Learned `(mean, sd, n)` of an axis, or `None` while the data is thin.
+    pub fn adaptive_baseline(&self, scope: &Scope, axis: &str) -> Option<(f64, f64, u64)> {
+        self.resolve(scope, |st| st.baseline.get(axis).map(|w| ((w.mean, w.sd(), w.n), w.n))).map(|v| v.0)
+    }
+
+    /// Same as [`adaptive_baseline`](Self::adaptive_baseline) plus the scope key that answered.
+    pub fn adaptive_baseline_scoped(&self, scope: &Scope, axis: &str) -> Option<((f64, f64, u64), String)> {
+        self.resolve(scope, |st| st.baseline.get(axis).map(|w| ((w.mean, w.sd(), w.n), w.n)))
+    }
+
+    /// `(recent mean, overall mean, drift z)` of an axis.
+    pub fn adaptive_recent(&self, scope: &Scope, axis: &str) -> Option<(f64, f64, f64)> {
+        self.resolve(scope, |st| st.baseline.get(axis).map(|w| ((w.recent_mean(), w.mean, w.drift_z()), w.n))).map(|v| v.0)
+    }
+
+    /// Learned ratio measured/predicted, shrunk toward 1 with few observations
+    /// and re-centred on the recent mean when it drifted (|z| > 2).
+    /// Returns `(factor, n, drift_z, scope key)`.
+    pub fn calibration_factor(&self, scope: &Scope, axis: &str) -> Option<(f64, u64, f64, String)> {
+        self.resolve(scope, |st| {
+            st.calibration.get(axis).map(|w| {
+                let drift = w.drift_z();
+                let center = if drift.abs() > 2.0 { w.recent_mean() } else { w.mean };
+                let shrunk = 1.0 + (center - 1.0) * (w.n as f64 / (w.n as f64 + CALIBRATION_SHRINK_K));
+                ((shrunk.clamp(0.25, 4.0), w.n, drift), w.n)
+            })
+        })
+        .map(|((f, n, d), key)| (f, n, d, key))
+    }
+
+    /// Smoothed probability of `to` following `from` (add-one smoothing).
+    pub fn transition_prior(&self, scope: &Scope, from: &str, to: &str) -> Option<f64> {
+        let (m2, m1, _) = scope.track.min_obs();
+        let l = scope.track.ledger();
+        for (key, need) in [(scope.key_secondary(), m2), (scope.key_primary(), m1)] {
+            let Some(st) = self.merged_scope(l, &key) else { continue };
+            let prefix = format!("{}>", from);
+            let total: u64 = st.transition.iter().filter(|(k, _)| k.starts_with(&prefix)).map(|(_, v)| *v).sum();
+            if total < need {
+                continue;
+            }
+            let outs = st.transition.keys().filter(|k| k.starts_with(&prefix)).count().max(1) as f64;
+            let hit = *st.transition.get(&format!("{}>{}", from, to)).unwrap_or(&0) as f64;
+            return Some((hit + 1.0) / (total as f64 + outs + 1.0));
+        }
+        None
+    }
+
+    /// `(rate, n)` of agreements recorded for an axis.
+    pub fn agreement_rate(&self, scope: &Scope, axis: &str) -> Option<(f64, u64)> {
+        self.resolve(scope, |st| st.agreement.get(axis).map(|w| ((w.mean, w.n), w.n))).map(|v| v.0)
+    }
+
+    /// `(mean margin, sd, n)` of the winner margin of an axis.
+    pub fn adaptive_decay(&self, scope: &Scope, axis: &str) -> Option<(f64, f64, u64)> {
+        self.resolve(scope, |st| st.decay.get(axis).map(|d| ((d.margin.mean, d.margin.sd(), d.margin.n), d.margin.n))).map(|v| v.0)
+    }
+
+    /// Share of all recorded confusions that this pair accounts for, and its count.
+    pub fn confusion_share(&self, scope: &Scope, a: &str, b: &str) -> Option<(f64, u64)> {
+        let (x, y) = if a <= b { (a, b) } else { (b, a) };
+        let key = format!("{}|{}", x, y);
+        self.resolve(scope, |st| {
+            let total: u64 = st.confusion.values().map(|c| c.ties).sum();
+            st.confusion.get(&key).map(|c| ((c.ties as f64 / total.max(1) as f64, c.ties), total))
+        })
+        .map(|v| v.0)
+    }
+
+    /// Past mean squared error of a forecasting method (see `hand-ts` fusion).
+    pub fn fusion_mse(&self, scope: &Scope, method: &str) -> Option<(f64, u64)> {
+        self.adaptive_baseline(scope, &format!("fusion_mse:{}", method)).map(|(m, _, n)| (m, n))
+    }
+
+    pub fn gate_rates(&self, scope: &Scope) -> Vec<GateRate> {
+        let l = scope.track.ledger();
+        let mut out = Vec::new();
+        for key in [scope.key_secondary(), scope.key_primary(), scope.key_global()] {
+            if let Some(st) = self.merged_scope(l, &key) {
+                if st.gates.is_empty() {
+                    continue;
+                }
+                for (id, g) in st.gates.iter() {
+                    let n = g.evaluated.max(1) as f64;
+                    out.push(GateRate {
+                        scope: key.clone(),
+                        gate: id.clone(),
+                        evaluated: g.evaluated,
+                        blocked_rate: g.blocked as f64 / n,
+                        sole_rate: g.sole as f64 / n,
+                        mean_severity: g.severity.mean,
+                    });
+                }
+                break;
+            }
+        }
+        out.sort_by(|a, b| b.blocked_rate.partial_cmp(&a.blocked_rate).unwrap_or(std::cmp::Ordering::Equal).then(a.gate.cmp(&b.gate)));
+        out
+    }
+
+    /// Baseline axes with a name prefix, from the first scope level that has any.
+    pub fn axes_of(&self, scope: &Scope, prefix: &str) -> Vec<AxisStatus> {
+        let l = scope.track.ledger();
+        for key in [scope.key_secondary(), scope.key_primary(), scope.key_global()] {
+            if let Some(st) = self.merged_scope(l, &key) {
+                let mut v: Vec<AxisStatus> = st
+                    .baseline
+                    .iter()
+                    .filter(|(a, _)| a.starts_with(prefix))
+                    .map(|(a, w)| axis_status(&key, a, "baseline", w))
+                    .collect();
+                if v.is_empty() {
+                    continue;
+                }
+                v.sort_by(|a, b| a.axis.cmp(&b.axis));
+                return v;
+            }
+        }
+        Vec::new()
+    }
+
+    // ----- persistence -----
+
+    /// Writes run files and ledgers. Returns a short line per file written.
+    pub fn flush(&mut self) -> Vec<String> {
+        let Some(dir) = self.dir.clone() else { return Vec::new() };
+        let mut lines = Vec::new();
+        let open: Vec<Ledger> = self.runs.keys().cloned().collect();
+        for l in Ledger::ALL {
+            if !self.dirty.contains(&l) && !open.contains(&l) {
+                continue;
+            }
+            if let Some(run) = self.runs.get(&l) {
+                let rf = RunFile {
+                    recipe: SDS_RECIPE.into(),
+                    ledger: l.as_str().into(),
+                    label: run.label.clone(),
+                    started_at: run.started_ms,
+                    updated_at: now_ms(),
+                    observations: run.observations,
+                    scopes: run.scopes.clone(),
+                };
+                let rdir = dir.join("runs").join(l.as_str());
+                let _ = std::fs::create_dir_all(&rdir);
+                if let Ok(txt) = serde_json::to_string_pretty(&rf) {
+                    match write_atomic(&rdir.join(&run.file), txt.as_bytes()) {
+                        Ok(()) => lines.push(format!("{}={}건→{}", l.as_str(), run.observations, run.file)),
+                        Err(e) => lines.push(format!("{} 실행 파일 저장 실패: {}", l.as_str(), e)),
+                    }
+                }
+            }
+            let mut snapshot = self.bases.get(&l).cloned().unwrap_or_default();
+            snapshot.recipe = SDS_RECIPE.into();
+            if let Some(run) = self.runs.get(&l) {
+                for (k, v) in run.scopes.iter() {
+                    snapshot.scopes.entry(k.clone()).or_default().absorb(v.clone(), ring_for_key(k), now_ms());
+                }
+            }
+            snapshot.updated_at = now_ms();
+            let mut txt = serde_json::to_string_pretty(&snapshot).unwrap_or_default();
+            if txt.len() > self.cap_bytes {
+                let mut keys: Vec<(String, u64, i64)> =
+                    snapshot.scopes.iter().map(|(k, v)| (k.clone(), v.observations(), v.updated_at)).collect();
+                keys.sort_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)));
+                for (k, _, _) in keys {
+                    if txt.len() <= self.cap_bytes {
+                        break;
+                    }
+                    snapshot.scopes.remove(&k);
+                    txt = serde_json::to_string_pretty(&snapshot).unwrap_or(txt);
+                }
+                lines.push(format!("{} 상한 초과로 저관측 스코프 절삭 (잔존 {})", l.as_str(), snapshot.scopes.len()));
+            }
+            match write_atomic(&dir.join(l.file_name()), txt.as_bytes()) {
+                Ok(()) => {
+                    self.dirty.remove(&l);
+                    lines.push(format!("{}.json={}B", l.as_str(), txt.len()));
+                }
+                Err(e) => lines.push(format!("{} 원장 저장 실패: {}", l.as_str(), e)),
+            }
+        }
+        self.write_tick = 0;
+        self.last_flush = Some(Instant::now());
+        if !lines.is_empty() {
+            self.push_log(format!("[SDS] 저장: {}", lines.join(" | ")));
+        }
+        lines
+    }
+
+    /// Flushes, then folds the open run buffers into the ledgers.
+    pub fn close_runs(&mut self) {
+        self.flush();
+        let runs: Vec<(Ledger, RunBuf)> = self.runs.drain().collect();
+        for (l, run) in runs {
+            let base = self.bases.entry(l).or_default();
+            for (k, v) in run.scopes.into_iter() {
+                let ring = ring_for_key(&k);
+                base.scopes.entry(k).or_default().absorb(v, ring, now_ms());
+            }
+            base.updated_at = now_ms();
+            self.dirty.insert(l);
+        }
+        self.flush();
+    }
+
+    /// Deletes everything and returns to the cold-start state.
+    pub fn purge(&mut self) {
+        self.bases.clear();
+        self.runs.clear();
+        self.dirty.clear();
+        if let Some(dir) = &self.dir {
+            let _ = std::fs::remove_dir_all(dir);
+            let _ = std::fs::create_dir_all(dir);
+        }
+        for l in Ledger::ALL {
+            self.bases.insert(l, fresh_file());
+        }
+        self.push_log("[SDS] 원장·실행 파일을 전량 삭제했습니다. 판정은 고정 기본값으로 복귀합니다".into());
+    }
+
+    pub fn status(&self, max_axes: usize) -> SdsStatus {
+        let mut ledgers = Vec::new();
+        let mut axes = Vec::new();
+        let mut confusions = Vec::new();
+        for l in Ledger::ALL {
+            let run = self.runs.get(&l);
+            let mut keys: Vec<String> = self.bases.get(&l).map(|b| b.scopes.keys().cloned().collect()).unwrap_or_default();
+            if let Some(r) = run {
+                for k in r.scopes.keys() {
+                    if !keys.contains(k) {
+                        keys.push(k.clone());
+                    }
+                }
+            }
+            keys.sort();
+            let mut obs = 0u64;
+            for k in keys.iter() {
+                let Some(st) = self.merged_scope(l, k) else { continue };
+                obs += st.observations();
+                for (a, w) in st.baseline.iter() {
+                    axes.push(axis_status(k, a, "baseline", w));
+                }
+                for (a, w) in st.calibration.iter() {
+                    axes.push(axis_status(k, a, "calibration", w));
+                }
+                for (a, d) in st.decay.iter() {
+                    axes.push(axis_status(k, a, "decay_margin", &d.margin));
+                }
+                for (a, w) in st.agreement.iter() {
+                    axes.push(axis_status(k, a, "agreement", w));
+                }
+                for (g, gs) in st.gates.iter() {
+                    let n = gs.evaluated.max(1) as f64;
+                    axes.push(AxisStatus {
+                        scope: k.clone(),
+                        axis: g.clone(),
+                        kind: "gate_block".into(),
+                        n: gs.evaluated,
+                        mean: gs.blocked as f64 / n,
+                        sd: gs.severity.sd(),
+                        recent: gs.sole as f64 / n,
+                        drift_z: gs.severity.drift_z(),
+                    });
+                }
+                for (pair, c) in st.confusion.iter() {
+                    confusions.push(ConfusionStatus {
+                        scope: k.clone(),
+                        pair: pair.clone(),
+                        ties: c.ties,
+                        a_wins: c.a_wins,
+                        b_wins: c.b_wins,
+                        mean_margin: c.margin.mean,
+                    });
+                }
+            }
+            ledgers.push(LedgerStatus {
+                ledger: l.as_str().into(),
+                scopes: keys.len(),
+                observations: obs,
+                run_observations: run.map(|r| r.observations).unwrap_or(0),
+            });
+        }
+        axes.sort_by(|a, b| b.n.cmp(&a.n).then(a.scope.cmp(&b.scope)).then(a.axis.cmp(&b.axis)));
+        axes.truncate(max_axes);
+        confusions.sort_by(|a, b| b.ties.cmp(&a.ties).then(a.pair.cmp(&b.pair)));
+        confusions.truncate(max_axes);
+        SdsStatus {
+            dir: self.dir.as_ref().map(|d| d.display().to_string()).unwrap_or_else(|| "(memory)".into()),
+            recipe: SDS_RECIPE.into(),
+            ledgers,
+            axes,
+            confusions,
+            log: self.log.iter().rev().take(30).cloned().collect(),
+        }
+    }
+
+    /// Number of scopes held for a track (ledger plus open run).
+    pub fn scope_count(&self, track: Track) -> usize {
+        let prefix = format!("{}|", track.as_str());
+        let l = track.ledger();
+        let mut keys: HashSet<&String> = HashSet::new();
+        if let Some(b) = self.bases.get(&l) {
+            keys.extend(b.scopes.keys().filter(|k| k.starts_with(&prefix)));
+        }
+        if let Some(r) = self.runs.get(&l) {
+            keys.extend(r.scopes.keys().filter(|k| k.starts_with(&prefix)));
+        }
+        keys.len()
+    }
+}
+
+fn fresh_file() -> SdsFile {
+    SdsFile { recipe: SDS_RECIPE.into(), updated_at: now_ms(), scopes: HashMap::new() }
+}
+
+fn axis_status(scope: &str, axis: &str, kind: &str, w: &Welford) -> AxisStatus {
+    AxisStatus {
+        scope: scope.to_string(),
+        axis: axis.to_string(),
+        kind: kind.into(),
+        n: w.n,
+        mean: w.mean,
+        sd: w.sd(),
+        recent: w.recent_mean(),
+        drift_z: w.drift_z(),
+    }
+}
+
+impl Drop for SdsStore {
+    fn drop(&mut self) {
+        if self.dir.is_some() && (!self.dirty.is_empty() || !self.runs.is_empty()) {
+            self.flush();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("hand_sds_{}_{}_{}", tag, std::process::id(), now_ms()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    fn feed(store: &mut SdsStore, scope: &Scope, axis: &str, n: usize, base: f64) {
+        for i in 0..n {
+            store.record_baseline(scope, axis, base + (i % 3) as f64 * 0.01);
+        }
+    }
+
+    #[test]
+    fn cold_start_answers_none_until_enough_observations() {
+        let mut s = SdsStore::memory();
+        let sc = Scope::new(Track::Vision, "tree", "near");
+        assert!(s.adaptive_baseline(&sc, "score").is_none());
+        feed(&mut s, &sc, "score", 7, 0.6);
+        assert!(s.adaptive_baseline(&sc, "score").is_none(), "primary needs 8, secondary 20, global 30");
+        feed(&mut s, &sc, "score", 1, 0.6);
+        let (_, key) = s.adaptive_baseline_scoped(&sc, "score").unwrap();
+        assert_eq!(key, "vision|tree|", "falls back to the primary scope");
+        feed(&mut s, &sc, "score", 12, 0.6);
+        let (_, key) = s.adaptive_baseline_scoped(&sc, "score").unwrap();
+        assert_eq!(key, "vision|tree|near", "secondary now has 20");
+    }
+
+    #[test]
+    fn a_thin_secondary_scope_backs_off_to_a_thicker_primary() {
+        let mut s = SdsStore::memory();
+        let near = Scope::new(Track::Vision, "tree", "near");
+        let far = Scope::new(Track::Vision, "tree", "far");
+        feed(&mut s, &near, "score", 25, 0.70);
+        feed(&mut s, &far, "score", 3, 0.30);
+        let (m_far, _, _) = s.adaptive_baseline(&far, "score").unwrap();
+        // The far scope has 3 observations, so the primary (28 pooled) answers.
+        assert!(m_far > 0.6, "pooled mean {m_far}");
+        let (m_near, _, n) = s.adaptive_baseline(&near, "score").unwrap();
+        assert_eq!(n, 25);
+        assert!((m_near - 0.71).abs() < 0.03);
+    }
+
+    #[test]
+    fn calibration_is_shrunk_toward_one_when_data_is_thin() {
+        let mut s = SdsStore::memory();
+        let sc = Scope::new(Track::Motion, "track", "f5");
+        for _ in 0..4 {
+            s.record_calibration(&sc, "mine_time", 1.5, 1.0);
+        }
+        let (f4, n4, _, _) = s.calibration_factor(&sc, "mine_time").unwrap();
+        assert_eq!(n4, 4);
+        let expected4 = 1.0 + 0.5 * (4.0 / 9.0);
+        assert!((f4 - expected4).abs() < 1e-9, "{f4} vs {expected4}");
+        for _ in 0..96 {
+            s.record_calibration(&sc, "mine_time", 1.5, 1.0);
+        }
+        let (f100, _, _, _) = s.calibration_factor(&sc, "mine_time").unwrap();
+        assert!(f100 > f4 && f100 < 1.5 && f100 > 1.45, "{f100}");
+        // Degenerate predictions are ignored.
+        let before = s.calibration_factor(&sc, "mine_time").unwrap().1;
+        s.record_calibration(&sc, "mine_time", 1.0, 0.0);
+        s.record_calibration(&sc, "mine_time", f64::NAN, 1.0);
+        assert_eq!(s.calibration_factor(&sc, "mine_time").unwrap().1, before);
+    }
+
+    #[test]
+    fn calibration_recentres_when_the_recent_values_drifted() {
+        let mut s = SdsStore::memory();
+        let sc = Scope::new(Track::Motion, "wheel", "f5");
+        for i in 0..40 {
+            s.record_calibration(&sc, "drive_time", 1.0 + 0.01 * (i % 2) as f64, 1.0);
+        }
+        let (steady, _, d0, _) = s.calibration_factor(&sc, "drive_time").unwrap();
+        assert!(d0.abs() < 2.0);
+        for _ in 0..8 {
+            s.record_calibration(&sc, "drive_time", 2.0, 1.0);
+        }
+        let (shifted, _, d1, _) = s.calibration_factor(&sc, "drive_time").unwrap();
+        assert!(d1.abs() > 2.0, "drift z {d1}");
+        assert!(shifted > steady + 0.3, "{shifted} vs {steady}");
+    }
+
+    #[test]
+    fn confusion_pairs_are_symmetric_and_counted() {
+        let mut s = SdsStore::memory();
+        let sc = Scope::new(Track::Vision, "", "");
+        for _ in 0..6 {
+            s.record_confusion(&sc, "coal_ore", "iron_ore_node", 0.02);
+        }
+        for _ in 0..4 {
+            s.record_confusion(&sc, "iron_ore_node", "coal_ore", 0.03);
+        }
+        s.record_confusion(&sc, "tree", "tree", 0.1);
+        s.record_confusion(&sc, "", "tree", 0.1);
+        // Global scope of the vision track needs 30 observations: give it 20 more.
+        for _ in 0..20 {
+            s.record_confusion(&sc, "tree", "boulder", 0.05);
+        }
+        let (share, ties) = s.confusion_share(&sc, "iron_ore_node", "coal_ore").unwrap();
+        assert_eq!(ties, 10);
+        assert!((share - 10.0 / 30.0).abs() < 1e-9);
+        let st = s.status(10);
+        let pair = st.confusions.iter().find(|c| c.pair == "coal_ore|iron_ore_node").unwrap();
+        assert_eq!((pair.a_wins, pair.b_wins), (6, 4));
+    }
+
+    #[test]
+    fn agreement_and_transition_priors() {
+        let mut s = SdsStore::memory();
+        let sc = Scope::new(Track::Motion, "track", "");
+        for i in 0..10 {
+            s.record_agreement(&sc, "locate_ok", i % 5 != 0);
+        }
+        let (rate, n) = s.agreement_rate(&sc, "locate_ok").unwrap();
+        assert_eq!(n, 10);
+        assert!((rate - 0.8).abs() < 1e-9);
+        for _ in 0..3 {
+            s.record_transition(&sc, "locate", "approach");
+        }
+        s.record_transition(&sc, "locate", "locate");
+        let p = s.transition_prior(&sc, "locate", "approach").unwrap();
+        // (3 + 1) / (4 + 2 outs + 1)
+        assert!((p - 4.0 / 7.0).abs() < 1e-9, "{p}");
+        assert!(s.transition_prior(&sc, "mine", "collect").is_none());
+        s.record_transition(&sc, "", "x");
+        s.record_transition(&sc, "a", "");
+    }
+
+    #[test]
+    fn gates_report_block_and_sole_rates() {
+        let mut s = SdsStore::memory();
+        let sc = Scope::new(Track::Vision, "tree", "");
+        for i in 0..10 {
+            s.record_gates(&sc, &[("floor".into(), 2, i < 3, i == 0), ("temporal".into(), 1, i < 1, false)]);
+        }
+        let rates = s.gate_rates(&sc);
+        assert_eq!(rates[0].gate, "floor");
+        assert!((rates[0].blocked_rate - 0.3).abs() < 1e-9);
+        assert!((rates[0].sole_rate - 0.1).abs() < 1e-9);
+        assert!((rates[1].blocked_rate - 0.1).abs() < 1e-9);
+        s.record_gates(&sc, &[]);
+    }
+
+    #[test]
+    fn decay_margin_baseline_is_learned() {
+        let mut s = SdsStore::memory();
+        let sc = Scope::new(Track::Vision, "", "");
+        for _ in 0..30 {
+            s.record_decay(&sc, "tile_scores", &[0.8, 0.3, 0.25, 0.2, 0.1]);
+        }
+        let (m, sd, n) = s.adaptive_decay(&sc, "tile_scores").unwrap();
+        assert_eq!(n, 30);
+        assert!((m - 0.5).abs() < 1e-6 && sd < 1e-6);
+    }
+
+    #[test]
+    fn ledgers_survive_a_restart_and_leave_no_temp_files() {
+        let dir = tmpdir("persist");
+        {
+            let mut s = SdsStore::open(&dir);
+            let sc = Scope::new(Track::Forecast, "score:tree", "");
+            for i in 0..5 {
+                s.record_baseline(&sc, "fusion_mse:holt", 0.01 + i as f64 * 0.001);
+            }
+            s.close_runs();
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().ends_with(".tmp")).collect();
+        assert!(leftovers.is_empty());
+        assert!(dir.join("task.json").exists());
+        let run_files: Vec<_> = std::fs::read_dir(dir.join("runs").join("task")).unwrap().collect();
+        assert_eq!(run_files.len(), 1);
+
+        let s = SdsStore::open(&dir);
+        let sc = Scope::new(Track::Forecast, "score:tree", "");
+        let (mse, n) = s.fusion_mse(&sc, "holt").expect("5 observations are enough for the forecast track");
+        assert_eq!(n, 5);
+        assert!((mse - 0.012).abs() < 1e-9);
+        assert!(s.log_lines().iter().any(|l| l.contains("원장 1종")), "{:?}", s.log_lines());
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unflushed_run_data_is_flushed_on_drop() {
+        let dir = tmpdir("drop");
+        {
+            let mut s = SdsStore::open(&dir);
+            s.record_baseline(&Scope::new(Track::Forecast, "x", ""), "a", 1.0);
+        }
+        assert!(dir.join("task.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_ledger_with_another_recipe_is_discarded_with_a_reason() {
+        let dir = tmpdir("recipe");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut old = fresh_file();
+        old.recipe = "hand-sds-v0:old".into();
+        let mut st = ScopeStat::default();
+        st.baseline.entry("score".into()).or_default().push(0.5, 4);
+        old.scopes.insert("vision||".into(), st);
+        std::fs::write(dir.join("perception.json"), serde_json::to_string(&old).unwrap()).unwrap();
+        std::fs::write(dir.join("command.json"), "{ not json").unwrap();
+        let s = SdsStore::open(&dir);
+        let log = s.log_lines().join("\n");
+        assert!(log.contains("레시피 세대 불일치"), "{log}");
+        assert!(log.contains("읽기/파싱 실패"), "{log}");
+        assert!(s.status(5).ledgers.iter().all(|l| l.observations == 0));
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oversized_ledgers_drop_the_least_observed_scopes_first() {
+        let dir = tmpdir("cap");
+        let mut s = SdsStore::open(&dir);
+        s.set_cap_bytes(6_000);
+        let busy = Scope::new(Track::Motion, "busy", "");
+        for i in 0..60 {
+            s.record_baseline(&busy, "a", i as f64);
+        }
+        for i in 0..40 {
+            let sc = Scope::new(Track::Motion, &format!("rare{i}"), "");
+            s.record_baseline(&sc, "a", 1.0);
+        }
+        s.close_runs();
+        let txt = std::fs::read_to_string(dir.join("task.json")).unwrap();
+        assert!(txt.len() <= 6_000 + 400, "ledger is {} bytes", txt.len());
+        let file: SdsFile = serde_json::from_str(&txt).unwrap();
+        assert!(file.scopes.contains_key("motion|busy|"), "the well observed scope is kept");
+        assert!(file.scopes.len() < 41);
+        assert!(s.log_lines().iter().any(|l| l.contains("절삭")));
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn purge_returns_to_cold_start() {
+        let dir = tmpdir("purge");
+        let mut s = SdsStore::open(&dir);
+        let sc = Scope::new(Track::Forecast, "x", "");
+        for _ in 0..5 {
+            s.record_baseline(&sc, "a", 1.0);
+        }
+        s.close_runs();
+        assert!(s.adaptive_baseline(&sc, "a").is_some());
+        s.purge();
+        assert!(s.adaptive_baseline(&sc, "a").is_none());
+        assert!(!dir.join("task.json").exists());
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_atomic_replaces_the_file_without_leaving_a_temp() {
+        let dir = tmpdir("atomic");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.json");
+        write_atomic(&path, b"{\"a\":1}").unwrap();
+        write_atomic(&path, b"{\"a\":2}").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"a\":2}");
+        assert!(!dir.join("a.json.tmp").exists());
+        // Writing into a missing directory fails and leaves nothing behind.
+        assert!(write_atomic(&dir.join("missing").join("b.json"), b"x").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_lists_axes_by_observation_count() {
+        let mut s = SdsStore::memory();
+        feed(&mut s, &Scope::new(Track::Vision, "tree", ""), "score", 12, 0.6);
+        feed(&mut s, &Scope::new(Track::Motion, "track", ""), "mine_time", 3, 3.0);
+        let st = s.status(3);
+        assert_eq!(st.axes.len(), 3);
+        assert!(st.axes[0].n >= st.axes[1].n && st.axes[1].n >= st.axes[2].n);
+        assert!(st.ledgers.iter().any(|l| l.ledger == "perception" && l.observations > 0));
+        assert_eq!(s.scope_count(Track::Vision), 2, "global and primary");
+        let axes = s.axes_of(&Scope::new(Track::Vision, "tree", ""), "sc");
+        assert_eq!(axes.len(), 1);
+        assert_eq!(axes[0].kind, "baseline");
+    }
+}
