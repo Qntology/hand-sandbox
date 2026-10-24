@@ -239,6 +239,24 @@ impl Runtime {
         }
         let preset = self.world.cfg.body.id();
         let body_kg = self.world.body.mass_kg();
+        let nn_lib = hand_core::nn::library(&self.world.body);
+        for ev in &events {
+            // Composite N:N: the development scenario phases this state counts as,
+            // scored with their research weights (`hand_core::nn`).
+            let Some(d) = &ev.dynamics else { continue };
+            for (spec, phase) in hand_core::nn::matching_phases(&nn_lib, &ev.posture) {
+                let cells = hand_core::nn::cells(&self.world.body, &ev.posture, &ev.report, Some(d));
+                let pr = hand_core::nn::score_phase(phase, &spec.seg_w, cells, &ev.report, Some(d));
+                let scope = Scope::new(Track::Balance, &format!("nn:{}", spec.id), &phase.id);
+                self.sds.record_baseline(&scope, "score", pr.score as f64);
+                self.sds.record_agreement(&scope, "item_ok", pr.item >= 1);
+                for c in pr.cells.iter().filter(|c| c.z.is_some()) {
+                    let axis = format!("{}>{}:{}", c.source.id(), c.target.id(), c.axis);
+                    self.sds.record_reference(&scope, &axis, c.value as f64, c.reference.unwrap_or(0.0) as f64, c.tolerance.unwrap_or(1.0) as f64);
+                }
+                self.nn_live.record(spec.id, spec.name_ko, &pr);
+            }
+        }
         for ev in events {
             let r = &ev.report;
             if r.source == Source::Quiet {
@@ -282,6 +300,23 @@ impl Runtime {
                 let scope = Scope::new(Track::Effort, j.segment.id(), &format!("{src}|{}", ev.state));
                 self.sds.record_baseline(&scope, &format!("{}:peak_ratio", j.joint), j.peak_ratio as f64);
                 self.sds.record_baseline(&scope, &format!("{}:effort", j.joint), j.effort as f64);
+            }
+            // The joint dynamics of the change into this state: the transient the
+            // quasi-static cells above cannot show (torque-speed, stall, late reaction).
+            if let Some(d) = &ev.dynamics {
+                let scope = Scope::new(Track::Effort, "dynamics", &format!("{src}|{}", ev.state));
+                self.sds.record_baseline(&scope, "min_margin", d.min_margin as f64);
+                self.sds.record_baseline(&scope, "margin_dip", (d.static_margin - d.min_margin) as f64);
+                self.sds.record_baseline(&scope, "peak_ratio", d.peak_ratio as f64);
+                self.sds.record_agreement(&scope, "feasible", d.feasible);
+                self.sds.record_agreement(&scope, "reached", d.reached);
+                for j in d.joints.iter().filter(|j| j.kind == "sim") {
+                    self.sds.record_baseline(&scope, &format!("{}:peak_ratio", j.name), j.peak_ratio as f64);
+                    self.sds.record_baseline(&scope, &format!("{}:lag_deg", j.name), j.max_lag_deg as f64);
+                    if j.saturated_s > 0.0 || j.stalled_s > 0.0 {
+                        self.sds.record_baseline(&scope, &format!("{}:sat_s", j.name), j.saturated_s as f64);
+                    }
+                }
             }
         }
         // Only a gain learned for this source counts; the global scope mixes

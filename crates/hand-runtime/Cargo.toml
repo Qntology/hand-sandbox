@@ -26,3 +26,11 @@ candle-nn = { workspace = true }
 # The development server mirrors the test records into LanceDB like the app does.
 hand-data = { path = "../hand-data" }
 tokio = { workspace = true }
+
+[features]
+default = []
+# GPU backends of every model the runtime loads (SigLIP2, TIPS, SAM, Granite TTM).
+cuda = ["hand-vision/cuda", "hand-ml/cuda"]
+metal = ["hand-vision/metal", "hand-ml/metal"]
+vulkan = ["hand-vision/vulkan", "hand-ml/vulkan"]
+rocm = ["hand-vision/rocm", "hand-ml/rocm"]

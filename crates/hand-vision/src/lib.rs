@@ -8,7 +8,8 @@
 //! 1. [`depth`]: monocular depth, TIPSv2-B/14 DPT ([`tips`]).
 //! 2. [`locate`]: SigLIP2 dense patch heat maps, peak = semantic position.
 //! 3. [`track`]: masks from the semantic points as prompts, kept across
-//!    keyframes (SAM 3.1 interface; region-growing stand-in).
+//!    keyframes (SAM interface: [`sam`] runs SAM ViT-B or MobileSAM on the
+//!    selected device, the region-growing stand-in runs without weights).
 //! 4. [`triangulate`]: range from two bearings over an odometry baseline, the
 //!    mandatory step before trusting a distance.
 //! 5. [`decide`]: the time-series decision (forecast the target, choose the
@@ -22,6 +23,8 @@ pub mod depth;
 pub mod frame;
 pub mod fusion;
 pub mod locate;
+pub mod sam;
+mod sam_decoder;
 pub mod tips;
 pub mod track;
 pub mod triangulate;
@@ -33,5 +36,6 @@ pub use depth::{depth_metrics, DepthMetrics, DepthModel};
 pub use frame::{DepthKind, DepthMap, Mask, Rgb};
 pub use locate::{Heat, LabelPrompt, SemanticLocator, SemanticPoint, SiglipLocator};
 pub use tips::{InputGrid, TipsConfig, TipsDepth};
+pub use sam::{SamCfg, SamModel, SamTracker, SamVariant};
 pub use track::{MaskTracker, PointPrompt, RegionCfg, RegionTracker, TrackedMask};
 pub use triangulate::{plan_step, triangulate, Bearing, Fix, TriCfg, TriError, TriStep};

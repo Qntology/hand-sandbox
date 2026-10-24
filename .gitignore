@@ -9,3 +9,7 @@ node_modules/
 
 # SDS ledgers and hash-chained logs written by the world runtime
 /data/runtime
+
+# Test runner logs (test_cuda / test_rocm / test_vulkan / test_cpu) and the downloaded protoc
+/test_logs
+/tools

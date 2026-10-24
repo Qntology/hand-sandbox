@@ -59,6 +59,8 @@ pub struct DeviceState {
     pub backends: Vec<BackendStatus>,
     pub selected: Backend,
     pub ordinal: usize,
+    /// How the start-up device was chosen.
+    pub reason: String,
 }
 
 fn device_state(state: &AppState) -> DeviceState {
@@ -67,6 +69,7 @@ fn device_state(state: &AppState) -> DeviceState {
         backends: state.backends().to_vec(),
         selected,
         ordinal,
+        reason: state.startup().reason.clone(),
     }
 }
 

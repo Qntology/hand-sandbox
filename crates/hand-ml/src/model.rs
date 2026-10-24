@@ -9,6 +9,7 @@ use candle_nn::VarBuilder;
 use image::DynamicImage;
 
 use crate::config::Siglip2Config;
+use crate::device::{device_family, trim_idle_pool, BatchPolicy};
 use crate::parallel::{fnv1a, FNV_OFFSET};
 use crate::preprocess::{preprocess, NaflexInput};
 use crate::text::TextTower;
@@ -36,7 +37,12 @@ pub struct Siglip2 {
     logit_scale: f32,
     logit_bias: f32,
     device: Device,
-    /// Identifies the checkpoint, so cached text vectors never cross models.
+    /// Rows per forward pass on this device.
+    policy: BatchPolicy,
+    /// Hash of the checkpoint alone (config, file sizes and times).
+    checkpoint: u64,
+    /// Identifies the checkpoint and the device family, so cached text
+    /// vectors never cross models or backends.
     fingerprint: u64,
 }
 
@@ -66,7 +72,8 @@ impl Siglip2 {
             config.text_max_len,
         )?;
         let mut model = Self::from_var_builder(config, vb, device, Some(tokenizer))?;
-        model.fingerprint = checkpoint_fingerprint(dir, &model.config);
+        model.checkpoint = checkpoint_fingerprint(dir, &model.config);
+        model.fingerprint = device_salt(model.checkpoint, device, &model.policy);
         Ok(model)
     }
 
@@ -81,7 +88,9 @@ impl Siglip2 {
         let text = TextTower::new(&config, vb.pp("text_model"))?;
         let logit_scale = read_scalar(&vb, "logit_scale").unwrap_or(0.0);
         let logit_bias = read_scalar(&vb, "logit_bias").unwrap_or(0.0);
-        let fingerprint = fnv1a(FNV_OFFSET, format!("{config:?}").as_bytes());
+        let policy = BatchPolicy::for_device(device);
+        let checkpoint = fnv1a(FNV_OFFSET, format!("{config:?}").as_bytes());
+        let fingerprint = device_salt(checkpoint, device, &policy);
         Ok(Siglip2 {
             config,
             vision,
@@ -90,8 +99,27 @@ impl Siglip2 {
             logit_scale,
             logit_bias,
             device: device.clone(),
+            policy,
+            checkpoint,
             fingerprint,
         })
+    }
+
+    /// Rows per forward pass on this model's device.
+    pub fn batch_policy(&self) -> BatchPolicy {
+        self.policy
+    }
+
+    /// Replaces the batch policy (tests, or a caller with its own memory budget).
+    /// The fingerprint follows, because fixed-shape text batches change the vectors.
+    pub fn set_batch_policy(&mut self, policy: BatchPolicy) {
+        self.fingerprint = device_salt(self.checkpoint, &self.device, &policy);
+        self.policy = policy;
+    }
+
+    /// Tokens one image of this patch grid sends through the tower.
+    fn tokens_of(input: &NaflexInput) -> usize {
+        input.grid_h * input.grid_w
     }
 
     pub fn config(&self) -> &Siglip2Config {
@@ -127,32 +155,72 @@ impl Siglip2 {
 
     /// Unit-length embeddings of many images. Images are preprocessed in
     /// parallel, grouped by patch grid, and each group runs through the vision
-    /// tower in micro-batches of at most `max_batch` images. Output order
+    /// tower in micro-batches of at most `max_batch` images (`0`: as many as
+    /// the device's [`BatchPolicy`] allows for that grid). Output order
     /// matches the input order.
     pub fn embed_images(&self, images: &[DynamicImage], max_batch: usize) -> Result<Vec<Vec<f32>>> {
-        use rayon::prelude::*;
-        use std::collections::BTreeMap;
+        let inputs = self.preprocess_all(images);
+        let mut out: Vec<Vec<f32>> = vec![Vec::new(); images.len()];
+        for chunk in self.image_chunks(&inputs, max_batch) {
+            let refs: Vec<&NaflexInput> = chunk.iter().map(|&i| &inputs[i]).collect();
+            let emb = l2_normalize(&self.vision.forward_batch(&refs)?)?;
+            let rows: Vec<Vec<f32>> = emb.to_vec2()?;
+            for (row, &i) in rows.into_iter().zip(&chunk) {
+                out[i] = row;
+            }
+        }
+        trim_idle_pool(&self.device);
+        Ok(out)
+    }
 
-        let inputs: Vec<NaflexInput> = images
-            .par_iter()
-            .map(|image| preprocess(image, &self.config))
-            .collect();
+    fn preprocess_all(&self, images: &[DynamicImage]) -> Vec<NaflexInput> {
+        use rayon::prelude::*;
+        images.par_iter().map(|image| preprocess(image, &self.config)).collect()
+    }
+
+    /// Input indices grouped by patch grid and cut into forward passes.
+    fn image_chunks(&self, inputs: &[NaflexInput], max_batch: usize) -> Vec<Vec<usize>> {
+        use std::collections::BTreeMap;
         let mut groups: BTreeMap<(usize, usize), Vec<usize>> = BTreeMap::new();
         for (i, input) in inputs.iter().enumerate() {
             groups.entry((input.grid_h, input.grid_w)).or_default().push(i);
         }
-        let mut out: Vec<Vec<f32>> = vec![Vec::new(); images.len()];
+        let mut out = Vec::new();
         for indices in groups.values() {
-            for chunk in indices.chunks(max_batch.max(1)) {
-                let refs: Vec<&NaflexInput> = chunk.iter().map(|&i| &inputs[i]).collect();
-                let emb = l2_normalize(&self.vision.forward_batch(&refs)?)?;
-                let rows: Vec<Vec<f32>> = emb.to_vec2()?;
-                for (row, &i) in rows.into_iter().zip(chunk) {
-                    out[i] = row;
-                }
+            let rows = match max_batch {
+                0 => self.policy.image_rows(Self::tokens_of(&inputs[indices[0]])),
+                n => n,
+            };
+            out.extend(indices.chunks(rows.max(1)).map(|c| c.to_vec()));
+        }
+        out
+    }
+
+    /// [`Siglip2::embed_dense`] for many images, batched like
+    /// [`Siglip2::embed_images`]: images that share a patch grid go through the
+    /// tower together, and each result is the same as the single-image call
+    /// (rows never mix inside the tower). Output order matches the input.
+    pub fn embed_dense_batch(&self, images: &[DynamicImage]) -> Result<Vec<DenseEmbedding>> {
+        let inputs = self.preprocess_all(images);
+        let mut out: Vec<Option<DenseEmbedding>> = (0..images.len()).map(|_| None).collect();
+        for chunk in self.image_chunks(&inputs, 0) {
+            let refs: Vec<&NaflexInput> = chunk.iter().map(|&i| &inputs[i]).collect();
+            let (dense, attn, pooled) = self.vision.forward_dense_batch(&refs)?;
+            let dense = l2_normalize(&dense)?;
+            let pooled = l2_normalize(&pooled)?.to_vec2::<f32>()?;
+            let attn = attn.to_vec2::<f32>()?;
+            for (k, &i) in chunk.iter().enumerate() {
+                out[i] = Some(DenseEmbedding {
+                    grid_h: inputs[i].grid_h,
+                    grid_w: inputs[i].grid_w,
+                    vectors: dense.get(k)?.to_vec2()?,
+                    attention: attn[k].clone(),
+                    pooled: pooled[k].clone(),
+                });
             }
         }
-        Ok(out)
+        trim_idle_pool(&self.device);
+        Ok(out.into_iter().map(|d| d.expect("every input is in one chunk")).collect())
     }
 
     /// Dense embedding of one image: a unit vector per patch in the same
@@ -183,10 +251,34 @@ impl Siglip2 {
             return Ok(Vec::new());
         }
         let len = self.config.text_max_len;
-        let ids_t = Tensor::from_slice(ids, (rows, len), &self.device)?;
-        let mask_t = Tensor::from_slice(mask, (rows, len), &self.device)?;
-        let emb = l2_normalize(&self.text.forward(&ids_t, &mask_t)?)?;
-        Ok(emb.to_vec2()?)
+        if !self.policy.fixed_shape {
+            let ids_t = Tensor::from_slice(ids, (rows, len), &self.device)?;
+            let mask_t = Tensor::from_slice(mask, (rows, len), &self.device)?;
+            let emb = l2_normalize(&self.text.forward(&ids_t, &mask_t)?)?;
+            trim_idle_pool(&self.device);
+            return Ok(emb.to_vec2()?);
+        }
+        // CUDA and ROCm: every pass is exactly `max_rows x len`; the last one is
+        // padded with copies of its first row, whose outputs are dropped. The
+        // vector of a phrase then does not depend on what shares its call
+        // (see `BatchPolicy`).
+        let b = self.policy.max_rows.max(1);
+        let mut out = Vec::with_capacity(rows);
+        for start in (0..rows).step_by(b) {
+            let n = b.min(rows - start);
+            let mut i = ids[start * len..(start + n) * len].to_vec();
+            let mut m = mask[start * len..(start + n) * len].to_vec();
+            for _ in n..b {
+                i.extend_from_slice(&ids[start * len..(start + 1) * len]);
+                m.extend_from_slice(&mask[start * len..(start + 1) * len]);
+            }
+            let ids_t = Tensor::from_vec(i, (b, len), &self.device)?;
+            let mask_t = Tensor::from_vec(m, (b, len), &self.device)?;
+            let emb: Vec<Vec<f32>> = l2_normalize(&self.text.forward(&ids_t, &mask_t)?)?.to_vec2()?;
+            out.extend(emb.into_iter().take(n));
+        }
+        trim_idle_pool(&self.device);
+        Ok(out)
     }
 
     /// SigLIP pair score per text: `sigmoid(exp(logit_scale) * cos + logit_bias)`.
@@ -221,6 +313,17 @@ fn checkpoint_fingerprint(dir: &Path, config: &Siglip2Config) -> u64 {
         }
     }
     h
+}
+
+/// Mixes the device family and the text batch shape into a fingerprint, so
+/// the phrase bank keeps CPU, CUDA, ROCm and Vulkan vectors apart.
+fn device_salt(h: u64, device: &Device, policy: &BatchPolicy) -> u64 {
+    let h = fnv1a(h, device_family(device).as_bytes());
+    if policy.fixed_shape {
+        fnv1a(h, &(policy.max_rows as u64).to_le_bytes())
+    } else {
+        h
+    }
 }
 
 fn sigmoid(x: f32) -> f32 {
@@ -374,6 +477,42 @@ mod tests {
         let s = m.scores(&img, &texts);
         assert!(s.iter().all(|p| (0.0..=1.0).contains(p)));
         assert!(s[0] > s[1]);
+    }
+
+    #[test]
+    fn batched_dense_embeddings_match_one_by_one() {
+        let m = tiny_model();
+        let images = vec![test_image(32, 16), test_image(32, 32), test_image(32, 16)];
+        let batched = m.embed_dense_batch(&images).unwrap();
+        assert_eq!(batched.len(), 3);
+        for (img, b) in images.iter().zip(&batched) {
+            let one = m.embed_dense(img).unwrap();
+            assert_eq!((one.grid_h, one.grid_w), (b.grid_h, b.grid_w));
+            for (u, v) in one.vectors.iter().zip(&b.vectors) {
+                assert!(u.iter().zip(v).all(|(a, c)| (a - c).abs() < 1e-4));
+            }
+            assert!(one.pooled.iter().zip(&b.pooled).all(|(a, c)| (a - c).abs() < 1e-4));
+            assert!(one.attention.iter().zip(&b.attention).all(|(a, c)| (a - c).abs() < 1e-5));
+        }
+    }
+
+    #[test]
+    fn fixed_shape_text_batches_give_the_dynamic_vectors() {
+        let mut m = tiny_model();
+        let len = m.config().text_max_len;
+        let rows = 5;
+        let ids: Vec<u32> = (0..rows * len).map(|i| (i * 7 % 50) as u32).collect();
+        let mask = vec![1.0f32; rows * len];
+        m.set_batch_policy(BatchPolicy { max_rows: 64, token_budget: 4096, fixed_shape: false });
+        let dynamic = m.embed_tokens(&ids, &mask, rows).unwrap();
+        let fp_dynamic = m.fingerprint();
+        m.set_batch_policy(BatchPolicy { max_rows: 4, token_budget: 4096, fixed_shape: true });
+        let fixed = m.embed_tokens(&ids, &mask, rows).unwrap();
+        assert_eq!(fixed.len(), rows, "padding rows are dropped");
+        for (a, b) in dynamic.iter().zip(&fixed) {
+            assert!(a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-5));
+        }
+        assert_ne!(fp_dynamic, m.fingerprint(), "the phrase bank keeps the two shapes apart");
     }
 
     #[test]

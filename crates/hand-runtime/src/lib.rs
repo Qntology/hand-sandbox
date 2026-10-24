@@ -9,6 +9,7 @@
 //!   together; `driver` carries the quests out.
 
 pub mod api;
+pub mod chase;
 mod api_test;
 pub mod config;
 mod driver;
@@ -16,6 +17,7 @@ pub mod embedding;
 pub mod ml;
 mod mldrive;
 mod mlsds;
+pub mod nnlive;
 pub mod perception;
 pub mod precision;
 pub mod record;

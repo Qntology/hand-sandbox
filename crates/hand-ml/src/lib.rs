@@ -22,6 +22,6 @@ pub mod vision;
 
 pub use classify::{classify, Anchors, DictEntry, Dictionary, Prediction};
 pub use config::Siglip2Config;
-pub use device::{probe_backends, Backend, BackendStatus};
+pub use device::{device_label, preferred, probe_backends, select, trim_idle_pool, Backend, BackendStatus, BatchPolicy, Selection};
 pub use model::{DenseEmbedding, Siglip2};
 pub use parallel::{BatchOpts, ImageEmbedder, PhraseBank, TextEmbedder, Tile};

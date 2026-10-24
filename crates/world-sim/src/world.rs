@@ -14,6 +14,7 @@ use std::sync::Mutex;
 use std::collections::{BTreeMap, HashSet};
 
 use hand_core::balance::{BalanceReport, Body, DriveLimits, FeedForward, Posture, Source, GRIP_SAFETY};
+use hand_core::dynamics::{self, BodyPose, DynCfg, DynDigest, Rollout};
 use hand_core::{compute_body, grasp, BalanceSummary, BodyInputs, BodyLimits, BodyPlan, BodyStatus, ConfigError, GraspSetup, Hand, HandConfig, Payload};
 use serde::{Deserialize, Serialize};
 
@@ -81,6 +82,10 @@ pub struct BalanceEvent {
     /// Terrain and phase bucket, such as `flat|mine` or `up_hi|move`.
     pub state: String,
     pub report: BalanceReport,
+    /// The joint dynamics of the change into this state (`None` for a re-sample).
+    pub dynamics: Option<DynDigest>,
+    /// The posture itself (every cause acting, for the composite N:N phases).
+    pub posture: Posture,
 }
 
 #[derive(Clone, Debug)]
@@ -268,6 +273,19 @@ pub struct World {
     pub ff_enabled: bool,
     /// Heat state per joint, `(τ/τ_cont)²` low-passed with the actuator's time constant.
     pub heat: BTreeMap<String, f32>,
+    /// Joint dynamics of the last posture change (`hand_core::dynamics`): the
+    /// presets' masses and actuators moving the joints, for the third-person view.
+    pub motion: Option<Motion>,
+    last_posture: Posture,
+}
+
+/// A simulated posture change and when it started.
+#[derive(Clone, Debug)]
+pub struct Motion {
+    pub rollout: Rollout,
+    pub posture: Posture,
+    pub start_s: f64,
+    pub state: String,
 }
 
 fn wrap_angle(a: f32) -> f32 {
@@ -446,6 +464,8 @@ impl World {
             ff_gains: BTreeMap::new(),
             ff_enabled: true,
             heat: BTreeMap::new(),
+            motion: None,
+            last_posture: Posture::quiet(0.0),
         })
     }
 
@@ -530,6 +550,25 @@ impl World {
     pub fn accel_time_s(&self) -> f32 {
         let l = self.limits();
         (l.max_speed_mps / l.accel_limit_mps2.max(0.05)).max(ACCEL_TIME_S)
+    }
+
+    /// The drive planner's start (`dir > 0`) or stop (`dir < 0`) acceleration on
+    /// `slope_deg` with the current cargo (`Body::planned_accel`).
+    pub fn planned_accel(&self, slope_deg: f32, dir: f32) -> f32 {
+        self.body.planned_accel_within(&self.limits(), slope_deg, self.carried_kg(), dir, ACCEL_TIME_S)
+    }
+
+    /// Distance to stop from cruise speed with the planned deceleration, metres.
+    pub fn braking_distance_m(&self, slope_deg: f32) -> f32 {
+        let v = self.drive_spec().max_speed_mps;
+        v * v / (2.0 * self.planned_accel(slope_deg, -1.0))
+    }
+
+    /// Path left on a move, metres.
+    fn remaining_m(&self, m: &MoveState) -> f32 {
+        let rest: f32 = m.edges.iter().skip(m.idx).map(|e| e.horizontal_m).sum();
+        let done = m.edges.get(m.idx).map_or(0.0, |e| e.horizontal_m * (m.progress_s / e.move_time_s.max(1e-6)).clamp(0.0, 1.0));
+        rest - done
     }
 
     fn ff_for(&self, s: Source) -> FeedForward {
@@ -1051,21 +1090,27 @@ impl World {
                 let slope = if rise >= 0.0 { e.slope_deg } else { -e.slope_deg };
                 let mut p = Posture { slope_deg: slope, ..Posture::quiet(cargo) };
                 let b = bucket(slope, if m.pause_left > 0.0 { e.step_m } else { 0.0 });
+                let mut b_brake = false;
                 if m.pause_left > 0.0 {
                     p.source = Source::StepUp;
                     p.step_m = e.step_m;
                     p.single_support = self.body.legged;
-                } else if m.elapsed_s < self.accel_time_s() {
-                    // The controller ramps up no harder than its ZMP margin allows.
+                } else if m.elapsed_s < self.drive_spec().max_speed_mps / self.planned_accel(slope, 1.0) {
+                    // The planner starts no harder than the ZMP's room toward the back edge allows on this slope.
                     p.source = Source::Accel;
-                    p.accel_mps2 = self.drive_spec().max_speed_mps / self.accel_time_s();
+                    p.accel_mps2 = self.planned_accel(slope, 1.0);
+                } else if self.remaining_m(m) < self.braking_distance_m(slope) {
+                    // The last stretch of a move is the stop, planned against the front edge.
+                    p.source = Source::Accel;
+                    p.accel_mps2 = -self.planned_accel(slope, -1.0);
+                    b_brake = true;
                 } else if self.body.legged {
                     p.source = Source::FootLift;
                     p.single_support = true;
                 } else if slope.abs() >= 3.0 {
                     p.source = Source::Slope;
                 }
-                (p, format!("{b}|move"))
+                (p, if b_brake { format!("{b}|brake") } else { format!("{b}|move") })
             }
             Some((_, Active::Work(w))) => match &w.kind {
                 WorkKind::Mine { .. } => (Posture::arm_raise(cargo), "flat|mine".into()),
@@ -1107,13 +1152,36 @@ impl World {
         }
         let key = format!("{}|{state}", post.source.id());
         let changed = self.balance.as_ref().map_or(true, |(k, _)| *k != key);
+        // A new posture: move the joints there with the presets' actuators.
+        let digest = if changed {
+            let roll = dynamics::simulate(&self.body, &self.last_posture, &post, &self.ff_for(post.source), grip, &DynCfg::default());
+            let d = roll.digest();
+            self.motion = Some(Motion { rollout: roll, posture: post, start_s: self.time_s, state: state.clone() });
+            self.last_posture = post;
+            Some(d)
+        } else {
+            None
+        };
         if changed || self.tick.saturating_sub(self.balance_since) >= BALANCE_RESAMPLE_TICKS {
             self.balance_since = self.tick;
             if self.balance_events.len() < 2000 {
-                self.balance_events.push(BalanceEvent { tick: self.tick, time_s: self.time_s, state: state.clone(), report: rep.clone() });
+                self.balance_events.push(BalanceEvent { tick: self.tick, time_s: self.time_s, state: state.clone(), report: rep.clone(), dynamics: digest, posture: post });
             }
         }
         self.balance = Some((key, rep));
+    }
+
+    /// The whole body at this instant, as the joint dynamics move it (base
+    /// frame: x forward, y left, z up from the ground under the robot).
+    pub fn body_pose(&self) -> Option<BodyPose> {
+        match &self.motion {
+            Some(m) => m.rollout.pose_at(&self.body, &m.posture, (self.time_s - m.start_s) as f32),
+            None => {
+                let q = Posture::quiet(self.carried_kg());
+                let r = dynamics::simulate(&self.body, &q, &q, &FeedForward::default(), 1e3, &DynCfg { settle_s: 0.05, ..DynCfg::default() });
+                r.pose_at(&self.body, &q, 0.0)
+            }
+        }
     }
 
     /// Summary of the current balance for the body status.

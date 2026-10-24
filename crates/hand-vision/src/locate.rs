@@ -80,6 +80,11 @@ pub trait SemanticLocator: Send {
     }
     /// One point per label that has a peak, best first.
     fn locate(&mut self, rgb: &Rgb, labels: &[LabelPrompt]) -> Result<Vec<SemanticPoint>>;
+    /// [`SemanticLocator::locate`] for several keyframes, in input order. A
+    /// locator that can batch its image model overrides this.
+    fn locate_batch(&mut self, frames: &[&Rgb], labels: &[LabelPrompt]) -> Result<Vec<Vec<SemanticPoint>>> {
+        frames.iter().map(|f| self.locate(f, labels)).collect()
+    }
 }
 
 /// Turns per-label heat maps on one grid into semantic points. Shared by the
@@ -196,26 +201,46 @@ impl SemanticLocator for SiglipLocator {
     }
 
     fn locate(&mut self, rgb: &Rgb, labels: &[LabelPrompt]) -> Result<Vec<SemanticPoint>> {
-        let dense = self.model.embed_dense(&rgb.to_dynamic())?;
-        let (cols, rows) = (dense.grid_w as u32, dense.grid_h as u32);
-        let mut heats = Vec::new();
+        let mut out = self.locate_batch(&[rgb], labels)?;
+        Ok(out.pop().unwrap_or_default())
+    }
+
+    /// One batched dense pass for all keyframes (`Siglip2::embed_dense_batch`),
+    /// the label text vectors embedded once for the whole batch, then the
+    /// heat maps per keyframe.
+    fn locate_batch(&mut self, frames: &[&Rgb], labels: &[LabelPrompt]) -> Result<Vec<Vec<SemanticPoint>>> {
+        let mut texts: Vec<(String, Vec<f32>, Option<Vec<f32>>)> = Vec::new();
         for l in labels {
             let pos = self.text_vectors(&l.prompts)?;
             let Some(p) = mean_unit(&pos) else { continue };
             let neg = if l.negatives.is_empty() { None } else { mean_unit(&self.text_vectors(&l.negatives)?) };
-            let values = dense
-                .vectors
-                .iter()
-                .map(|v| {
-                    let cp: f32 = v.iter().zip(&p).map(|(a, b)| a * b).sum();
-                    let cn: f32 = neg.as_ref().map(|n| v.iter().zip(n).map(|(a, b)| a * b).sum()).unwrap_or(0.0);
-                    self.model.pair_probability(cp - self.negative_weight * cn.max(0.0))
-                })
-                .collect();
-            let presence = self.model.pair_probability(dense.pooled.iter().zip(&p).map(|(a, b)| a * b).sum());
-            heats.push((l.id.clone(), Heat { cols, rows, values }, presence));
+            texts.push((l.id.clone(), p, neg));
         }
-        Ok(points_with_presence(rgb.width, rgb.height, heats))
+        let images: Vec<image::DynamicImage> = frames.iter().map(|f| f.to_dynamic()).collect();
+        let dense = self.model.embed_dense_batch(&images)?;
+        let dot = |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(x, y)| x * y).sum() };
+        Ok(frames
+            .iter()
+            .zip(&dense)
+            .map(|(rgb, d)| {
+                let (cols, rows) = (d.grid_w as u32, d.grid_h as u32);
+                let heats = texts
+                    .iter()
+                    .map(|(id, p, neg)| {
+                        let values = d
+                            .vectors
+                            .iter()
+                            .map(|v| {
+                                let cn = neg.as_ref().map(|n| dot(v, n)).unwrap_or(0.0);
+                                self.model.pair_probability(dot(v, p) - self.negative_weight * cn.max(0.0))
+                            })
+                            .collect();
+                        (id.clone(), Heat { cols, rows, values }, self.model.pair_probability(dot(&d.pooled, p)))
+                    })
+                    .collect();
+                points_with_presence(rgb.width, rgb.height, heats)
+            })
+            .collect())
     }
 }
 

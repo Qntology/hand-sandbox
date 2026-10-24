@@ -668,19 +668,46 @@ impl TipsDepth {
     /// Metric depth at the keyframe's size. Takes `&self` so one loaded model
     /// can serve several callers.
     pub fn predict(&self, rgb: &Rgb) -> anyhow::Result<DepthMap> {
-        if rgb.width == 0 || rgb.height == 0 {
-            bail!("empty keyframe ({}x{})", rgb.width, rgb.height);
+        let mut out = self.predict_batch(&[rgb])?;
+        Ok(out.pop().expect("one map per frame"))
+    }
+
+    /// [`TipsDepth::predict`] for many keyframes. Frames of one size share the
+    /// input grid and go through the encoder and the DPT head together, as
+    /// many per pass as the device's [`hand_ml::BatchPolicy`] allows for that
+    /// grid. Batch rows never mix (attention is per image, convolutions per
+    /// sample), so every map equals the single-frame one up to float
+    /// rounding. The idle device pool is trimmed afterwards.
+    pub fn predict_batch(&self, frames: &[&Rgb]) -> anyhow::Result<Vec<DepthMap>> {
+        use std::collections::BTreeMap;
+        let mut groups: BTreeMap<(u32, u32), Vec<usize>> = BTreeMap::new();
+        for (i, f) in frames.iter().enumerate() {
+            if f.width == 0 || f.height == 0 {
+                bail!("empty keyframe ({}x{})", f.width, f.height);
+            }
+            groups.entry((f.width, f.height)).or_default().push(i);
         }
-        let (cols, rows) = self.input_grid.grid_for(rgb.width, rgb.height);
+        let policy = hand_ml::BatchPolicy::for_device(&self.device);
         let p = self.cfg.patch_size;
-        let pixels = model_input(rgb, (cols * p) as u32, (rows * p) as u32, &self.device)?;
-        let taps = self.encoder.taps(&pixels)?;
-        let depth = self.head.forward(&taps)?.upsample_bilinear2d(rgb.height as usize, rgb.width as usize, false)?;
-        let mut map = DepthMap { width: rgb.width, height: rgb.height, kind: DepthKind::Metric, data: depth.flatten_all()?.to_vec1()? };
-        // The expectation cannot leave the bin range; this only removes float
-        // rounding past the last centre.
-        clamp_metric(&mut map, self.cfg.max_depth);
-        Ok(map)
+        let mut out: Vec<Option<DepthMap>> = (0..frames.len()).map(|_| None).collect();
+        for (&(w, h), idx) in &groups {
+            let (cols, rows) = self.input_grid.grid_for(w, h);
+            for chunk in idx.chunks(policy.image_rows(cols * rows)) {
+                let inputs = chunk.iter().map(|&i| model_input(frames[i], (cols * p) as u32, (rows * p) as u32, &self.device)).collect::<anyhow::Result<Vec<_>>>()?;
+                let pixels = Tensor::cat(&inputs, 0)?;
+                let taps = self.encoder.taps(&pixels)?;
+                let depth = self.head.forward(&taps)?.upsample_bilinear2d(h as usize, w as usize, false)?;
+                for (k, &i) in chunk.iter().enumerate() {
+                    let mut map = DepthMap { width: w, height: h, kind: DepthKind::Metric, data: depth.get(k)?.flatten_all()?.to_vec1()? };
+                    // The expectation cannot leave the bin range; this only removes float
+                    // rounding past the last centre.
+                    clamp_metric(&mut map, self.cfg.max_depth);
+                    out[i] = Some(map);
+                }
+            }
+        }
+        hand_ml::trim_idle_pool(&self.device);
+        Ok(out.into_iter().map(|m| m.expect("every frame is in one group")).collect())
     }
 }
 
@@ -720,6 +747,10 @@ impl DepthModel for TipsDepth {
 
     fn infer(&mut self, rgb: &Rgb) -> anyhow::Result<DepthMap> {
         self.predict(rgb)
+    }
+
+    fn infer_batch(&mut self, frames: &[&Rgb]) -> anyhow::Result<Vec<DepthMap>> {
+        self.predict_batch(frames)
     }
 }
 

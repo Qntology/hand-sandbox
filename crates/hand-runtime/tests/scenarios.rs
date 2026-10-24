@@ -61,6 +61,14 @@ fn a_typed_korean_command_is_carried_out_to_the_warehouse() {
     assert!(q.steps.iter().all(|s| s.state == State::Done && s.progress == 1.0));
     let kinds: Vec<StepKind> = q.steps.iter().map(|s| s.kind).collect();
     assert_eq!(kinds.last(), Some(&StepKind::Deliver));
+    // The quest itself produced composite N:N states (carrying while braking at
+    // the end of each move), scored with the research weights as they happened.
+    let nn = rt.api_call("nn_status", &serde_json::Value::Null).unwrap();
+    let scen = nn["scenarios"].as_array().unwrap();
+    assert!(scen.iter().any(|s| s["scenario"] == "S4"), "carry + brake was scored: {nn}");
+    for s in scen {
+        println!("[NN-SUM] quest 원목 2개 · {} {} 점수 {} · 위상 {} · 사건 {} · 게이트 {} · 최소 여유 {:.2} · 최대 피크 {:.0}%", s["scenario"], s["name_ko"], s["score"], s["phases_seen"], s["events"], s["gated"], s["min_margin"].as_f64().unwrap_or(f64::NAN), s["peak_ratio"].as_f64().unwrap_or(0.0) * 100.0);
+    }
 }
 
 #[test]

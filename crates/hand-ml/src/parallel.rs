@@ -118,7 +118,7 @@ impl ImageEmbedder for Siglip2 {
     }
 
     fn embed_images_batch(&self, images: &[DynamicImage]) -> Result<Vec<Vec<f32>>> {
-        self.embed_images(images, 16)
+        self.embed_images(images, 0)
     }
 }
 

@@ -156,6 +156,8 @@ pub struct FrameOut {
     pub lossless: bool,
     pub tick: u64,
     pub detections: Vec<Detection>,
+    /// Joint markers, CoM, ZMP and support of the third-person view (pixels).
+    pub overlay: Option<Value>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,6 +166,9 @@ pub enum FrameView {
     Agent,
     /// A top-down map of the surroundings.
     Top,
+    /// Third person: a chase camera `orbit_deg` around the robot, with its
+    /// links and joints as the joint dynamics move them.
+    Chase { orbit_deg: i16 },
 }
 
 struct WorldLabels<'a>(&'a World);
@@ -197,6 +202,8 @@ fn new_world(cfg: &RuntimeConfig) -> Result<World> {
 
 pub struct Runtime {
     pub cfg: RuntimeConfig,
+    /// Composite N:N phases scored as the quests produce them.
+    pub(crate) nn_live: crate::nnlive::NnLive,
     pub(crate) world: World,
     pub(crate) cam: Camera,
     parser: Parser,
@@ -259,6 +266,7 @@ impl Runtime {
             last_scan: None,
             scan_seq: 0,
             last_device: String::new(),
+            nn_live: crate::nnlive::NnLive::default(),
             eval: EvalCounters::default(),
             last_flush_tick: 0,
             focus: None,
@@ -413,8 +421,32 @@ impl Runtime {
         let m = hand_vision::TipsDepth::load(dir, device)?;
         self.ml.depth = crate::ml::DepthEngine::Model(Box::new(m));
         let ms = t0.elapsed().as_secs_f32() * 1000.0;
-        self.log("embed", Level::Info, format!("TIPSv2 DPT 깊이 모델 로드 ({ms:.0} ms) · {}", dir.display()), None);
+        self.log("embed", Level::Info, format!("TIPSv2 DPT 깊이 모델 로드 ({ms:.0} ms) · {} · {}", hand_ml::device_label(device), dir.display()), None);
         Ok(())
+    }
+
+    /// Loads SAM (MobileSAM or ViT-B, whichever file `dir` has) as the mask
+    /// tracker. Without weights the region-growing tracker stays.
+    pub fn use_sam(&mut self, dir: &Path, device: &candle_core::Device) -> Result<()> {
+        let t0 = Instant::now();
+        let m = hand_vision::SamModel::load(dir, device)?;
+        let mode = m.variant().mode();
+        self.ml.tracker = Box::new(hand_vision::SamTracker::new(Arc::new(m)));
+        let ms = t0.elapsed().as_secs_f32() * 1000.0;
+        self.log("embed", Level::Info, format!("{mode} 마스크 모델 로드 ({ms:.0} ms) · {} · {}", hand_ml::device_label(device), dir.display()), None);
+        Ok(())
+    }
+
+    /// Back to the depth stand-in (no TIPS weights in use).
+    pub fn use_depth_stand_in(&mut self) {
+        self.ml.depth = crate::ml::DepthEngine::StandIn(crate::ml::DepthStandIn::new(self.cfg.seed));
+        self.log("embed", Level::Info, "깊이: 대역 모델(stand-in)", None);
+    }
+
+    /// Back to the region-growing mask tracker.
+    pub fn use_region_tracker(&mut self) {
+        self.ml.tracker = Box::new(hand_vision::RegionTracker::default());
+        self.log("embed", Level::Info, "마스크 추적: 영역 확장(region-grow)", None);
     }
 
     // ----- configuration -----
@@ -756,6 +788,7 @@ impl Runtime {
     /// camera. The boxes are fractions of the frame, so any size fits them.
     /// The top view is square and uses `height` for its side.
     pub fn frame_sized(&mut self, view: FrameView, width: u32, height: u32, quality: f32) -> Result<FrameOut> {
+        let mut overlay = None;
         let (frame, detections) = match view {
             FrameView::Agent => {
                 let cam = Camera { width: width.clamp(32, 2048) as usize, height: height.clamp(32, 2048) as usize, ..self.cam };
@@ -784,6 +817,12 @@ impl Runtime {
                 (f, det)
             }
             FrameView::Top => (self.world.render_top(height.clamp(32, 2048) as usize, 24.0), Vec::new()),
+            FrameView::Chase { orbit_deg } => {
+                let cam = Camera { width: width.clamp(32, 2048) as usize, height: height.clamp(32, 2048) as usize, fov_deg: 64.0, max_dist_m: 30.0, ..self.cam };
+                let (f, o) = crate::chase::render(&self.world, &cam, orbit_deg as f32);
+                overlay = o;
+                (f, Vec::new())
+            }
         };
         let enc = encode_webp(&frame.rgb, frame.width as u32, frame.height as u32, quality).map_err(|e| anyhow!("WebP 인코딩 실패: {e}"))?;
         Ok(FrameOut {
@@ -794,6 +833,7 @@ impl Runtime {
             lossless: enc.lossless,
             tick: frame.tick,
             detections,
+            overlay,
             webp: enc.bytes,
         })
     }

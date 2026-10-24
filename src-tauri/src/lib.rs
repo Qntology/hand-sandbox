@@ -40,7 +40,15 @@ pub fn run() {
             sim::rt_call,
             sim::test_db_mirror,
             sim::tips_use,
+            sim::sam_use,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running the logistics hand simulator");
+        .build(tauri::generate_context!())
+        .expect("error while building the logistics hand simulator")
+        .run(|_app, event| {
+            if let tauri::RunEvent::Exit = event {
+                // A Windows process that used ROCm ends here without the DLL unload
+                // that can hang in rocBLAS (no-op for every other build and device).
+                hand_ml::device::rocm_exit_now_if_used(0);
+            }
+        });
 }

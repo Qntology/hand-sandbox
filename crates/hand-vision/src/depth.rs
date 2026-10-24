@@ -30,6 +30,11 @@ pub trait DepthModel: Send {
         None
     }
     fn infer(&mut self, rgb: &Rgb) -> Result<DepthMap>;
+    /// Depth of several keyframes, in input order. A model that can batch
+    /// overrides this; each map must be the one [`DepthModel::infer`] gives.
+    fn infer_batch(&mut self, frames: &[&Rgb]) -> Result<Vec<DepthMap>> {
+        frames.iter().map(|f| self.infer(f)).collect()
+    }
 }
 
 /// Standard monocular depth errors over pixels where both maps are finite and

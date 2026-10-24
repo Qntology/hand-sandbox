@@ -33,7 +33,7 @@ pub const MIN_CELLS: usize = 32;
 pub const MAX_CELLS: usize = 160;
 
 /// Names of the commands [`Runtime::api_call`] answers.
-pub const COMMANDS: [&str; 22] = [
+pub const COMMANDS: [&str; 26] = [
     "world_new",
     "sim_step",
     "world_frame",
@@ -56,6 +56,10 @@ pub const COMMANDS: [&str; 22] = [
     "body_plan_eval",
     "body_plan_set",
     "world_body",
+    "tips_use",
+    "sam_use",
+    "devices",
+    "nn_status",
 ];
 
 /// How many steps ahead the time-series tab forecasts.
@@ -306,6 +310,17 @@ fn text<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(Value::as_str)
 }
 
+/// The `devices` answer of a host without device state: every backend this
+/// build has, and the start-up choice with its reason.
+pub fn device_json(sel: &hand_ml::Selection) -> Value {
+    json!({
+        "backends": hand_ml::probe_backends(),
+        "selected": sel.backend.name(),
+        "ordinal": sel.ordinal,
+        "reason": sel.reason,
+    })
+}
+
 impl Runtime {
     /// The integrated test drives the world itself; stepping it or adding
     /// quests from outside would mix into the recording.
@@ -358,6 +373,7 @@ impl Runtime {
     pub fn api_world_frame(&mut self, width: u32, height: u32, quality: f32, view: &str) -> Result<Value, String> {
         let view = match view {
             "top" => FrameView::Top,
+            v if v.starts_with("chase") => FrameView::Chase { orbit_deg: v.split_once(':').and_then(|(_, o)| o.parse::<f32>().ok()).unwrap_or(0.0).clamp(-180.0, 180.0) as i16 },
             _ => FrameView::Agent,
         };
         let f = self.frame_sized(view, width, height, quality).map_err(|e| e.to_string())?;
@@ -377,6 +393,7 @@ impl Runtime {
             "width": f.width, "height": f.height, "bytes": f.bytes,
             "encode_ms": r3(f.encode_ms), "lossless": f.lossless, "tick": f.tick,
             "detections": dets,
+            "overlay": f.overlay,
         }))
     }
 
@@ -485,6 +502,37 @@ impl Runtime {
     // ----- by name -----
 
     /// Answers a command by name with the JSON arguments the UI sends (camelCase keys).
+    /// `tips_use` and `sam_use` for a host without its own device state (the
+    /// development server): the device is the start-up choice
+    /// ([`hand_ml::preferred`]: `HAND_DEVICE`, else the first GPU that opens),
+    /// the folder `dir`, else the model's environment variable, else
+    /// `models/...` under the working directory. `enabled: false` goes back to
+    /// the stand-in. The Tauri app has its own commands that use the device
+    /// picked in the UI.
+    pub fn api_model_use(&mut self, which: &str, args: &Value) -> Result<Value, String> {
+        let enabled = args.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+        let sel = hand_ml::preferred();
+        let folder = |env: &str, default: &str| -> std::path::PathBuf {
+            text(args, "dir").map(std::path::PathBuf::from).or_else(|| std::env::var(env).ok().map(std::path::PathBuf::from)).unwrap_or_else(|| std::path::PathBuf::from(default))
+        };
+        match (which, enabled) {
+            ("tips", false) => self.use_depth_stand_in(),
+            ("sam", false) => self.use_region_tracker(),
+            (w, true) => {
+                let device = sel.backend.device(sel.ordinal).map_err(|e| format!("{} 장치를 열 수 없습니다: {e:#}", sel.backend.name()))?;
+                if w == "tips" {
+                    self.use_tips(&folder(hand_vision::tips::DIR_ENV, hand_vision::tips::DEFAULT_DIR), &device).map_err(|e| format!("{e:#}"))?;
+                } else {
+                    self.use_sam(&folder(hand_vision::sam::DIR_ENV, hand_vision::sam::DEFAULT_DIR), &device).map_err(|e| format!("{e:#}"))?;
+                }
+            }
+            _ => {}
+        }
+        let mut v = self.api_models_status()?;
+        v["device"] = device_json(&sel);
+        Ok(v)
+    }
+
     /// Which recogniser and which time-series model are in use right now. The
     /// host (Tauri) adds the model folders and whether their files exist.
     pub fn api_models_status(&self) -> Result<Value, String> {
@@ -494,6 +542,8 @@ impl Runtime {
             "embedding": mode != "oracle",
             "ttm": self.has_ttm(),
             "parser_embedding": self.has_embedder(),
+            "devices": {"depth": self.ml.depth_device(), "locate": self.ml.locate_device(), "track": self.ml.tracker.device()},
+            "ml": {"depth": self.ml.depth_mode(), "locate": self.ml.locate_mode(), "track": self.ml.track_mode()},
         }))
     }
 
@@ -530,6 +580,10 @@ impl Runtime {
             "sds_status" => self.api_sds_status(),
             "ts_forecast" => self.api_ts_forecast(text(args, "scope").unwrap_or(""), text(args, "axis").unwrap_or("")),
             "models_status" => self.api_models_status(),
+            "tips_use" => self.api_model_use("tips", args),
+            "sam_use" => self.api_model_use("sam", args),
+            "devices" => Ok(device_json(&hand_ml::preferred())),
+            "nn_status" => Ok(json!({"scenarios": self.nn_live.summary(), "phases": self.nn_live.phases().collect::<Vec<_>>()})),
             "log_tail" => self.api_log_tail(num(args, "afterSeq").unwrap_or(0.0).max(0.0) as u64, num(args, "limit").unwrap_or(200.0) as usize, text(args, "category")),
             other => Err(format!("unknown command {other}")),
         }
