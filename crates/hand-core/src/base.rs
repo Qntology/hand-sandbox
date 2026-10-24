@@ -42,6 +42,7 @@ impl BaseKind {
                 footprint_m: 0.30,
                 drive_accel_mps2: None,
                 mass_kg: None,
+                walk_com_z_m: None,
             },
             BaseKind::Mecanum => BaseSpec {
                 kind: self,
@@ -53,6 +54,7 @@ impl BaseKind {
                 footprint_m: 0.30,
                 drive_accel_mps2: None,
                 mass_kg: None,
+                walk_com_z_m: None,
             },
             BaseKind::Track => BaseSpec {
                 kind: self,
@@ -64,6 +66,7 @@ impl BaseKind {
                 footprint_m: 0.36,
                 drive_accel_mps2: None,
                 mass_kg: None,
+                walk_com_z_m: None,
             },
             BaseKind::HumanFoot => BaseSpec {
                 kind: self,
@@ -75,6 +78,7 @@ impl BaseKind {
                 footprint_m: 0.25,
                 drive_accel_mps2: None,
                 mass_kg: None,
+                walk_com_z_m: None,
             },
         }
     }
@@ -103,6 +107,10 @@ pub struct BaseSpec {
     /// whose wheels then cost what they cost on firm ground).
     #[serde(default)]
     pub mass_kg: Option<f32>,
+    /// CoM height while walking, metres (set from the body for legs; `None`:
+    /// the gait is not known and the ground does not change the speed).
+    #[serde(default)]
+    pub walk_com_z_m: Option<f32>,
 }
 
 /// One piece of a route for the drive model.

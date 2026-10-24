@@ -15,14 +15,18 @@ use std::collections::{BTreeMap, HashSet};
 
 use hand_core::balance::{BalanceReport, Body, DriveLimits, FeedForward, Posture, Source, GRIP_SAFETY};
 use hand_core::dynamics::{self, BodyPose, DynCfg, DynDigest, Rollout};
-use hand_core::{compute_body, grasp, BalanceSummary, BodyInputs, BodyLimits, BodyPlan, BodyStatus, ConfigError, GraspSetup, Hand, HandConfig, Payload};
+use hand_core::{compute_body, BalanceSummary, BodyInputs, BodyLimits, BodyPlan, BodyStatus, ConfigError, Hand, HandConfig};
 use serde::{Deserialize, Serialize};
 
 use crate::kinds::{Ground, ItemKind, NodeKind, MIN_PIECE};
 use crate::nav::{self, Cell, EdgePlan, Goal};
+use crate::render;
 use crate::rng::Rng;
 use crate::snapshot::*;
 use crate::terrain::{cell_center, FlatZone, RuggedLayout, Terrain, TerrainKind, CELL_M};
+
+mod acts;
+pub use acts::{material_of, ActPlay, PushState, WalkState, GET_UP_S, PUSH_START_SLACK_M};
 
 /// Length of one simulation tick, seconds.
 pub const TICK_S: f32 = 0.1;
@@ -42,8 +46,6 @@ pub const DELIVER_TIME_S: f32 = 1.0;
 pub const MANIPULATION_POWER_W: f64 = 30.0;
 /// Turning speed, radians per second (assumption).
 pub const TURN_RATE_RAD_S: f32 = 2.5;
-/// Friction between finger pads and every item (assumption).
-pub const ITEM_FRICTION: f32 = 0.6;
 /// Heading error above which a non-holonomic base turns in place, radians.
 const TURN_IN_PLACE_RAD: f32 = 0.6;
 /// Heading error at which the in-place turn stops, radians.
@@ -183,6 +185,10 @@ pub enum Action {
     /// Break a divisible piece lying on the ground: a new piece with
     /// `portion` of it appears beside it, the rest stays.
     Split { drop: u32, portion: f32 },
+    /// Push an item lying on the ground with the bumper (wheeled and tracked
+    /// bases) to within reach of a point; the robot must stand lined up behind
+    /// it (`World::push_route`).
+    Push { drop: u32, x: f32, z: f32 },
 }
 
 impl Action {
@@ -203,6 +209,7 @@ impl Action {
                 (None, _) => "drop(all)".to_string(),
             },
             Action::Split { drop, portion } => format!("split({},{portion:.2})", drop_id(*drop)),
+            Action::Push { drop, x, z } => format!("push({}→{x:.1},{z:.1})", drop_id(*drop)),
         }
     }
 }
@@ -236,6 +243,12 @@ pub enum ActionError {
     NotDivisible,
     /// The piece, or what would be left of it, is below [`MIN_PIECE`].
     PieceTooSmall { amount: f32 },
+    /// The body cannot bring its palm down to the item (`hand_core::act::reach`).
+    CannotReach { lowest_m: f32, need_m: f32, reason: String },
+    /// This base cannot push (legs), or the item cannot be pushed there.
+    CannotPush { reason: String },
+    /// The robot lies on the ground after a fall and is getting up.
+    Fallen,
 }
 
 impl ActionError {
@@ -253,6 +266,9 @@ impl ActionError {
             ActionError::NothingToDrop => "nothing_to_drop",
             ActionError::NotDivisible => "not_divisible",
             ActionError::PieceTooSmall { .. } => "piece_too_small",
+            ActionError::CannotReach { .. } => "reach_ground",
+            ActionError::CannotPush { .. } => "push_impossible",
+            ActionError::Fallen => "fallen",
         }
     }
 }
@@ -272,6 +288,9 @@ pub enum WorldEvent {
     /// A piece broken off `drop`: the new piece `piece` holds `amount` items.
     ItemSplit { drop: String, piece: String, item: ItemKind, amount: f32, left: f32 },
     BatteryDepleted,
+    /// A moment of an action's physics (`hand_core::act`): a contact, a lift-off,
+    /// a slip, an impact, a heel strike, a fall. `parts` are the focus views it concerns.
+    Act { act: String, kind: String, label: String, ok: bool, value: Option<f32>, parts: Vec<String> },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -314,6 +333,7 @@ enum Active {
     Move(MoveState),
     Turn { target: f32 },
     Work(WorkState),
+    Push(PushState),
 }
 
 pub struct World {
@@ -350,6 +370,15 @@ pub struct World {
     last_posture: Posture,
     /// Where the rugged features went (`None` on the open map).
     pub layout: Option<RuggedLayout>,
+    /// The action being played out (`hand_core::act`), and the last one, kept for the focus views.
+    pub act: Option<ActPlay>,
+    pub last_act: Option<ActPlay>,
+    /// The actions' own draws (friction, aim, slips), apart from the world's stream.
+    act_rng: Rng,
+    /// The robot lies on the ground after a fall until this time.
+    pub fallen_until: Option<f64>,
+    /// A legged robot's steps along the current move.
+    pub walk: WalkState,
 }
 
 impl Clone for World {
@@ -382,6 +411,11 @@ impl Clone for World {
             motion: self.motion.clone(),
             last_posture: self.last_posture,
             layout: self.layout.clone(),
+            act: self.act.clone(),
+            last_act: self.last_act.clone(),
+            act_rng: self.act_rng.clone(),
+            fallen_until: self.fallen_until,
+            walk: self.walk.clone(),
         }
     }
 }
@@ -576,28 +610,9 @@ impl World {
             strike_acc: 0.0,
         };
 
-        let grasps = ItemKind::ALL
-            .iter()
-            .map(|&k| {
-                let s = k.spec();
-                let out = grasp(
-                    &hand,
-                    &Payload { name: s.label_en.into(), size_m: s.size_m, mass_kg: s.mass_kg, friction: ITEM_FRICTION },
-                    &GraspSetup::default(),
-                );
-                let r = &out.result;
-                let margin = if r.required_n > 1e-6 { r.friction_capacity_n / r.required_n } else { 99.0 };
-                GraspInfo {
-                    item: k,
-                    stable: r.stable,
-                    margin: margin.min(99.0),
-                    max_payload_kg: r.max_payload_kg,
-                    grasp_type: format!("{:?}", r.grasp_type).to_lowercase(),
-                }
-            })
-            .collect();
+        let grasps = ItemKind::ALL.iter().map(|&k| top_grasp_info(&hand, k, 1.0)).collect();
 
-        let (cfg_body, base_kind, fingers) = (cfg.body, cfg.hand.base, cfg.hand.fingers);
+        let (cfg_body, base_kind, fingers, cfg_seed) = (cfg.body, cfg.hand.base, cfg.hand.fingers, cfg.seed);
         Ok(World {
             cfg,
             hand,
@@ -624,6 +639,11 @@ impl World {
             motion: None,
             last_posture: Posture::quiet(0.0),
             layout,
+            act: None,
+            last_act: None,
+            act_rng: Rng::new(cfg_seed ^ 0x51D3_A6C2_7F10_88E5),
+            fallen_until: None,
+            walk: WalkState::default(),
         })
     }
 
@@ -661,6 +681,7 @@ impl World {
         self.balance = None;
         self.motion = None;
         self.last_posture = Posture::quiet(self.carried_kg());
+        self.fallen_until = None;
     }
 
     // ----- lookups -----
@@ -713,15 +734,7 @@ impl World {
         if (amount - 1.0).abs() < AMOUNT_EPS {
             return self.grasp_info(item).clone();
         }
-        let s = item.spec();
-        let out = grasp(
-            &self.hand,
-            &Payload { name: s.label_en.into(), size_m: s.piece_size_m(amount), mass_kg: s.mass_kg * amount, friction: ITEM_FRICTION },
-            &GraspSetup::default(),
-        );
-        let r = &out.result;
-        let margin = if r.required_n > 1e-6 { r.friction_capacity_n / r.required_n } else { 99.0 };
-        GraspInfo { item, stable: r.stable, margin: margin.min(99.0), max_payload_kg: r.max_payload_kg, grasp_type: format!("{:?}", r.grasp_type).to_lowercase() }
+        top_grasp_info(&self.hand, item, amount)
     }
 
     /// Friction capacity of one hand for a piece, newtons.
@@ -790,6 +803,7 @@ impl World {
             power_w: self.hand.base.power_w * l.power_scale,
             drive_accel_mps2: (!self.body.legged).then(|| self.body.chassis.drive_force_n / mass),
             mass_kg: Some(mass),
+            walk_com_z_m: self.body.legged.then(|| hand_core::act::gait::walking_com_z(&self.body)),
             ..self.hand.base
         }
     }
@@ -915,6 +929,9 @@ impl World {
         if self.battery_depleted() {
             return Err(ActionError::BatteryDepleted);
         }
+        if self.fallen_until.is_some_and(|t| self.time_s < t) {
+            return Err(ActionError::Fallen);
+        }
         let state = match &action {
             Action::MoveTo { x, z, reach_m } => {
                 let goal = if *reach_m <= 0.0 {
@@ -943,7 +960,8 @@ impl World {
                 self.check_reach(dx, dz, PICKUP_REACH_M)?;
                 let info = self.grasp_for(kind, amount);
                 self.agent.grip_margin = Some(info.margin);
-                if !info.stable {
+                // From above, the fingers' friction alone carries it: one hand, or both sharing it.
+                if !info.stable && 2.0 * info.margin < 1.0 {
                     return Err(ActionError::GraspUnstable { margin: info.margin });
                 }
                 let item_kg = kind.spec().mass_kg * amount;
@@ -955,11 +973,16 @@ impl World {
                     });
                 }
                 // Can the arms lift it, and does the robot stay balanced while they do?
-                let (rep, two_arms) = self.body.lift(item_kg, self.carried_kg(), &self.ff_for(Source::ArmLift), self.grip_capacity_for(kind, amount));
+                let (rep, mut two_arms) = self.body.lift(item_kg, self.carried_kg(), &self.ff_for(Source::ArmLift), self.grip_capacity_for(kind, amount));
                 if !rep.feasible {
                     return Err(ActionError::LiftOverload { limiting: rep.limiting.clone().unwrap_or_default(), margin: rep.margin });
                 }
-                let t = if two_arms { PICKUP_TIME_S * TWO_ARM_LIFT_FACTOR } else { PICKUP_TIME_S };
+                // A grip one hand cannot hold with its safety factor takes both hands.
+                if !info.stable {
+                    two_arms = true;
+                }
+                // Bend down, close, lift, stow: the action's own time series (`hand_core::act::grasp`).
+                let t = self.start_grasp(*drop, two_arms)?;
                 Active::Work(WorkState { kind: WorkKind::Pick { drop: *drop, two_arms }, remaining_s: t })
             }
             Action::Drop { item, amount } => {
@@ -967,7 +990,10 @@ impl World {
                 if have <= AMOUNT_EPS || amount.is_some_and(|a| a <= AMOUNT_EPS) {
                     return Err(ActionError::NothingToDrop);
                 }
-                Active::Work(WorkState { kind: WorkKind::Drop { item: *item, amount: *amount, waypoint: self.waypoint_in_reach() }, remaining_s: DROP_TIME_S })
+                let waypoint = self.waypoint_in_reach();
+                let pieces = self.pieces_to_set_down(*item, *amount);
+                let t = self.start_release(&pieces, waypoint);
+                Active::Work(WorkState { kind: WorkKind::Drop { item: *item, amount: *amount, waypoint }, remaining_s: t })
             }
             Action::Split { drop, portion } => {
                 let (dx, dz, kind, amount) = {
@@ -991,8 +1017,11 @@ impl World {
                 if !any {
                     return Err(ActionError::NothingToDeliver);
                 }
-                Active::Work(WorkState { kind: WorkKind::Deliver { waypoint: *waypoint, item: *item }, remaining_s: DELIVER_TIME_S })
+                let pieces = self.pieces_to_set_down(*item, None);
+                let t = self.start_release(&pieces, Some(*waypoint));
+                Active::Work(WorkState { kind: WorkKind::Deliver { waypoint: *waypoint, item: *item }, remaining_s: t })
             }
+            Action::Push { drop, x, z } => Active::Push(self.start_push(*drop, *x, *z)?),
         };
         let label = action.label();
         self.active = Some((action, state));
@@ -1001,6 +1030,7 @@ impl World {
 
     /// Stops the current action.
     pub fn cancel(&mut self) -> Vec<TimedEvent> {
+        self.end_act();
         match self.active.take() {
             Some((a, _)) => {
                 self.agent.speed_mps = 0.0;
@@ -1094,6 +1124,9 @@ impl World {
             Active::Work(w) => {
                 used = self.advance_work(w, remaining, events, &mut done);
             }
+            Active::Push(ps) => {
+                used = self.advance_push(ps, remaining, events, &mut done);
+            }
         }
         self.active = Some((action, state));
         if let Some((ok, reason)) = done {
@@ -1149,9 +1182,15 @@ impl World {
         m.elapsed_s += t;
         self.rotate_toward(heading, t);
         let f = (m.progress_s / e.move_time_s).clamp(0.0, 1.0);
+        let (px, pz) = (self.agent.x, self.agent.z);
         self.agent.x = fx + (tx - fx) * f;
         self.agent.z = fz + (tz - fz) * f;
         self.agent.speed_mps = e.horizontal_m / e.move_time_s;
+        // Legs: every step that comes down can slip; a slip the robot cannot catch is a fall.
+        if let Some(why) = self.walk_steps((self.agent.x - px).hypot(self.agent.z - pz), &e, events) {
+            *done = Some((false, Some(format!("fall: {why}"))));
+            return t;
+        }
         // The ground being entered: rolling resistance or the walking terrain factor.
         self.add_energy(power * e.energy_factor as f64 * t as f64);
         if m.progress_s >= e.move_time_s - 1e-6 {
@@ -1214,6 +1253,7 @@ impl World {
 
         let t = w.remaining_s.min(remaining);
         self.add_energy(MANIPULATION_POWER_W * t as f64);
+        self.act_advance(t, events);
         match w.kind.clone() {
             WorkKind::Mine { node } => {
                 let rate = self.mining_rate();
@@ -1236,13 +1276,25 @@ impl World {
             WorkKind::Pick { drop, .. } => {
                 w.remaining_s -= t;
                 if w.remaining_s <= 1e-6 {
-                    self.complete_pick(drop, events);
-                    *done = Some((true, None));
+                    let play = self.end_act();
+                    match play.as_ref().map(|p| (p.rollout.outcome.ok, p.rollout.outcome.code)) {
+                        Some((false, code)) => {
+                            if let Some(p) = &play {
+                                self.grasp_failed(drop, p);
+                            }
+                            *done = Some((false, Some(code.unwrap_or("grasp_failed").to_string())));
+                        }
+                        _ => {
+                            self.complete_pick(drop, events);
+                            *done = Some((true, None));
+                        }
+                    }
                 }
             }
             WorkKind::Deliver { waypoint, item } => {
                 w.remaining_s -= t;
                 if w.remaining_s <= 1e-6 {
+                    self.end_act();
                     self.complete_deliver(waypoint, item, events);
                     *done = Some((true, None));
                 }
@@ -1250,7 +1302,8 @@ impl World {
             WorkKind::Drop { item, amount, waypoint } => {
                 w.remaining_s -= t;
                 if w.remaining_s <= 1e-6 {
-                    self.complete_drop(item, amount, waypoint, events);
+                    let play = self.end_act();
+                    self.complete_drop(item, amount, waypoint, play.as_ref(), events);
                     *done = Some((true, None));
                 }
             }
@@ -1333,8 +1386,9 @@ impl World {
         taken
     }
 
-    fn complete_drop(&mut self, item: Option<ItemKind>, amount: Option<f32>, waypoint: Option<u32>, events: &mut Vec<TimedEvent>) {
+    fn complete_drop(&mut self, item: Option<ItemKind>, amount: Option<f32>, waypoint: Option<u32>, play: Option<&ActPlay>, events: &mut Vec<TimedEvent>) {
         let taken = self.take_cargo(item, amount);
+        let mut piece_index = 0usize;
         for (k, a) in taken {
             if let Some(wid) = waypoint {
                 if let Some(w) = self.waypoints.iter_mut().find(|w| w.id == wid) {
@@ -1357,7 +1411,13 @@ impl World {
             let mut ids = Vec::new();
             for (j, p) in pieces.iter().enumerate() {
                 let off = (j as f32 - (pieces.len() as f32 - 1.0) * 0.5) * 0.13;
-                let d = DropItem { id: self.next_drop, kind: k, x: bx + sx * off, z: bz + sz * off, amount: *p };
+                // Where the release let it fall, rebound included; the old spread when there was no release.
+                let (lx, lz) = play
+                    .and_then(|pl| self.release_landing(pl, piece_index))
+                    .filter(|&(x, z)| on_land(self, x, z))
+                    .unwrap_or((bx + sx * off, bz + sz * off));
+                piece_index += 1;
+                let d = DropItem { id: self.next_drop, kind: k, x: lx, z: lz, amount: *p };
                 self.next_drop += 1;
                 ids.push(drop_id(d.id));
                 self.drops.push(d);
@@ -1517,6 +1577,7 @@ impl World {
                 }
                 WorkKind::Split { .. } => (Posture::arm_raise(cargo), "flat|split".into()),
             },
+            Some((_, Active::Push(_))) => (Posture { moving: true, ..Posture::quiet(cargo) }, "flat|push".into()),
             _ => (Posture::quiet(cargo), "flat|idle".into()),
         }
     }
@@ -1563,6 +1624,9 @@ impl World {
     /// The whole body at this instant, as the joint dynamics move it (base
     /// frame: x forward, y left, z up from the ground under the robot).
     pub fn body_pose(&self) -> Option<BodyPose> {
+        if let Some(p) = self.act_body_pose() {
+            return Some(p);
+        }
         match &self.motion {
             Some(m) => m.rollout.pose_at(&self.body, &m.posture, (self.time_s - m.start_s) as f32),
             None => {
@@ -1671,6 +1735,37 @@ impl World {
     pub fn body_status(&self, vision_confidence: Option<f32>, frame_ms: Option<f32>) -> BodyStatus {
         compute_body(&self.body_inputs(vision_confidence, frame_ms))
     }
+
+    /// The pieces a set-down takes out of the bay, in the order the hand takes them.
+    fn pieces_to_set_down(&self, item: Option<ItemKind>, amount: Option<f32>) -> Vec<(ItemKind, f32)> {
+        let mut left = amount.unwrap_or(f32::INFINITY);
+        let mut out = Vec::new();
+        for (k, n) in &self.agent.carried {
+            if !item.map_or(true, |i| i == *k) {
+                continue;
+            }
+            let mut rest = n.min(left);
+            left -= rest;
+            while rest > AMOUNT_EPS {
+                out.push((*k, rest.min(1.0)));
+                rest -= 1.0;
+            }
+        }
+        out
+    }
+}
+
+/// The grasp table entry of a hand for a piece lifted off the ground from above:
+/// the fingers' squeeze times the friction the controller believes, over the
+/// weight with the safety factor (`hand_core::act::grasp::top_grasp_ok`).
+fn top_grasp_info(hand: &Hand, item: ItemKind, amount: f32) -> GraspInfo {
+    let s = item.spec();
+    let mass = s.mass_kg * amount;
+    let mu = hand_core::act::material::pad_on(material_of(item)).mean;
+    let cap = hand_core::act::grasp::capacity(hand, s.piece_size_m(amount), mass, mu);
+    let need = mass * hand_core::balance::G * GRIP_SAFETY;
+    let margin = if need > 1e-6 { mu * cap.squeeze_n / need } else { 99.0 };
+    GraspInfo { item, stable: cap.contacts >= 2 && margin >= 1.0, margin: margin.min(99.0), max_payload_kg: mu * cap.squeeze_n / (hand_core::balance::G * GRIP_SAFETY), grasp_type: cap.grasp_type }
 }
 
 #[cfg(test)]
@@ -1815,23 +1910,28 @@ mod tests {
     }
 
     #[test]
-    fn five_finger_track_carries_a_log_to_the_warehouse() {
-        let mut w = world(FingerCount::Five, BaseKind::Track);
+    fn five_finger_legs_carry_a_log_to_the_warehouse() {
+        // Legs: the body bends to the ground (a wheeled or tracked mid body cannot).
+        let mut w = world(FingerCount::Five, BaseKind::HumanFoot);
         let ev = mine_nearest(&mut w, NodeKind::Tree);
         assert!(ev.iter().any(|e| matches!(e.event, WorldEvent::NodeBroken { .. })));
         let drop = w.drops[0].clone();
         w.command(Action::MoveTo { x: drop.x, z: drop.z, reach_m: 0.5 }).unwrap();
         run(&mut w, 60.0);
         w.command(Action::PickUp { drop: drop.id }).unwrap();
-        let ev = run(&mut w, 10.0);
-        assert!(ev.iter().any(|e| matches!(e.event, WorldEvent::ItemPicked { .. })));
+        let ev = run(&mut w, 20.0);
+        assert!(ev.iter().any(|e| matches!(e.event, WorldEvent::ItemPicked { .. })), "{ev:?}");
         assert_eq!(w.carried_count(ItemKind::Log), 1);
+        // The pick played its physics: the bend, the contact and the lift-off came out as events.
+        for k in ["bend_bottom", "contact", "lift_off", "stowed"] {
+            assert!(ev.iter().any(|e| matches!(&e.event, WorldEvent::Act { kind, .. } if kind == k)), "no {k}");
+        }
         let wh = w.waypoint_by_key("warehouse").unwrap().clone();
         w.command(Action::MoveTo { x: wh.x, z: wh.z, reach_m: 1.0 }).unwrap();
         let ev = run(&mut w, 600.0);
         assert!(ok_done(&ev));
         w.command(Action::Deliver { waypoint: wh.id, item: Some(ItemKind::Log) }).unwrap();
-        run(&mut w, 10.0);
+        run(&mut w, 20.0);
         assert_eq!(w.carried_count(ItemKind::Log), 0);
         let stock = &w.waypoint(wh.id).unwrap().stock;
         assert_eq!(stock, &vec![(ItemKind::Log, 1.0)]);
@@ -1875,9 +1975,10 @@ mod tests {
     fn item_catalogue_spans_what_the_hands_can_hold() {
         // The item sizes and masses are assumptions chosen so that hands of
         // different finger counts give different answers; check they still do.
+        // From above only the fingers' friction holds: one hand, or two sharing the item.
         let holdable = |f: FingerCount| {
             let w = world(f, BaseKind::Track);
-            ItemKind::ALL.into_iter().filter(|&k| w.grasp_info(k).stable).count()
+            ItemKind::ALL.into_iter().filter(|&k| w.grasp_info(k).stable || 2.0 * w.grasp_info(k).margin >= 1.0).count()
         };
         let (two, five) = (holdable(FingerCount::Two), holdable(FingerCount::Five));
         assert!(five >= 3, "a five-finger hand should hold at least three of four items, holds {five}");
@@ -1887,11 +1988,11 @@ mod tests {
 
     #[test]
     fn an_unstable_grasp_blocks_the_pickup() {
-        let mut w = world(FingerCount::Two, BaseKind::Track);
-        // Force the situation: whichever item the hand cannot hold.
+        let mut w = world(FingerCount::Two, BaseKind::HumanFoot);
+        // Force the situation: whichever item even two such hands cannot hold.
         let bad = ItemKind::ALL
             .into_iter()
-            .find(|&k| !w.grasp_info(k).stable)
+            .find(|&k| 2.0 * w.grasp_info(k).margin < 1.0)
             .expect("the two-finger hand cannot hold every item (see item_catalogue_spans_what_the_hands_can_hold)");
         w.drops.push(DropItem::whole(500, bad, w.agent.x + 0.4, w.agent.z));
         match w.command(Action::PickUp { drop: 500 }) {
@@ -1968,21 +2069,27 @@ mod tests {
             w.drops.push(DropItem::whole(600, kind, w.agent.x + 0.4, w.agent.z));
             w.command(Action::PickUp { drop: 600 })
         };
-        let mut budget = world_with(BodyPlan { arm: hand_core::Tier::Budget, ..BodyPlan::default() }, BaseKind::Track);
+        let mut budget = world_with(BodyPlan { arm: hand_core::Tier::Budget, ..BodyPlan::default() }, BaseKind::HumanFoot);
         match place(&mut budget, ItemKind::Log) {
             Err(ActionError::LiftOverload { limiting, .. }) => assert!(limiting.contains("elbow"), "{limiting}"),
             other => panic!("{other:?}"),
         }
-        let mut mid = world_with(BodyPlan::default(), BaseKind::Track);
+        let mut mid = world_with(BodyPlan::default(), BaseKind::HumanFoot);
         assert!(place(&mut mid, ItemKind::Log).is_ok());
-        let ev = run(&mut mid, 10.0);
-        assert!(ev.iter().any(|e| matches!(e.event, WorldEvent::ItemPicked { .. })));
-        // Iron ore needs both mid arms, which takes longer than a one-handed pick.
-        let mut iron = world_with(BodyPlan::default(), BaseKind::Track);
+        let ev = run(&mut mid, 20.0);
+        assert!(ev.iter().any(|e| matches!(e.event, WorldEvent::ItemPicked { .. })), "{ev:?}");
+        // Iron ore (more than mid legs carry): a bend, a squeeze and a lift take seconds, not the old fixed second.
+        let mut iron = world_with(BodyPlan::uniform(hand_core::Tier::Pro), BaseKind::HumanFoot);
         let t0 = iron.time_s;
         place(&mut iron, ItemKind::IronOre).unwrap();
-        run(&mut iron, 10.0);
+        run(&mut iron, 20.0);
         assert!((iron.time_s - t0) as f32 >= PICKUP_TIME_S * TWO_ARM_LIFT_FACTOR - 0.15);
+        // A tracked mid body has no waist pitch: it cannot reach the ground at all.
+        let mut track = world_with(BodyPlan::default(), BaseKind::Track);
+        match place(&mut track, ItemKind::Log) {
+            Err(ActionError::CannotReach { lowest_m, need_m, .. }) => assert!(lowest_m > need_m + 0.3, "{lowest_m} {need_m}"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -2109,7 +2216,7 @@ mod tests {
         add_stock(&mut w.agent.carried, ItemKind::Coal, 1.0);
         // At the base camp: onto its pile.
         w.command(Action::Drop { item: Some(ItemKind::Log), amount: Some(1.0) }).unwrap();
-        let ev = run(&mut w, 5.0);
+        let ev = run(&mut w, 15.0);
         assert!(ev.iter().any(|e| matches!(&e.event, WorldEvent::ItemDropped { waypoint: Some(_), .. })));
         assert_eq!(w.waypoint_by_key("base_camp").unwrap().stock_of(ItemKind::Log), 1.0);
         assert_eq!(w.carried_count(ItemKind::Log), 1);
@@ -2118,17 +2225,19 @@ mod tests {
         w.agent.yaw = 0.0;
         let before = w.drops.len();
         w.command(Action::Drop { item: None, amount: None }).unwrap();
-        let ev = run(&mut w, 5.0);
+        let ev = run(&mut w, 30.0);
         assert!(ev.iter().any(|e| matches!(&e.event, WorldEvent::ItemDropped { waypoint: None, .. })));
         assert_eq!(w.drops.len(), before + 2, "a log and a coal lump");
         assert!(w.agent.carried.is_empty() && w.carried_kg() == 0.0);
         let d = w.drops.last().unwrap();
-        assert!((d.x - w.agent.x).abs() < DROP_AHEAD_M + 0.2 && d.x > w.agent.x, "ahead of the robot");
+        assert!((d.x - w.agent.x).abs() < DROP_AHEAD_M + 0.3 && d.x > w.agent.x, "ahead of the robot: {} vs {}", d.x, w.agent.x);
+        // A tracked body cannot bend: it lets go from hand height and the piece falls the rest.
+        assert!(ev.iter().any(|e| matches!(&e.event, WorldEvent::Act { kind, .. } if kind == "impact")));
     }
 
     #[test]
     fn a_stone_breaks_in_half_and_the_half_is_easier_to_hold() {
-        let mut w = world(FingerCount::Two, BaseKind::Track);
+        let mut w = world(FingerCount::Two, BaseKind::HumanFoot);
         w.agent.yaw = 0.0;
         w.drops.push(DropItem::whole(700, ItemKind::Stone, w.agent.x + 0.4, w.agent.z));
         w.drops.push(DropItem::whole(701, ItemKind::Log, w.agent.x - 0.4, w.agent.z));
@@ -2149,7 +2258,7 @@ mod tests {
         assert!((w.drop_item(700).unwrap().mass_kg() - 1.3).abs() < 1e-4);
         if half.stable {
             w.command(Action::PickUp { drop: piece }).unwrap();
-            run(&mut w, 10.0);
+            run(&mut w, 20.0);
             assert!((w.carried_amount(ItemKind::Stone) - 0.5).abs() < 1e-5);
             assert_eq!(w.carried_count(ItemKind::Stone), 0, "half a stone is not a whole one");
         }

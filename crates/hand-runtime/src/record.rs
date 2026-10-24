@@ -4,14 +4,21 @@
 //! The game pass records at a fixed keyframe interval (the timeline's first
 //! row). The ML decision pass records one keyframe per decision (the third
 //! row): the picture taken after the move the previous decision asked for.
+//! Both rows also record a keyframe at each moment of an action's physics
+//! (a contact, a lift-off, a slip, an impact, a fall: `KeyEvent`), and every
+//! keyframe carries the focus views of that instant (`FocusFrame`: hand,
+//! finger joints, feet, leg joints, waist, neck, wheels, tracks) with three
+//! close-ups (the hand, the body from the side, low by the feet or wheels).
 
 use std::collections::BTreeMap;
 
 use anyhow::{anyhow, Result};
+use hand_core::act::focus::FocusFrame;
 use hand_core::BalanceSummary;
 use hand_vision::{DepthMetrics, Features, Intrinsics, Pose, Rgb};
 use serde::{Deserialize, Serialize};
 use world_sim::world::EYE_HEIGHT_M;
+use world_sim::render::{render_focus, FocusCam};
 use world_sim::{decode_webp, encode_webp, Camera, World};
 
 use crate::ml::KeyTruth;
@@ -124,8 +131,24 @@ pub struct Keyframe {
     pub ml: Option<MlView>,
     pub ml_webp: Option<Vec<u8>>,
     pub decision: Option<DecisionView>,
-    /// Per-track SDS z-scores (or flags) for the SDS lane: `depth`, `locate`, `tracker`, `decide`, `fusion`, `balance`.
+    /// Per-track SDS z-scores (or flags) for the SDS lane: `depth`, `locate`, `tracker`, `decide`, `fusion`, `balance`, `act`.
     pub sds: BTreeMap<String, f32>,
+    /// The action moment that made this keyframe (`None` for a fixed-interval one).
+    pub event: Option<KeyEvent>,
+    /// The focus views of this instant.
+    pub focus: Option<FocusFrame>,
+    /// Focus close-ups as WebP: `hand`, `side`, `low`.
+    pub focus_webp: Vec<(String, Vec<u8>)>,
+}
+
+/// An action moment that made a keyframe.
+#[derive(Clone, Debug, Serialize)]
+pub struct KeyEvent {
+    pub act: String,
+    pub kind: String,
+    pub label: String,
+    pub ok: bool,
+    pub parts: Vec<String>,
 }
 
 impl Keyframe {
@@ -162,7 +185,23 @@ pub fn intrinsics(cam: &Camera) -> Intrinsics {
     Intrinsics { width: cam.width as u32, height: cam.height as u32, fov_deg: cam.fov_deg, pitch_deg: cam.pitch_deg }
 }
 
-/// Renders a keyframe with its ground truth.
+/// Width and height of the focus close-ups, pixels.
+pub const FOCUS_W: usize = 192;
+pub const FOCUS_H: usize = 128;
+
+/// The three focus close-ups of the world now, as WebP.
+pub fn capture_focus(world: &World, quality: f32) -> Vec<(String, Vec<u8>)> {
+    let cam = Camera { width: FOCUS_W, height: FOCUS_H, fov_deg: 50.0, max_dist_m: 12.0, ..Camera::default() };
+    FocusCam::ALL
+        .into_iter()
+        .filter_map(|c| {
+            let f = render_focus(world, &cam, c);
+            encode_webp(&f.rgb, f.width as u32, f.height as u32, quality).ok().map(|e| (c.id().to_string(), e.bytes))
+        })
+        .collect()
+}
+
+/// Renders a keyframe with its ground truth and the focus views of the instant.
 pub fn capture_keyframe(world: &World, cam: &Camera, quality: f32, index: u32) -> Result<Keyframe> {
     let frame = world.render(cam);
     let enc = encode_webp(&frame.rgb, frame.width as u32, frame.height as u32, quality).map_err(|e| anyhow!("WebP 인코딩 실패: {e}"))?;
@@ -181,6 +220,9 @@ pub fn capture_keyframe(world: &World, cam: &Camera, quality: f32, index: u32) -
         ml_webp: None,
         decision: None,
         sds: BTreeMap::new(),
+        event: None,
+        focus: Some(world.focus_frame()),
+        focus_webp: capture_focus(world, quality),
     })
 }
 

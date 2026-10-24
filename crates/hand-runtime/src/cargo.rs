@@ -122,10 +122,13 @@ fn gates_for(w: &World, d: &DropItem, amount: f32, cargo_kg: f32, ctx: &CargoCtx
     let kg = spec.mass_kg * amount;
     let split = if spec.divisible { CargoAction::Split { portion: 0.5 } } else { CargoAction::Refuse };
     let mut out = Vec::new();
-    // 1. The hand: friction capacity over the force needed (grasp test, safety factor in).
+    // 1. The hands: the fingers' friction from above over the force needed (safety factor in);
+    //    a piece one hand cannot hold is held by both, sharing it.
     let g = w.grasp_for(d.kind, amount);
-    let sev = if !g.stable { 3 } else if g.margin < 1.2 { 1 } else { 0 };
-    out.push(gate("grip", "손 마찰", g.margin, 1.0, "×", sev, if sev >= 2 { split } else { CargoAction::Take }, format!("마찰 용량 / 필요 힘 {:.2} ({} {} kg)", g.margin, spec.label_ko, fmt_kg(kg))));
+    let both = 2.0 * g.margin;
+    let sev = if both < 1.0 { 3 } else if g.margin < 1.2 { 1 } else { 0 };
+    let how = if g.stable { String::new() } else if both >= 1.0 { format!(" · 두 손이면 {both:.2}") } else { String::new() };
+    out.push(gate("grip", "손 마찰", if g.stable { g.margin } else { both }, 1.0, "×", sev, if sev >= 2 { split } else { CargoAction::Take }, format!("마찰 용량 / 필요 힘 {:.2}{how} ({} {} kg)", g.margin, spec.label_ko, fmt_kg(kg))));
     // 2. The arms and the balance while lifting (one arm, else both).
     let ff = FeedForward { enabled: w.ff_enabled, gain: w.ff_gains.get(&Source::ArmLift).copied().unwrap_or(1.0) };
     let (rep, two) = w.body.lift(kg, cargo_kg, &ff, w.grip_capacity_for(d.kind, amount));

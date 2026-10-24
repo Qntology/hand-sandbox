@@ -5,14 +5,22 @@
 //! behave consistently under a made-up error model; they say nothing about how
 //! a real SigLIP2 would perform.
 
+use hand_core::{BaseKind, HandConfig};
 use hand_quest::{State, StepKind};
 use hand_runtime::{FrameView, GateCfg, NoiseCfg, Runtime, RuntimeConfig};
 use world_sim::{ItemKind, NodeKind};
 
 const LEXICON: &str = include_str!("../../../data/world_lexicon.json");
 
+/// The robot of these scenarios walks, so its hands reach the ground: with
+/// the arm and shoulder height of the presets a wheeled body cannot bend down
+/// to an item and pushes it instead (`a_wheeled_body_pushes_what_it_cannot_reach`).
+fn legged(cfg: RuntimeConfig) -> RuntimeConfig {
+    RuntimeConfig { hand: HandConfig { base: BaseKind::HumanFoot, ..cfg.hand }, ..cfg }
+}
+
 fn runtime_with(cfg: RuntimeConfig) -> Runtime {
-    Runtime::new(cfg, LEXICON, None).expect("runtime")
+    Runtime::new(legged(cfg), LEXICON, None).expect("runtime")
 }
 
 fn runtime(seed: u64, noise: NoiseCfg) -> Runtime {
@@ -107,6 +115,27 @@ fn collecting_without_a_destination_keeps_the_items_in_hand() {
     assert_done(&rt, &q);
     assert_eq!(rt.world().carried_count(ItemKind::Log), 1);
     assert_eq!(stock(&rt, "warehouse", ItemKind::Log), 0);
+}
+
+#[test]
+fn a_wheeled_body_pushes_what_it_cannot_reach() {
+    // Shoulder 1.00 m, arm 0.42 m and no waist pitch: the palm stops about
+    // 0.65 m above the ground, so the wheeled robot moves the log with its
+    // bumper, and a collection with nowhere to push to cannot be done.
+    let wheeled = || Runtime::new(RuntimeConfig { seed: 7, noise: NoiseCfg::none(), ..RuntimeConfig::default() }, LEXICON, None).expect("runtime");
+    let mut rt = wheeled();
+    assert_eq!(rt.world().hand.base.kind, BaseKind::Wheel);
+    let q = run_command(&mut rt, "원목 1개를 창고로 가져와", 40_000);
+    assert_done(&rt, &q);
+    assert_eq!(stock(&rt, "warehouse", ItemKind::Log), 1);
+    assert!(quest_log(&rt).contains("범퍼로 밀어"), "{}", quest_log(&rt));
+    assert_eq!(rt.world().carried_count(ItemKind::Log), 0, "it never held the log");
+    let mut rt = wheeled();
+    let q = run_command(&mut rt, "원목 1개 캐줘", 30_000);
+    assert_eq!(q.state, State::Failed, "{}", quest_log(&rt));
+    let f = q.failure.as_ref().unwrap();
+    assert_eq!(f.code, "reach_ground", "{f:?}");
+    assert!(f.message_ko.contains("손바닥"), "{}", f.message_ko);
 }
 
 #[test]

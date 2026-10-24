@@ -12,10 +12,17 @@
 //!   cost) the balance, the drive and the routes use, [`wear`] the reducers'
 //!   life, and [`effects`] the environment N:N benchmark of the five body
 //!   effects (slip, load, fatigue, joint load, posture stability).
+//! * [`kin`] solves a whole-body pose (joints, contacts, ZMP), [`act`] plays
+//!   the actions out on it as time series (grasp and release, push, walk,
+//!   drive, bend) with friction, mass, elasticity and collisions, and
+//!   [`actbench`] scores those actions against measurements the engine does
+//!   not use.
 //!
 //! Units: metres, seconds, kilograms, newtons, and radians inside the model
 //! (degrees only appear in the UI).
 
+pub mod act;
+pub mod actbench;
 pub mod balance;
 pub mod base;
 pub mod body;
@@ -24,6 +31,7 @@ pub mod effects;
 pub mod finger;
 pub mod hand;
 pub mod joint;
+pub mod kin;
 pub mod math;
 pub mod nn;
 pub mod parts;

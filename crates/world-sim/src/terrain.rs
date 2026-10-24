@@ -263,10 +263,13 @@ impl Terrain {
                 }
             }
         }
-        // The beach: land near the water slopes down to it and stays wet.
+        // The beach: land near the water slopes down to it and stays wet. The
+        // protected way keeps its ground (a road along the shore, not a slope
+        // of loose sand a wheel cannot climb).
         let shore = self.water_distance_m(8.0);
         for i in 0..w * d {
-            if fixed[i] || shore[i] > 2.5 {
+            let (x, z) = cell_center(i % w, i / w);
+            if fixed[i] || shore[i] > 2.5 || near_polyline(x, z, corridor_m) {
                 continue;
             }
             let h = self.heights_cm[i] as f32 * (shore[i] / 2.5);

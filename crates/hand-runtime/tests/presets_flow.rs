@@ -40,7 +40,8 @@ fn a_preset_from_the_ui_reaches_the_joint_dynamics_and_the_overlay() {
 #[test]
 fn a_quest_records_the_joint_dynamics_in_the_sds() {
     let mut rt = runtime();
-    rt.api_world_new(7, 64, None, None).unwrap();
+    // On legs: the hands reach the log, so the lift is a posture change.
+    rt.api_world_new(7, 64, None, Some("human_foot")).unwrap();
     rt.api_command_submit("원목 1개를 창고로 가져와").unwrap();
     for _ in 0..60 {
         rt.api_sim_step(40).unwrap();
