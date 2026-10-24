@@ -1,25 +1,34 @@
 // 하단 '통합 테스트' 탭: 게임 로직 → ML 로직 통합 테스트를 영상 편집기처럼 보여 준다.
 //   1줄 게임: 고정 간격 키프레임 (게임 로직이 퀘스트를 수행하며 촬영)
+//   행위: 행위의 물리 순간(접촉 · 들림 · 미끄러짐 · 충격 · 넘어짐 …)마다 찍은 키프레임 — 위 칸 게임, 아래 칸 ML 결정
 //   2줄 ML 인식: 같은 키프레임의 깊이 컬러맵 + 추적 마스크 + 의미 위치 점
 //   3줄 ML 결정: 결정(시계열·삼각 측량) → 이동 → 촬영한 키프레임
-//   4줄 SDS: 키프레임마다 트랙별(깊이·위치·추적·결정·혼합·밸런스) z-점수
+//   4줄 SDS: 키프레임마다 트랙별(깊이·위치·추적·결정·혼합·밸런스·행위) z-점수
+// '보기' 선택에서 1인칭 대신 부위(손 모양 · 손 관절 · 발 모양 · 발 관절 · 허리 · 목 관절 · 바퀴 · 트랙)를 고르면
+// 1·3줄과 행위 줄의 칸이 그 순간의 부위 그림(키프레임의 FocusFrame)으로 바뀌어, 움직이는 부위를 키프레임마다 따라갈 수 있다.
 // 명령은 위 뷰포트 툴바(tl-cmd · 테스트 실행 · 중지)나 월드 화면 입력줄에서 낸다. '자동 기록'이 켜져 있으면
 // 재생 루프(sim_step)가 기록을 진행시키고, 응답의 test 요약이 바뀔 때마다 test_status 로 줄을 다시 그린다.
 // 이미지는 보이는 칸만 test_keyframe 으로 받는다.
 import { call } from './api.js';
 import { bus, state } from './state.js';
-import { $, clear, el, fmt } from './util.js';
+import { $, clear, el, fmt, storageGet, storageSet } from './util.js';
 import { setStatus, toast } from './toast.js';
 import { submitCommand } from './command-bar.js';
+import { EVENT_KO, FOCUS_PARTS, PART_KO, drawFocus, focusPanel, resolvePart } from './focus-view.js';
 
 const LANES = [
   { id: 'game', label: '1 게임', sub: '게임 로직 촬영', h: 'h-img' },
+  { id: 'act', label: '행위', sub: '물리 순간 · 게임 / ML', h: 'h-act' },
   { id: 'perceive', label: '2 ML 인식', sub: '깊이 · 위치 · 추적', h: 'h-img' },
   { id: 'decide', label: '3 ML 결정', sub: '시계열 → 이동 → 촬영', h: 'h-img' },
   { id: 'sds', label: '4 SDS', sub: '트랙별 z · 게임 / ML', h: 'h-sds' },
 ];
-const SDS_KEYS = ['depth', 'locate', 'tracker', 'decide', 'fusion', 'balance'];
-const SDS_KO = { depth: '깊이', locate: '위치', tracker: '추적', decide: '결정', fusion: '혼합', balance: '밸런스' };
+const LANE_PX = { 'h-img': 76, 'h-act': 96, 'h-sds': 46 };
+const SDS_KEYS = ['depth', 'locate', 'tracker', 'decide', 'fusion', 'balance', 'act'];
+const SDS_KO = { depth: '깊이', locate: '위치', tracker: '추적', decide: '결정', fusion: '혼합', balance: '밸런스', act: '행위' };
+const ACT_W = 70;
+// 1·3줄과 행위 줄의 칸이 보여 줄 것: 'frame'(1인칭 원본), 'auto'(행위 부위), 또는 부위 id.
+let focusPart = storageGet('tl-focus', 'frame');
 const KIND_KO = { search: '탐색 회전', triangulate: '삼각 측량', approach: '접근', arrive: '도달', hold: '보류', explore: '시점 이동' };
 const TILE_W = 96;
 
@@ -32,7 +41,7 @@ let pps = 100; // 초당 픽셀
 let sel = null; // {pass: 'game'|'ml', index}
 let observer = null;
 const cache = new Map(); // `${pass}:${i}` → test_keyframe 응답
-const pending = new Set();
+const pending = new Map(); // `${pass}:${i}` → 받는 중인 응답
 
 function r(x, d = 2) {
   return Number.isFinite(x) ? Number(x).toFixed(d) : '—';
@@ -52,22 +61,24 @@ function build() {
     ...[[50, '×0.5'], [100, '×1'], [160, '×1.6']].map(([v, t]) => el('option', { value: String(v), text: t, selected: v === pps })));
   const view = el('select', { id: 'tl-view', aria: { label: '보기' }, on: { change: (e) => setView(e.target.value) } },
     el('option', { value: 'timeline', text: '타임라인' }), el('option', { value: 'stats', text: '성공률 · N:N' }));
+  const focus = el('select', { id: 'tl-focus', aria: { label: '키프레임 칸에 보일 부위' }, title: '1·3줄과 행위 줄의 칸에 1인칭 원본 대신 그 순간의 부위 그림을 보입니다', on: { change: (e) => { focusPart = e.target.value; storageSet('tl-focus', focusPart); renderLanes(); } } },
+    ...FOCUS_PARTS.map((p) => el('option', { value: p.id, text: p.ko, selected: p.id === focusPart })));
   const mirror = el('button', { type: 'button', class: 'vt-btn', id: 'tl-mirror', text: 'DB(Lance) 기록', title: '이번 세션의 퀘스트·키프레임·밸런스 행을 LanceDB 테이블로 복사합니다', on: { click: () => mirrorDb(false) } });
   pane.append(
     el('div', { class: 'tl-root' },
       el('div', { class: 'tl-toolbar' },
         el('span', { class: 'tl-phase', id: 'tl-phase', text: '대기' }),
         el('span', { class: 'tl-modes', id: 'tl-modes' }),
-        el('span', { style: 'margin-left:auto;display:flex;gap:6px;align-items:center' }, zoom, view, mirror)),
+        el('span', { style: 'margin-left:auto;display:flex;gap:6px;align-items:center' }, el('span', { class: 'vt-label', text: '칸' }), focus, zoom, view, mirror)),
       el('div', { class: 'tl-body', id: 'tl-body' },
         el('div', { class: 'tl-main' },
           el('div', { class: 'tl-labels', id: 'tl-labels' },
             el('div', { class: 'tl-l-ruler' }, el('small', { text: '초 (틱/10)' })),
-            ...LANES.map((l) => el('div', { class: `tl-l-${l.id}`, style: `height:${l.h === 'h-sds' ? 46 : 76}px` }, l.label, el('small', { text: l.sub })))),
+            ...LANES.map((l) => el('div', { class: `tl-l-${l.id}`, style: `height:${LANE_PX[l.h]}px` }, l.label, el('small', { text: l.sub })))),
           el('div', { class: 'tl-scroll', id: 'tl-scroll', on: { click: onScrollClick } },
             el('div', { class: 'tl-canvas', id: 'tl-canvas' }))),
         el('aside', { class: 'tl-inspector', id: 'tl-inspector', aria: { label: '키프레임 검사기' } },
-          el('div', { class: 'tl-empty', text: '키프레임을 누르면 원본 · 깊이/마스크 · 삼각 측량 · 결정 · 밸런스(N:N)가 여기에 나옵니다.' })),
+          el('div', { class: 'tl-empty', text: '키프레임을 누르면 원본 · 깊이/마스크 · 행위의 부위 포커스(손 · 발 · 허리 · 목 · 바퀴 · 트랙) · 삼각 측량 · 결정 · 밸런스(N:N)가 여기에 나옵니다.' })),
         el('div', { class: 'tl-stats', id: 'tl-stats' }))));
   renderLanes();
 }
@@ -112,9 +123,11 @@ function renderLanes() {
     return;
   }
   observer = new IntersectionObserver(onVisible, { root: $('tl-scroll'), rootMargin: '0px 200px' });
-  // 1·2줄: 게임 키프레임. 단계 색 띠도 1줄 위에.
+  const fixed = (rows) => rows.filter((k) => !k.event);
+  const moments = (rows) => rows.filter((k) => k.event);
+  // 1·2줄: 고정 간격 게임 키프레임. 단계 색 띠도 1줄 위에.
   let lastStep = null;
-  game.forEach((k) => {
+  fixed(game).forEach((k) => {
     const x = tickT(k) * pps;
     if (k.step && k.step !== lastStep) {
       lastStep = k.step;
@@ -126,9 +139,21 @@ function renderLanes() {
     lanes.perceive.append(tile('game', k, x, 'ml', cap, (ml?.flags ?? []).length > 0));
     lanes.sds.append(sdsCell('game', k, x, 0));
   });
+  // 행위 줄: 행위의 물리 순간에 찍은 키프레임 (위 칸 게임, 아래 칸 ML 결정). 겹치지 않게 오른쪽으로 밀고,
+  // 실제 시각에는 눈금을 둔다.
+  for (const [pass, rows, row] of [['game', moments(game), 0], ['ml', moments(decide), 1]]) {
+    let prev = -1e9;
+    rows.forEach((k) => {
+      const t0 = tickT(k) * pps;
+      const x = Math.max(t0, prev + ACT_W + 2);
+      prev = x;
+      lanes.act.append(el('i', { class: `tl-act-tick${k.event.ok ? '' : ' fail'}`, style: `left:${t0}px;top:${row * 48}px` }));
+      lanes.act.append(actTile(pass, k, x, row));
+    });
+  }
   // 3줄: 결정 키프레임. 겹치지 않게 오른쪽으로 민다.
   let prevX = -1e9;
-  decide.forEach((k) => {
+  fixed(decide).forEach((k) => {
     const x = Math.max(tickT(k) * pps, prevX + TILE_W * 0.78);
     prevX = x;
     const d = k.decision;
@@ -162,6 +187,20 @@ function tile(pass, k, x, kind, caption, flagged = false) {
   return t;
 }
 
+/** 행위 줄의 칸: 물리 순간의 종류, 실패면 빨간 테두리, 행위 SDS z 점. */
+function actTile(pass, k, x, row) {
+  const e = k.event;
+  const t = el('button', { type: 'button', class: `tl-tile tl-act${e.ok ? '' : ' fail'}`, style: `left:${x}px;top:${4 + row * 48}px`, dataset: { pass, index: String(k.i), kind: 'act' }, title: `${pass === 'ml' ? 'ML 결정' : '게임'} ${r(tickT(k), 1)} s · ${e.label}`, on: { click: (ev) => { ev.stopPropagation(); select(pass, k.i); } } },
+    el('div', { class: 'ph', text: '…' }),
+    el('span', { class: 'cap', text: `${EVENT_KO[e.kind] ?? e.kind}` }));
+  const z = k.sds?.act;
+  if (Number.isFinite(z)) t.append(el('i', { class: `zdot ${zClass(z)}`, title: `행위 SDS z ${r(z, 1)} (이 종류 순간의 기준선 대비)` }));
+  const c = cache.get(`${pass}:${k.i}`);
+  if (c) fill(t, c);
+  else observer?.observe(t);
+  return t;
+}
+
 function sdsCell(pass, k, x, row) {
   const box = el('div', { class: 'tl-sds', style: `left:${x}px;top:${4 + row * 20}px`, title: `${pass === 'ml' ? 'ML 결정' : '게임'} #${k.i} SDS z: ${SDS_KEYS.map((s) => `${SDS_KO[s]} ${r(k.sds?.[s], 1)}`).join(' · ')}`, on: { click: (e) => { e.stopPropagation(); select(pass, k.i); } } });
   for (const s of SDS_KEYS) box.append(el('i', { class: zClass(k.sds?.[s]) }));
@@ -169,32 +208,48 @@ function sdsCell(pass, k, x, row) {
 }
 
 function fill(t, data) {
-  const src = t.dataset.kind === 'ml' ? data.ml_webp : data.frame_webp;
-  const ph = t.querySelector('.ph');
-  if (!src) {
-    if (ph) ph.textContent = '없음';
+  const kind = t.dataset.kind;
+  const ph = t.querySelector('.ph, img, canvas.fcv');
+  // 1·3줄은 '칸' 선택을 따르고, 행위 줄은 1인칭일 때도 행위 부위를 그린다(원본은 검사기에).
+  const mode = kind === 'act' && focusPart === 'frame' ? 'auto' : focusPart;
+  if (kind !== 'ml' && mode !== 'frame') {
+    const f = data.focus;
+    if (!f) {
+      ph?.replaceWith(el('div', { class: 'ph', text: '포커스 없음' }));
+      return;
+    }
+    const part = resolvePart(mode, f);
+    const cv = el('canvas', { class: 'fcv', title: PART_KO[part] ?? part });
+    ph?.replaceWith(cv);
+    requestAnimationFrame(() => drawFocus(cv, f, part, { compact: true }));
     return;
   }
-  const img = el('img', { alt: '', src: `data:image/webp;base64,${src}` });
-  ph?.replaceWith(img);
+  const src = kind === 'ml' ? data.ml_webp : data.frame_webp;
+  if (!src) {
+    ph?.replaceWith(el('div', { class: 'ph', text: '없음' }));
+    return;
+  }
+  ph?.replaceWith(el('img', { alt: '', src: `data:image/webp;base64,${src}` }));
 }
 
-async function fetchKf(pass, index, needMl = false) {
+/** 키프레임 응답. 칸은 근접 화면 없이(`close_ups: false`) 가볍게, 검사기는 `full`로 근접 화면까지 받는다. */
+async function fetchKf(pass, index, needMl = false, full = false) {
   const key = `${pass}:${index}`;
-  const have = cache.get(key);
   // 분석 전에 받아 둔 키프레임은 분석이 끝나면 다시 받는다(2줄 그림이 그때 생긴다).
-  if (have && (!needMl || have.ml_webp)) return have;
-  if (pending.has(key)) return null;
-  pending.add(key);
-  try {
-    const v = await call('test_keyframe', { pass, index }, { quiet: true });
-    cache.set(key, v);
-    return v;
-  } catch {
-    return null;
-  } finally {
-    pending.delete(key);
+  const enough = (v) => v && (!needMl || v.ml_webp) && (!full || v.focus_webp);
+  const have = cache.get(key);
+  if (enough(have)) return have;
+  // 이미 받는 중이면 그 응답을 기다리고(칸을 누른 순간 받는 중이어도 검사기가 열린다), 모자라면 다시 받는다.
+  if (pending.has(key)) {
+    const v = await pending.get(key);
+    if (enough(v)) return v;
   }
+  const p = call('test_keyframe', { pass, index, close_ups: full }, { quiet: true })
+    .then((v) => { cache.set(key, v); return v; })
+    .catch(() => null)
+    .finally(() => { if (pending.get(key) === p) pending.delete(key); });
+  pending.set(key, p);
+  return p;
 }
 
 function onVisible(entries) {
@@ -232,7 +287,7 @@ async function select(pass, index) {
   sel = { pass, index };
   highlight();
   const insp = $('tl-inspector');
-  const v = await fetchKf(pass, index, true) ?? cache.get(`${pass}:${index}`);
+  const v = await fetchKf(pass, index, true, true) ?? cache.get(`${pass}:${index}`);
   if (!v || sel.pass !== pass || sel.index !== index) return;
   clear(insp);
   const b = v.brief;
@@ -243,13 +298,18 @@ async function select(pass, index) {
     if (k) select(pass, k.i);
   };
   insp.append(el('h5', {},
-    el('span', { class: 'grow', text: `${pass === 'ml' ? 'ML 결정' : '게임'} #${index} · ${r(b.t, 1)} s · 틱 ${b.tick}${b.step ? ` · ${b.step}` : ''}` }),
+    el('span', { class: 'grow', text: `${pass === 'ml' ? 'ML 결정' : '게임'} #${index} · ${r(b.t, 1)} s · 틱 ${b.tick}${b.step ? ` · ${b.step}` : ''}${b.event ? ` · ${EVENT_KO[b.event.kind] ?? b.event.kind}` : ''}` }),
     el('button', { type: 'button', class: 'vt-btn', text: '◀', title: '이전 키프레임', on: { click: () => nav(-1) } }),
     el('button', { type: 'button', class: 'vt-btn', text: '▶', title: '다음 키프레임', on: { click: () => nav(1) } })));
   insp.append(el('div', { class: 'tl-pics' },
     el('figure', {}, el('img', { alt: '키프레임 원본', src: `data:image/webp;base64,${v.frame_webp}` }), el('figcaption', { text: `원본 ${v.width}×${v.height} · 자세 (${b.pose.join(', ')})` })),
     el('figure', {}, v.ml_webp ? el('img', { alt: '깊이와 추적 마스크', src: `data:image/webp;base64,${v.ml_webp}` }) : el('div', { class: 'tl-empty', text: '분석 전' }),
       el('figcaption', { text: '깊이(가까움=따뜻) · 흰 윤곽=대상 마스크 · 분홍 십자=의미 위치' }))));
+  // 이 순간의 부위 포커스: 사건, 근접 화면 셋(손 · 옆 · 낮게), 여덟 부위 그림(이 순간이 다루는 부위는 테두리).
+  if (v.focus || v.event) {
+    insp.append(el('div', { class: 'ct-sec', text: '행위 · 부위 포커스' }));
+    insp.append(focusPanel(v.focus, v.focus_webp, v.event));
+  }
   const ml = v.ml;
   if (ml) {
     const t = ml.target ?? {};

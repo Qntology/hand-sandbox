@@ -259,7 +259,7 @@ impl Runtime {
         }
     }
 
-    fn current_step_label(&self) -> Option<String> {
+    pub(crate) fn current_step_label(&self) -> Option<String> {
         let id = self.quests.current_id()?;
         let q = self.quests.get(&id)?;
         q.steps.iter().find(|s| s.state == hand_quest::State::Active).map(|s| s.label_ko.clone())
@@ -467,6 +467,9 @@ impl Runtime {
             })),
             "decision": kf.decision.as_ref().map(|d| json!({"label": d.decision, "kind": d.kind, "residual": d.residual_deg.map(r3), "executed": d.executed, "ok": d.ok})),
             "sds": kf.sds.iter().map(|(k, v)| (k.clone(), json!(r3(*v)))).collect::<serde_json::Map<String, Value>>(),
+            // The action moment that made the keyframe, and what its focus views are about.
+            "event": kf.event.as_ref().map(|e| json!({"act": e.act, "kind": e.kind, "label": e.label, "ok": e.ok, "parts": e.parts})),
+            "focus": kf.focus.as_ref().map(|f| json!({"action": f.action, "action_ko": f.action_ko, "phase": f.phase, "parts": f.parts, "margin": r3(f.body.margin), "trunk_deg": r3(f.body.trunk_deg), "slip_ratio": f.hand.grip.map(|g| r3(g.slip_ratio)), "closure": r3(f.hand.closure)})),
         })
     }
 
@@ -524,16 +527,30 @@ impl Runtime {
 
     /// `test_keyframe({pass, index})`: the keyframe's pictures and everything the tracks said.
     pub fn api_test_keyframe(&self, pass: &str, index: usize) -> Result<Value, String> {
+        self.api_test_keyframe_with(pass, index, true)
+    }
+
+    /// `test_keyframe({pass, index, close_ups})`: without the focus close-ups
+    /// (`close_ups: false`) for the timeline's tiles, which draw only the frame
+    /// or the focus numbers.
+    pub fn api_test_keyframe_with(&self, pass: &str, index: usize, close_ups: bool) -> Result<Value, String> {
         let rec = self.rec_of(pass).ok_or("이 통과의 기록이 없습니다")?;
         let kf = rec.keyframes.get(index).ok_or_else(|| format!("키프레임 {index}이(가) 없습니다"))?;
-        Ok(json!({
+        let mut v = json!({
             "brief": Self::kf_brief(kf),
             "frame_webp": b64(&kf.webp),
             "ml_webp": kf.ml_webp.as_deref().map(b64),
             "width": kf.intr.width, "height": kf.intr.height,
             "ml": kf.ml, "decision": kf.decision, "balance": kf.balance,
+            // Every focus view of the instant (hand, finger joints, feet, leg joints, waist, neck, wheels, tracks).
+            "focus": kf.focus, "event": kf.event,
             "truth": kf.truth.objects.iter().map(|o| json!({"entity": o.entity, "label": o.label, "label_ko": o.label_ko, "bbox": [o.bbox[0] as f32 / kf.truth.src_width as f32, o.bbox[1] as f32 / kf.truth.src_height as f32, o.bbox[2] as f32 / kf.truth.src_width as f32, o.bbox[3] as f32 / kf.truth.src_height as f32], "depth_m": r3(o.depth_m)})).collect::<Vec<_>>(),
-        }))
+        });
+        // The close-ups: the hand, the body from the side, low by the feet or wheels.
+        if close_ups {
+            v["focus_webp"] = Value::Object(kf.focus_webp.iter().map(|(k, w)| (k.clone(), json!(b64(w)))).collect());
+        }
+        Ok(v)
     }
 
     /// `test_video({pass, from, count})`: video frames as WebP.
@@ -598,5 +615,8 @@ fn placeholder(k: &Keyframe) -> Keyframe {
         ml_webp: None,
         decision: None,
         sds: BTreeMap::new(),
+        event: k.event.clone(),
+        focus: None,
+        focus_webp: Vec::new(),
     }
 }

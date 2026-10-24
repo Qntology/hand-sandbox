@@ -58,8 +58,23 @@ pub enum Goal {
     Within { x: f32, z: f32, reach_m: f32 },
 }
 
+/// Something the base pushes along the ground ahead of it: a pushed item's
+/// mass and what it is made of.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PushLoad {
+    pub mass_kg: f32,
+    pub material: hand_core::act::material::ItemMaterial,
+}
+
 /// Judges one move. `None` when the base cannot pass.
 pub fn edge(spec: &BaseSpec, t: &Terrain, a: Cell, b: Cell) -> Option<EdgePlan> {
+    edge_with(spec, t, a, b, None)
+}
+
+/// [`edge`] while pushing a load: the item's static friction on the ground
+/// it is pushed onto and its share of the slope go on top of the drive's own
+/// need (a move the drive cannot make with it is not passable).
+pub fn edge_with(spec: &BaseSpec, t: &Terrain, a: Cell, b: Cell, load: Option<PushLoad>) -> Option<EdgePlan> {
     // No base drives or walks into the sea.
     if t.is_water(b.0, b.1) {
         return None;
@@ -92,6 +107,21 @@ pub fn edge(spec: &BaseSpec, t: &Terrain, a: Cell, b: Cell) -> Option<EdgePlan> 
     if slope_deg > ground_limit {
         return None;
     }
+    // How much of the cruise speed this ground leaves: shorter steps on slippery
+    // ground, wheel or track slip on soft ground (`hand_core::act`).
+    let signed = if rise >= 0.0 { slope_deg } else { -slope_deg };
+    let extra = match (load, spec.mass_kg) {
+        (Some(l), Some(m)) => {
+            let th = signed.to_radians();
+            let mu = hand_core::act::material::item_on(l.material, t.ground_at(b.0, b.1).surface()).0.mean;
+            (l.mass_kg * hand_core::balance::G * (mu * th.cos() + th.sin())).max(0.0) / m.max(1e-3)
+        }
+        _ => 0.0,
+    };
+    let factor = hand_core::act::locomotion_factor_with(spec, props, signed, extra)?;
+    let move_time = ground_only.time_s / factor;
+    // The drive turns at its cruise speed whatever the slip: the power is the
+    // cruise power, and the slower ground speed makes the stretch cost more.
     let speed = horizontal / ground_only.time_s.max(1e-6);
     let energy_factor = energy_factor(spec.kind, props, spec.mass_kg.unwrap_or(0.0), speed, spec.power_w);
     let mut pause = 0.0;
@@ -108,7 +138,7 @@ pub fn edge(spec: &BaseSpec, t: &Terrain, a: Cell, b: Cell) -> Option<EdgePlan> 
         from: a,
         to: b,
         horizontal_m: horizontal,
-        move_time_s: ground_only.time_s,
+        move_time_s: move_time,
         pause_s: pause,
         step_m: step,
         slope_deg,
@@ -148,6 +178,11 @@ fn heuristic(goal: &Goal, c: Cell, speed: f32) -> f32 {
 /// A* over the 8-neighbour grid, minimising drive time. `blocked` marks cells
 /// the base cannot enter (resource nodes). Returns `None` when no route exists.
 pub fn plan(spec: &BaseSpec, t: &Terrain, blocked: &dyn Fn(usize, usize) -> bool, start: Cell, goal: Goal) -> Option<Plan> {
+    plan_with(spec, t, blocked, start, goal, None)
+}
+
+/// [`plan`] for a base pushing a load ahead of it ([`edge_with`]).
+pub fn plan_with(spec: &BaseSpec, t: &Terrain, blocked: &dyn Fn(usize, usize) -> bool, start: Cell, goal: Goal, load: Option<PushLoad>) -> Option<Plan> {
     if let Goal::Cell(g) = goal {
         if blocked(g.0, g.1) {
             return None;
@@ -184,7 +219,7 @@ pub fn plan(spec: &BaseSpec, t: &Terrain, blocked: &dyn Fn(usize, usize) -> bool
                     continue;
                 }
             }
-            let Some(e) = edge(spec, t, c, nc) else { continue };
+            let Some(e) = edge_with(spec, t, c, nc, load) else { continue };
             let cost = g + e.move_time_s + e.pause_s;
             let ni = t.idx(nc.0, nc.1);
             if cost < best[ni] {
@@ -275,13 +310,21 @@ mod tests {
 
     #[test]
     fn flat_route_time_matches_the_drive_model() {
-        let t = flat(32, 32);
+        use crate::kinds::Ground;
+        let mut t = flat(32, 32);
+        for x in 0..32 {
+            t.set_ground(x, 2, Ground::Rock);
+        }
         let spec = BaseKind::Wheel.spec();
         let p = plan(&spec, &t, &none, (2, 2), Goal::Cell((10, 2))).unwrap();
         assert_eq!(p.cells.len(), 9);
         let r = simulate_drive(&spec, &[Segment::Flat { length_m: 4.0 }]);
-        assert!((p.time_s - r.time_s).abs() < 1e-4);
-        assert!((p.energy_j - r.energy_j).abs() < 1e-2);
+        // On rock the tyre's slip is a fraction of a percent of the drive model's time.
+        let f = hand_core::act::locomotion_factor(&spec, Ground::Rock.surface().props(), 0.0).unwrap();
+        assert!(f > 0.99 && f <= 1.0, "{f}");
+        assert!((p.time_s - r.time_s / f).abs() < 1e-3, "{} vs {}", p.time_s, r.time_s / f);
+        let ef = p.edges[0].energy_factor;
+        assert!((p.energy_j - r.energy_j / f * ef).abs() < 1.0, "{} vs {}", p.energy_j, r.energy_j / f * ef);
     }
 
     #[test]
@@ -357,9 +400,19 @@ mod tests {
         t.set_ground(8, 4, Ground::Rock);
         let rock = edge(&weak, &t, (7, 4), (8, 4)).expect("rock: friction and drive suffice");
         t.set_ground(8, 4, Ground::Sand);
-        let sand = edge(&BaseKind::Wheel.spec(), &t, (7, 4), (8, 4)).expect("sand: the friction limit alone (atan 0.25 = 14°) allows 11°");
-        assert!(sand.ground_limit_deg < 15.0 && sand.margin < rock.margin);
+        // On sand the thrust a wheel's short contact gets at full slip (Janosi–Hanamoto,
+        // 80% of the friction limit) less the rolling resistance climbs only about 8°,
+        // under the friction limit alone (atan 0.25 = 14°).
+        assert!(edge(&BaseKind::Wheel.spec(), &t, (7, 4), (8, 4)).is_none(), "sand: 11° is past the traction at full slip");
         assert!(edge(&weak, &t, (7, 4), (8, 4)).is_none(), "a weak drive spends its force on the sand's rolling resistance");
+        // A gentler 5.7° slope: the wheel climbs the sand, slipping, slower than over rock.
+        t.set_height_cm(8, 4, 5);
+        let sand = edge(&BaseKind::Wheel.spec(), &t, (7, 4), (8, 4)).expect("sand: 5.7° is within the traction");
+        t.set_ground(8, 4, Ground::Rock);
+        let firm = edge(&BaseKind::Wheel.spec(), &t, (7, 4), (8, 4)).unwrap();
+        t.set_ground(8, 4, Ground::Sand);
+        assert!(sand.ground_limit_deg < 15.0 && sand.margin < firm.margin && sand.move_time_s > firm.move_time_s, "sand {} s vs rock {} s", sand.move_time_s, firm.move_time_s);
+        assert!(rock.margin > 0.0);
         // Level sand: passable, but the rolling resistance costs energy; legs pay the walking factor.
         t.set_height_cm(8, 4, 0);
         let level = edge(&weak, &t, (7, 4), (8, 4)).unwrap();
@@ -368,6 +421,20 @@ mod tests {
         assert!((walk.energy_factor - 2.1).abs() < 1e-6);
         t.set_ground(8, 4, Ground::Gravel);
         assert!(edge(&weak, &t, (7, 4), (8, 4)).unwrap().energy_factor < level.energy_factor);
+    }
+
+    #[test]
+    fn a_pushed_item_closes_the_slopes_the_drive_cannot_push_it_up() {
+        use crate::kinds::Ground;
+        let mut t = flat(16, 16);
+        // 11.3° of grass.
+        t.set_height_cm(8, 4, 10);
+        t.set_ground(8, 4, Ground::Grass);
+        let spec = BaseSpec { mass_kg: Some(19.3), drive_accel_mps2: Some(240.0 / 19.3), ..BaseKind::Wheel.spec() };
+        assert!(edge(&spec, &t, (7, 4), (8, 4)).is_some(), "alone the wheels climb it");
+        let ore = PushLoad { mass_kg: 4.0, material: hand_core::act::material::ItemMaterial::IronOre };
+        assert!(edge_with(&spec, &t, (7, 4), (8, 4), Some(ore)).is_none(), "pushing 4 kg of ore up it is past the grass's traction");
+        assert!(edge_with(&spec, &t, (8, 4), (7, 4), Some(ore)).is_some(), "down it the slope helps");
     }
 
     #[test]

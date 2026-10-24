@@ -35,10 +35,15 @@ pub enum Track {
     Effort,
     /// Quest and quest-step outcomes per pass (game logic or ML logic).
     Quest,
+    /// The actions' physics (`hand_core::act`), in layers: the outcome of
+    /// each action, its phases' timing and time-series features, the load on
+    /// each body part, against research references where they exist, and the
+    /// calibration of the success the action predicted.
+    Act,
 }
 
 impl Track {
-    pub const ALL: [Track; 12] = [
+    pub const ALL: [Track; 13] = [
         Track::Vision,
         Track::Search,
         Track::Motion,
@@ -51,6 +56,7 @@ impl Track {
         Track::Balance,
         Track::Effort,
         Track::Quest,
+        Track::Act,
     ];
 
     /// The four ML keyframe tracks, in pipeline order.
@@ -70,6 +76,7 @@ impl Track {
             Track::Balance => "balance",
             Track::Effort => "effort",
             Track::Quest => "quest",
+            Track::Act => "act",
         }
     }
 
@@ -91,6 +98,8 @@ impl Track {
             Track::Balance | Track::Effort => (8, 4, 12),
             // One observation per quest step: few, so trust a scope early.
             Track::Quest => (4, 3, 6),
+            // One observation per action (a pick, a push, a walked edge).
+            Track::Act => (6, 4, 8),
         }
     }
 
@@ -106,6 +115,7 @@ impl Track {
             Track::Motion | Track::Forecast | Track::Quest => Ledger::Task,
             Track::Depth | Track::Locate | Track::Tracker | Track::Decide | Track::Fusion => Ledger::Ml,
             Track::Balance | Track::Effort => Ledger::Body,
+            Track::Act => Ledger::Act,
         }
     }
 }
@@ -121,10 +131,12 @@ pub enum Ledger {
     Ml,
     /// Posture balance and joint effort.
     Body,
+    /// The actions' outcomes, phases and part loads.
+    Act,
 }
 
 impl Ledger {
-    pub const ALL: [Ledger; 5] = [Ledger::Perception, Ledger::Command, Ledger::Task, Ledger::Ml, Ledger::Body];
+    pub const ALL: [Ledger; 6] = [Ledger::Perception, Ledger::Command, Ledger::Task, Ledger::Ml, Ledger::Body, Ledger::Act];
 
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -133,6 +145,7 @@ impl Ledger {
             Ledger::Task => "task",
             Ledger::Ml => "ml",
             Ledger::Body => "body",
+            Ledger::Act => "act",
         }
     }
 

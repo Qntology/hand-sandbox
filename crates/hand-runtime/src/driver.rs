@@ -18,6 +18,13 @@
 //! grid point. Before each pick-up the cargo decision (`crate::cargo`) says
 //! whether to take the piece, make a trip with what is aboard first, or break
 //! the piece and take part of it.
+//!
+//! The actions play their physics (`hand_core::act`), so they can fail the
+//! way the real ones do, and the driver handles it the way a careful operator
+//! would: a grasp that slips or misses is tried again (`MAX_GRASP_TRIES`), a
+//! body that cannot bring its hand down to the ground pushes the item to the
+//! destination with its bumper instead (`MAX_PUSH_TRIES` lost pushes), and a
+//! fall is waited out and the move tried again (`MAX_FALLS`).
 
 use hand_quest::{QuestResult, State};
 use hand_sds::{Level, Scope, Track};
@@ -31,6 +38,13 @@ use world_sim::{amount_text, Action, ActionError, ItemKind, NodeKind, TimedEvent
 use hand_search::text::eul_reul;
 
 use crate::cargo::{self, CargoAction, CargoCtx, CargoDecision};
+
+/// Grasps of one piece the driver tries before it leaves the piece (est: an operator's retry policy).
+pub(crate) const MAX_GRASP_TRIES: u32 = 3;
+/// Pushes of one piece that may lose it before the driver leaves it (est).
+pub(crate) const MAX_PUSH_TRIES: u32 = 3;
+/// Falls in one quest before the driver gives up (est).
+pub(crate) const MAX_FALLS: u32 = 3;
 use crate::perception::EntKind;
 use crate::precision::LmState;
 use crate::runtime::Runtime;
@@ -58,6 +72,8 @@ pub(crate) enum MoveFor {
     Shuttle,
     /// A round trip: back to where the rest is lying.
     Return,
+    /// Lining up behind a piece to push it.
+    PushLineUp(u32),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -69,6 +85,7 @@ pub(crate) enum Act {
     Deliver(ItemKind),
     Split(u32),
     Unload,
+    Push(u32),
 }
 
 #[derive(Clone, Debug)]
@@ -79,6 +96,13 @@ pub(crate) struct TaskTarget {
     /// Items lifted into the bay so far (half a stone is 0.5).
     pub picked: f32,
     pub label_ko: String,
+}
+
+/// A piece being pushed to the destination: which one and how many pushes lost it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PushJob {
+    pub drop: u32,
+    pub tries: u32,
 }
 
 /// Where a round trip stands.
@@ -160,6 +184,13 @@ pub(crate) struct Task {
     pub touch_miss: u32,
     pub wasted: u32,
     pub delivered: Vec<(String, f32)>,
+    // the actions' physics
+    /// Failed grasps of the current piece.
+    pub grasp_tries: u32,
+    pub falls: u32,
+    pub push: Option<PushJob>,
+    /// Pieces that reached the destination by pushing.
+    pub pushed: Vec<(String, f32)>,
 }
 
 fn add_amount(list: &mut Vec<(String, f32)>, id: &str, a: f32) {
@@ -266,6 +297,10 @@ impl Task {
             touch_miss: 0,
             wasted: 0,
             delivered: Vec::new(),
+            grasp_tries: 0,
+            falls: 0,
+            push: None,
+            pushed: Vec::new(),
         })
     }
 
@@ -322,6 +357,9 @@ pub(crate) fn action_error_ko(e: &ActionError) -> String {
         ActionError::NothingToDrop => "적재함에 내려놓을 물건이 없습니다".into(),
         ActionError::NotDivisible => "이 물건은 손으로 쪼갤 수 없습니다".into(),
         ActionError::PieceTooSmall { amount } => format!("조각이 너무 작아 더 쪼갤 수 없습니다 ({} 개)", amount_text(*amount)),
+        ActionError::CannotReach { reason, .. } => format!("바닥에 손이 닿지 않습니다: {reason}"),
+        ActionError::CannotPush { reason } => format!("밀 수 없습니다: {reason}"),
+        ActionError::Fallen => "넘어져 일어나는 중입니다".into(),
     }
 }
 
@@ -414,6 +452,10 @@ impl Runtime {
                     Flow::Continue
                 }
             };
+        }
+        // After a fall the robot gets up before anything else.
+        if self.world.fallen_until.is_some_and(|f| self.world.time_s < f) {
+            return Flow::Continue;
         }
         self.next_action(t)
     }
@@ -708,6 +750,9 @@ impl Runtime {
         if let Some(flow) = self.trip_step(t) {
             return flow;
         }
+        if t.push.is_some() {
+            return self.push_step(t);
+        }
         loop {
             let (need_more, name) = {
                 let x = t.target();
@@ -744,6 +789,18 @@ impl Runtime {
                     }
                     Err(e) => fail(e.code(), action_error_ko(&e)),
                 };
+            }
+            // A body that cannot bring its hand to the ground pushes the piece there instead (or cannot fetch it).
+            if let Err(why) = self.world.reach_ground(d.kind, d.amount) {
+                if t.destination.is_none() {
+                    return fail("reach_ground", format!("{name}{} 집을 수 없습니다: {why}", eul_reul(&name)));
+                }
+                if self.world.body.legged {
+                    return fail("reach_ground", format!("{name}{} 집을 수 없습니다: {why}", eul_reul(&name)));
+                }
+                self.log("quest", Level::Info, format!("{name}: 바닥에 손이 닿지 않아 범퍼로 밀어 옮김 — {why}"), Some(json!({"drop": id})));
+                t.push = Some(PushJob { drop: id, tries: 0 });
+                return self.push_step(t);
             }
             // The cargo decision: take it, make a trip first, or break it.
             let ctx = CargoCtx { quest_cargo_kg: self.quest_cargo_kg(t), destination: self.waypoint_of(t).map(|(_, x, z, _)| (x, z)) };
@@ -790,6 +847,61 @@ impl Runtime {
                 }
                 Err(e) => fail(e.code(), action_error_ko(&e)),
             };
+        }
+    }
+
+    /// Advances a push: line up behind the piece, face the way, push it to the
+    /// destination; when it lies there it goes onto the pile and counts as
+    /// delivered. A push that lost the piece starts over from where it lies.
+    fn push_step(&mut self, t: &mut Task) -> Flow {
+        let Some(job) = t.push else { return Flow::Continue };
+        let Some((wid, wx, wz, place)) = self.waypoint_of(t) else { return fail("unknown_target", "목적지를 찾을 수 없습니다") };
+        let name = t.target().label_ko.clone();
+        let Some(d) = self.world.drop_item(job.drop).cloned() else {
+            t.push = None;
+            t.drop_idx += 1;
+            return Flow::Continue;
+        };
+        if (d.x - wx).hypot(d.z - wz) <= DELIVER_REACH_M {
+            let mut ev = Vec::new();
+            if let Some(a) = self.world.stock_pushed(job.drop, wid, &mut ev) {
+                self.log_world_events(&ev);
+                if let Some(x) = t.targets.iter_mut().find(|x| x.item == d.kind) {
+                    x.picked += a;
+                }
+                add_amount(&mut t.delivered, d.kind.id(), a);
+                add_amount(&mut t.pushed, d.kind.id(), a);
+                self.log("quest", Level::Info, format!("{name}{} {place}까지 밀어 옮김", eul_reul(&name)), Some(json!({"drop": job.drop, "amount": a})));
+            }
+            t.push = None;
+            t.drop_idx += 1;
+            let (picked, wanted) = (t.target().picked, t.target().wanted);
+            self.progress(t, (picked / wanted as f32).min(1.0), Some(format!("{}/{wanted}개 (밀어서)", amount_text(picked))));
+            return Flow::Continue;
+        }
+        let (_, (lx, lz, yaw)) = match self.world.push_route(job.drop, wx, wz) {
+            Ok(r) => r,
+            Err(e) => return fail(e.code(), format!("{name}{} {place}까지 밀 수 없습니다: {}", eul_reul(&name), action_error_ko(&e))),
+        };
+        let off = (lx - self.world.agent.x).hypot(lz - self.world.agent.z);
+        // The nearest cell centre is within half a cell's diagonal of any point.
+        if off > world_sim::world::PUSH_START_SLACK_M {
+            return match self.issue(t, Action::MoveTo { x: lx, z: lz, reach_m: 0.36 }, Act::Move(MoveFor::PushLineUp(job.drop))) {
+                Ok(()) => Flow::Continue,
+                Err(e) => fail(e.code(), action_error_ko(&e)),
+            };
+        }
+        let err = (yaw - self.world.agent.yaw + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+        if err.abs() > 0.12 {
+            return match self.issue(t, Action::Turn { yaw_deg: yaw.to_degrees() }, Act::Turn) {
+                Ok(()) => Flow::Continue,
+                Err(e) => fail(e.code(), action_error_ko(&e)),
+            };
+        }
+        self.progress(t, (t.target().picked / t.target().wanted as f32).min(1.0), Some(format!("{name} 미는 중 → {place}")));
+        match self.issue(t, Action::Push { drop: job.drop, x: wx, z: wz }, Act::Push(job.drop)) {
+            Ok(()) => Flow::Continue,
+            Err(e) => fail(e.code(), action_error_ko(&e)),
         }
     }
 
@@ -1018,6 +1130,49 @@ impl Runtime {
             if why == "cancelled" {
                 return fail("cancelled", "중지되었습니다");
             }
+            // A fall: the robot gets up (the world holds it down for a while) and the phase moves again.
+            if why.starts_with("fall") {
+                t.falls += 1;
+                let ground = self.world.ground_here().id();
+                self.sds.record_agreement(&Scope::new(Track::Act, "walk", ground), "no_fall", false);
+                if t.falls > MAX_FALLS {
+                    return fail("fall", format!("{}번 넘어져 그만둠 — {}", t.falls, why.trim_start_matches("fall: ")));
+                }
+                self.log("quest", Level::Warn, format!("넘어짐 {}/{MAX_FALLS} — 일어나서 다시 감: {}", t.falls, why.trim_start_matches("fall: ")), None);
+                return Flow::Continue;
+            }
+            match act {
+                Act::Pick(id) => {
+                    // A grasp that slipped or missed: the piece fell back; try again, then leave it.
+                    t.grasp_tries += 1;
+                    if t.grasp_tries < MAX_GRASP_TRIES {
+                        self.log("quest", Level::Warn, format!("잡기 실패 ({why}) — 다시 잡기 {}/{MAX_GRASP_TRIES}", t.grasp_tries + 1), Some(json!({"drop": id, "code": why})));
+                    } else {
+                        self.log("quest", Level::Warn, format!("{MAX_GRASP_TRIES}번 잡지 못해 이 조각은 두고 감 ({why})"), Some(json!({"drop": id, "code": why})));
+                        t.grasp_tries = 0;
+                        t.drop_idx += 1;
+                        t.wasted += 1;
+                    }
+                    t.pick_retry = false;
+                    return Flow::Continue;
+                }
+                Act::Push(id) => {
+                    if let Some(j) = t.push.as_mut() {
+                        j.tries += 1;
+                        if j.tries >= MAX_PUSH_TRIES {
+                            self.log("quest", Level::Warn, format!("{MAX_PUSH_TRIES}번 밀다 놓쳐 이 조각은 두고 감 ({why})"), Some(json!({"drop": id, "code": why})));
+                            t.push = None;
+                            t.drop_idx += 1;
+                            t.wasted += 1;
+                        } else {
+                            self.log("quest", Level::Warn, format!("밀다 놓침 ({why}) — 다시 줄 서기 {}/{MAX_PUSH_TRIES}", j.tries + 1), Some(json!({"drop": id, "code": why})));
+                        }
+                    }
+                    return Flow::Continue;
+                }
+                Act::Move(MoveFor::PushLineUp(_)) => return Flow::Continue,
+                _ => {}
+            }
             // A move that fails midway (a blocked cell, for example) is retried from the top.
             return match act {
                 Act::Move(MoveFor::Approach(id)) => {
@@ -1078,6 +1233,7 @@ impl Runtime {
             Act::Pick(_) => {
                 t.drop_idx += 1;
                 t.pick_retry = false;
+                t.grasp_tries = 0;
                 let (picked, wanted) = (t.target().picked, t.target().wanted);
                 self.progress(t, (picked / wanted as f32).min(1.0), Some(format!("{}/{wanted}개", amount_text(picked))));
                 Flow::Continue
@@ -1096,6 +1252,7 @@ impl Runtime {
                 Flow::Continue
             }
             Act::Unload => Flow::Continue,
+            Act::Push(_) | Act::Move(MoveFor::PushLineUp(_)) => Flow::Continue,
         }
     }
 
@@ -1199,7 +1356,7 @@ impl Runtime {
             r.precision.map(|p| format!(" · 접촉 확인 정밀도 {:.0}%", p * 100.0)).unwrap_or_default(),
             if r.wasted_actions > 0 { format!(" · 헛수고 {}회", r.wasted_actions) } else { String::new() },
             if r.trips > 1 { format!(" · {}회 왕복", r.trips) } else { String::new() }
-        );
+        ) + &if t.pushed.is_empty() { String::new() } else { format!(" · 밀어서 옮김 {}", items_ko(&t.pushed)) } + &if t.falls > 0 { format!(" · 넘어짐 {}회", t.falls) } else { String::new() };
         let picked: Vec<(String, f32)> = t.targets.iter().map(|x| (x.resource.clone(), x.picked)).collect();
         r.summary = match t.kind {
             "fetch" => format!("{}{} {dest_ko}에 인도했습니다 — {tail}", items_ko(&t.delivered), eul_reul(&items_ko(&t.delivered))),

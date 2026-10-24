@@ -66,7 +66,8 @@
 | 줍기·인도에 걸리는 시간 | `PICKUP_TIME_S`, `DELIVER_TIME_S` | 각 1.0 s | 가정 |
 | 조작 전력(채취·줍기·내려놓기) | `MANIPULATION_POWER_W` | 30 W | 가정 |
 | 제자리 회전 속도 | `TURN_RATE_RAD_S` | 2.5 rad/s | 가정 |
-| 아이템 마찰 계수 | `ITEM_FRICTION` | 0.6 | 가정 (재질별 값 아님) |
+| 손 패드 · 지면과 아이템의 마찰 (v0.6) | `hand_core::act::material::{pad_on, item_on}` | 패드–나무 0.60, 돌·철광석 0.83, 석탄 0.45 (산포 10%); 아이템–지면 0.41–0.62 (정지·운동, 산포 10%) | CTU Code 2014, Nikolić 2024, Teffo & Naudé 2013, NAVFAC DM-7.02, Linthorne & Cooper 2013, Fall 2014 (`docs/research/actions.md` §1.2–1.3). v0.5의 `ITEM_FRICTION` 0.6(재질 구분 없음)을 대체. 석탄 패드 마찰과 산포는 추정 |
+| 행위 시계열 (v0.6) | `hand_core::act` | 굽힘(관절 범위·토크), 잡기(조준·쥠 안전계수 2·연질 접촉·충돌·들기 관성), 놓기(낙하·반발), 밀기(한계면·안정 반경), 걷기(LIPM·미끄럼·넘어짐), 주행(견인–미끄럼) | `docs/research/actions.md` §1. 관절 범위, 착지 속도, 범퍼 강성, 일어나는 시간 6 s 등은 추정 |
 | 채취 속도 | `World::mining_rate` | 손가락 수 / 5 (5지 = 1.0) | 가정 |
 | 노드 경도 | `NodeSpec::hardness` | 나무 2.0, 바위 1.5, 석탄·철 3.0 | Minecraft 관례를 따른 값. "도구 필요" 규칙은 두지 않음 |
 | 노드 드롭 수 | `NodeSpec::drop_count` | 나무 3, 바위 2, 석탄 광석 2, 철 광석 1 | 가정 |

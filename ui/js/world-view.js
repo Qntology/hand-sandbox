@@ -1,9 +1,11 @@
 // 월드 화면: world_frame(WebP) 폴링 → 캔버스, 탐지 박스 오버레이, 범례, 표시 토글.
 // 폴링은 약 6fps 이고, 이전 호출이 끝나지 않았거나 틱·옵션이 그대로면 건너뛴다.
+// 포커스 시점(focus:hand|side|low)은 행위가 쓰는 부위의 근접 화면과, 응답의 focus(FocusFrame)로 그 부위의 힘·관절 그림을 함께 보인다.
 import { call } from './api.js';
 import { bus, state } from './state.js';
 import { $, clear, el, fmt, observeResize } from './util.js';
 import { drawJointOverlay, renderJointPanel } from './joint-view.js';
+import { DRAWN_PARTS, PART_KO, drawFocus, partAvailable, resolvePart } from './focus-view.js';
 
 const POLL_MS = 160;
 const RETRY_MS = 2500;
@@ -70,6 +72,8 @@ async function drawFrame(f) {
   $('joint-layer').hidden = !chase;
   drawJointOverlay(f.overlay ?? null, f.width, f.height);
   renderJointPanel(chase ? f.overlay : null);
+  lastFocus = f.focus ?? null;
+  renderFocusHud();
   if (sizeChanged) layoutFrame();
   if (!drewOnce) {
     drewOnce = true;
@@ -79,6 +83,40 @@ async function drawFrame(f) {
   $('sb-frame').textContent = `${fmt.bytes(f.bytes)} · ${fmt.n(f.encode_ms, 1)} ms`;
   renderDetections();
   bus.emit('frame', state.frame);
+}
+
+// ── 포커스 시점의 부위 그림 ─────────────────────────────────────
+let lastFocus = null;
+
+/** 카메라마다 먼저 보일 부위: 손 근접 → 손 모양, 옆 → 허리, 낮게 → 발·바퀴·트랙 중 이 몸에 있는 것. */
+function defaultPart(cam, f) {
+  if (cam === 'hand') return 'hand';
+  if (cam === 'side') return 'waist';
+  return ['foot', 'wheel', 'track'].find((p) => partAvailable(f, p)) ?? 'foot';
+}
+
+function renderFocusHud() {
+  const view = $('view-select').value;
+  const f = lastFocus;
+  const hud = $('focus-hud');
+  hud.hidden = !view.startsWith('focus') || !f;
+  if (hud.hidden) return;
+  const cam = view.split(':')[1] ?? 'hand';
+  const pick = $('fh-part').value || 'auto';
+  // 자동: 지금 행위·사건이 다루는 부위, 없으면 카메라의 부위.
+  const part = pick === 'auto' ? ((f.parts ?? []).length ? resolvePart('auto', f) : defaultPart(cam, f)) : pick;
+  $('fh-title').textContent = `부위 포커스 · ${PART_KO[part] ?? part}`;
+  drawFocus($('fh-canvas'), f, part);
+  const cap = clear($('fh-cap'));
+  cap.append(`${f.action_ko ?? '행위 없음'}${f.phase ? ` · ${f.phase}` : ''} · 안정 여유 ${fmt.n(f.body?.margin, 2)} · 몸통 ${fmt.n(f.body?.trunk_deg, 0)}°`);
+  if (f.event) cap.append(el('div', { class: f.event_ok === false ? 'fail' : '', text: `${f.event}` }));
+}
+
+function initFocusHud() {
+  const sel = $('fh-part');
+  sel.append(el('option', { value: 'auto', text: '자동 (행위 부위)' }), ...DRAWN_PARTS.map((p) => el('option', { value: p, text: PART_KO[p] })));
+  sel.addEventListener('change', renderFocusHud);
+  observeResize($('fh-canvas'), renderFocusHud);
 }
 
 // ── 탐지 박스 · 범례 ────────────────────────────────────────────
@@ -181,6 +219,7 @@ function initToggles() {
 
 export function initWorldView() {
   initToggles();
+  initFocusHud();
   observeResize($('world-wrap'), layoutFrame);
   layoutFrame();
   const orbitShown = () => {

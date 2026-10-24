@@ -10,7 +10,9 @@
 //! rest (touch and mine, pick up, carry, deliver) uses the game's actions,
 //! which still have to pass the physics (lift, balance, capacity). Waypoints
 //! are on the map, as in the game pass; the drops a broken node released are
-//! told by the event, as in the game pass.
+//! told by the event, as in the game pass. The actions' physics fail here as
+//! they do there, and are handled the same way (`crate::driver`): a grasp is
+//! tried again, a body that cannot reach the ground pushes, a fall is waited out.
 
 use std::collections::VecDeque;
 
@@ -25,7 +27,7 @@ use world_sim::world::{AMOUNT_EPS, DELIVER_REACH_M, EYE_HEIGHT_M, MINE_REACH_M, 
 use world_sim::{amount_text, Action, ActionError, ItemKind, NodeKind, TimedEvent, WorldEvent};
 
 use crate::cargo::{self, CargoAction, CargoCtx};
-use crate::driver::action_error_ko;
+use crate::driver::{action_error_ko, MAX_FALLS, MAX_GRASP_TRIES, MAX_PUSH_TRIES};
 
 /// A node counts as the one the ML logic meant when it is this close to the
 /// estimated target point (the estimate is the visible surface; the node's
@@ -97,6 +99,12 @@ pub(crate) struct MlTask {
     drop_items: Vec<DropTarget>,
     unloaded: Vec<(String, f32)>,
     unload_started: bool,
+    // the actions' physics
+    grasp_tries: u32,
+    falls: u32,
+    /// The piece being pushed and the pushes that lost it.
+    push: Option<(u32, u32)>,
+    last_pick: Option<u32>,
 }
 
 enum Flow {
@@ -196,6 +204,10 @@ impl Runtime {
             drop_items,
             unloaded: vec![],
             unload_started: false,
+            grasp_tries: 0,
+            falls: 0,
+            push: None,
+            last_pick: None,
         })
     }
 
@@ -316,6 +328,52 @@ impl Runtime {
                         if why == "cancelled" {
                             return fail("cancelled", "중지되었습니다");
                         }
+                        // A fall: get up, then plan the move again.
+                        if why.starts_with("fall") {
+                            t.falls += 1;
+                            t.queue.clear();
+                            if t.falls > MAX_FALLS {
+                                return fail("fall", format!("[ML] {}번 넘어져 그만둠", t.falls));
+                            }
+                            self.log("quest", Level::Warn, format!("[ML] 넘어짐 {}/{MAX_FALLS} — 일어나서 다시 감", t.falls), None);
+                            if t.phase == MlPhase::Look {
+                                t.decider.move_failed();
+                            }
+                            return Flow::Continue;
+                        }
+                        // A grasp that slipped or missed: the same piece again, then leave it.
+                        if t.phase == MlPhase::Collect && (why.starts_with("grasp") || why == "lift_overload") {
+                            t.grasp_tries += 1;
+                            t.queue.clear();
+                            if t.grasp_tries < MAX_GRASP_TRIES {
+                                if let Some(id) = t.last_pick {
+                                    if let Some(i) = t.drops.iter().position(|d| *d == id) {
+                                        t.drop_idx = i;
+                                    }
+                                }
+                                self.log("quest", Level::Warn, format!("[ML] 잡기 실패 ({why}) — 다시 잡기 {}/{MAX_GRASP_TRIES}", t.grasp_tries + 1), None);
+                            } else {
+                                t.grasp_tries = 0;
+                                t.wasted += 1;
+                                self.log("quest", Level::Warn, format!("[ML] {MAX_GRASP_TRIES}번 잡지 못해 이 조각은 두고 감 ({why})"), None);
+                            }
+                            return Flow::Continue;
+                        }
+                        // A push that lost the piece: line up again, then leave it.
+                        if t.phase == MlPhase::Collect && why.starts_with("push") {
+                            t.queue.clear();
+                            if let Some((id, n)) = t.push {
+                                if n + 1 >= MAX_PUSH_TRIES {
+                                    t.push = None;
+                                    t.drop_idx += 1;
+                                    t.wasted += 1;
+                                    self.log("quest", Level::Warn, format!("[ML] {MAX_PUSH_TRIES}번 밀다 놓쳐 d{id}는 두고 감 ({why})"), None);
+                                } else {
+                                    t.push = Some((id, n + 1));
+                                }
+                            }
+                            return Flow::Continue;
+                        }
                         if t.phase == MlPhase::Look {
                             t.decider.move_failed();
                             t.queue.clear();
@@ -329,6 +387,10 @@ impl Runtime {
                     }
                 }
             }
+        }
+        // After a fall the robot gets up before anything else.
+        if self.world.fallen_until.is_some_and(|f| self.world.time_s < f) {
+            return Flow::Continue;
         }
         if let Some(a) = t.queue.pop_front() {
             let label = a.label();
@@ -661,6 +723,9 @@ impl Runtime {
         if let Some(p) = t.split_piece.take() {
             t.drops.insert(t.drop_idx, p);
         }
+        if t.push.is_some() {
+            return self.ml_push(t);
+        }
         let (picked, wanted) = (t.target().picked, t.target().wanted);
         if picked + AMOUNT_EPS >= wanted as f32 || t.drop_idx >= t.drops.len() {
             if picked + AMOUNT_EPS >= wanted as f32 {
@@ -698,6 +763,14 @@ impl Runtime {
             return Flow::Continue;
         }
         let dest = t.destination.as_deref().and_then(|k| self.world.waypoint_by_key(k)).map(|w| (w.id, w.x, w.z));
+        // A body that cannot bring its hand to the ground pushes the piece to the destination instead.
+        if let Err(why) = self.world.reach_ground(d.kind, d.amount) {
+            if dest.is_none() || self.world.body.legged {
+                return fail("reach_ground", format!("[ML] {}을(를) 집을 수 없습니다: {why}", d.kind.spec().label_ko));
+            }
+            t.push = Some((id, 0));
+            return self.ml_push(t);
+        }
         let ctx = CargoCtx { quest_cargo_kg: self.ml_quest_cargo_kg(t), destination: dest.map(|w| (w.1, w.2)) };
         let dec = cargo::decide(&self.world, &d, &ctx);
         if dec.action != CargoAction::Take {
@@ -706,6 +779,7 @@ impl Runtime {
         match dec.action {
             CargoAction::Take => {
                 t.drop_idx += 1;
+                t.last_pick = Some(id);
                 t.queue.push_back(Action::PickUp { drop: id });
             }
             CargoAction::Split { portion } => t.queue.push_back(Action::Split { drop: id, portion }),
@@ -725,6 +799,45 @@ impl Runtime {
             }
             CargoAction::Refuse => return fail(dec.code.unwrap_or("lift_overload"), format!("[ML] {}", dec.summary_ko)),
         }
+        Flow::Continue
+    }
+
+    /// A push as the game pass does it: line up, face, push; at the
+    /// destination the piece goes onto the pile and counts as delivered.
+    fn ml_push(&mut self, t: &mut MlTask) -> Flow {
+        let Some((id, _)) = t.push else { return Flow::Continue };
+        let Some((wid, wx, wz)) = t.destination.as_deref().and_then(|k| self.world.waypoint_by_key(k)).map(|w| (w.id, w.x, w.z)) else { return fail("unknown_target", "목적지를 찾을 수 없습니다") };
+        let Some(d) = self.world.drop_item(id).cloned() else {
+            t.push = None;
+            t.drop_idx += 1;
+            return Flow::Continue;
+        };
+        if (d.x - wx).hypot(d.z - wz) <= DELIVER_REACH_M {
+            let mut ev = Vec::new();
+            if let Some(a) = self.world.stock_pushed(id, wid, &mut ev) {
+                self.log_world_events(&ev);
+                if let Some(x) = t.targets.iter_mut().find(|x| x.item == d.kind) {
+                    x.picked += a;
+                }
+                let k = d.kind.id().to_string();
+                match t.delivered.iter_mut().find(|(n, _)| *n == k) {
+                    Some(e) => e.1 += a,
+                    None => t.delivered.push((k, a)),
+                }
+            }
+            t.push = None;
+            t.drop_idx += 1;
+            return Flow::Continue;
+        }
+        let (_, (lx, lz, yaw)) = match self.world.push_route(id, wx, wz) {
+            Ok(r) => r,
+            Err(e) => return fail(e.code(), format!("[ML] 밀 수 없습니다: {}", action_error_ko(&e))),
+        };
+        if (lx - self.world.agent.x).hypot(lz - self.world.agent.z) > world_sim::world::PUSH_START_SLACK_M {
+            t.queue.push_back(Action::MoveTo { x: lx, z: lz, reach_m: 0.36 });
+        }
+        t.queue.push_back(Action::Turn { yaw_deg: yaw.to_degrees() });
+        t.queue.push_back(Action::Push { drop: id, x: wx, z: wz });
         Flow::Continue
     }
 

@@ -141,7 +141,11 @@ impl Runtime {
                 self.api_test_status()
             })(),
             "test_status" => self.api_test_status(),
-            "test_keyframe" => self.api_test_keyframe(if text("pass").is_empty() { "game" } else { text("pass") }, num("index").unwrap_or(0.0).max(0.0) as usize),
+            "test_keyframe" => self.api_test_keyframe_with(
+                if text("pass").is_empty() { "game" } else { text("pass") },
+                num("index").unwrap_or(0.0).max(0.0) as usize,
+                args.get("close_ups").and_then(Value::as_bool).unwrap_or(true),
+            ),
             "test_video" => self.api_test_video(if text("pass").is_empty() { "game" } else { text("pass") }, num("from").unwrap_or(0.0).max(0.0) as usize, num("count").unwrap_or(30.0) as usize),
             "test_stats" => self.api_test_stats(),
             "test_cancel" => {

@@ -596,6 +596,63 @@ pub fn render_chase(world: &World, cam: &Camera, view: &ChaseView, robot: &[Obb]
     render_with(world, cam, view.origin, view.yaw, view.pitch, robot)
 }
 
+/// Close-up cameras of the focus views: the working hand from its side, the
+/// whole body from the side (waist, neck, legs), and low by the feet, the
+/// wheels or the tracks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FocusCam {
+    Hand,
+    Side,
+    Low,
+}
+
+impl FocusCam {
+    pub const ALL: [FocusCam; 3] = [FocusCam::Hand, FocusCam::Side, FocusCam::Low];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            FocusCam::Hand => "hand",
+            FocusCam::Side => "side",
+            FocusCam::Low => "low",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<FocusCam> {
+        FocusCam::ALL.into_iter().find(|c| c.id() == id)
+    }
+
+    /// Where the camera looks (base frame) and where it sits relative to that, metres.
+    fn aim(self, pose: Option<&hand_core::dynamics::BodyPose>) -> ([f32; 3], [f32; 3]) {
+        match self {
+            FocusCam::Hand => {
+                let palm = pose.and_then(|p| p.boxes.iter().find(|b| b.name == "palm_r")).map_or([0.3, -0.18, 0.7], |b| b.center);
+                (palm, [-0.05, -0.6, 0.18])
+            }
+            FocusCam::Side => ([0.05, 0.0, 0.55], [0.15, -2.1, 0.25]),
+            FocusCam::Low => ([0.12, 0.0, 0.10], [0.35, -1.0, 0.22]),
+        }
+    }
+}
+
+/// Renders a focus close-up of the robot as it is now (`World::body_pose`).
+pub fn render_focus(world: &World, cam: &Camera, which: FocusCam) -> Frame {
+    let pose = world.body_pose();
+    let boxes = pose.as_ref().map(|p| world.robot_boxes(p)).unwrap_or_default();
+    let (t, off) = which.aim(pose.as_ref());
+    let target = world.body_to_world(t);
+    let mut origin = world.body_to_world([t[0] + off[0], t[1] + off[1], t[2] + off[2]]);
+    // Keep the camera out of the ground under it.
+    let floor = world.surface_m(origin[0], origin[2]) + 0.08;
+    if origin[1] < floor {
+        origin[1] = floor;
+    }
+    let d = [target[0] - origin[0], target[1] - origin[1], target[2] - origin[2]];
+    let yaw = d[2].atan2(d[0]);
+    let pitch = d[1].atan2((d[0] * d[0] + d[2] * d[2]).sqrt());
+    render_with(world, cam, origin, yaw, pitch, &boxes)
+}
+
 fn render_with(world: &World, cam: &Camera, origin: [f32; 3], yaw: f32, pitch: f32, robot: &[Obb]) -> Frame {
     let scene = Scene::build(world);
     let (w, h) = (cam.width.max(1), cam.height.max(1));

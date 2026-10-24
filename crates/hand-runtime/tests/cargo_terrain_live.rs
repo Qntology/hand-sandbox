@@ -6,7 +6,7 @@
 //! The recogniser is the stand-in (the renderer's ground truth, no noise);
 //! these tests show the pieces fit, not how a real model would perform.
 
-use hand_core::{BaseKind, BodyPlan, Tier};
+use hand_core::{BaseKind, BodyPlan, HandConfig, Tier};
 use hand_quest::State;
 use hand_sds::{Scope, Track};
 use hand_runtime::{NoiseCfg, Runtime, RuntimeConfig, TestPhase};
@@ -15,7 +15,10 @@ use world_sim::{ItemKind, TerrainKind};
 
 const LEXICON: &str = include_str!("../../../data/world_lexicon.json");
 
+/// The robot walks, so its hands reach the items on the ground (a wheeled
+/// body of these presets pushes them instead: `scenarios.rs`).
 fn runtime_with(cfg: RuntimeConfig) -> Runtime {
+    let cfg = RuntimeConfig { hand: HandConfig { base: BaseKind::HumanFoot, ..cfg.hand }, ..cfg };
     Runtime::new(cfg, LEXICON, None).expect("runtime")
 }
 
@@ -41,7 +44,8 @@ fn assert_done(rt: &Runtime, q: &hand_quest::Quest) {
 
 #[test]
 fn carried_items_are_set_down_by_command_here_or_at_a_place() {
-    let mut rt = runtime(7);
+    // Pro legs: two logs (4.8 kg) are within their continuous knee limit (the mid legs' is 3.4 kg).
+    let mut rt = runtime_with(RuntimeConfig { seed: 7, noise: NoiseCfg::none(), body: BodyPlan::named("pro").unwrap(), ..RuntimeConfig::default() });
     let q = run_command(&mut rt, "원목 2개 캐줘", 30_000);
     assert_done(&rt, &q);
     assert_eq!(rt.world().carried_count(ItemKind::Log), 2);

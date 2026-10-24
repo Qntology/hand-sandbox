@@ -177,7 +177,7 @@
           <button type="button" class="vt-btn active" id="tg-pip" aria-pressed="true">PiP</button>
           <div class="vt-sep"></div>
           <label class="vt-label" for="view-select">시점</label>
-          <select id="view-select" title="3인칭: 로봇 뒤 추적 카메라에 관절 동역학(프리셋 질량·액추에이터)으로 움직이는 몸과 관절 토크·ZMP를 겹쳐 그립니다"><option value="agent">에이전트 시점 (1인칭)</option><option value="chase">3인칭 (관절 물리)</option><option value="top">탑뷰</option></select>
+          <select id="view-select" title="3인칭: 로봇 뒤 추적 카메라에 관절 동역학(프리셋 질량·액추에이터)으로 움직이는 몸과 관절 토크·ZMP를 겹쳐 그립니다. 포커스: 행위가 쓰는 부위의 근접 화면과 그 부위의 힘·관절 그림"><option value="agent">에이전트 시점 (1인칭)</option><option value="chase">3인칭 (관절 물리)</option><option value="top">탑뷰</option><option value="focus:hand">포커스 · 손 근접</option><option value="focus:side">포커스 · 옆 (허리·목·다리)</option><option value="focus:low">포커스 · 낮게 (발·바퀴·트랙)</option></select>
           <label class="vt-label" for="orbit-range" id="orbit-label" hidden>궤도</label>
           <input type="range" id="orbit-range" min="-180" max="180" step="15" value="-30" hidden aria-label="3인칭 카메라 궤도 각도" title="3인칭 카메라를 로봇 둘레로 돌립니다 (0° = 뒤, 음수 = 오른쪽 · 작업 팔)" />
           <label class="vt-label" for="frame-preset">프레임</label>
@@ -213,6 +213,11 @@
               <tbody id="jp-rows"></tbody>
             </table>
             <ul class="jp-notes" id="jp-notes"></ul>
+          </section>
+          <section class="vp-glass focus-hud" id="focus-hud" aria-label="부위 포커스" hidden>
+            <div class="fh-head"><b id="fh-title">부위 포커스</b><select id="fh-part" aria-label="그릴 부위"></select></div>
+            <canvas id="fh-canvas" aria-label="부위 포커스 그림"></canvas>
+            <div class="fh-cap" id="fh-cap"></div>
           </section>
           <div class="world-empty" id="world-empty" role="status">월드를 만드는 중입니다…</div>
 

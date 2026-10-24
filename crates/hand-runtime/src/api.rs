@@ -33,7 +33,8 @@ pub const MIN_CELLS: usize = 32;
 pub const MAX_CELLS: usize = 160;
 
 /// Names of the commands [`Runtime::api_call`] answers.
-pub const COMMANDS: [&str; 31] = [
+pub const COMMANDS: [&str; 32] = [
+    "act_status",
     "inventory_drop",
     "world_reset",
     "body_reset",
@@ -527,13 +528,42 @@ impl Runtime {
         })
     }
 
-    /// `world_frame({width, height, quality, view})`: a WebP screenshot and the boxes of the last scan.
+    /// `act_status()`: the action being played (how far in, its physics
+    /// moments so far), the last one finished with its numbers, the walk's
+    /// steps and slips, and the focus views of now.
+    pub fn api_act_status(&self) -> Value {
+        let w = self.world();
+        let brief = |r: &hand_core::act::ActRollout, upto: f32| {
+            json!({
+                "kind": r.kind.id(), "kind_ko": r.kind.label_ko(),
+                "duration_s": r3(r.duration_s), "elapsed_s": r3(upto.min(r.duration_s)),
+                "outcome": {"ok": r.outcome.ok, "code": r.outcome.code, "reason": r.outcome.reason_ko},
+                "events": r.events.iter().filter(|e| e.t <= upto + 1e-6).map(|e| json!({"t": r3(e.t), "kind": e.kind, "label": e.label_ko, "ok": e.ok, "value": e.value.map(r3), "parts": e.parts.iter().map(|p| p.id()).collect::<Vec<_>>()})).collect::<Vec<_>>(),
+                "metrics": r.metrics.iter().filter(|(_, v)| v.is_finite()).map(|(k, v)| (k.to_string(), json!(r3(*v)))).collect::<serde_json::Map<String, Value>>(),
+                "notes": r.notes,
+            })
+        };
+        json!({
+            "now": w.act.as_ref().map(|p| brief(&p.rollout, p.elapsed_s)),
+            "last": w.last_act.as_ref().map(|p| brief(&p.rollout, p.rollout.duration_s)),
+            "fallen": w.fallen_until.is_some(),
+            "walk": {"steps": w.walk.steps, "slips": w.walk.slips},
+            "focus": w.focus_frame(),
+        })
+    }
+
+    /// `world_frame({width, height, quality, view})`: a WebP screenshot and the
+    /// boxes of the last scan. `view` is `agent`, `top`, `chase:<orbit°>` or
+    /// `focus:<hand|side|low>`; a focus view also returns the focus views of
+    /// the instant (`focus`, as a keyframe's).
     pub fn api_world_frame(&mut self, width: u32, height: u32, quality: f32, view: &str) -> Result<Value, String> {
         let view = match view {
             "top" => FrameView::Top,
             v if v.starts_with("chase") => FrameView::Chase { orbit_deg: v.split_once(':').and_then(|(_, o)| o.parse::<f32>().ok()).unwrap_or(0.0).clamp(-180.0, 180.0) as i16 },
+            v if v.starts_with("focus") => FrameView::Focus(v.split_once(':').and_then(|(_, c)| world_sim::render::FocusCam::from_id(c)).unwrap_or(world_sim::render::FocusCam::Hand)),
             _ => FrameView::Agent,
         };
+        let focus = matches!(view, FrameView::Focus(_)).then(|| serde_json::to_value(self.world.focus_frame()).unwrap_or(Value::Null));
         let f = self.frame_sized(view, width, height, quality).map_err(|e| e.to_string())?;
         let dets: Vec<Value> = f
             .detections
@@ -552,6 +582,7 @@ impl Runtime {
             "encode_ms": r3(f.encode_ms), "lossless": f.lossless, "tick": f.tick,
             "detections": dets,
             "overlay": f.overlay,
+            "focus": focus,
         }))
     }
 
@@ -781,6 +812,7 @@ impl Runtime {
             "devices" => Ok(device_json(&hand_ml::preferred())),
             "nn_status" => Ok(json!({"scenarios": self.nn_live.summary(), "phases": self.nn_live.phases().collect::<Vec<_>>()})),
             "physics_status" => Ok(self.api_physics_status()),
+            "act_status" => Ok(self.api_act_status()),
             "log_tail" => self.api_log_tail(num(args, "afterSeq").unwrap_or(0.0).max(0.0) as u64, num(args, "limit").unwrap_or(200.0) as usize, text(args, "category")),
             other => Err(format!("unknown command {other}")),
         }

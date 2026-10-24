@@ -1,0 +1,907 @@
+//! Whole-body kinematics and statics of the actions (`crate::act`).
+//!
+//! [`crate::balance`] holds one fixed posture per disturbance and
+//! [`crate::dynamics`] moves the upper body between two of them. The actions
+//! (bend, grasp, push, walk) need poses those two do not have: a squat, a hip
+//! flexion, a trunk pitched far forward, a hand at the ground, a pushing hand,
+//! a swing leg. This module places every link of a robot built from the
+//! presets by joint angle and works out, for one instant:
+//!
+//! * where every joint is, and the links as boxes (for the focus views),
+//! * the moment every joint holds against gravity, the body's acceleration and
+//!   the forces on the hands (D'Alembert statics: the slow joint motions of an
+//!   action add little next to the base acceleration and the hand forces),
+//! * the ground reaction, its zero-moment point and the margin inside the
+//!   support (the stance feet, or the chassis contact rectangle),
+//! * the normal load and the shear of every contact: each foot with its centre
+//!   of pressure, each axle of a wheeled base, the pressure along a track.
+//!
+//! Geometry is the reference robot's (`parts`): hip 0.58 m, waist 0.70 m,
+//! shoulder 1.00 m, upper arm 0.22 m, forearm 0.20 m. Below the hip the leg is
+//! a thigh and a shank of equal length over an ankle 0.08 m above the sole, as
+//! `dynamics` draws it; the knee bends forward and its position follows from
+//! the hip and the ankle (two-link inverse kinematics). A wheeled or tracked
+//! base carries the pelvis on its mast at hip height.
+//!
+//! Signs: a joint's `torque` is the moment, about +y (left), of the loads on
+//! its far side: gravity and inertia of the links beyond it and the hand
+//! forces for the upper joints and the hip, the ground reaction under the
+//! foot for a stance knee and ankle. Ratios use its magnitude.
+
+use serde::{Deserialize, Serialize};
+
+use crate::balance::{Body, JointLoad, CARGO_X_M, CARGO_Z_M, G, HIP_HALF_WIDTH_M, MAST_KG};
+use crate::base::BaseKind;
+use crate::dynamics::{BodyPose, JointPoint, LinkBox};
+use crate::parts::*;
+use crate::Source;
+
+/// Ankle joint above the sole, metres (as `dynamics` draws the leg).
+pub const ANKLE_H_M: f32 = 0.08;
+/// Thigh and shank length, metres: the hip-to-ankle distance split in two.
+pub const THIGH_M: f32 = (HIP_M - ANKLE_H_M) * 0.5;
+pub const SHANK_M: f32 = (HIP_M - ANKLE_H_M) * 0.5;
+/// Hip centre to the waist joint along the pelvis, metres.
+pub const PELVIS_M: f32 = WAIST_M - HIP_M;
+/// Waist joint to the shoulder line along the trunk, metres.
+pub const TRUNK_M: f32 = SHOULDER_M - WAIST_M;
+/// Shoulder line to the neck joint along the trunk, metres (as `balance`).
+pub const NECK_UP_M: f32 = 0.07;
+/// Palm centre beyond the wrist, metres (as `balance`).
+pub const PALM_OFFSET_M: f32 = 0.06;
+/// Wheel radius of the wheeled chassis, metres (est: the 100 mm omni wheel of
+/// the budget tier rounded up for the hub-motor tiers; drawing and curb impact).
+pub const WHEEL_R_M: f32 = 0.06;
+/// Width of one wheel or track belt, metres (est, drawing and track pressure).
+pub const BELT_W_M: f32 = 0.08;
+/// The bumper plate ahead of the front wheels or the track sprockets: its
+/// face (x from the chassis centre, beyond the wheels) and its band of height, metres (est).
+pub const BUMPER_GAP_M: f32 = 0.02;
+pub const BUMPER_Z_M: [f32; 2] = [0.03, 0.11];
+
+/// Knee flexion range of the legged presets, degrees: the median of four
+/// humanoids' URDF ranges (165°, 150°, 117°, 110°; `docs/research/actions.md` §2.1).
+pub const KNEE_FLEX_MAX_DEG: f32 = 135.0;
+/// Ankle dorsiflexion with the foot flat, degrees (est, research §2.1).
+pub const ANKLE_DORSI_MAX_DEG: f32 = 30.0;
+/// Hip flexion range, degrees: the median of three humanoids' URDF ranges (145°, 106°, 100°; research §2.1).
+pub const HIP_FLEX_MAX_DEG: f32 = 106.0;
+/// Forward waist pitch of a belly preset with a pitch joint, degrees: the
+/// median of three humanoids' URDF ranges (30°, 70°, 77.5°; research §2.1).
+pub const WAIST_PITCH_MAX_DEG: f32 = 70.0;
+/// Neck pitch range, degrees (as `dynamics`).
+pub const NECK_PITCH_MAX_DEG: f32 = 45.0;
+/// Largest fold between the trunk and a thigh (hip flexion plus waist pitch),
+/// degrees: beyond it the trunk box (0.20 m deep) meets the thigh (est, collision).
+pub const TRUNK_THIGH_FOLD_MAX_DEG: f32 = 150.0;
+/// A link other than the hand and the base may come no closer to the ground, metres.
+pub const GROUND_CLEARANCE_M: f32 = 0.01;
+
+/// Where each joint is and what it holds at one instant.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct KinJoint {
+    /// `waist_pitch`, `neck`, `shoulder_r`, `elbow_r`, `hip_pitch_r`, `hip_roll_r`, `knee_r`, `ankle_r`, `drive_front`, `drive_rear`, `drive`.
+    pub name: String,
+    pub segment: Segment,
+    pub pos: [f32; 3],
+    /// Joint angle, degrees (flexion positive; `None` for a drive).
+    pub angle_deg: Option<f32>,
+    pub actuator: String,
+    /// Signed moment the joint holds (N·m; traction force in N for a drive).
+    pub torque: f32,
+    pub peak: f32,
+    pub cont: f32,
+    /// |torque| over the peak rating (cannot hold above 1) and over the continuous one (heats above 1).
+    pub ratio: f32,
+    pub effort: f32,
+    /// The angle is inside the joint's range.
+    pub in_range: bool,
+    /// A rigid joint without an actuator (the trunk of a belly preset without a pitch joint).
+    pub structural: bool,
+}
+
+/// One ground contact.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ContactPatch {
+    /// `foot_r`, `foot_l`, `axle_front`, `axle_rear`, `track`.
+    pub name: String,
+    /// Normal load, N (0: in the air or unloaded).
+    pub normal_n: f32,
+    /// Shear the ground gives along x, N (forward positive).
+    pub shear_n: f32,
+    /// Centre of pressure in the base frame, metres.
+    pub cop: [f32; 2],
+    /// Footprint `[x0, x1, y0, y1]`, metres.
+    pub rect: [f32; 4],
+    /// Along a track: pressure at the rear and the front end, kPa, and the loaded length, m.
+    pub pressure_kpa: Option<[f32; 2]>,
+    pub loaded_len_m: Option<f32>,
+}
+
+/// The pose of one instant. Angles in degrees, lengths in metres, base frame
+/// (x forward, y left, z up, ground at z = 0).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct KinPose {
+    /// Hip centre (x, z) of a legged robot; the knees follow by inverse kinematics.
+    pub hip: [f32; 2],
+    /// Ankle of each leg (right, left): x, and its height above the stance ankle (0: the foot is on the ground).
+    pub feet: [[f32; 2]; 2],
+    /// Pelvis shift toward +y (left), metres; single support on the right foot shifts it negative.
+    pub pelvis_y: f32,
+    /// Pelvis pitch about the hips, forward positive (the hip flexion of a legged robot together with the thigh).
+    pub pelvis_deg: f32,
+    /// Trunk pitch at the waist joint, forward positive (0 without a pitch joint).
+    pub waist_deg: f32,
+    /// Head pitch at the neck, forward (down) positive.
+    pub neck_deg: f32,
+    /// Shoulder flexion relative to the trunk (0 hanging along it, forward positive) and elbow flexion, per arm (right, left).
+    pub shoulder_deg: [f32; 2],
+    pub elbow_deg: [f32; 2],
+    /// Wheeled base pitch on a slope or a step, nose up positive.
+    pub base_pitch_deg: f32,
+    pub cargo_kg: f32,
+    /// Finger closure 0 (open) … 1 (closed), for drawing.
+    pub closure: f32,
+}
+
+impl KinPose {
+    /// Standing upright with the arms hanging and slightly bent.
+    pub fn stand(cargo_kg: f32) -> KinPose {
+        KinPose {
+            hip: [0.0, HIP_M],
+            feet: [[0.0, 0.0], [0.0, 0.0]],
+            pelvis_y: 0.0,
+            pelvis_deg: 0.0,
+            waist_deg: 0.0,
+            neck_deg: 0.0,
+            shoulder_deg: [0.0, 0.0],
+            elbow_deg: [10.0, 10.0],
+            base_pitch_deg: 0.0,
+            cargo_kg,
+            closure: 0.0,
+        }
+    }
+
+    /// Trunk angle from vertical (pelvis plus waist), degrees.
+    pub fn trunk_deg(&self) -> f32 {
+        self.pelvis_deg + self.waist_deg
+    }
+
+    /// Every angle and position blended from `a` (u = 0) to `b` (u = 1).
+    pub fn lerp(a: &KinPose, b: &KinPose, u: f32) -> KinPose {
+        let l = |x: f32, y: f32| x + (y - x) * u;
+        let l2 = |x: [f32; 2], y: [f32; 2]| [l(x[0], y[0]), l(x[1], y[1])];
+        KinPose {
+            hip: l2(a.hip, b.hip),
+            feet: [l2(a.feet[0], b.feet[0]), l2(a.feet[1], b.feet[1])],
+            pelvis_y: l(a.pelvis_y, b.pelvis_y),
+            pelvis_deg: l(a.pelvis_deg, b.pelvis_deg),
+            waist_deg: l(a.waist_deg, b.waist_deg),
+            neck_deg: l(a.neck_deg, b.neck_deg),
+            shoulder_deg: l2(a.shoulder_deg, b.shoulder_deg),
+            elbow_deg: l2(a.elbow_deg, b.elbow_deg),
+            base_pitch_deg: l(a.base_pitch_deg, b.base_pitch_deg),
+            cargo_kg: l(a.cargo_kg, b.cargo_kg),
+            closure: l(a.closure, b.closure),
+        }
+    }
+}
+
+/// Loads of one instant beyond gravity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct KinLoads {
+    /// Force the object or the world puts ON each hand (right, left), newtons, base frame.
+    pub hand_force: [[f32; 3]; 2],
+    /// Force the world puts on the bumper (pushing with the chassis), newtons, at the bumper face.
+    pub bumper_force: [f32; 3],
+    /// Acceleration of the whole body (base start or stop forward, the gait's CoM bounce upward), m/s².
+    pub accel: [f32; 3],
+}
+
+impl KinLoads {
+    /// An object of `kg` in the right hand (in both, split, when `two_arms`), accelerating upward at `a_up`.
+    pub fn holding(kg: f32, two_arms: bool, a_up: f32) -> KinLoads {
+        let f = -kg * (G + a_up);
+        if two_arms {
+            KinLoads { hand_force: [[0.0, 0.0, 0.5 * f], [0.0, 0.0, 0.5 * f]], ..KinLoads::default() }
+        } else {
+            KinLoads { hand_force: [[0.0, 0.0, f], [0.0; 3]], ..KinLoads::default() }
+        }
+    }
+}
+
+/// The robot at one instant.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct KinReport {
+    pub joints: Vec<KinJoint>,
+    pub contacts: Vec<ContactPatch>,
+    pub com: [f32; 3],
+    pub zmp: [f32; 2],
+    /// Support rectangle `[x0, x1, y0, y1]` (the stance feet or the chassis).
+    pub support: [f32; 4],
+    /// `balance`'s margin: 1 with the ZMP at the centre, 0 at the edge, negative outside.
+    pub margin: f32,
+    /// Ground reaction on the robot, N.
+    pub grf: [f32; 3],
+    pub mass_kg: f32,
+    /// Palm centres and knee positions (right, left).
+    pub hands: [[f32; 3]; 2],
+    pub knees: [[f32; 3]; 2],
+    /// The bumper face's centre (wheeled and tracked bases).
+    pub bumper: Option<[f32; 3]>,
+    /// Every joint within its peak and its range, the ZMP inside the support.
+    pub feasible: bool,
+    pub limiting: Option<String>,
+    /// Joints out of their range, as "name angle > limit".
+    pub out_of_range: Vec<String>,
+    /// Σ (τ / τ_peak)² over the actuated joints (the `balance` effort metric).
+    pub effort_sum: f32,
+    /// The pose that was asked for.
+    pub pose: KinPose,
+    #[serde(skip)]
+    pub boxes: Vec<LinkBox>,
+}
+
+impl KinReport {
+    pub fn joint(&self, name: &str) -> Option<&KinJoint> {
+        self.joints.iter().find(|j| j.name == name)
+    }
+
+    pub fn contact(&self, name: &str) -> Option<&ContactPatch> {
+        self.contacts.iter().find(|c| c.name == name)
+    }
+
+    /// The worst actuated joint by peak ratio.
+    pub fn worst(&self) -> Option<&KinJoint> {
+        self.joints.iter().filter(|j| !j.structural).max_by(|a, b| a.ratio.total_cmp(&b.ratio))
+    }
+
+    /// The actuated joints as `balance` reports them (for the SDS effort track, the heat and the wear).
+    pub fn joint_loads(&self) -> Vec<JointLoad> {
+        self.joints
+            .iter()
+            .filter(|j| !j.structural)
+            .map(|j| JointLoad { joint: j.name.clone(), segment: j.segment, actuator: j.actuator.clone(), torque_nm: j.torque.abs(), cont_nm: j.cont, peak_nm: j.peak, effort: j.effort, peak_ratio: j.ratio })
+            .collect()
+    }
+
+    /// The pose for the renderer and the views (`dynamics::BodyPose`).
+    pub fn body_pose(&self, t: f32, source: Source) -> BodyPose {
+        let joints = self
+            .joints
+            .iter()
+            .map(|j| JointPoint {
+                name: j.name.clone(),
+                kind: if j.structural { "structure" } else if j.name.starts_with("drive") { "statics" } else { "sim" },
+                pos: j.pos,
+                q_deg: j.angle_deg,
+                tau_nm: j.torque.abs(),
+                peak_nm: j.peak,
+                ratio: j.ratio,
+                saturated: j.ratio > 1.0,
+                stalled: false,
+            })
+            .collect();
+        BodyPose { t, source, boxes: self.boxes.clone(), joints, com: self.com, zmp: self.zmp, support: self.support, margin: self.margin, grf: self.grf }
+    }
+}
+
+/// Joint ranges of motion the poses must respect, degrees.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct Rom {
+    pub knee_max: f32,
+    /// Ankle dorsiflexion (shank forward of vertical with the foot flat).
+    pub ankle_dorsi_max: f32,
+    pub hip_flex_max: f32,
+    /// Waist pitch forward (0: the belly preset has no pitch joint).
+    pub waist_max: f32,
+    pub neck_max: f32,
+    pub shoulder: [f32; 2],
+    pub elbow_max: f32,
+}
+
+impl Rom {
+    /// The ranges of a robot built from the presets.
+    pub fn of(body: &Body) -> Rom {
+        Rom {
+            knee_max: KNEE_FLEX_MAX_DEG,
+            ankle_dorsi_max: ANKLE_DORSI_MAX_DEG,
+            hip_flex_max: HIP_FLEX_MAX_DEG,
+            waist_max: if body.belly.pitch.is_some() { WAIST_PITCH_MAX_DEG } else { 0.0 },
+            neck_max: NECK_PITCH_MAX_DEG,
+            shoulder: [-60.0, 180.0],
+            elbow_max: 150.0,
+        }
+    }
+}
+
+type V3 = [f32; 3];
+
+fn add(a: V3, b: V3) -> V3 {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+fn sub(a: V3, b: V3) -> V3 {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+fn scale(a: V3, s: f32) -> V3 {
+    [a[0] * s, a[1] * s, a[2] * s]
+}
+fn cross(a: V3, b: V3) -> V3 {
+    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+}
+/// Unit direction in the sagittal plane `deg` forward of straight up.
+fn up_dir(deg: f32) -> V3 {
+    let a = deg.to_radians();
+    [a.sin(), 0.0, a.cos()]
+}
+/// Unit direction in the sagittal plane `deg` forward of straight down.
+fn down_dir(deg: f32) -> V3 {
+    let a = deg.to_radians();
+    [a.sin(), 0.0, -a.cos()]
+}
+/// Rotates a point or a direction about the y axis through the origin by a base pitch (nose up positive).
+fn pitch_about_origin(p: V3, deg: f32) -> V3 {
+    let (s, c) = (-deg.to_radians()).sin_cos();
+    [p[0] * c + p[2] * s, p[1], -p[0] * s + p[2] * c]
+}
+
+/// Knee of a two-link leg from the hip to the ankle (thigh and shank of equal
+/// length) bending forward, and the knee flexion in degrees. `None` when the
+/// ankle is beyond the leg's length.
+pub fn knee_ik(hip: [f32; 2], ankle: [f32; 2]) -> Option<([f32; 2], f32)> {
+    let (dx, dz) = (ankle[0] - hip[0], ankle[1] - hip[1]);
+    let d = (dx * dx + dz * dz).sqrt();
+    if d > THIGH_M + SHANK_M + 1e-4 || d < 1e-3 {
+        return None;
+    }
+    let d = d.min(THIGH_M + SHANK_M);
+    // Equal links: the knee sits on the perpendicular bisector, `h` from the midpoint.
+    let h = (THIGH_M * THIGH_M - 0.25 * d * d).max(0.0).sqrt();
+    let (mx, mz) = (hip[0] + 0.5 * dx, hip[1] + 0.5 * dz);
+    // Perpendicular to hip → ankle, on the forward side.
+    let (mut px, mut pz) = (-dz / d, dx / d);
+    if px < 0.0 {
+        px = -px;
+        pz = -pz;
+    }
+    let knee = [mx + h * px, mz + h * pz];
+    let interior = (1.0 - 0.5 * d * d / (THIGH_M * THIGH_M)).clamp(-1.0, 1.0).acos();
+    Some((knee, (std::f32::consts::PI - interior).to_degrees()))
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Grp {
+    Head,
+    Trunk,
+    Pelvis,
+    Upper(usize),
+    Fore(usize),
+    Hand(usize),
+    Thigh(usize),
+    Shank(usize),
+    Foot(usize),
+    Base,
+}
+
+struct Mass {
+    group: Grp,
+    m: f32,
+    p: V3,
+}
+
+/// How a leg preset's mass splits between thigh and shank so that the
+/// standing leg keeps the preset's CoM below the hip (each link's own CoM at
+/// 45% of its length from its top joint).
+pub fn thigh_share(body: &Body) -> f32 {
+    let full = THIGH_M + 0.45 * SHANK_M;
+    ((full - body.leg.com_down_m) / (full - 0.45 * THIGH_M)).clamp(0.3, 0.95)
+}
+
+/// Solves one instant of a pose with its loads.
+pub fn solve(body: &Body, pose: &KinPose, loads: &KinLoads) -> KinReport {
+    solve_with(body, pose, loads, true)
+}
+
+/// [`solve`] without building the drawing boxes (the planners' searches).
+pub fn solve_fast(body: &Body, pose: &KinPose, loads: &KinLoads) -> KinReport {
+    solve_with(body, pose, loads, false)
+}
+
+fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinReport {
+    let rom = Rom::of(body);
+    let legged = body.legged;
+    let mut masses: Vec<Mass> = Vec::new();
+    let mut boxes: Vec<LinkBox> = Vec::new();
+    let mut out_of_range: Vec<String> = Vec::new();
+    let tag = |s: usize| if s == 0 { "r" } else { "l" };
+
+    // ----- lower body -----
+    let half = STANCE_WIDTH_M * 0.5;
+    let foot_y = [-half, half];
+    let mut knees = [[0.0f32; 3]; 2];
+    let mut ankles = [[0.0f32; 3]; 2];
+    let mut hips = [[0.0f32; 3]; 2];
+    let mut stance = [false; 2];
+    // Per leg: ankle dorsiflexion (shank from vertical), knee flexion, hip flexion.
+    let mut leg_angles = [(0.0f32, 0.0f32, 0.0f32); 2];
+    let hip_c: V3 = if legged { [pose.hip[0], pose.pelvis_y, pose.hip[1]] } else { [0.0, pose.pelvis_y, HIP_M] };
+    if legged {
+        let share = thigh_share(body);
+        for s in 0..2 {
+            let lift = pose.feet[s][1].max(0.0);
+            stance[s] = lift <= 1e-4;
+            let hip2 = [hip_c[0], hip_c[2]];
+            let ankle2 = [pose.feet[s][0], ANKLE_H_M + lift];
+            let (knee, knee_flex) = knee_ik(hip2, ankle2).unwrap_or_else(|| {
+                out_of_range.push(format!("leg_{} 다리 길이를 넘는 자세", tag(s)));
+                let (dx, dz) = (ankle2[0] - hip2[0], ankle2[1] - hip2[1]);
+                let d = (dx * dx + dz * dz).sqrt().max(1e-3);
+                ([hip2[0] + dx / d * THIGH_M, hip2[1] + dz / d * THIGH_M], 0.0)
+            });
+            // A swing foot moves with the pelvis; a stance foot stays where it stands.
+            let y = foot_y[s] + if stance[s] { 0.0 } else { pose.pelvis_y };
+            hips[s] = [hip_c[0], hip_c[1] + if s == 0 { -HIP_HALF_WIDTH_M } else { HIP_HALF_WIDTH_M }, hip_c[2]];
+            knees[s] = [knee[0], y, knee[1]];
+            ankles[s] = [ankle2[0], y, ankle2[1]];
+            let shank = (knee[0] - ankle2[0]).atan2(knee[1] - ankle2[1]).to_degrees();
+            let thigh = (knee[0] - hip2[0]).atan2(hip2[1] - knee[1]).to_degrees();
+            // Hip flexion: the trunk's pitch plus the thigh's forward swing.
+            leg_angles[s] = (shank, knee_flex, pose.pelvis_deg + thigh);
+            masses.push(Mass { group: Grp::Thigh(s), m: body.leg.mass_kg * share, p: add(hips[s], scale(sub(knees[s], hips[s]), 0.45)) });
+            masses.push(Mass { group: Grp::Shank(s), m: body.leg.mass_kg * (1.0 - share), p: add(knees[s], scale(sub(ankles[s], knees[s]), 0.45)) });
+            let fl = body.leg.foot_len_m;
+            let sole = ankles[s][2] - ANKLE_H_M;
+            let foot_c = [ankles[s][0] + 0.25 * fl, y, sole + 0.03];
+            masses.push(Mass { group: Grp::Foot(s), m: body.leg.foot_mass_kg, p: foot_c });
+            boxes.push(limb_box(if s == 0 { "thigh_r" } else { "thigh_l" }, Segment::Leg, hips[s], knees[s], 0.05));
+            boxes.push(limb_box(if s == 0 { "shank_r" } else { "shank_l" }, Segment::Leg, knees[s], ankles[s], 0.045));
+            boxes.push(LinkBox { name: if s == 0 { "foot_r" } else { "foot_l" }, segment: Segment::Foot, center: foot_c, axes: EYE3, half: [fl * 0.5, body.leg.foot_width_m * 0.5, 0.03] });
+            if knee_flex > rom.knee_max + 0.5 {
+                out_of_range.push(format!("knee_{} {:.0}° > {:.0}°", tag(s), knee_flex, rom.knee_max));
+            }
+            if stance[s] && shank > rom.ankle_dorsi_max + 0.5 {
+                out_of_range.push(format!("ankle_{} 배측굴곡 {:.0}° > {:.0}°", tag(s), shank, rom.ankle_dorsi_max));
+            }
+            if leg_angles[s].2 > rom.hip_flex_max + 0.5 {
+                out_of_range.push(format!("hip_pitch_{} {:.0}° > {:.0}°", tag(s), leg_angles[s].2, rom.hip_flex_max));
+            }
+        }
+    } else {
+        masses.push(Mass { group: Grp::Base, m: MAST_KG, p: [0.0, 0.0, 0.35] });
+        masses.push(Mass { group: Grp::Base, m: body.chassis.mass_kg, p: [0.0, 0.0, body.chassis.com_m] });
+    }
+
+    // ----- pelvis, trunk, head -----
+    let u = up_dir(pose.pelvis_deg);
+    let waist = add(hip_c, scale(u, PELVIS_M));
+    let trunk_deg = pose.trunk_deg();
+    let v = up_dir(trunk_deg);
+    let shoulder_c = add(waist, scale(v, TRUNK_M));
+    let neck = add(shoulder_c, scale(v, NECK_UP_M));
+    let head_dir = up_dir(trunk_deg + pose.neck_deg);
+    let belly_p = add(hip_c, scale(u, PELVIS_M - body.belly.com_down_m));
+    masses.push(Mass { group: Grp::Pelvis, m: body.belly.mass_kg, p: belly_p });
+    let chest_p = add(waist, scale(v, body.chest.com_up_m));
+    masses.push(Mass { group: Grp::Trunk, m: body.chest.mass_kg, p: chest_p });
+    if body.plan.battery_low {
+        masses.push(Mass { group: Grp::Pelvis, m: body.chest.battery_kg, p: belly_p });
+    } else {
+        masses.push(Mass { group: Grp::Trunk, m: body.chest.battery_kg, p: chest_p });
+    }
+    if pose.cargo_kg > 0.0 {
+        // The bay rides on the pelvis in front of the belly.
+        let fwd = [u[2], 0.0, -u[0]];
+        let bay = add(add(hip_c, scale(u, CARGO_Z_M - HIP_M)), scale(fwd, CARGO_X_M));
+        masses.push(Mass { group: Grp::Pelvis, m: pose.cargo_kg, p: bay });
+    }
+    masses.push(Mass { group: Grp::Head, m: body.head.mass_kg, p: add(neck, scale(head_dir, body.head.com_up_m)) });
+    boxes.push(oriented_box("pelvis", Segment::Belly, add(hip_c, scale(u, 0.06)), pose.pelvis_deg, [0.09, 0.14, 0.07]));
+    boxes.push(oriented_box("trunk", Segment::Chest, add(waist, scale(v, 0.16)), trunk_deg, [0.10, 0.16, 0.16]));
+    boxes.push(oriented_box("head", Segment::Head, add(neck, scale(head_dir, 0.07)), trunk_deg + pose.neck_deg, [0.07, 0.08, 0.07]));
+
+    // ----- arms -----
+    let (m_up, r_up, m_fore) = body.arm_split();
+    let mut hands = [[0.0f32; 3]; 2];
+    let mut shoulders = [[0.0f32; 3]; 2];
+    let mut elbows = [[0.0f32; 3]; 2];
+    for s in 0..2 {
+        let y = if s == 0 { -SHOULDER_HALF_WIDTH_M } else { SHOULDER_HALF_WIDTH_M };
+        let sh = [shoulder_c[0], shoulder_c[1] + y, shoulder_c[2]];
+        // Shoulder flexion is measured from hanging along the trunk.
+        let up_ang = pose.shoulder_deg[s] - trunk_deg;
+        let du = down_dir(up_ang);
+        let df = down_dir(up_ang + pose.elbow_deg[s]);
+        let el = add(sh, scale(du, UPPER_ARM_M));
+        let wrist = add(el, scale(df, FOREARM_M));
+        let hand = add(wrist, scale(df, PALM_OFFSET_M));
+        shoulders[s] = sh;
+        elbows[s] = el;
+        hands[s] = hand;
+        masses.push(Mass { group: Grp::Upper(s), m: m_up, p: add(sh, scale(du, r_up)) });
+        masses.push(Mass { group: Grp::Fore(s), m: m_fore, p: add(el, scale(df, 0.45 * FOREARM_M)) });
+        masses.push(Mass { group: Grp::Hand(s), m: body.hand_kg, p: hand });
+        boxes.push(limb_box(if s == 0 { "upper_arm_r" } else { "upper_arm_l" }, Segment::Arm, sh, el, 0.035));
+        boxes.push(limb_box(if s == 0 { "forearm_r" } else { "forearm_l" }, Segment::Arm, el, wrist, 0.03));
+        boxes.extend(hand_boxes(s, wrist, df, pose.closure, body));
+        if !(rom.shoulder[0] - 0.5..=rom.shoulder[1] + 0.5).contains(&pose.shoulder_deg[s]) {
+            out_of_range.push(format!("shoulder_{} {:.0}°", tag(s), pose.shoulder_deg[s]));
+        }
+        if !(-0.5..=rom.elbow_max + 0.5).contains(&pose.elbow_deg[s]) {
+            out_of_range.push(format!("elbow_{} {:.0}°", tag(s), pose.elbow_deg[s]));
+        }
+    }
+    if pose.waist_deg.abs() > rom.waist_max + 0.5 {
+        out_of_range.push(if rom.waist_max == 0.0 { format!("허리 피치 관절 없음 (요청 {:.0}°)", pose.waist_deg) } else { format!("waist_pitch {:.0}° > {:.0}°", pose.waist_deg, rom.waist_max) });
+    }
+    if pose.neck_deg.abs() > rom.neck_max + 0.5 {
+        out_of_range.push(format!("neck {:.0}° > {:.0}°", pose.neck_deg, rom.neck_max));
+    }
+    if legged {
+        for s in 0..2 {
+            let fold = leg_angles[s].2 + pose.waist_deg;
+            if fold > TRUNK_THIGH_FOLD_MAX_DEG + 0.5 {
+                out_of_range.push(format!("몸통이 허벅지에 닿음 (고관절 {:.0}° + 허리 {:.0}° > {:.0}°)", leg_angles[s].2, pose.waist_deg, TRUNK_THIGH_FOLD_MAX_DEG));
+                break;
+            }
+        }
+    }
+
+    // ----- a wheeled base pitches with the ground -----
+    let pitch = if legged { 0.0 } else { pose.base_pitch_deg };
+    let tilt = |p: V3| if pitch != 0.0 { pitch_about_origin(p, pitch) } else { p };
+    if pitch != 0.0 {
+        for m in masses.iter_mut() {
+            m.p = tilt(m.p);
+        }
+        for b in boxes.iter_mut() {
+            b.center = tilt(b.center);
+            for a in b.axes.iter_mut() {
+                *a = tilt(*a);
+            }
+        }
+    }
+    let hands = hands.map(tilt);
+    let shoulders = shoulders.map(tilt);
+    let elbows = elbows.map(tilt);
+    let (waist, neck) = (tilt(waist), tilt(neck));
+    let bumper = (!legged).then(|| tilt([0.5 * body.support_len_m + WHEEL_R_M + BUMPER_GAP_M, 0.0, 0.5 * (BUMPER_Z_M[0] + BUMPER_Z_M[1])]));
+    // Links (not the hands, feet or the base) must stay off the ground.
+    for b in &boxes {
+        if matches!(b.segment, Segment::Hand | Segment::Foot) {
+            continue;
+        }
+        let low = b.center[2] - (0..3).map(|i| b.axes[i][2].abs() * b.half[i]).sum::<f32>();
+        if low < GROUND_CLEARANCE_M - 0.005 {
+            out_of_range.push(format!("{} 땅에 닿음 ({:.2} m)", b.name, low));
+            break;
+        }
+    }
+    if !legged {
+        boxes.extend(base_boxes(body, pitch));
+    }
+
+    // ----- gravity, inertia and the external forces -----
+    let a = loads.accel;
+    let g_eff: V3 = [-a[0], -a[1], -(G + a[2])];
+    let mass: f32 = masses.iter().map(|m| m.m).sum();
+    let mut com = [0.0f32; 3];
+    for m in &masses {
+        com = add(com, scale(m.p, m.m / mass.max(1e-6)));
+    }
+    let hand_f = loads.hand_force;
+    let mut s_force = scale(g_eff, mass);
+    let mut m_o = [0.0f32; 3];
+    for m in &masses {
+        m_o = add(m_o, cross(m.p, scale(g_eff, m.m)));
+    }
+    for s in 0..2 {
+        s_force = add(s_force, hand_f[s]);
+        m_o = add(m_o, cross(hands[s], hand_f[s]));
+    }
+    if let Some(b) = bumper {
+        s_force = add(s_force, loads.bumper_force);
+        m_o = add(m_o, cross(b, loads.bumper_force));
+    }
+    let fz = s_force[2].min(-1e-6);
+    let zmp = [-m_o[1] / fz, m_o[0] / fz];
+    let grf = scale(s_force, -1.0);
+
+    // Moment about a joint of the masses in `groups` plus the forces on the hands in `hand_sides`.
+    let moment = |j: V3, groups: &[Grp], hand_sides: &[usize]| -> V3 {
+        let mut t = [0.0f32; 3];
+        for m in masses.iter().filter(|m| groups.contains(&m.group)) {
+            t = add(t, cross(sub(m.p, j), scale(g_eff, m.m)));
+        }
+        for &s in hand_sides {
+            t = add(t, cross(sub(hands[s], j), hand_f[s]));
+        }
+        t
+    };
+    let jnt = |name: &str, seg: Segment, pos: V3, angle: Option<f32>, act: Option<&Actuator>, tau: f32, in_range: bool| -> KinJoint {
+        match act {
+            Some(a) => KinJoint { name: name.into(), segment: seg, pos, angle_deg: angle, actuator: a.name.into(), torque: tau, peak: a.peak_nm, cont: a.cont_nm, ratio: tau.abs() / a.peak_nm.max(1e-3), effort: tau.abs() / a.cont_nm.max(1e-3), in_range, structural: false },
+            None => KinJoint { name: name.into(), segment: seg, pos, angle_deg: angle, actuator: "구조 (피치 관절 없음)".into(), torque: tau, peak: 0.0, cont: 0.0, ratio: 0.0, effort: 0.0, in_range, structural: true },
+        }
+    };
+    let arm_groups = |s: usize| [Grp::Upper(s), Grp::Fore(s), Grp::Hand(s)];
+    let above_waist = [Grp::Head, Grp::Trunk, Grp::Upper(0), Grp::Fore(0), Grp::Hand(0), Grp::Upper(1), Grp::Fore(1), Grp::Hand(1)];
+    let mut joints: Vec<KinJoint> = Vec::new();
+    joints.push(jnt("waist_pitch", Segment::Belly, waist, Some(pose.waist_deg), body.belly.pitch.as_ref(), moment(waist, &above_waist, &[0, 1])[1], pose.waist_deg.abs() <= rom.waist_max + 0.5));
+    joints.push(jnt("neck", Segment::Head, neck, Some(pose.neck_deg), Some(&body.head.neck), moment(neck, &[Grp::Head], &[])[1], pose.neck_deg.abs() <= rom.neck_max + 0.5));
+    for s in 0..2 {
+        joints.push(jnt(&format!("shoulder_{}", tag(s)), Segment::Arm, shoulders[s], Some(pose.shoulder_deg[s]), Some(&body.arm.shoulder), moment(shoulders[s], &arm_groups(s), &[s])[1], true));
+        joints.push(jnt(&format!("elbow_{}", tag(s)), Segment::Arm, elbows[s], Some(pose.elbow_deg[s]), Some(&body.arm.elbow), moment(elbows[s], &[Grp::Fore(s), Grp::Hand(s)], &[s])[1], true));
+    }
+
+    // ----- contacts and the lower joints -----
+    let mut contacts = Vec::new();
+    let support;
+    if legged {
+        let fl = body.leg.foot_len_m;
+        let fw = body.leg.foot_width_m;
+        let rects: Vec<[f32; 4]> = (0..2).map(|s| [ankles[s][0] - 0.25 * fl, ankles[s][0] + 0.75 * fl, ankles[s][1] - fw * 0.5, ankles[s][1] + fw * 0.5]).collect();
+        let on: Vec<usize> = (0..2).filter(|s| stance[*s]).collect();
+        let on = if on.is_empty() { vec![0] } else { on };
+        support = on.iter().fold([f32::INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::NEG_INFINITY], |r, &s| [r[0].min(rects[s][0]), r[1].max(rects[s][1]), r[2].min(rects[s][2]), r[3].max(rects[s][3])]);
+        // Vertical load of each stance foot from the lateral ZMP (all on one in single support).
+        let shares: [f32; 2] = if on.len() == 2 {
+            let r = ((ankles[1][1] - zmp[1]) / (ankles[1][1] - ankles[0][1]).max(1e-3)).clamp(0.0, 1.0);
+            [r, 1.0 - r]
+        } else {
+            [if on[0] == 0 { 1.0 } else { 0.0 }, if on[0] == 1 { 1.0 } else { 0.0 }]
+        };
+        let above_hip = [Grp::Head, Grp::Trunk, Grp::Pelvis, Grp::Upper(0), Grp::Fore(0), Grp::Hand(0), Grp::Upper(1), Grp::Fore(1), Grp::Hand(1)];
+        for s in 0..2 {
+            let share = shares[s];
+            let f = scale(grf, share);
+            let rect = rects[s];
+            let cop = [zmp[0].clamp(rect[0], rect[1]), if on.len() == 2 { ankles[s][1] } else { zmp[1].clamp(rect[2], rect[3]) }];
+            contacts.push(ContactPatch { name: format!("foot_{}", tag(s)), normal_n: if stance[s] { f[2].max(0.0) } else { 0.0 }, shear_n: if stance[s] { f[0] } else { 0.0 }, cop, rect, pressure_kpa: None, loaded_len_m: None });
+            let cop3 = [cop[0], cop[1], 0.0];
+            let (ank_t, knee_t, hip_t, roll_t) = if stance[s] {
+                // Bottom up: the ground reaction under the foot, the foot and the shank below the joint.
+                let ankle_m = add(cross(sub(cop3, ankles[s]), f), moment(ankles[s], &[Grp::Foot(s)], &[]));
+                let knee_m = add(cross(sub(cop3, knees[s]), f), moment(knees[s], &[Grp::Foot(s), Grp::Shank(s)], &[]));
+                // Top down at the hip: this leg's share of everything above the hips.
+                let hm = moment(hips[s], &above_hip, &[0, 1]);
+                (ankle_m[1], knee_m[1], hm[1] * share, if on.len() == 1 { hm[0] } else { 0.0 })
+            } else {
+                // A swing leg: the hip and the knee hold the leg itself.
+                (0.0, moment(knees[s], &[Grp::Shank(s), Grp::Foot(s)], &[])[1], moment(hips[s], &[Grp::Thigh(s), Grp::Shank(s), Grp::Foot(s)], &[])[1], 0.0)
+            };
+            let (dorsi, kflex, hflex) = leg_angles[s];
+            joints.push(jnt(&format!("hip_pitch_{}", tag(s)), Segment::Leg, hips[s], Some(hflex), Some(&body.leg.knee), hip_t, hflex <= rom.hip_flex_max + 0.5));
+            joints.push(jnt(&format!("hip_roll_{}", tag(s)), Segment::Leg, hips[s], Some(0.0), Some(&body.leg.knee), roll_t, true));
+            joints.push(jnt(&format!("knee_{}", tag(s)), Segment::Leg, knees[s], Some(kflex), Some(&body.leg.knee), knee_t, kflex <= rom.knee_max + 0.5));
+            joints.push(jnt(&format!("ankle_{}", tag(s)), Segment::Foot, ankles[s], Some(dorsi), Some(&body.leg.ankle), ank_t, !stance[s] || dorsi <= rom.ankle_dorsi_max + 0.5));
+        }
+    } else {
+        let len = body.support_len_m * pitch.to_radians().cos();
+        let w = body.support_width_m;
+        support = [-0.5 * len, 0.5 * len, -0.5 * w, 0.5 * w];
+        let n = grf[2].max(0.0);
+        let shear = grf[0];
+        let f = body.chassis.drive_force_n;
+        if body.base == BaseKind::Track {
+            // A track carries its load as a linear pressure along the contact (the eccentric-load rule).
+            let e = zmp[0];
+            let area = len * 2.0 * BELT_W_M;
+            let p0 = n / area.max(1e-4) / 1000.0;
+            let (rear, front, loaded) = if e.abs() <= len / 6.0 {
+                (p0 * (1.0 - 6.0 * e / len), p0 * (1.0 + 6.0 * e / len), len)
+            } else {
+                // Past the middle third the far end lifts: a triangle 3·(L/2 − |e|) long.
+                let l = (3.0 * (0.5 * len - e.abs())).max(1e-3);
+                let peak = 2.0 * n / (l * 2.0 * BELT_W_M) / 1000.0;
+                if e > 0.0 { (0.0, peak, l) } else { (peak, 0.0, l) }
+            };
+            contacts.push(ContactPatch { name: "track".into(), normal_n: n, shear_n: shear, cop: zmp, rect: support, pressure_kpa: Some([rear, front]), loaded_len_m: Some(loaded) });
+            joints.push(KinJoint { name: "drive".into(), segment: Segment::Foot, pos: tilt([0.0, 0.0, WHEEL_R_M]), angle_deg: None, actuator: body.chassis.name.into(), torque: shear, peak: 2.0 * f, cont: f, ratio: shear.abs() / (2.0 * f).max(1e-3), effort: shear.abs() / f.max(1e-3), in_range: true, structural: false });
+        } else {
+            // Front and rear axle loads from the ZMP between them; all wheels drive, traction by load.
+            let (xr, xf) = (-0.5 * len, 0.5 * len);
+            let nf = (n * (zmp[0] - xr) / (xf - xr)).clamp(0.0, n);
+            for (name, jname, x, nn) in [("axle_front", "drive_front", xf, nf), ("axle_rear", "drive_rear", xr, n - nf)] {
+                let sh = if n > 1e-6 { shear * nn / n } else { 0.0 };
+                contacts.push(ContactPatch { name: name.into(), normal_n: nn, shear_n: sh, cop: [x, 0.0], rect: [x - 0.02, x + 0.02, -0.5 * w, 0.5 * w], pressure_kpa: None, loaded_len_m: None });
+                let fa = 0.5 * f;
+                joints.push(KinJoint { name: jname.into(), segment: Segment::Foot, pos: tilt([x, 0.0, WHEEL_R_M]), angle_deg: None, actuator: body.chassis.name.into(), torque: sh, peak: 2.0 * fa, cont: fa, ratio: sh.abs() / (2.0 * fa).max(1e-3), effort: sh.abs() / fa.max(1e-3), in_range: true, structural: false });
+            }
+        }
+    }
+
+    // ----- margin and feasibility -----
+    let (hx, hy) = (0.5 * (support[1] - support[0]), 0.5 * (support[3] - support[2]));
+    let (cx, cy) = (0.5 * (support[0] + support[1]), 0.5 * (support[2] + support[3]));
+    let margin = (1.0 - (zmp[0] - cx).abs() / hx.max(1e-3)).min(1.0 - (zmp[1] - cy).abs() / hy.max(1e-3));
+    let mut feasible = out_of_range.is_empty();
+    let mut limiting = out_of_range.first().map(|r| format!("관절 범위: {r}"));
+    if let Some(w) = joints.iter().filter(|j| !j.structural).max_by(|a, b| a.ratio.total_cmp(&b.ratio)) {
+        if w.ratio > 1.0 {
+            feasible = false;
+            limiting.get_or_insert_with(|| format!("{} {:.1}/{:.1} N·m ({})", w.name, w.torque.abs(), w.peak, w.actuator));
+        }
+    }
+    if margin < 0.0 {
+        feasible = false;
+        limiting.get_or_insert_with(|| format!("균형 여유 {margin:.2} < 0"));
+    }
+    let effort_sum = joints.iter().filter(|j| !j.structural).map(|j| j.ratio * j.ratio).sum();
+    if !draw {
+        boxes.clear();
+    }
+    KinReport { joints, contacts, com, zmp, support, margin, grf, mass_kg: mass, hands, knees, bumper, feasible, limiting, out_of_range, effort_sum, pose: *pose, boxes }
+}
+
+const EYE3: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
+/// A box with its z axis `deg` forward of vertical in the sagittal plane.
+fn oriented_box(name: &'static str, segment: Segment, center: V3, deg: f32, half: V3) -> LinkBox {
+    let z = up_dir(deg);
+    let x = [z[2], 0.0, -z[0]];
+    LinkBox { name, segment, center, axes: [x, [0.0, 1.0, 0.0], z], half }
+}
+
+/// A box along the segment from `a` to `b`, `w` half wide (as `dynamics`).
+fn limb_box(name: &'static str, segment: Segment, a: V3, b: V3, w: f32) -> LinkBox {
+    let d = sub(b, a);
+    let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-6);
+    let z = scale(d, 1.0 / len);
+    let x0 = if z[2].abs() < 0.9 { [0.0, 0.0, 1.0] } else { [1.0, 0.0, 0.0] };
+    let c = cross(z, x0);
+    let cl = (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt().max(1e-6);
+    let y = scale(c, 1.0 / cl);
+    let x = cross(y, z);
+    LinkBox { name, segment, center: scale(add(a, b), 0.5), axes: [x, y, z], half: [w, w, len * 0.5] }
+}
+
+/// The palm and the fingers of one hand as boxes: the palm continues the
+/// forearm, the fingers spread across it and curl toward the palm side by the
+/// closure (each joint at `closure` of its flexion range, as `sim::closure_angles`
+/// for direct drive; segment lengths as `hand`).
+fn hand_boxes(side: usize, wrist: V3, dir: V3, closure: f32, body: &Body) -> Vec<LinkBox> {
+    let n = u8::from(body.fingers) as usize;
+    let mut v = vec![limb_box(if side == 0 { "palm_r" } else { "palm_l" }, Segment::Hand, wrist, add(wrist, scale(dir, 0.10)), 0.035)];
+    // The palm side faces forward of the forearm in the sagittal plane.
+    let palm_n = [-dir[2], 0.0, dir[0]];
+    let palm_n = if palm_n[0] < 0.0 { scale(palm_n, -1.0) } else { palm_n };
+    let segs: &[f32] = if n == 2 { &[0.050, 0.035] } else { &[0.040, 0.025, 0.018] };
+    let flex_max = [90.0f32, 100.0, 80.0];
+    let base = add(wrist, scale(dir, 0.10));
+    for k in 0..n {
+        let off = -0.035 + 0.07 * k as f32 / (n.max(2) - 1) as f32;
+        let mut p = add(base, [0.0, off, 0.0]);
+        let mut ang = 0.0f32;
+        for (i, len) in segs.iter().enumerate() {
+            ang += closure.clamp(0.0, 1.0) * flex_max[i.min(2)];
+            let a = ang.to_radians();
+            let d = add(scale(dir, a.cos()), scale(palm_n, a.sin()));
+            let q = add(p, scale(d, *len));
+            v.push(limb_box(if side == 0 { "finger_r" } else { "finger_l" }, Segment::Hand, p, q, 0.009));
+            p = q;
+        }
+    }
+    v
+}
+
+/// Chassis, mast, bumper and the wheels or tracks, pitched with the base.
+fn base_boxes(body: &Body, pitch_deg: f32) -> Vec<LinkBox> {
+    let len = body.support_len_m;
+    let w = body.support_width_m;
+    let p = |q: V3| pitch_about_origin(q, pitch_deg);
+    let ax = EYE3.map(|a| pitch_about_origin(a, pitch_deg));
+    let mut v = vec![
+        LinkBox { name: "chassis", segment: Segment::Foot, center: p([0.0, 0.0, WHEEL_R_M + 0.05]), axes: ax, half: [len * 0.5, w * 0.5 - BELT_W_M, 0.05] },
+        LinkBox { name: "mast", segment: Segment::Leg, center: p([0.0, 0.0, 0.5 * (WHEEL_R_M + 0.1 + HIP_M)]), axes: ax, half: [0.03, 0.03, 0.5 * (HIP_M - WHEEL_R_M - 0.1)] },
+        LinkBox { name: "bumper", segment: Segment::Foot, center: p([0.5 * len + WHEEL_R_M + BUMPER_GAP_M - 0.01, 0.0, 0.5 * (BUMPER_Z_M[0] + BUMPER_Z_M[1])]), axes: ax, half: [0.01, w * 0.5, 0.5 * (BUMPER_Z_M[1] - BUMPER_Z_M[0])] },
+    ];
+    if body.base == BaseKind::Track {
+        for y in [-0.5 * w + 0.5 * BELT_W_M, 0.5 * w - 0.5 * BELT_W_M] {
+            v.push(LinkBox { name: "track", segment: Segment::Foot, center: p([0.0, y, WHEEL_R_M]), axes: ax, half: [len * 0.5 + WHEEL_R_M, BELT_W_M * 0.5, WHEEL_R_M] });
+        }
+    } else {
+        for x in [-0.5 * len, 0.5 * len] {
+            for y in [-0.5 * w + 0.5 * BELT_W_M, 0.5 * w - 0.5 * BELT_W_M] {
+                v.push(LinkBox { name: "wheel", segment: Segment::Foot, center: p([x, y, WHEEL_R_M]), axes: ax, half: [WHEEL_R_M, BELT_W_M * 0.5, WHEEL_R_M] });
+            }
+        }
+    }
+    v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hand::FingerCount;
+
+    fn body(tier: Tier, base: BaseKind) -> Body {
+        Body::new(&BodyPlan::uniform(tier), base, FingerCount::Five)
+    }
+
+    #[test]
+    fn standing_matches_the_balance_model() {
+        // Upright with the arms down, the whole-body CoM and the mass are the `balance` ones.
+        for base in [BaseKind::HumanFoot, BaseKind::Wheel] {
+            let b = body(Tier::Mid, base);
+            let r = solve(&b, &KinPose::stand(0.0), &KinLoads::default());
+            assert!((r.mass_kg - b.mass_kg()).abs() < 1e-3, "{base:?}: {} vs {}", r.mass_kg, b.mass_kg());
+            let q = b.solve(&crate::Posture::quiet(0.0), &crate::FeedForward { enabled: false, gain: 1.0 }, 1e3);
+            assert!((r.com[2] - q.com[2]).abs() < 0.03, "{base:?} CoM height {} vs {}", r.com[2], q.com[2]);
+            assert!((r.grf[2] - r.mass_kg * G).abs() < 1e-2);
+            assert!(r.feasible && r.margin > 0.3, "{base:?}: {:?} margin {}", r.limiting, r.margin);
+        }
+    }
+
+    #[test]
+    fn the_knee_follows_the_hip_and_ankle() {
+        let (k, flex) = knee_ik([0.0, HIP_M], [0.0, ANKLE_H_M]).unwrap();
+        assert!(k[0].abs() < 1e-4 && flex.abs() < 0.1, "straight leg: {k:?} {flex}");
+        // A squat: the hip 0.25 m lower bends the knee forward.
+        let (k, flex) = knee_ik([-0.05, HIP_M - 0.25], [0.0, ANKLE_H_M]).unwrap();
+        assert!(k[0] > 0.0 && flex > 60.0, "{k:?} {flex}");
+        assert!(knee_ik([0.0, HIP_M + 0.05], [0.0, ANKLE_H_M]).is_none(), "beyond the leg's length");
+    }
+
+    #[test]
+    fn a_load_in_the_hand_loads_the_shoulder_elbow_and_moves_the_zmp() {
+        let b = body(Tier::Mid, BaseKind::HumanFoot);
+        let mut p = KinPose::stand(0.0);
+        p.shoulder_deg = [30.0, 0.0];
+        p.elbow_deg = [60.0, 10.0];
+        let empty = solve(&b, &p, &KinLoads::default());
+        let loaded = solve(&b, &p, &KinLoads::holding(2.4, false, 0.0));
+        let sh = |r: &KinReport| r.joint("shoulder_r").unwrap().torque.abs();
+        let el = |r: &KinReport| r.joint("elbow_r").unwrap().torque.abs();
+        assert!(sh(&loaded) > sh(&empty) + 2.4 * G * 0.2, "{} vs {}", sh(&loaded), sh(&empty));
+        assert!(el(&loaded) > el(&empty));
+        assert!(loaded.zmp[0] > empty.zmp[0], "the load in front moves the ZMP forward");
+        // Same posture in `balance` (arm_lift): the shoulder torque agrees within 10%.
+        let bal = b.solve(&crate::Posture::arm_lift(2.4, false, 0.0), &crate::FeedForward { enabled: false, gain: 1.0 }, 1e3);
+        let bs = bal.joint("shoulder_r").unwrap().torque_nm;
+        assert!((sh(&loaded) - bs).abs() / bs < 0.10, "kin {} vs balance {bs}", sh(&loaded));
+    }
+
+    #[test]
+    fn a_rigid_trunk_cannot_pitch_and_a_squat_bends_the_knees() {
+        let mid = body(Tier::Mid, BaseKind::Wheel);
+        let mut p = KinPose::stand(0.0);
+        p.waist_deg = 30.0;
+        let r = solve(&mid, &p, &KinLoads::default());
+        assert!(!r.feasible && r.limiting.as_deref().unwrap_or("").contains("허리"), "{:?}", r.limiting);
+        let pro = body(Tier::Pro, BaseKind::Wheel);
+        let r = solve(&pro, &p, &KinLoads::default());
+        assert!(r.feasible, "{:?}", r.limiting);
+        assert!(r.joint("waist_pitch").unwrap().torque.abs() > 5.0);
+        // Legs: lowering the hip bends the knees and loads them more than standing does.
+        let legs = body(Tier::Mid, BaseKind::HumanFoot);
+        let stand = solve(&legs, &KinPose::stand(0.0), &KinLoads::default());
+        let mut sq = KinPose::stand(0.0);
+        sq.hip = [-0.08, HIP_M - 0.2];
+        sq.pelvis_deg = 30.0;
+        let r = solve(&legs, &sq, &KinLoads::default());
+        fn k(r: &KinReport) -> &KinJoint {
+            r.joint("knee_r").unwrap()
+        }
+        assert!(k(&r).angle_deg.unwrap() > 50.0 && k(&r).torque.abs() > k(&stand).torque.abs(), "{:?}", k(&r));
+    }
+
+    #[test]
+    fn wheel_and_track_loads_follow_the_zmp() {
+        let b = body(Tier::Mid, BaseKind::Wheel);
+        let mut p = KinPose::stand(0.0);
+        p.shoulder_deg = [80.0, 80.0];
+        p.elbow_deg = [0.0, 0.0];
+        let r = solve(&b, &p, &KinLoads::holding(2.0, true, 0.0));
+        let (f, rr) = (r.contact("axle_front").unwrap(), r.contact("axle_rear").unwrap());
+        assert!(f.normal_n > rr.normal_n, "arms forward load the front axle: {} vs {}", f.normal_n, rr.normal_n);
+        assert!((f.normal_n + rr.normal_n - r.grf[2]).abs() < 1e-2);
+        let t = body(Tier::Mid, BaseKind::Track);
+        let r = solve(&t, &p, &KinLoads::holding(2.0, true, 0.0));
+        let tr = r.contact("track").unwrap();
+        let pk = tr.pressure_kpa.unwrap();
+        assert!(pk[1] > pk[0], "the front of the track carries more: {pk:?}");
+        // A push at the bumper is a backward force on the robot: the ground must give forward shear.
+        let push = solve(&b, &KinPose::stand(0.0), &KinLoads { bumper_force: [-30.0, 0.0, 0.0], ..KinLoads::default() });
+        assert!((push.grf[0] - 30.0).abs() < 1e-3, "{:?}", push.grf);
+    }
+}

@@ -169,6 +169,9 @@ pub enum FrameView {
     /// Third person: a chase camera `orbit_deg` around the robot, with its
     /// links and joints as the joint dynamics move them.
     Chase { orbit_deg: i16 },
+    /// A close-up on the part an action works with: the hand, the body from
+    /// the side (waist, neck, legs), or low by the feet, wheels or tracks.
+    Focus(world_sim::render::FocusCam),
 }
 
 struct WorldLabels<'a>(&'a World);
@@ -335,6 +338,7 @@ impl Runtime {
                     (Level::Info, format!("{} {drop} 쪼갬 → 조각 {piece} {}개 + 남은 {}개", item.spec().label_ko, amount_text(*amount), amount_text(*left)))
                 }
                 WorldEvent::BatteryDepleted => (Level::Error, "배터리 방전".to_string()),
+                WorldEvent::Act { act, kind, label, ok, .. } => (if *ok { Level::Debug } else { Level::Warn }, format!("[{act}:{kind}] {label}")),
             };
             self.audit.log("world", level, msg, Some(tidy(json!({"tick": te.tick, "time_s": te.time_s, "event": te.event}))));
         }
@@ -635,6 +639,8 @@ impl Runtime {
         self.drive(&events);
         self.record_balance_events();
         self.record_tick();
+        self.record_act_keyframes(&events);
+        self.record_act_sds(&events);
         if self.world.tick.saturating_sub(self.last_flush_tick) >= 600 {
             self.flush_sds();
         }
@@ -891,6 +897,10 @@ impl Runtime {
                 let (f, o) = crate::chase::render(&self.world, &cam, orbit_deg as f32);
                 overlay = o;
                 (f, Vec::new())
+            }
+            FrameView::Focus(which) => {
+                let cam = Camera { width: width.clamp(32, 2048) as usize, height: height.clamp(32, 2048) as usize, fov_deg: 50.0, max_dist_m: 12.0, ..self.cam };
+                (world_sim::render::render_focus(&self.world, &cam, which), Vec::new())
             }
         };
         let enc = encode_webp(&frame.rgb, frame.width as u32, frame.height as u32, quality).map_err(|e| anyhow!("WebP 인코딩 실패: {e}"))?;
