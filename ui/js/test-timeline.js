@@ -3,11 +3,14 @@
 //   2줄 ML 인식: 같은 키프레임의 깊이 컬러맵 + 추적 마스크 + 의미 위치 점
 //   3줄 ML 결정: 결정(시계열·삼각 측량) → 이동 → 촬영한 키프레임
 //   4줄 SDS: 키프레임마다 트랙별(깊이·위치·추적·결정·혼합·밸런스) z-점수
-// 상태는 test_step 을 반복 호출해 키프레임이 쌓이는 대로 그린다. 이미지는 보이는 칸만 test_keyframe 으로 받는다.
+// 명령은 위 뷰포트 툴바(tl-cmd · 테스트 실행 · 중지)나 월드 화면 입력줄에서 낸다. '자동 기록'이 켜져 있으면
+// 재생 루프(sim_step)가 기록을 진행시키고, 응답의 test 요약이 바뀔 때마다 test_status 로 줄을 다시 그린다.
+// 이미지는 보이는 칸만 test_keyframe 으로 받는다.
 import { call } from './api.js';
 import { bus, state } from './state.js';
 import { $, clear, el, fmt } from './util.js';
 import { setStatus, toast } from './toast.js';
+import { submitCommand } from './command-bar.js';
 
 const LANES = [
   { id: 'game', label: '1 게임', sub: '게임 로직 촬영', h: 'h-img' },
@@ -17,11 +20,14 @@ const LANES = [
 ];
 const SDS_KEYS = ['depth', 'locate', 'tracker', 'decide', 'fusion', 'balance'];
 const SDS_KO = { depth: '깊이', locate: '위치', tracker: '추적', decide: '결정', fusion: '혼합', balance: '밸런스' };
-const KIND_KO = { search: '탐색 회전', triangulate: '삼각 측량', approach: '접근', arrive: '도달', hold: '보류' };
+const KIND_KO = { search: '탐색 회전', triangulate: '삼각 측량', approach: '접근', arrive: '도달', hold: '보류', explore: '시점 이동' };
 const TILE_W = 96;
 
 let status = null;
-let running = false;
+let busy = false; // 명령 요청이 오가는 중
+let lastBrief = ''; // sim_step 응답의 test 요약 (바뀌면 test_status 를 다시 받는다)
+let fetching = false;
+let finishedId = null; // 끝난 기록의 DB 미러를 한 번만
 let pps = 100; // 초당 픽셀
 let sel = null; // {pass: 'game'|'ml', index}
 let observer = null;
@@ -42,10 +48,6 @@ function zClass(z) {
 function build() {
   const pane = $('bpane-test');
   clear(pane);
-  const cmd = el('input', { type: 'text', id: 'tl-cmd', value: '원목 1개를 창고로 가져와', maxlength: '200', spellcheck: 'false', aria: { label: '테스트 명령' } });
-  const seed = el('input', { type: 'number', id: 'tl-seed', value: '7', min: '0', step: '1', aria: { label: '시드' } });
-  const run = el('button', { type: 'button', class: 'btn btn-sm', id: 'tl-run', text: '테스트 실행', on: { click: start } });
-  const stop = el('button', { type: 'button', class: 'vt-btn', id: 'tl-stop', text: '중지', on: { click: cancel } });
   const zoom = el('select', { id: 'tl-zoom', aria: { label: '확대' }, on: { change: (e) => { pps = Number(e.target.value); renderLanes(); } } },
     ...[[50, '×0.5'], [100, '×1'], [160, '×1.6']].map(([v, t]) => el('option', { value: String(v), text: t, selected: v === pps })));
   const view = el('select', { id: 'tl-view', aria: { label: '보기' }, on: { change: (e) => setView(e.target.value) } },
@@ -54,7 +56,6 @@ function build() {
   pane.append(
     el('div', { class: 'tl-root' },
       el('div', { class: 'tl-toolbar' },
-        cmd, el('label', { class: 'vt-label', for: 'tl-seed', text: '시드' }), seed, run, stop,
         el('span', { class: 'tl-phase', id: 'tl-phase', text: '대기' }),
         el('span', { class: 'tl-modes', id: 'tl-modes' }),
         el('span', { style: 'margin-left:auto;display:flex;gap:6px;align-items:center' }, zoom, view, mirror)),
@@ -107,7 +108,7 @@ function renderLanes() {
   if (!status?.active) {
     lanes.game.append(el('div', { class: 'tl-empty', text: state.mock
       ? '통합 테스트는 실제 Rust 런타임에서만 동작합니다. 개발 서버(cargo run -p hand-runtime --example serve)나 Tauri 앱에서 여세요.'
-      : '위 입력줄에 명령을 넣고 "테스트 실행"을 누르세요. 먼저 게임 로직이 퀘스트를 수행하며 촬영하고, 그 키프레임을 ML 로직이 분석한 뒤, 같은 월드에서 ML 로직이 직접 결정하며 다시 수행합니다.' }));
+      : '위 툴바의 명령 칸이나 월드 화면 입력줄에 명령을 넣고 실행하세요. "자동 기록"이 켜져 있으면 재생하는 동안 1 게임(지금 월드에서 촬영) → 2 ML 인식 → 3 ML 결정(명령을 시작한 순간의 월드를 복제해 다시 수행)이 저절로 쌓입니다.' }));
     return;
   }
   observer = new IntersectionObserver(onVisible, { root: $('tl-scroll'), rootMargin: '0px 200px' });
@@ -352,16 +353,18 @@ async function refreshStats() {
 }
 
 // ── 실행 ────────────────────────────────────────────────────────
+const PHASE_KO = { game: '1/3 게임 촬영', perceive: '2/3 ML 인식', decide: '3/3 ML 결정', done: '완료' };
+
 function renderToolbar() {
   const st = status;
   const ph = $('tl-phase');
-  const phaseKo = { game: '1/3 게임 로직 촬영', perceive: '2/3 ML 인식', decide: '3/3 ML 결정', done: '완료' };
   if (!st?.active) ph.textContent = '대기';
   else {
     const g = st.game?.keyframes?.length ?? 0;
     const d = st.decide?.keyframes?.length ?? 0;
     const p = st.perceive ?? {};
-    ph.textContent = `${phaseKo[st.phase] ?? st.phase} · 틱 ${st.tick} · 게임 키프레임 ${g} (분석 ${p.done ?? 0}/${p.total ?? g}) · 결정 ${d} · 게임 ${st.game_quest?.state ?? '—'} · ML ${st.ml_quest?.state ?? '—'}`;
+    const skip = st.ml_needed === false ? ' · ML 결정 생략(찾을 대상 없음)' : '';
+    ph.textContent = `${PHASE_KO[st.phase] ?? st.phase} · "${st.command ?? ''}" · 틱 ${st.tick} · 게임 키프레임 ${g} (분석 ${p.done ?? 0}/${p.total ?? g}) · 결정 ${d} · 게임 ${st.game_quest?.state ?? '—'} · ML ${st.ml_quest?.state ?? '—'}${skip}`;
   }
   const m = st?.modes;
   const modes = $('tl-modes');
@@ -370,57 +373,86 @@ function renderToolbar() {
     for (const [k, v] of [['깊이', m.depth], ['위치', m.locate], ['추적', m.track]]) modes.append(el('span', { class: `tl-chip ${String(v).startsWith('stand-in') ? 'stand' : 'real'}`, text: `${k} ${v}` }));
     modes.append(el('span', { class: `tl-chip ${m.ttm ? 'real' : ''}`, text: m.ttm ? 'TTM 연결' : 'TTM 없음(융합만)' }));
   }
-  $('tl-run').disabled = running;
+  $('tl-run').disabled = busy;
+  renderLive(null);
 }
 
-async function start() {
-  if (state.mock) {
-    toast('실제 런타임 필요', '통합 테스트는 개발 서버나 Tauri 앱에서만 동작합니다.', 'warn');
+// 뷰포트 툴바의 기록 표시: ● 기록 중 · 단계 · 키프레임 수 · 대기 명령
+function renderLive(brief) {
+  const box = $('tl-live');
+  const b = brief ?? (status?.active ? { active: true, live: status.live, phase: status.phase, game: status.game?.keyframes?.length ?? 0, decide: status.decide?.keyframes?.length ?? 0, perceived: status.perceive?.done ?? 0 } : null);
+  const on = !!b?.active && b.live && b.phase !== 'done';
+  box.classList.toggle('on', on);
+  if (!b?.active) {
+    box.textContent = b?.queued ? `대기 명령 ${b.queued}` : '';
     return;
   }
-  if (running) return;
-  const command = $('tl-cmd').value.trim();
-  if (!command) return;
-  bus.emit('test-start');
-  cache.clear();
-  sel = null;
-  running = true;
+  const q = b.queued ? ` · 대기 ${b.queued}` : '';
+  box.textContent = b.phase === 'done'
+    ? `기록 완료 · 게임 ${b.game} · 결정 ${b.decide}${q}`
+    : `${PHASE_KO[b.phase] ?? b.phase} · 게임 ${b.game}${b.phase !== 'game' ? ` · 분석 ${b.perceived}` : ''}${b.phase === 'decide' ? ` · 결정 ${b.decide}` : ''}${q}`;
+  box.title = b.command ? `기록 중인 명령: ${b.command}` : '';
+}
+
+/** 툴바 '테스트 실행': 툴바 명령 칸의 문장을 입력줄과 같은 길(command_submit + 자동 기록)로 낸다. */
+async function runFromToolbar() {
+  const text = $('tl-cmd').value.trim();
+  if (!text || busy) return;
+  if (state.mock && $('tl-record').checked) toast('실제 런타임 필요', '통합 테스트 기록은 개발 서버나 Tauri 앱에서만 됩니다. 명령만 실행합니다.', 'warn');
+  busy = true;
   renderToolbar();
   try {
-    status = await call('test_start', { command, seed: Number($('tl-seed').value) || 0, body: state.bodyPlan ?? null, base: state.config.base });
-    renderLanes();
-    renderToolbar();
-    let lastDecide = -1;
-    while (running && status?.phase !== 'done') {
-      status = await call('test_step', { ticks: 200 }, { quiet: true });
-      const n = (status.game?.keyframes?.length ?? 0) + (status.decide?.keyframes?.length ?? 0) * 1000 + (status.perceive?.done ?? 0) * 7;
-      if (n !== lastDecide) {
-        lastDecide = n;
-        renderLanes();
-      }
-      renderToolbar();
-    }
-    if (status?.phase === 'done') {
-      setStatus(`통합 테스트 완료: 게임 ${status.game_quest?.state ?? '—'} · ML ${status.ml_quest?.state ?? '—'}`);
-      await mirrorDb(true);
-      refreshStats();
-    }
-  } catch (e) {
-    toast('통합 테스트 실패', e.message, 'err', 8000);
+    await submitCommand(text);
   } finally {
-    running = false;
+    busy = false;
     renderToolbar();
-    bus.emit('test-end');
   }
 }
 
 async function cancel() {
-  running = false;
   try {
+    await submitCommand('멈춰', { quietHistory: true });
     await call('test_cancel', {}, { quiet: true });
   } catch {
     /* 이미 끝났으면 조용히 */
   }
+  await refreshStatus(true);
+}
+
+/** sim_step 응답의 test 요약이 바뀌면 상태를 다시 받아 줄을 그린다. */
+async function refreshStatus(force = false) {
+  if (state.mock || fetching) return;
+  fetching = true;
+  try {
+    const s = await call('test_status', {}, { quiet: true });
+    if (s?.id !== status?.id) {
+      cache.clear();
+      sel = null;
+    }
+    status = s;
+    renderLanes();
+    renderToolbar();
+    if (s?.active && s.phase === 'done' && finishedId !== s.id) {
+      finishedId = s.id;
+      setStatus(`통합 테스트 기록 완료: "${s.command}" · 게임 ${s.game_quest?.state ?? '—'} · ML ${s.ml_quest?.state ?? '—'}`);
+      await mirrorDb(true);
+      refreshStats();
+    }
+  } catch {
+    /* 폴링 실패는 조용히 */
+  } finally {
+    fetching = false;
+  }
+  if (force) lastBrief = '';
+}
+
+function onSimTest(brief) {
+  renderLive(brief);
+  if (!brief) return;
+  const key = JSON.stringify([brief.id, brief.phase, brief.game, brief.perceived, brief.decide]);
+  if (key === lastBrief) return;
+  lastBrief = key;
+  refreshStatus();
 }
 
 async function mirrorDb(quiet) {
@@ -436,6 +468,14 @@ async function mirrorDb(quiet) {
 
 export function initTestTimeline() {
   build();
+  $('tl-run').addEventListener('click', runFromToolbar);
+  $('tl-stop').addEventListener('click', cancel);
+  $('tl-cmd').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); runFromToolbar(); }
+  });
+  bus.on('sim-test', onSimTest);
+  bus.on('command', (c) => { if (c?.recording || c?.queued) refreshStatus(true); });
+  bus.on('world-new', () => { status = null; cache.clear(); sel = null; renderLanes(); renderToolbar(); });
   renderToolbar();
   bus.on('tab', ({ group, name }) => {
     if (group !== 'bottom' || name !== 'test') return;

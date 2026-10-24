@@ -38,6 +38,16 @@ pub fn eul_reul(word: &str) -> &'static str {
     }
 }
 
+/// The subject particle that fits `word`: 이 after a final consonant, 가 after
+/// a vowel, and the written-out choice for words that do not end in Hangul.
+pub fn i_ga(word: &str) -> &'static str {
+    match ends_with_final(word) {
+        Some(true) => "이",
+        Some(false) => "가",
+        None => "이(가)",
+    }
+}
+
 /// The direction particle that fits `word`: 로 after a vowel or ㄹ, 으로 after
 /// another final consonant.
 pub fn euro(word: &str) -> &'static str {

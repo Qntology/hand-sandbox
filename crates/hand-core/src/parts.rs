@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::base::BaseKind;
 use crate::hand::FingerCount;
+use crate::wear::Reducer;
 
 /// Hip height above the ground (or the chassis mast top for wheeled bases), metres.
 pub const HIP_M: f32 = 0.58;
@@ -88,6 +89,8 @@ pub struct Actuator {
     pub backdrivable: bool,
     /// Thermal time constant of the heat model, seconds (est: research §1).
     pub thermal_tau_s: f32,
+    /// Reducer family, for the wear model's life rating (`wear::rating`).
+    pub reducer: Reducer,
     /// Source keys in `docs/research/parts.md`.
     pub src: &'static str,
 }
@@ -112,21 +115,21 @@ impl Actuator {
 }
 
 /// Feetech STS3215-C018, 12 V [1].
-pub const STS3215: Actuator = Actuator { name: "Feetech STS3215 (12 V)", peak_nm: 2.94, cont_nm: 0.98, speed_rad_s: 4.7, mass_kg: 0.055, price_usd: 32.0, backdrivable: false, thermal_tau_s: 200.0, src: "1" };
+pub const STS3215: Actuator = Actuator { name: "Feetech STS3215 (12 V)", peak_nm: 2.94, cont_nm: 0.98, speed_rad_s: 4.7, mass_kg: 0.055, price_usd: 32.0, backdrivable: false, thermal_tau_s: 200.0, reducer: Reducer::Spur, src: "1" };
 /// Hiwonder HTD-45H, 11.1 V [4]; continuous is an estimate (a third of peak, like Feetech).
-pub const HTD45H: Actuator = Actuator { name: "Hiwonder HTD-45H", peak_nm: 4.41, cont_nm: 1.5, speed_rad_s: 5.8, mass_kg: 0.064, price_usd: 30.0, backdrivable: false, thermal_tau_s: 200.0, src: "4" };
+pub const HTD45H: Actuator = Actuator { name: "Hiwonder HTD-45H", peak_nm: 4.41, cont_nm: 1.5, speed_rad_s: 5.8, mass_kg: 0.064, price_usd: 30.0, backdrivable: false, thermal_tau_s: 200.0, reducer: Reducer::Spur, src: "4" };
 /// Dynamixel XM430-W350 [7][10].
-pub const XM430: Actuator = Actuator { name: "Dynamixel XM430-W350", peak_nm: 4.1, cont_nm: 0.82, speed_rad_s: 4.8, mass_kg: 0.082, price_usd: 310.0, backdrivable: false, thermal_tau_s: 250.0, src: "7,10" };
+pub const XM430: Actuator = Actuator { name: "Dynamixel XM430-W350", peak_nm: 4.1, cont_nm: 0.82, speed_rad_s: 4.8, mass_kg: 0.082, price_usd: 310.0, backdrivable: false, thermal_tau_s: 250.0, reducer: Reducer::Spur, src: "7,10" };
 /// Robstride 01 [15].
-pub const RS01: Actuator = Actuator { name: "Robstride 01", peak_nm: 17.0, cont_nm: 6.0, speed_rad_s: 33.0, mass_kg: 0.38, price_usd: 130.0, backdrivable: true, thermal_tau_s: 600.0, src: "15" };
+pub const RS01: Actuator = Actuator { name: "Robstride 01", peak_nm: 17.0, cont_nm: 6.0, speed_rad_s: 33.0, mass_kg: 0.38, price_usd: 130.0, backdrivable: true, thermal_tau_s: 600.0, reducer: Reducer::Planetary, src: "15" };
 /// Robstride 02 [15].
-pub const RS02: Actuator = Actuator { name: "Robstride 02", peak_nm: 17.0, cont_nm: 6.0, speed_rad_s: 42.9, mass_kg: 0.405, price_usd: 145.0, backdrivable: true, thermal_tau_s: 600.0, src: "15" };
+pub const RS02: Actuator = Actuator { name: "Robstride 02", peak_nm: 17.0, cont_nm: 6.0, speed_rad_s: 42.9, mass_kg: 0.405, price_usd: 145.0, backdrivable: true, thermal_tau_s: 600.0, reducer: Reducer::Planetary, src: "15" };
 /// Robstride 03 [16].
-pub const RS03: Actuator = Actuator { name: "Robstride 03", peak_nm: 60.0, cont_nm: 20.0, speed_rad_s: 20.4, mass_kg: 0.88, price_usd: 225.0, backdrivable: true, thermal_tau_s: 800.0, src: "16" };
+pub const RS03: Actuator = Actuator { name: "Robstride 03", peak_nm: 60.0, cont_nm: 20.0, speed_rad_s: 20.4, mass_kg: 0.88, price_usd: 225.0, backdrivable: true, thermal_tau_s: 800.0, reducer: Reducer::Planetary, src: "16" };
 /// Robstride 04 [17]; 40 N·m continuous needs the large heatsink.
-pub const RS04: Actuator = Actuator { name: "Robstride 04", peak_nm: 120.0, cont_nm: 40.0, speed_rad_s: 20.9, mass_kg: 1.42, price_usd: 255.0, backdrivable: true, thermal_tau_s: 900.0, src: "17" };
+pub const RS04: Actuator = Actuator { name: "Robstride 04", peak_nm: 120.0, cont_nm: 40.0, speed_rad_s: 20.9, mass_kg: 1.42, price_usd: 255.0, backdrivable: true, thermal_tau_s: 900.0, reducer: Reducer::Planetary, src: "17" };
 /// Berkeley Humanoid Lite 6512 printed cycloidal actuator [22]; continuous and speed est.
-pub const BHL6512: Actuator = Actuator { name: "BHL 6512 (자작 사이클로이드)", peak_nm: 20.0, cont_nm: 7.0, speed_rad_s: 15.0, mass_kg: 0.55, price_usd: 170.0, backdrivable: true, thermal_tau_s: 500.0, src: "22" };
+pub const BHL6512: Actuator = Actuator { name: "BHL 6512 (자작 사이클로이드)", peak_nm: 20.0, cont_nm: 7.0, speed_rad_s: 15.0, mass_kg: 0.55, price_usd: 170.0, backdrivable: true, thermal_tau_s: 500.0, reducer: Reducer::Cycloid, src: "22" };
 
 /// The seven segments of the body, as the N:N balance tables name them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

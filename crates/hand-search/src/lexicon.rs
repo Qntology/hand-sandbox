@@ -254,7 +254,9 @@ fn node_of(id: &str, raw: RawNode) -> Node {
 }
 
 /// The verb node ids the parser understands.
-pub const KNOWN_VERBS: [&str; 5] = ["harvest", "pickup", "deliver", "go", "stop"];
+pub const KNOWN_VERBS: [&str; 6] = ["harvest", "pickup", "deliver", "go", "stop", "drop"];
+/// The verbs every lexicon must have (`drop` came later and is optional).
+pub const REQUIRED_VERBS: [&str; 5] = ["harvest", "pickup", "deliver", "go", "stop"];
 
 impl Lexicon {
     pub fn from_json(raw: &str) -> Result<Lexicon> {
@@ -345,7 +347,7 @@ impl Lexicon {
                 bail!("verb node {:?} is not one of {:?}", v.id, KNOWN_VERBS);
             }
         }
-        for want in KNOWN_VERBS {
+        for want in REQUIRED_VERBS {
             if !self.verbs.iter().any(|v| v.id == want) {
                 bail!("the lexicon has no verb node {want:?}");
             }

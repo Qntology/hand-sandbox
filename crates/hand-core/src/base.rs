@@ -40,6 +40,8 @@ impl BaseKind {
                 holonomic: false,
                 power_w: 120.0,
                 footprint_m: 0.30,
+                drive_accel_mps2: None,
+                mass_kg: None,
             },
             BaseKind::Mecanum => BaseSpec {
                 kind: self,
@@ -49,6 +51,8 @@ impl BaseKind {
                 holonomic: true,
                 power_w: 150.0,
                 footprint_m: 0.30,
+                drive_accel_mps2: None,
+                mass_kg: None,
             },
             BaseKind::Track => BaseSpec {
                 kind: self,
@@ -58,6 +62,8 @@ impl BaseKind {
                 holonomic: false,
                 power_w: 200.0,
                 footprint_m: 0.36,
+                drive_accel_mps2: None,
+                mass_kg: None,
             },
             BaseKind::HumanFoot => BaseSpec {
                 kind: self,
@@ -67,6 +73,8 @@ impl BaseKind {
                 holonomic: false,
                 power_w: 180.0,
                 footprint_m: 0.25,
+                drive_accel_mps2: None,
+                mass_kg: None,
             },
         }
     }
@@ -87,6 +95,14 @@ pub struct BaseSpec {
     pub power_w: f32,
     /// Ground footprint along the direction of travel, metres.
     pub footprint_m: f32,
+    /// Continuous drive force over the robot's mass, m/s² (set from the body;
+    /// `None` on a bare base, whose climb is then limited by friction only).
+    #[serde(default)]
+    pub drive_accel_mps2: Option<f32>,
+    /// Robot mass with its cargo, kg (set from the body; `None` on a bare base,
+    /// whose wheels then cost what they cost on firm ground).
+    #[serde(default)]
+    pub mass_kg: Option<f32>,
 }
 
 /// One piece of a route for the drive model.

@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::kinds::{ItemKind, NodeKind};
+use crate::terrain::TerrainKind;
 
 pub fn node_id(id: u32) -> String {
     format!("n{id}")
@@ -36,8 +37,14 @@ pub struct Bounds {
 pub struct CarryView {
     pub item: ItemKind,
     pub label_ko: String,
+    /// Whole items.
     pub count: u32,
+    /// Items, broken pieces included (`0.5` is half a stone).
+    pub amount: f32,
+    /// Mass of everything in this entry.
     pub mass_kg: f32,
+    /// Mass of one whole item.
+    pub unit_kg: f32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -79,6 +86,8 @@ pub struct DropView {
     pub item: ItemKind,
     pub label_ko: String,
     pub pos: Pos3,
+    /// How much of one item the piece is.
+    pub amount: f32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -91,10 +100,11 @@ pub struct WorldSnapshot {
     pub waypoints: Vec<WaypointView>,
     pub nodes: Vec<NodeView>,
     pub drops: Vec<DropView>,
+    pub terrain: TerrainKind,
 }
 
 /// Terrain as flat arrays, sent once per world because it never changes while
-/// the world runs. `ground` holds 0 sand, 1 grass, 2 dirt, 3 rock.
+/// the world runs. `ground` holds 0 sand, 1 grass, 2 dirt, 3 rock, 4 water, 5 wet sand.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TerrainGrid {
     pub cells_w: usize,
@@ -103,6 +113,7 @@ pub struct TerrainGrid {
     pub heights_cm: Vec<i16>,
     pub curb_cm: Vec<u8>,
     pub ground: Vec<u8>,
+    pub kind: TerrainKind,
 }
 
 /// What one grasp test says about holding an item with the current hand.

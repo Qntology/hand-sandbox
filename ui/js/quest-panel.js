@@ -1,9 +1,14 @@
-// 퀘스트: 오른쪽 퀘스트 카드 목록, 인벤토리, 월드 화면의 퀘스트 트래커.
+// 퀘스트: 오른쪽 퀘스트 카드 목록, 인벤토리(내려놓기 버튼), 보관 더미, 월드 화면의 퀘스트 트래커.
 // 매 틱 갱신되므로 카드별 서명(signature)이 같으면 DOM 을 그대로 두어 포커스와 깜빡임을 지킨다.
 import { bus, state } from './state.js';
 import { $, clear, el, fmt } from './util.js';
 import { panelOpen } from './layout.js';
 import { toast } from './toast.js';
+import { submitCommand } from './command-bar.js';
+
+const ITEM_COLOR = { log: '#805c36', stone: '#808084', coal: '#3a3a40', iron_ore: '#ba8c70' };
+/** 개수 표기: 정수면 그대로, 쪼갠 조각이면 소수 둘째 자리까지. */
+const amountText = (a) => (Math.abs(a - Math.round(a)) < 1e-3 ? String(Math.round(a)) : String(Number(a.toFixed(2))));
 
 const STATE_KO = { pending: '대기', active: '진행 중', done: '완료', failed: '실패' };
 const STATE_BADGE = { pending: 'badge-dim', active: 'badge-info', done: 'badge-ok', failed: 'badge-crit' };
@@ -154,16 +159,36 @@ function focusQuest() {
 }
 
 // ── 인벤토리 ────────────────────────────────────────────────────
-// carrying[].mass_kg 는 "개당 질량"으로 해석한다(계약상 모호). 합계는 개수 × 개당 질량.
+// carrying[].mass_kg 는 "개당 질량", amount 는 쪼갠 조각까지 센 개수(0.5 = 돌 반 개), total_kg 는 합계.
+let invSig = '';
+
+/** 내려놓기: 명령과 같은 길(command_submit)로 보내 대기·기록·로그가 같게 한다. */
+async function dropFromInventory(it, all) {
+  const text = it ? `${it.label_ko} ${all ? '' : '1개 '}내려놔`.replace(/\s+/g, ' ') : '다 내려놔';
+  const r = await submitCommand(text, { quietHistory: true });
+  if (r && !r.ok) toast('내려놓기 실패', r.error ?? '명령을 만들지 못했습니다', 'err');
+}
+
 function renderInventory(snap) {
   const items = snap?.agent?.carrying ?? [];
   const list = $('inv-list');
-  clear(list);
-  if (!items.length) list.append(el('li', {}, el('span', { class: 'empty-note', text: '들고 있는 물건이 없습니다' })));
+  const sig = JSON.stringify(items.map((it) => [it.item_id, it.amount ?? it.count]));
   let total = 0;
-  for (const it of items) {
-    total += it.count * it.mass_kg;
-    list.append(el('li', {}, el('span', { text: `${it.label_ko} × ${it.count}` }), el('span', { class: 'mass', text: `개당 ${fmt.n(it.mass_kg, 1)} kg` })));
+  for (const it of items) total += it.total_kg ?? it.count * it.mass_kg;
+  if (sig !== invSig) {
+    invSig = sig;
+    clear(list);
+    if (!items.length) list.append(el('li', {}, el('span', { class: 'empty-note', text: '들고 있는 물건이 없습니다' })));
+    for (const it of items) {
+      const n = it.amount ?? it.count;
+      list.append(el('li', { class: 'inv-item' },
+        el('span', { class: 'inv-name', text: `${it.label_ko} × ${amountText(n)}` }),
+        el('span', { class: 'mass', text: `개당 ${fmt.n(it.mass_kg, 1)} kg · ${fmt.n(it.total_kg ?? n * it.mass_kg, 1)} kg` }),
+        el('span', { class: 'inv-btns' },
+          el('button', { type: 'button', class: 'vt-btn', text: '1개 내려놓기', title: `${it.label_ko} 1개를 내려놓습니다 (웨이포인트 가까이면 그 더미에, 아니면 땅에)`, on: { click: () => dropFromInventory(it, false) } }),
+          n > 1 + 1e-3 ? el('button', { type: 'button', class: 'vt-btn', text: '모두', title: `${it.label_ko} ${amountText(n)}개를 모두 내려놓습니다`, on: { click: () => dropFromInventory(it, true) } }) : null)));
+    }
+    $('inv-drop-all').disabled = !items.length;
   }
   const stomach = state.body?.parts?.find((p) => p.id === 'stomach');
   const limit = stomach?.max;
@@ -175,7 +200,50 @@ function renderInventory(snap) {
   $('sum-inventory').textContent = items.length ? `${items.reduce((a, i) => a + i.count, 0)}개 · ${fmt.n(total, 1)} kg` : '비어 있음';
 }
 
+// ── 보관 더미 (웨이포인트 적재) ────────────────────────────────
+let stockSig = '';
+
+function renderStock(snap) {
+  const box = $('stock-list');
+  const wps = snap?.waypoints ?? [];
+  const q = state.quests.find((x) => x.state === 'active');
+  const stepLabel = q?.steps?.find((x) => x.state === 'active')?.label_ko ?? '';
+  const sig = JSON.stringify([wps.map((w) => [w.id, (w.stock ?? []).map((s) => [s.item_id, s.amount ?? s.count])]), stepLabel]);
+  if (sig === stockSig) return;
+  stockSig = sig;
+  clear(box);
+  let pieces = 0;
+  let kg = 0;
+  for (const w of wps) {
+    const stock = w.stock ?? [];
+    const wkg = stock.reduce((a, s) => a + (s.total_kg ?? (s.amount ?? s.count) * s.mass_kg), 0);
+    const wn = stock.reduce((a, s) => a + (s.amount ?? s.count), 0);
+    pieces += wn;
+    kg += wkg;
+    const flag = w.id === 'warehouse' ? '#3468dc' : '#e87828';
+    box.append(el('div', { class: `stock-card${stepLabel.includes(w.label_ko) ? ' target' : ''}` },
+      el('div', { class: 'sc-head' },
+        el('span', {}, el('i', { class: 'sc-sw', style: `background:${flag}` }), w.label_ko),
+        el('small', { text: stock.length ? `${amountText(wn)}개 · ${fmt.n(wkg, 1)} kg` : '비어 있음' })),
+      stock.length
+        ? el('ul', {}, ...stock.map((s) => {
+          const n = s.amount ?? s.count;
+          const whole = Math.floor(n + 1e-3);
+          const part = n - whole > 1e-3;
+          const dots = [];
+          for (let i = 0; i < Math.min(whole, 30); i++) dots.push(el('i', { style: `background:${ITEM_COLOR[s.item_id] ?? '#999'}` }));
+          if (part) dots.push(el('i', { class: 'part', style: `background:${ITEM_COLOR[s.item_id] ?? '#999'}` }));
+          return el('li', {}, el('span', { text: s.label_ko }), el('span', { class: 'pile', aria: { hidden: 'true' } }, ...dots), el('span', { class: 'n', text: `× ${amountText(n)}` }));
+        }))
+        : el('div', { class: 'sc-empty', text: '아직 쌓인 물건이 없습니다' })));
+  }
+  $('sum-stock').textContent = pieces > 0 ? `${amountText(pieces)}개 · ${fmt.n(kg, 1)} kg` : '비어 있음';
+}
+
 export function initQuestPanel() {
+  $('inv-drop-all').addEventListener('click', () => dropFromInventory(null, true));
+  bus.on('snapshot', renderStock);
+  bus.on('quests', () => renderStock(state.snapshot));
   const tracker = $('quest-tracker');
   tracker.addEventListener('click', focusQuest);
   tracker.addEventListener('keydown', (e) => {
@@ -187,4 +255,5 @@ export function initQuestPanel() {
   renderList([]);
   renderTracker([]);
   renderInventory(null);
+  renderStock(null);
 }

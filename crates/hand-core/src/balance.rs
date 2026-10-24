@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use crate::base::{BaseKind, BaseSpec};
 use crate::hand::FingerCount;
 use crate::parts::*;
+use crate::surface::{self, Contact, Surface};
 
 pub const G: f32 = 9.81;
 /// Delay of a purely reactive correction, seconds (electromechanical delay 80–100 ms, research §3).
@@ -46,10 +47,6 @@ pub const KNEE_LEVER_STAND_M: f32 = 0.03;
 pub const KNEE_SAFETY: f32 = 1.5;
 /// Lateral distance from the pelvis centre to a hip joint, metres (est, 0.191·H/2 scaled to 1.2 m).
 pub const HIP_HALF_WIDTH_M: f32 = 0.09;
-/// Foot sole friction (est, rubber on dirt) for the slip limit on slopes.
-pub const FOOT_FRICTION: f32 = 0.6;
-/// Rolling resistance of the chassis wheels (est).
-pub const ROLLING_RESISTANCE: f32 = 0.03;
 /// Mass of the mast that carries the upper body on a wheeled chassis, kg (est: 0.5 m of 2020 extrusion plus mounts).
 pub const MAST_KG: f32 = 1.0;
 /// Where the cargo bay sits: in front of the belly, metres (est).
@@ -159,6 +156,12 @@ pub struct Posture {
     pub single_support: bool,
     /// Forward acceleration, m/s².
     pub accel_mps2: f32,
+    /// The ground under the robot (`surface`).
+    #[serde(default)]
+    pub ground: Surface,
+    /// Walking or driving: the base's own shear (gait, rolling resistance) acts.
+    #[serde(default)]
+    pub moving: bool,
 }
 
 impl Posture {
@@ -173,7 +176,14 @@ impl Posture {
             step_m: 0.0,
             single_support: false,
             accel_mps2: 0.0,
+            ground: Surface::Firm,
+            moving: false,
         }
+    }
+
+    /// The base pushes on the ground: it walks, drives or speeds up.
+    pub fn propelling(&self) -> bool {
+        self.moving || self.single_support || self.accel_mps2 != 0.0
     }
 
     /// Working arm raised to strike (75° elevation, est for hitting a block at chest height).
@@ -269,6 +279,8 @@ pub struct BalanceReport {
     pub effort_sum: f32,
     pub feasible: bool,
     pub limiting: Option<String>,
+    /// Friction the contacts need on this ground against what it gives.
+    pub contact: Contact,
     /// Feed-forward prediction of the shift and the gain used.
     pub ff_predicted_m: f32,
     pub ff_gain: f32,
@@ -658,6 +670,13 @@ impl Body {
                 limiting = Some(format!("{} {:.1}/{:.1} N·m ({})", w.joint, w.torque_nm * (1.0 + eps_ff), w.peak_nm, w.actuator));
             }
         }
+        // The contacts slide when the slope, the acceleration and the base's own
+        // shear need more friction than the ground gives.
+        let contact = surface::contact(self.base, post.ground.props(), post.slope_deg, post.accel_mps2, post.propelling());
+        if contact.utilisation > 1.0 {
+            feasible = false;
+            limiting = Some(format!("미끄러짐: 필요 마찰 {:.2} > {} {:.2}", contact.required_mu, post.ground.label_ko(), contact.available_mu));
+        }
         if margin < 0.0 {
             feasible = false;
             limiting = Some(format!("균형 여유 {:.2} < 0", margin));
@@ -687,6 +706,7 @@ impl Body {
             effort_sum,
             feasible,
             limiting,
+            contact,
             ff_predicted_m: predicted,
             ff_gain: ff.gain,
             couplings: Vec::new(),
@@ -748,7 +768,8 @@ impl Body {
             }
         } else {
             let slope = post.slope_deg.to_radians();
-            let force = e.mass * (G * (slope.sin() + ROLLING_RESISTANCE * slope.cos()) + a.abs());
+            let crr = if post.propelling() { surface::rolling_resistance(self.base, post.ground.props()) } else { 0.0 };
+            let force = e.mass * (G * (slope.sin() + crr * slope.cos()) + a.abs());
             let f = self.chassis.drive_force_n.max(1e-3);
             out.push(JointLoad { joint: "drive".into(), segment: Segment::Foot, actuator: self.chassis.name.into(), torque_nm: force, cont_nm: f, peak_nm: 2.0 * f, effort: force / f, peak_ratio: force / (2.0 * f) });
         }
@@ -844,10 +865,11 @@ impl Body {
                 step = h_max;
                 reasons.push(format!("무릎 피크로 오를 수 있는 턱 {:.0} cm", h_max * 100.0));
             }
-            let slip = FOOT_FRICTION.atan().to_degrees();
+            let firm = Surface::Firm.props();
+            let slip = surface::friction_slope_limit_deg(self.base, firm);
             if slip < slope {
                 slope = slip;
-                reasons.push(format!("발바닥 마찰 {FOOT_FRICTION} 미끄럼 한계 {slip:.0}°"));
+                reasons.push(format!("단단한 바닥에서 발 마찰 {:.2} − 보행 전단 {:.3}의 미끄럼 한계 {slip:.0}°", firm.mu_foot, surface::GAIT_RCOF));
             }
             capacity = (self.leg.knee.cont_nm / (G * KNEE_LEVER_WALK_M) - self.mass_kg()).max(0.0);
         } else {
@@ -855,10 +877,11 @@ impl Body {
                 speed = self.chassis.max_speed_mps;
                 reasons.push(format!("섀시 최고 속도 {:.2} m/s ({})", speed, self.chassis.name));
             }
-            let trac = (self.chassis.drive_force_n / (m * G) - ROLLING_RESISTANCE).clamp(-1.0, 1.0).asin().to_degrees();
+            // On firm ground; each ground's own limit is `surface::climb_limit_deg`.
+            let trac = surface::climb_limit_deg(self.base, Surface::Firm.props(), Some(self.chassis.drive_force_n / m));
             if trac < slope {
                 slope = trac.max(0.0);
-                reasons.push(format!("구동력 {:.0} N으로 오를 수 있는 경사 {:.0}°", self.chassis.drive_force_n, slope));
+                reasons.push(format!("단단한 바닥에서 구동력 {:.0} N·마찰로 오를 수 있는 경사 {:.0}°", self.chassis.drive_force_n, slope));
             }
             // Steepest slope where the margin (with the waist lean) stays above MARGIN_KEEP.
             let mut tip = 0.0;
@@ -899,27 +922,49 @@ impl Body {
     /// forward, so each is limited by the room between the ZMP and the support
     /// edge it moves toward, less the kept margin, on this slope (a wheeled
     /// base pitches with it and its CoM moves downhill) with this cargo. An
-    /// uphill start is also limited by traction. The flat, symmetric limit of
-    /// `drive_limits` stays as the upper bound.
-    pub fn planned_accel(&self, spec: &BaseSpec, slope_deg: f32, cargo_kg: f32, dir: f32, min_ramp_s: f32) -> f32 {
-        self.planned_accel_within(&self.drive_limits(spec, cargo_kg), slope_deg, cargo_kg, dir, min_ramp_s)
+    /// uphill start is also limited by the drive force, and every start and
+    /// stop by the friction the ground transmits on that slope. The flat,
+    /// symmetric limit of `drive_limits` stays as the upper bound.
+    pub fn planned_accel(&self, spec: &BaseSpec, slope_deg: f32, cargo_kg: f32, ground: Surface, dir: f32, min_ramp_s: f32) -> f32 {
+        self.planned_accel_within(&self.drive_limits(spec, cargo_kg), slope_deg, cargo_kg, ground, dir, min_ramp_s)
     }
 
     /// [`Body::planned_accel`] with the drive limits already computed (the world caches them).
-    pub fn planned_accel_within(&self, l: &DriveLimits, slope_deg: f32, cargo_kg: f32, dir: f32, min_ramp_s: f32) -> f32 {
-        let p = Posture { source: if slope_deg.abs() >= 3.0 { Source::Slope } else { Source::Quiet }, slope_deg, ..Posture::quiet(cargo_kg) };
+    pub fn planned_accel_within(&self, l: &DriveLimits, slope_deg: f32, cargo_kg: f32, ground: Surface, dir: f32, min_ramp_s: f32) -> f32 {
+        let p = Posture { source: if slope_deg.abs() >= 3.0 { Source::Slope } else { Source::Quiet }, slope_deg, ground, ..Posture::quiet(cargo_kg) };
         let r = self.solve(&p, &FeedForward::default(), 1e3);
         let s = r.support;
         let keep = MARGIN_KEEP * 0.5 * (s[1] - s[0]);
         let room = if dir > 0.0 { r.zmp[0] - (s[0] + keep) } else { (s[1] - keep) - r.zmp[0] };
         let mut a = (G * room.max(0.0) / r.com[2].max(0.1)).min(l.accel_limit_mps2);
+        let props = ground.props();
+        let slope = slope_deg.to_radians();
         if !self.legged && dir > 0.0 {
             let m = self.mass_kg() + cargo_kg;
-            let slope = slope_deg.to_radians();
-            let trac = self.chassis.drive_force_n / m - G * (slope.sin() + ROLLING_RESISTANCE * slope.cos());
+            let trac = self.chassis.drive_force_n / m - G * (slope.sin() + surface::rolling_resistance(self.base, props) * slope.cos());
             a = a.min(trac.max(0.0));
         }
+        // The ground's friction is the last word (gravity works against a start uphill and a stop downhill).
+        a = a.min(surface::traction_accel_limit(self.base, props, if dir > 0.0 { slope_deg } else { -slope_deg }));
         (l.max_speed_mps / min_ramp_s.max(1e-3)).min(a).max(0.05)
+    }
+
+    /// Cargo the base carries on this ground and slope (`slope_deg` positive
+    /// uphill along the travel): the continuous limit of `drive_limits`, and
+    /// for a wheeled or tracked base no more than its drive force still pushes
+    /// against the slope and the rolling resistance (`m·g·(sin θ + crr·cos θ) ≤ F`;
+    /// downhill, where gravity does the pushing, no drive limit).
+    pub fn capacity_on(&self, spec: &BaseSpec, ground: Surface, slope_deg: f32) -> f32 {
+        let cap = self.drive_limits(spec, 0.0).capacity_kg;
+        if self.legged {
+            return cap;
+        }
+        let th = slope_deg.to_radians();
+        let need = th.sin() + surface::rolling_resistance(self.base, ground.props()) * th.cos();
+        if need <= 1e-3 {
+            return cap;
+        }
+        cap.min((self.chassis.drive_force_n / (G * need) - self.mass_kg()).max(0.0))
     }
 
     /// Lifts `load_kg` with one arm, or with both when one is not enough.

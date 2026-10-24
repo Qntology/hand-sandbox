@@ -33,7 +33,11 @@ pub const MIN_CELLS: usize = 32;
 pub const MAX_CELLS: usize = 160;
 
 /// Names of the commands [`Runtime::api_call`] answers.
-pub const COMMANDS: [&str; 26] = [
+pub const COMMANDS: [&str; 31] = [
+    "inventory_drop",
+    "world_reset",
+    "body_reset",
+    "world_terrain",
     "world_new",
     "sim_step",
     "world_frame",
@@ -60,6 +64,7 @@ pub const COMMANDS: [&str; 26] = [
     "sam_use",
     "devices",
     "nn_status",
+    "physics_status",
 ];
 
 /// How many steps ahead the time-series tab forecasts.
@@ -109,10 +114,10 @@ fn pos(p: &Pos3, depth_m: f32) -> Value {
     json!([r3(p.x), r3(depth_m - p.z), r3(p.y)])
 }
 
-/// `mass_kg` in a carry entry is the mass of one item, as the UI reads it; the
-/// simulator reports the mass of the whole stack.
+/// `mass_kg` in a carry entry is the mass of one item, as the UI reads it;
+/// `amount` counts broken pieces (half a stone is 0.5), `total_kg` is the stack.
 fn carry(c: &CarryView) -> Value {
-    json!({"item_id": c.item.id(), "label_ko": c.label_ko, "count": c.count, "mass_kg": r3(c.mass_kg / c.count.max(1) as f32)})
+    json!({"item_id": c.item.id(), "label_ko": c.label_ko, "count": c.count, "amount": r3(c.amount), "mass_kg": r3(c.unit_kg), "total_kg": r3(c.mass_kg)})
 }
 
 pub fn snapshot_json(s: &WorldSnapshot) -> Value {
@@ -121,6 +126,7 @@ pub fn snapshot_json(s: &WorldSnapshot) -> Value {
         "tick": s.tick,
         "time_s": r3(s.time_s as f32),
         "seed": s.seed,
+        "terrain": s.terrain.id(),
         "bounds": [r3(s.bounds.width_m), r3(s.bounds.depth_m)],
         "agent": {
             "pos": pos(&s.agent.pos, d),
@@ -145,7 +151,7 @@ pub fn snapshot_json(s: &WorldSnapshot) -> Value {
             "id": n.id, "kind": n.kind.id(), "label_ko": n.label_ko, "pos": pos(&n.pos, d), "hp": r3(n.hp),
         })).collect::<Vec<_>>(),
         "drops": s.drops.iter().map(|x| json!({
-            "id": x.id, "item_id": x.item.id(), "label_ko": x.label_ko, "pos": pos(&x.pos, d),
+            "id": x.id, "item_id": x.item.id(), "label_ko": x.label_ko, "pos": pos(&x.pos, d), "amount": r3(x.amount),
         })).collect::<Vec<_>>(),
     })
 }
@@ -197,6 +203,19 @@ fn parsed_json(rt: &Runtime, p: &ParsedCommand) -> Value {
             summary_of(targets, "mine", None, mean(&scores), w, targets_json(targets))
         }
         Some(Plan::Goto { place: pl }) => ("goto", None, None, None, Some(place(&pl.place)), pl.score, Vec::new()),
+        Some(Plan::Drop { items, place: pl }) => {
+            let one = items.len() == 1;
+            // One item with a count reads "원목 ×1" (the count goes in its own field);
+            // everything else spells out its amounts.
+            let item_ko = match items.as_slice() {
+                [] => Some("적재함 전부".to_string()),
+                [t] if t.quantity.is_some() => Some(label_ko(w, &t.resource)),
+                _ => Some(items.iter().map(|t| format!("{} {}", label_ko(w, &t.resource), t.quantity.map_or("전부".to_string(), |q| format!("{q}개")))).collect::<Vec<_>>().join(" + ")),
+            };
+            let tj = items.iter().map(|t| json!({"item_id": t.resource, "label_ko": label_ko(w, &t.resource), "count": t.quantity, "score": r3(t.score)})).collect::<Vec<_>>();
+            let conf = if items.is_empty() { 1.0 } else { mean(&items.iter().map(|t| t.score).collect::<Vec<_>>()) };
+            ("drop", items.first().filter(|_| one).map(|t| t.resource.clone()), item_ko, items.first().filter(|_| one).and_then(|t| t.quantity), pl.as_ref().map(|p| place(&p.place)), conf, tj)
+        }
         Some(Plan::Stop) => ("stop", None, None, None, None, 1.0, Vec::new()),
         None => ("unknown", None, None, None, None, 0.0, Vec::new()),
     };
@@ -266,6 +285,8 @@ fn submission_json(rt: &Runtime, text: &str, s: &Submission) -> Value {
         "error_code": s.error_code,
         "mode": s.mode,
         "text": text,
+        "recording": rt.test_session().is_some_and(|t| t.live && t.phase != crate::TestPhase::Done),
+        "queued": false,
     })
 }
 
@@ -323,13 +344,46 @@ pub fn device_json(sel: &hand_ml::Selection) -> Value {
 
 impl Runtime {
     /// The integrated test drives the world itself; stepping it or adding
-    /// quests from outside would mix into the recording.
+    /// quests from outside would mix into the recording. A live recording is
+    /// the play loop's own (see [`Runtime::live_running`]).
     fn refuse_during_test(&self) -> Result<(), String> {
-        match self.test_session().map(|t| t.phase) {
+        match self.test_session().filter(|t| !t.live).map(|t| t.phase) {
             Some(crate::TestPhase::Game) | Some(crate::TestPhase::Perceive) | Some(crate::TestPhase::Decide) => {
                 Err("통합 테스트가 진행 중입니다. 끝나거나 중지한 뒤에 진행하세요".into())
             }
             _ => Ok(()),
+        }
+    }
+
+    /// A live recording that has not finished yet.
+    pub fn live_running(&self) -> bool {
+        self.test_session().is_some_and(|t| t.live && t.phase != crate::TestPhase::Done)
+    }
+
+    /// What the play loop needs to know about the recording (the timeline asks
+    /// `test_status` for the rest when these numbers change).
+    fn live_brief(&self) -> Value {
+        match self.test_session() {
+            None => json!({"active": false, "queued": self.live_queue.len()}),
+            Some(t) => json!({
+                "active": true, "live": t.live, "id": t.id, "phase": t.phase, "command": t.command, "ml_needed": t.ml_needed,
+                "game": t.game.as_ref().map_or_else(|| if t.phase == crate::TestPhase::Game { self.recording.as_ref().map_or(0, |r| r.keyframes.len()) } else { 0 }, |r| r.keyframes.len()),
+                "perceived": t.perceive_next,
+                "decide": t.decide.as_ref().map_or_else(|| if t.phase == crate::TestPhase::Decide { self.recording.as_ref().map_or(0, |r| r.keyframes.len()) } else { 0 }, |r| r.keyframes.len()),
+                "queued": self.live_queue.len(),
+            }),
+        }
+    }
+
+    /// Starts the next queued command as a live recording when nothing runs.
+    fn live_pump(&mut self) {
+        if self.live_running() || self.busy() {
+            return;
+        }
+        if let Some(cmd) = self.live_queue.pop_front() {
+            if let Err(e) = self.live_start(&cmd) {
+                self.log("quest", hand_sds::Level::Warn, format!("대기 명령 \"{cmd}\"을 시작하지 못함: {e}"), None);
+            }
         }
     }
 
@@ -344,6 +398,7 @@ impl Runtime {
         if self.test_session().is_some() {
             let _ = self.api_test_call("test_cancel", &Value::Null);
         }
+        self.live_queue.clear();
         let mut hand = config;
         if let Some(b) = base.filter(|b| !b.is_empty()) {
             let kind: BaseKind = serde_json::from_value(Value::String(b.to_string())).map_err(|_| format!("알 수 없는 베이스 '{b}'"))?;
@@ -355,10 +410,20 @@ impl Runtime {
         Ok(snapshot_json(&self.snapshot()))
     }
 
-    /// `sim_step({ticks})`: runs ticks, answers the new state and the notable log lines.
+    /// `sim_step({ticks})`: runs ticks, answers the new state and the notable
+    /// log lines. With a live recording on, the ticks advance the recording
+    /// (the game pass, then perception, then the ML decision pass).
     pub fn api_sim_step(&mut self, ticks: u32) -> Result<Value, String> {
         self.refuse_during_test()?;
-        let lines = self.step(ticks.clamp(1, 200));
+        let ticks = ticks.clamp(1, 200);
+        let lines = if self.live_running() {
+            let before = self.audit.last_seq();
+            self.test_advance(ticks).map_err(|e| e.to_string())?;
+            self.audit.tail(before, 500, None).0
+        } else {
+            self.step(ticks)
+        };
+        self.live_pump();
         let notable: Vec<&LogLine> = lines.iter().filter(|l| l.level != hand_sds::Level::Debug).collect();
         let events: Vec<Value> = notable[notable.len().saturating_sub(50)..].iter().map(|l| log_json(l)).collect();
         Ok(json!({
@@ -366,7 +431,100 @@ impl Runtime {
             "quests": self.api_quest_list()?,
             "body": self.api_body_status()?,
             "events": events,
+            "test": self.live_brief(),
         }))
+    }
+
+    /// `inventory_drop({item, amount})`: a quest that sets carried items down
+    /// here (onto a waypoint's pile when one is in reach). `item` null drops
+    /// everything, `amount` null all of that kind.
+    pub fn api_inventory_drop(&mut self, item: Option<&str>, amount: Option<u32>) -> Result<Value, String> {
+        self.refuse_during_test()?;
+        if self.world().agent.carried.is_empty() {
+            return Err("적재함이 비어 있습니다".into());
+        }
+        let items = match item.filter(|i| !i.is_empty()) {
+            Some(i) => {
+                let k = world_sim::ItemKind::from_id(i).ok_or_else(|| format!("알 수 없는 물건 '{i}'"))?;
+                if self.world().carried_amount(k) <= world_sim::world::AMOUNT_EPS {
+                    return Err(format!("적재함에 {}이(가) 없습니다", k.spec().label_ko));
+                }
+                vec![hand_search::DropTarget { resource: i.to_string(), quantity: amount, via: Via::Exact, score: 1.0, text: k.spec().label_ko.to_string() }]
+            }
+            None => vec![],
+        };
+        let id = self.submit_plan(Plan::Drop { items, place: None }, "인벤토리 버튼")?;
+        Ok(json!({"ok": true, "quest_id": id, "quests": self.api_quest_list()?}))
+    }
+
+    /// `world_reset()`: the world as its seed made it, the body as it is.
+    pub fn api_world_reset(&mut self) -> Result<Value, String> {
+        if self.test_session().is_some() {
+            let _ = self.api_test_call("test_cancel", &Value::Null);
+        }
+        self.live_queue.clear();
+        self.reset_world().map_err(|e| e.to_string())?;
+        Ok(json!({"snapshot": snapshot_json(&self.snapshot()), "quests": self.api_quest_list()?, "body": self.api_body_status()?}))
+    }
+
+    /// `body_reset()`: battery, joint heat and wear back to rested.
+    pub fn api_body_reset(&mut self) -> Result<Value, String> {
+        self.reset_body();
+        Ok(json!({"snapshot": snapshot_json(&self.snapshot()), "body": self.api_body_status()?}))
+    }
+
+    /// `world_terrain()`: the height field and ground kinds, once per world.
+    /// Rows go along the simulator's `z` from 0, which the UI draws at the top
+    /// (`y = depth`); see the module comment on the flip.
+    pub fn api_world_terrain(&self) -> Result<Value, String> {
+        let g = self.world().terrain_grid();
+        Ok(json!({
+            "kind": g.kind.id(), "cells_w": g.cells_w, "cells_d": g.cells_d, "cell_m": g.cell_m,
+            "heights_cm": g.heights_cm, "curb_cm": g.curb_cm, "ground": g.ground,
+            "ground_kinds": world_sim::Ground::ALL.iter().map(|k| json!({"code": k.code(), "id": k.id(), "label_ko": k.label_ko(), "color": k.color()})).collect::<Vec<_>>(),
+            "layout": self.world().layout,
+        }))
+    }
+
+    /// `physics_status()`: the ground under the robot and what it does to the
+    /// five effects now — the friction picture, each joint's heat and life
+    /// used, the cargo the drive carries here, the world's condition scored as
+    /// an effects benchmark scenario, and the ground table.
+    pub fn api_physics_status(&self) -> Value {
+        let w = self.world();
+        let (post, state) = w.posture_now();
+        let g = w.ground_here();
+        let bal = w.balance_summary();
+        let joints: Vec<Value> = w
+            .heat
+            .keys()
+            .chain(w.wear.keys())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(|j| {
+                let torque = bal.as_ref().and_then(|b| b.joints.iter().find(|x| &x.joint == j)).map(|x| x.torque_nm);
+                let life = w.joint_actuator(j).zip(torque).map(|(a, t)| hand_core::wear::life_h(&a, t));
+                json!({
+                    "joint": j,
+                    "heat": r3(w.heat.get(j).copied().unwrap_or(0.0)),
+                    "life_used": w.wear.get(j).copied().unwrap_or(0.0),
+                    "life_h_at_torque": life.filter(|l| l.is_finite()),
+                    "rating": w.joint_actuator(j).map(|a| hand_core::wear::rating(&a)),
+                })
+            })
+            .collect();
+        let live = hand_core::effects::live_scenario(&w.body, &post).map(|s| hand_core::effects::evaluate(&w.body, &s));
+        json!({
+            "ground": {"id": g.id(), "label_ko": g.label_ko(), "surface": g.surface().props()},
+            "state": state,
+            "slope_deg": r3(post.slope_deg),
+            "moving": post.propelling(),
+            "contact": bal.as_ref().and_then(|b| b.contact),
+            "joints": joints,
+            "load": {"carried_kg": r3(w.carried_kg()), "body_kg": r3(w.body.mass_kg()), "capacity_kg": r3(w.capacity_kg()), "capacity_here_kg": r3(w.capacity_here())},
+            "live": live,
+            "surfaces": hand_core::surface::SURFACES,
+        })
     }
 
     /// `world_frame({width, height, quality, view})`: a WebP screenshot and the boxes of the last scan.
@@ -399,8 +557,39 @@ impl Runtime {
 
     /// `command_submit({text})`: parses a typed command and queues its quest.
     pub fn api_command_submit(&mut self, input: &str) -> Result<Value, String> {
+        self.api_command_submit_rec(input, false)
+    }
+
+    /// `command_submit({text, record})`: with `record`, the command is
+    /// recorded as a live integrated test (three timeline rows) when nothing
+    /// runs, else it waits its turn; a stop always acts at once.
+    pub fn api_command_submit_rec(&mut self, input: &str, record: bool) -> Result<Value, String> {
         self.refuse_during_test()?;
-        let s = self.submit(input);
+        if !record {
+            let s = self.submit(input);
+            return Ok(submission_json(self, input, &s));
+        }
+        let probe = self.parser().parse(input, None);
+        if matches!(probe.plan, Some(Plan::Stop)) {
+            // A stop acts at once: the recording, the waiting commands, the quests.
+            self.live_queue.clear();
+            if self.live_running() {
+                let _ = self.api_test_call("test_cancel", &Value::Null);
+            }
+            let s = self.submit(input);
+            return Ok(submission_json(self, input, &s));
+        }
+        if probe.plan.is_some() && (self.live_running() || self.busy()) {
+            self.live_queue.push_back(input.to_string());
+            let n = self.live_queue.len();
+            self.log("quest", hand_sds::Level::Info, format!("명령 대기 ({n}번째): \"{input}\" — 지금 기록이 끝나면 시작"), None);
+            let s = self.submit_preview(input);
+            let mut v = submission_json(self, input, &s);
+            v["queued"] = json!(n);
+            v["ok"] = json!(true);
+            return Ok(v);
+        }
+        let s = self.live_start(input).map_err(|e| e.to_string())?;
         Ok(submission_json(self, input, &s))
     }
 
@@ -566,6 +755,9 @@ impl Runtime {
                 if let Some(body) = crate::api_test::plan_from(args)? {
                     self.cfg.body = body;
                 }
+                if let Some(t) = text(args, "terrain").filter(|t| !t.is_empty()) {
+                    self.cfg.terrain = world_sim::TerrainKind::from_id(t).ok_or_else(|| format!("알 수 없는 지형 '{t}' (open 또는 rugged)"))?;
+                }
                 self.api_world_new(seed, size, config, text(args, "base"))
             }
             "sim_step" => self.api_sim_step(num(args, "ticks").unwrap_or(1.0).max(1.0) as u32),
@@ -573,7 +765,11 @@ impl Runtime {
                 let (w, h) = (num(args, "width").unwrap_or(480.0) as u32, num(args, "height").unwrap_or(320.0) as u32);
                 self.api_world_frame(w, h, num(args, "quality").unwrap_or(75.0) as f32, text(args, "view").unwrap_or("agent"))
             }
-            "command_submit" => self.api_command_submit(text(args, "text").unwrap_or("")),
+            "command_submit" => self.api_command_submit_rec(text(args, "text").unwrap_or(""), args.get("record").and_then(Value::as_bool).unwrap_or(false)),
+            "inventory_drop" => self.api_inventory_drop(text(args, "item"), num(args, "amount").map(|a| a.max(1.0) as u32)),
+            "world_reset" => self.api_world_reset(),
+            "body_reset" => self.api_body_reset(),
+            "world_terrain" => self.api_world_terrain(),
             "quest_list" => self.api_quest_list(),
             "perception_scan" => self.api_perception_scan(num(args, "topK").unwrap_or(8.0).max(1.0) as usize),
             "body_status" => self.api_body_status(),
@@ -584,6 +780,7 @@ impl Runtime {
             "sam_use" => self.api_model_use("sam", args),
             "devices" => Ok(device_json(&hand_ml::preferred())),
             "nn_status" => Ok(json!({"scenarios": self.nn_live.summary(), "phases": self.nn_live.phases().collect::<Vec<_>>()})),
+            "physics_status" => Ok(self.api_physics_status()),
             "log_tail" => self.api_log_tail(num(args, "afterSeq").unwrap_or(0.0).max(0.0) as u64, num(args, "limit").unwrap_or(200.0) as usize, text(args, "category")),
             other => Err(format!("unknown command {other}")),
         }

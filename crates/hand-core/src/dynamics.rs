@@ -39,7 +39,7 @@
 
 use serde::Serialize;
 
-use crate::balance::{step_knee_lever, Body, FeedForward, Posture, Source, CARGO_X_M, CARGO_Z_M, G, HIP_HALF_WIDTH_M, KNEE_LEVER_STAND_M, KNEE_LEVER_WALK_M, MAST_KG, REACTION_DELAY_S, ROLLING_RESISTANCE};
+use crate::balance::{step_knee_lever, Body, FeedForward, Posture, Source, CARGO_X_M, CARGO_Z_M, G, HIP_HALF_WIDTH_M, KNEE_LEVER_STAND_M, KNEE_LEVER_WALK_M, MAST_KG, REACTION_DELAY_S};
 use crate::parts::*;
 
 type V = [f64; 3];
@@ -827,7 +827,8 @@ fn lower_torques(body: &Body, post: &Posture, single: bool, grf: [f32; 3], zmp: 
     if !body.legged {
         let slope = (post.slope_deg as f64).to_radians();
         let m = f[2] / G as f64;
-        let force = m * (G as f64 * (slope.sin() + ROLLING_RESISTANCE as f64 * slope.cos()) + root.accel.abs() as f64);
+        let crr = if post.propelling() { crate::surface::rolling_resistance(body.base, post.ground.props()) as f64 } else { 0.0 };
+        let force = m * (G as f64 * (slope.sin() + crr * slope.cos()) + root.accel.abs() as f64);
         return vec![force as f32];
     }
     let half = STANCE_WIDTH_M as f64 / 2.0;

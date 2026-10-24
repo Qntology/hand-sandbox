@@ -16,7 +16,7 @@ use hand_search::{Lexicon, ParsedCommand, Parser, Plan};
 use hand_ts::Forecast;
 use serde::Serialize;
 use serde_json::{json, Value};
-use world_sim::{encode_webp, Camera, ItemKind, NodeKind, TimedEvent, World, WorldConfig, WorldEvent, WorldSnapshot};
+use world_sim::{amount_text, encode_webp, Camera, ItemKind, NodeKind, TimedEvent, World, WorldConfig, WorldEvent, WorldSnapshot};
 
 use hand_search::text::eul_reul;
 use crate::config::{GateCfg, NoiseCfg, RuntimeConfig};
@@ -197,7 +197,7 @@ pub fn label_ko(world: &World, label: &str) -> String {
 }
 
 fn new_world(cfg: &RuntimeConfig) -> Result<World> {
-    World::new(WorldConfig { seed: cfg.seed, cells: cfg.cells, hand: cfg.hand, body: cfg.body }).map_err(|e| anyhow!("월드를 만들 수 없습니다: {e}"))
+    World::new(WorldConfig { seed: cfg.seed, cells: cfg.cells, hand: cfg.hand, body: cfg.body, terrain: cfg.terrain }).map_err(|e| anyhow!("월드를 만들 수 없습니다: {e}"))
 }
 
 pub struct Runtime {
@@ -233,6 +233,8 @@ pub struct Runtime {
     pub(crate) ml_task: Option<crate::mldrive::MlTask>,
     pub(crate) test: Option<crate::testrun::TestSession>,
     pub test_cfg: crate::testrun::TestCfg,
+    /// Commands typed while a live recording runs, started one after another.
+    pub(crate) live_queue: std::collections::VecDeque<String>,
 }
 
 impl Runtime {
@@ -280,6 +282,7 @@ impl Runtime {
             ml_task: None,
             test: None,
             test_cfg: crate::testrun::TestCfg::default(),
+            live_queue: std::collections::VecDeque::new(),
         };
         let msg = format!(
             "월드 시작: seed {} · {}×{}칸 · 베이스 {:?} · 손가락 {} · 인식기 {}",
@@ -317,10 +320,20 @@ impl Runtime {
                 WorldEvent::NodeBroken { node, kind, drops } => {
                     (Level::Info, format!("{}({node}){} 캠 → 아이템 {}개 떨어짐", kind.spec().label_ko, eul_reul(kind.spec().label_ko), drops.len()))
                 }
-                WorldEvent::ItemPicked { drop, item, mass_kg, grip_margin } => {
-                    (Level::Info, format!("{} {drop} 줍기 ({mass_kg:.1} kg, 마찰 여유 {grip_margin:.2})", item.spec().label_ko))
+                WorldEvent::ItemPicked { drop, item, mass_kg, grip_margin, amount } => {
+                    (Level::Info, format!("{} {drop} 줍기 ({}개, {mass_kg:.1} kg, 마찰 여유 {grip_margin:.2})", item.spec().label_ko, amount_text(*amount)))
                 }
-                WorldEvent::Delivered { waypoint, item, count } => (Level::Info, format!("{waypoint}에 {} {count}개 인도", item.spec().label_ko)),
+                WorldEvent::Delivered { waypoint, item, amount } => (Level::Info, format!("{waypoint}에 {} {}개 인도", item.spec().label_ko, amount_text(*amount))),
+                WorldEvent::ItemDropped { item, amount, waypoint, drops } => (
+                    Level::Info,
+                    match waypoint {
+                        Some(w) => format!("{} {}개를 {w} 더미에 내려놓음", item.spec().label_ko, amount_text(*amount)),
+                        None => format!("{} {}개를 땅에 내려놓음 ({})", item.spec().label_ko, amount_text(*amount), drops.join(", ")),
+                    },
+                ),
+                WorldEvent::ItemSplit { drop, piece, item, amount, left } => {
+                    (Level::Info, format!("{} {drop} 쪼갬 → 조각 {piece} {}개 + 남은 {}개", item.spec().label_ko, amount_text(*amount), amount_text(*left)))
+                }
                 WorldEvent::BatteryDepleted => (Level::Error, "배터리 방전".to_string()),
             };
             self.audit.log("world", level, msg, Some(tidy(json!({"tick": te.tick, "time_s": te.time_s, "event": te.event}))));
@@ -570,6 +583,49 @@ impl Runtime {
         Ok(())
     }
 
+    /// The world back to how its seed made it (nodes, empty ground and piles,
+    /// the robot at the base camp), keeping the robot's body as it is: battery
+    /// charge, joint heat and wear stay. Quests and landmarks are cleared; the
+    /// SDS keeps what it learned. Use [`Runtime::reset_body`] for the body.
+    pub fn reset_world(&mut self) -> Result<()> {
+        self.cancel();
+        self.world.reset_world_keep_body().map_err(|e| anyhow!("월드를 되돌릴 수 없습니다: {e}"))?;
+        self.task = None;
+        self.ml_task = None;
+        self.quests.clear();
+        self.gates.clear();
+        self.last_scan = None;
+        self.focus = None;
+        self.eval = EvalCounters::default();
+        self.flush_sds();
+        let msg = format!("월드 리셋: seed {} 처음 상태로 (신체 상태는 유지 · 배터리 {:.0}%)", self.cfg.seed, self.world.battery_ratio() * 100.0);
+        self.log("world", Level::Info, msg, Some(json!({"seed": self.cfg.seed, "kept_energy_j": self.world.agent.energy_used_j})));
+        Ok(())
+    }
+
+    /// The robot's body rested: full battery, cold joints, no joint wear. The
+    /// world, the robot's place and its cargo stay; a running quest goes on.
+    pub fn reset_body(&mut self) {
+        let (battery, strikes) = (self.world.battery_ratio(), self.world.agent.strikes);
+        let worn = self.world.most_worn().map(|(j, d)| format!(", 가장 닳은 관절 {j} 수명 {:.2}% → 0", d * 100.0)).unwrap_or_default();
+        self.world.reset_body();
+        self.log("world", Level::Info, format!("신체 상태 리셋: 배터리 {:.0}% → 100%, 채취 타격 {strikes} → 0, 관절 발열 초기화{worn}", battery * 100.0), None);
+    }
+
+    /// Queues a quest for a plan the UI built itself (the inventory buttons),
+    /// as `submit` does for a typed command. Returns the quest id.
+    pub fn submit_plan(&mut self, plan: Plan, what: &str) -> std::result::Result<String, String> {
+        let tick = self.world.tick;
+        match self.quests.add(&plan, &WorldLabels(&self.world), tick) {
+            Ok(id) => {
+                let title = self.quests.get(&id).map(|q| q.title.clone()).unwrap_or_default();
+                self.log("quest", Level::Info, format!("퀘스트 {id} 접수 ({what}): {title}"), Some(json!({"quest": id})));
+                Ok(id)
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
     // ----- running -----
 
     /// One world tick (0.1 s) and one driver step.
@@ -655,6 +711,19 @@ impl Runtime {
             }
         }
         out
+    }
+
+    /// What [`Runtime::submit`] would answer, without queueing a quest (for a
+    /// command that waits for the running recording to end).
+    pub fn submit_preview(&self, text: &str) -> Submission {
+        let emb = self.embedder.clone();
+        let parsed = self.parser.parse(text, emb.as_deref().map(|e| e as &dyn PhraseEmbedder));
+        let mode = if emb.is_some() { "lexical+embedding" } else { "lexical" }.to_string();
+        let (error, error_code) = match (&parsed.plan, &parsed.problem) {
+            (None, Some(p)) => (Some(p.message.clone()), Some(p.code.clone())),
+            _ => (None, None),
+        };
+        Submission { ok: parsed.plan.is_some(), stopped: false, quest_id: None, error, error_code, mode, parsed }
     }
 
     // ----- looking -----
@@ -862,6 +931,11 @@ fn plan_brief(p: &ParsedCommand) -> String {
         ),
         Some(Plan::Collect { targets }) => format!("채취 {}", targets.iter().map(|t| format!("{}×{}", t.resource, t.quantity)).collect::<Vec<_>>().join(", ")),
         Some(Plan::Goto { place }) => format!("이동 {}", place.place),
+        Some(Plan::Drop { items, place }) => format!(
+            "내려놓기 {}{}",
+            if items.is_empty() { "전부".to_string() } else { items.iter().map(|t| format!("{}×{}", t.resource, t.quantity.map_or("전부".to_string(), |q| q.to_string()))).collect::<Vec<_>>().join(", ") },
+            place.as_ref().map(|p| format!(" @ {}", p.place)).unwrap_or_default()
+        ),
         Some(Plan::Stop) => "중지".to_string(),
         None => p.problem.as_ref().map(|x| format!("해석 불가({})", x.code)).unwrap_or_else(|| "해석 불가".into()),
     }

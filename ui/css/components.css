@@ -297,6 +297,34 @@ output { font-family: var(--font-mono); font-size: 0.68rem; color: var(--text-di
 .inv-list li { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; padding: 5px 0; border-bottom: 1px solid var(--border); font-size: 0.74rem; }
 .inv-list li:last-child { border-bottom: none; }
 .inv-list .mass { font-family: var(--font-mono); font-size: 0.68rem; color: var(--text-dim); }
+.inv-list li.inv-item { align-items: center; flex-wrap: wrap; }
+.inv-list .inv-name { flex: 1 1 auto; min-width: 0; }
+.inv-list .inv-btns { display: inline-flex; gap: 4px; }
+.inv-list .inv-btns .vt-btn { min-height: 22px; padding: 0 7px; font-size: 0.64rem; }
+.inv-actions { grid-template-columns: 1fr; }
+.reset-row { margin-top: 6px; }
+
+/* 보관 더미 (웨이포인트 적재) */
+.stock-list { display: flex; flex-direction: column; gap: 8px; }
+.stock-card { border: 1px solid var(--border-cell); border-radius: var(--radius); padding: 7px 9px; background: var(--bg-card); }
+.stock-card .sc-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; font-size: 0.72rem; color: var(--text-bright); font-weight: 600; }
+.stock-card .sc-head small { font-family: var(--font-mono); font-size: 0.64rem; color: var(--text-dim); font-weight: 500; }
+.stock-card .sc-sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
+.stock-card ul { list-style: none; margin-top: 5px; display: flex; flex-direction: column; gap: 3px; }
+.stock-card li { display: flex; align-items: center; gap: 6px; font-size: 0.68rem; color: var(--text); }
+.stock-card li .pile { display: inline-flex; flex-wrap: wrap; gap: 2px; flex: 1; }
+.stock-card li .pile i { width: 8px; height: 8px; border-radius: 1px; display: inline-block; }
+.stock-card li .pile i.part { opacity: 0.55; transform: scale(0.75); }
+.stock-card li .n { font-family: var(--font-mono); font-size: 0.66rem; color: var(--text-bright); min-width: 3.2em; text-align: right; }
+.stock-card .sc-empty { font-size: 0.66rem; color: var(--text-muted); margin-top: 4px; }
+.stock-card.target { border-color: var(--warning); }
+
+/* 뷰포트 툴바의 명령 실행 · 기록 */
+.vt-run { display: flex; align-items: center; gap: 6px; flex: 1 1 380px; min-width: 260px; }
+.vt-run input[type=text] { flex: 1 1 200px; min-width: 140px; min-height: 26px; font-size: 0.72rem; }
+.vt-rec { font-size: 0.66rem; white-space: nowrap; gap: 5px; }
+.vt-rec-state { font-family: var(--font-mono); font-size: 0.62rem; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 300px; }
+.vt-rec-state.on::before { content: "●"; color: var(--danger); margin-right: 5px; animation: pulse 1.2s infinite; }
 
 /* ── 토스트 ────────────────────────────────────────────────────── */
 .toast-stack { position: fixed; right: 16px; bottom: calc(var(--statusbar-h) + 12px); display: flex; flex-direction: column; gap: 8px; z-index: 9999; width: min(380px, calc(100vw - 32px)); pointer-events: none; }

@@ -257,7 +257,7 @@ pub fn library(body: &Body) -> Vec<ScenarioSpec> {
     let start = if walk {
         Posture { source: Source::FootLift, single_support: true, slope_deg: 10.0, ..Posture::quiet(0.0) }
     } else {
-        let a = body.planned_accel(&body.base.spec(), 10.0, 0.0, 1.0, PLANNER_MIN_RAMP_S);
+        let a = body.planned_accel(&body.base.spec(), 10.0, 0.0, crate::surface::Surface::Firm, 1.0, PLANNER_MIN_RAMP_S);
         Posture { source: Source::Accel, accel_mps2: a, slope_deg: 10.0, ..Posture::quiet(0.0) }
     };
     out.push(ScenarioSpec {

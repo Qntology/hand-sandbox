@@ -3,6 +3,7 @@
 import { bus, state } from './state.js';
 import { $, clear, el, fmt, LEVEL_KO, svgEl } from './util.js';
 import { refreshTooltip } from './layout.js';
+import { resetBody } from './world-panel.js';
 
 // 영역 모양(viewBox 150×240). 로봇은 손이 하나라 arm_l/arm_r 은 해부학적 좌우가 아니라 손의 두 지표다.
 const ZONES = [
@@ -129,6 +130,7 @@ export function initBodyHud() {
     for (const id of refs.keys()) highlight(id, id === part);
   });
   hud.addEventListener('mouseleave', () => { for (const id of refs.keys()) highlight(id, false); });
+  $('bh-reset').addEventListener('click', () => resetBody());
   $('bh-toggle').addEventListener('click', () => {
     const folded = hud.classList.toggle('folded');
     $('bh-toggle').setAttribute('aria-expanded', String(!folded));

@@ -108,6 +108,35 @@ fn bring_without_saying_where_asks_where() {
     assert_eq!(p.problem.unwrap().code, "missing_destination");
 }
 
+fn dropped(p: &ParsedCommand) -> (Vec<(String, Option<u32>)>, Option<String>) {
+    match p.plan.as_ref().unwrap_or_else(|| panic!("no plan for {:?}: {:?}", p.text, p.problem)) {
+        Plan::Drop { items, place } => (items.iter().map(|t| (t.resource.clone(), t.quantity)).collect(), place.as_ref().map(|x| x.place.clone())),
+        other => panic!("expected Drop for {:?}, got {other:?}", p.text),
+    }
+}
+
+#[test]
+fn setting_down_what_is_carried() {
+    assert_eq!(dropped(&parse("원목 1개 내려놔")), (vec![("log".into(), Some(1))], None));
+    assert_eq!(dropped(&parse("원목 내려놓아")), (vec![("log".into(), None)], None), "no number: all logs");
+    assert_eq!(dropped(&parse("다 내려놔")), (vec![], None), "everything");
+    let p = parse("인벤토리에 있는 돌 2개 버려");
+    assert_eq!(dropped(&p), (vec![("stone".into(), Some(2))], None));
+    assert!(p.unmatched.is_empty(), "{:?}", p.unmatched);
+    assert_eq!(dropped(&parse("베이스캠프에 원목 내려놔")), (vec![("log".into(), None)], Some("base_camp".into())));
+    assert_eq!(dropped(&parse("drop 2 logs")), (vec![("log".into(), Some(2))], None));
+    assert_eq!(dropped(&parse("put down the coal")), (vec![("coal".into(), None)], None));
+    assert_eq!(parse("철광석 내려놓고 멈춰").plan, Some(Plan::Stop), "stop wins");
+}
+
+#[test]
+fn gathering_and_setting_down_somewhere_is_still_a_fetch() {
+    let p = parse("원목 캐서 창고에 내려놔");
+    assert_eq!(fetch(&p), (vec![("log".to_string(), 1)], "warehouse".to_string()));
+    let p = parse("두 개의 돌을 창고에 가져다 놔");
+    assert_eq!(fetch(&p), (vec![("stone".to_string(), 2)], "warehouse".to_string()));
+}
+
 #[test]
 fn walking_to_a_place_and_stopping() {
     match parse("창고로 이동해").plan.unwrap() {

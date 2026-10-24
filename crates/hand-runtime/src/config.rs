@@ -96,6 +96,9 @@ pub struct RuntimeConfig {
     /// Part presets of the body (`hand_core::parts`).
     #[serde(default)]
     pub body: BodyPlan,
+    /// The landscape of new worlds (open, or rugged with sea, cliffs and ridges).
+    #[serde(default)]
+    pub terrain: world_sim::TerrainKind,
     pub camera: CameraCfg,
     pub gates: GateCfg,
     pub noise: NoiseCfg,
@@ -109,6 +112,9 @@ pub struct RuntimeConfig {
     pub max_relocations: u32,
     /// Times a quest may go back to searching for more of a resource.
     pub max_rounds: u32,
+    /// Round trips a quest may make when the load does not fit in one.
+    #[serde(default = "default_max_trips")]
+    pub max_trips: u32,
     pub approach_reach_m: f32,
     /// Objects covering fewer pixels than this are not reported.
     pub min_pixels: u32,
@@ -118,6 +124,10 @@ fn default_hand() -> HandConfig {
     HandConfig::preset(FingerCount::Five)
 }
 
+fn default_max_trips() -> u32 {
+    16
+}
+
 impl Default for RuntimeConfig {
     fn default() -> Self {
         RuntimeConfig {
@@ -125,6 +135,7 @@ impl Default for RuntimeConfig {
             cells: 64,
             hand: default_hand(),
             body: BodyPlan::default(),
+            terrain: world_sim::TerrainKind::Open,
             camera: CameraCfg::default(),
             gates: GateCfg::default(),
             noise: NoiseCfg::demo(),
@@ -132,8 +143,9 @@ impl Default for RuntimeConfig {
             approach_scan_every_ticks: 8,
             rotate_deg: 60.0,
             locate_timeout_s: 240.0,
-            max_relocations: 6,
+            max_relocations: 10,
             max_rounds: 8,
+            max_trips: default_max_trips(),
             approach_reach_m: 0.65,
             min_pixels: 6,
         }

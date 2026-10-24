@@ -98,18 +98,24 @@ export function worldNew({ seed, size, config, base }) {
   return snapshot();
 }
 
-export function snapshot() {
-  const w = need();
+function stack(list) {
   const merged = new Map();
-  for (const c of w.agent.carrying) {
-    const m = merged.get(c.item_id) ?? { item_id: c.item_id, label_ko: c.label_ko, count: 0, mass_kg: c.mass_kg };
+  for (const c of list) {
+    const m = merged.get(c.item_id) ?? { item_id: c.item_id, label_ko: c.label_ko, count: 0, amount: 0, mass_kg: c.mass_kg, total_kg: 0 };
     m.count += 1;
+    m.amount += 1;
+    m.total_kg += c.mass_kg;
     merged.set(c.item_id, m);
   }
+  return [...merged.values()];
+}
+
+export function snapshot() {
+  const w = need();
   return {
-    tick: w.tick, time_s: w.tick * DT, seed: w.seed, bounds: w.bounds,
-    agent: { pos: [...w.agent.pos], yaw_deg: (w.agent.yaw * 180) / Math.PI, speed_mps: w.agent.speed, base: w.base, carrying: [...merged.values()] },
-    waypoints: w.waypoints,
+    tick: w.tick, time_s: w.tick * DT, seed: w.seed, bounds: w.bounds, terrain: 'open',
+    agent: { pos: [...w.agent.pos], yaw_deg: (w.agent.yaw * 180) / Math.PI, speed_mps: w.agent.speed, base: w.base, carrying: stack(w.agent.carrying) },
+    waypoints: w.waypoints.map((p) => ({ ...p, stock: stack(p.pile ?? []) })),
     nodes: w.nodes.filter((n) => n.hp > 0).map(({ id, kind, label_ko, pos, hp }) => ({ id, kind, label_ko, pos, hp })),
     drops: w.drops,
   };
@@ -147,6 +153,43 @@ function findItem(t) {
   return null;
 }
 
+// 내려놓기(모의): 적재함에서 바로 빼서 가까운 웨이포인트 더미나 땅에 둔다.
+function dropNow(key, all) {
+  const a = W.agent;
+  const pick = a.carrying.filter((c) => !key || c.item_id === key);
+  if (!pick.length) return 0;
+  const take = all || !key ? pick : pick.slice(0, 1);
+  a.carrying = a.carrying.filter((c) => !take.includes(c));
+  const wp = W.waypoints.find((p) => dist2(p.pos, a.pos) <= 1.6);
+  if (wp) (wp.pile ??= []).push(...take);
+  else for (const c of take) W.drops.push({ id: `d${W.nextDrop++}`, item_id: c.item_id, label_ko: c.label_ko, pos: [a.pos[0] + 0.4, a.pos[1], 0] });
+  log('world', 'info', `(모의) ${take.length}개 내려놓음${wp ? ` → ${wp.label_ko} 더미` : ' → 땅'}`);
+  return take.length;
+}
+
+export function inventoryDrop({ item, amount }) {
+  need();
+  const n = dropNow(item ?? null, amount == null);
+  if (!n) throw '적재함에 내려놓을 물건이 없습니다';
+  return { ok: true, quest_id: null, quests: questList() };
+}
+
+export function worldReset() {
+  const w = need();
+  const { energy, fatigue, heat } = w;
+  worldNew({ seed: w.seed, size: w.size, config: w.config, base: w.base });
+  Object.assign(W, { energy, fatigue, heat });
+  log('world', 'info', '(모의) 월드 리셋: 신체 상태 유지');
+  return { snapshot: snapshot(), quests: questList(), body: bodyStatus() };
+}
+
+export function bodyReset() {
+  const w = need();
+  Object.assign(w, { energy: 0, fatigue: 0, heat: 0 });
+  log('world', 'info', '(모의) 신체 상태 리셋');
+  return { snapshot: snapshot(), body: bodyStatus() };
+}
+
 export function commandSubmit({ text }) {
   need(); // 월드가 없으면 오류를 던진다
   const raw = String(text ?? '').trim();
@@ -158,6 +201,12 @@ export function commandSubmit({ text }) {
     return { ok: false, parsed: { action: 'unknown', item_id: null, item_label_ko: null, count: null, destination: null, confidence: 0 }, quest_id: null, trace, error, mode: 'lexical' };
   };
   if (!raw) return fail('명령이 비어 있습니다');
+  if (/내려놔|내려놓|버려|비워|drop|putdown/i.test(t)) {
+    const it = findItem(t);
+    const n = dropNow(it?.key ?? null, !/(\d+|한|하나)개/.test(t));
+    if (!n) return { ...fail('적재함에 내려놓을 물건이 없습니다'), parsed: { action: 'drop', confidence: 1 } };
+    return { ok: true, parsed: { action: 'drop', item_id: it?.key ?? null, item_label_ko: it?.it.ko ?? '적재함 전부', count: n, destination: null, confidence: 1 }, quest_id: null, trace, error: null, mode: 'lexical' };
+  }
   const item = findItem(t);
   if (!item) return fail('명령에서 아이템을 찾지 못했습니다. 예: 철광석 3개 캐서 베이스캠프로 가져와');
   trace.push({ stage: item.alias ? 'ngram' : 'lexical', text: item.hit, score: item.alias ? 0.78 : 1, role: 'item', accepted: true });
@@ -361,6 +410,8 @@ function runStep(q, rt) {
       rt.work += 1;
       s.progress = rt.work / 8;
       if (rt.work >= 8) {
+        const wp = rt.dest ? W.waypoints.find((p) => p.id === rt.dest.id) : null;
+        if (wp) (wp.pile ??= []).push(...a.carrying.filter((c) => c.item_id === rt.key));
         a.carrying = a.carrying.filter((c) => c.item_id !== rt.key);
         nextStep(q, rt);
       }

@@ -146,6 +146,7 @@ impl Runtime {
             "test_stats" => self.api_test_stats(),
             "test_cancel" => {
                 self.cancel();
+                self.live_restore();
                 self.test = None;
                 self.recording = None;
                 self.pass = "game".into();

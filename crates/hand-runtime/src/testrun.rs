@@ -11,6 +11,12 @@
 //!
 //! The UI advances the session in small steps (`test_step`) so the timeline
 //! fills while it runs.
+//!
+//! A **live** session (`live_start`) records a command typed while the world
+//! plays: the game pass runs in the live world from where it is (no reset),
+//! the start state is kept as a copy, and the decision pass replays that copy
+//! while the live world waits; afterwards the live world comes back as the
+//! game pass left it. The play loop (`sim_step`) advances it.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -20,14 +26,16 @@ use base64::Engine;
 use hand_core::balance::{reference, Source};
 use hand_core::parts::Segment;
 use hand_core::{BaseKind, BodyPlan};
-use hand_quest::Quest;
+use hand_quest::{Quest, QuestBook};
 use hand_sds::{Level, Scope, Track};
 use hand_vision::{triangulate, Bearing, Rgb};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use world_sim::World;
 
+use crate::precision::PrecisionGates;
 use crate::record::{capture_keyframe, capture_video, Keyframe, RecordCfg, Recording};
-use crate::runtime::Runtime;
+use crate::runtime::{Runtime, ScanReport, Submission};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TestCfg {
@@ -70,6 +78,21 @@ pub struct TestSession {
     pub error: Option<String>,
     started_tick: u64,
     rays: HashMap<u32, Vec<Bearing>>,
+    /// Recorded from the live world while it plays (see the module comment).
+    pub live: bool,
+    /// The quest needs finding things, so the ML decision pass is worth running.
+    pub ml_needed: bool,
+    start_world: Option<World>,
+    stash: Option<LiveStash>,
+}
+
+/// The live world, its quests and landmarks, kept aside while the decision
+/// pass replays the start state.
+struct LiveStash {
+    world: World,
+    quests: QuestBook,
+    gates: PrecisionGates,
+    last_scan: Option<ScanReport>,
 }
 
 fn b64(v: &[u8]) -> String {
@@ -119,9 +142,76 @@ impl Runtime {
             error: None,
             started_tick: self.world.tick,
             rays: HashMap::new(),
+            live: false,
+            ml_needed: true,
+            start_world: None,
+            stash: None,
         });
         self.log("quest", Level::Info, format!("통합 테스트 {id} 시작: \"{command}\" · 시드 {seed} · 프리셋 {} · 베이스 {:?}", body.id(), hand.base), None);
         Ok(())
+    }
+
+    /// Starts recording a command in the live world, from where it is now:
+    /// the game pass begins at once, perception and the ML decision follow by
+    /// themselves as the play loop advances. Only when nothing else runs (the
+    /// caller queues the command otherwise). A command that makes no quest
+    /// (a stop, an error) records nothing.
+    pub fn live_start(&mut self, command: &str) -> Result<Submission> {
+        let start = self.world.clone();
+        self.test = None;
+        self.test_seq += 1;
+        let id = format!("{}-t{}", self.session_id, self.test_seq);
+        self.begin_pass("game", &id);
+        let s = self.submit(command);
+        let plan = s.quest_id.as_deref().and_then(|q| self.quests.get(q)).map(|q| q.plan.clone());
+        let Some(plan) = plan.filter(|_| s.ok && !s.stopped) else {
+            self.recording = None;
+            self.pass = "game".into();
+            return Ok(s);
+        };
+        let ml_needed = matches!(plan, hand_search::Plan::Fetch { .. } | hand_search::Plan::Collect { .. });
+        self.test = Some(TestSession {
+            id: id.clone(),
+            command: command.into(),
+            seed: self.cfg.seed,
+            body: self.cfg.body,
+            base: self.cfg.hand.base,
+            phase: TestPhase::Game,
+            game: None,
+            decide: None,
+            perceive_next: 0,
+            game_quest: None,
+            ml_quest: None,
+            notes: vec![],
+            error: None,
+            started_tick: self.world.tick,
+            rays: HashMap::new(),
+            live: true,
+            ml_needed,
+            start_world: Some(start),
+            stash: None,
+        });
+        self.log(
+            "quest",
+            Level::Info,
+            format!("기록 시작 {id}: \"{command}\" — 1 게임(지금 월드) → 2 ML 인식 → 3 ML 결정{}", if ml_needed { "(같은 시작 상태 복제 월드)" } else { " 생략: 찾을 대상이 없는 명령" }),
+            None,
+        );
+        Ok(s)
+    }
+
+    /// Ends a live session early. The live world comes back if the decision
+    /// pass had set it aside.
+    pub(crate) fn live_restore(&mut self) {
+        if let Some(st) = self.test.as_mut().and_then(|t| t.stash.take()) {
+            self.ml_task = None;
+            self.task = None;
+            self.world = st.world;
+            self.quests = st.quests;
+            self.gates = st.gates;
+            self.last_scan = st.last_scan;
+            self.log("world", Level::Info, "ML 결정 통과를 멈추고 라이브 월드로 돌아옴", None);
+        }
     }
 
     fn begin_pass(&mut self, pass: &str, test_id: &str) {
@@ -223,6 +313,15 @@ impl Runtime {
                 t.ml_quest = quest;
                 t.phase = TestPhase::Done;
                 self.pass = "game".into();
+                if let Some(st) = t.stash.take() {
+                    // Back to the live world as the game pass left it.
+                    self.world = st.world;
+                    self.quests = st.quests;
+                    self.gates = st.gates;
+                    self.last_scan = st.last_scan;
+                    self.task = None;
+                    self.ml_task = None;
+                }
                 let id = t.id.clone();
                 let ok = |q: &Option<Quest>| q.as_ref().map_or("—".to_string(), |q| format!("{:?}", q.state).to_lowercase());
                 let msg = format!("통합 테스트 {id} 끝: 게임 {} · ML {}", ok(&t.game_quest), ok(&t.ml_quest));
@@ -303,13 +402,35 @@ impl Runtime {
         t.perceive_next = end;
         self.pass = prev_pass;
         self.run_id = prev_run;
+        if end >= n && t.live && !t.ml_needed {
+            // A command with nothing to find: the game and perception rows are the record.
+            t.phase = TestPhase::Done;
+            self.log("quest", Level::Info, format!("기록 {} 끝: ML 결정 통과는 찾을 대상이 없어 생략", t.id), None);
+            for l in self.db.flush() {
+                self.audit.info("sds", format!("[DB] {l}"));
+            }
+            self.test = Some(t);
+            return Ok(());
+        }
         if end >= n {
             // Decision pass: the same world again, the ML logic finds and approaches.
             let (seed, body, base, cmd, id) = (t.seed, t.body, t.base, t.command.clone(), t.id.clone());
-            let mut hand = self.cfg.hand;
-            hand.base = base;
-            self.cfg.body = body;
-            self.reset_with(Some(seed), None, Some(hand))?;
+            if t.live {
+                // The start state the game pass began from, in a copy; the live world waits.
+                let start = t.start_world.take().unwrap_or_else(|| self.world.clone());
+                let world = std::mem::replace(&mut self.world, start);
+                let quests = std::mem::replace(&mut self.quests, QuestBook::new());
+                let gates = std::mem::replace(&mut self.gates, PrecisionGates::new(self.cfg.gates.clone()));
+                t.stash = Some(LiveStash { world, quests, gates, last_scan: self.last_scan.take() });
+                self.task = None;
+                self.ml_task = None;
+                self.focus = None;
+            } else {
+                let mut hand = self.cfg.hand;
+                hand.base = base;
+                self.cfg.body = body;
+                self.reset_with(Some(seed), None, Some(hand))?;
+            }
             t.phase = TestPhase::Decide;
             t.started_tick = self.world.tick;
             self.test = Some(t);
@@ -380,6 +501,7 @@ impl Runtime {
         let ml_quest = if t.phase == TestPhase::Decide { self.quests.all().last().cloned() } else { t.ml_quest.clone() };
         Ok(json!({
             "active": true,
+            "live": t.live, "ml_needed": t.ml_needed,
             "id": t.id, "command": t.command, "seed": t.seed, "preset": t.body.id(), "body": t.body, "base": t.base,
             "phase": t.phase, "tick": self.world.tick,
             "perceive": {"done": t.perceive_next, "total": t.game.as_ref().map_or(0, |g| g.keyframes.len())},

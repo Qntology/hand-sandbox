@@ -35,6 +35,8 @@ pub enum ObjectClass {
     Node = 3,
     Drop = 4,
     Waypoint = 5,
+    /// The pile of delivered items beside a waypoint's flag (entity = waypoint id).
+    Stock = 6,
 }
 
 impl ObjectClass {
@@ -45,9 +47,43 @@ impl ObjectClass {
             3 => ObjectClass::Node,
             4 => ObjectClass::Drop,
             5 => ObjectClass::Waypoint,
+            6 => ObjectClass::Stock,
             _ => ObjectClass::Sky,
         }
     }
+}
+
+/// Piece slots of a waypoint's pile inside its cell: four columns around the
+/// pole on the side away from the flag, five pieces high (`(dx, dz)` metres).
+const PILE_COLUMNS: [(f32, f32); 4] = [(-0.16, -0.13), (-0.16, 0.13), (0.0, -0.17), (0.0, 0.17)];
+const PILE_LAYERS: usize = 5;
+
+/// Where the pieces of a pile sit: `(cell offset in x, dx, dz, layer)` for
+/// every piece, filling the waypoint's own cell first, then the cell on its
+/// `-x` side. At most `2 * 4 * 5` pieces are drawn; the rest only count.
+pub fn pile_slots(pieces: usize) -> Vec<(i32, f32, f32, usize)> {
+    let per_cell = PILE_COLUMNS.len() * PILE_LAYERS;
+    (0..pieces.min(2 * per_cell))
+        .map(|i| {
+            let (cell, k) = (i / per_cell, i % per_cell);
+            let (col, layer) = (k % PILE_COLUMNS.len(), k / PILE_COLUMNS.len());
+            let (dx, dz) = PILE_COLUMNS[col];
+            (-(cell as i32), dx, dz, layer)
+        })
+        .collect()
+}
+
+/// The pieces of a stock list, one per whole item and one for each broken rest.
+pub fn stock_pieces(stock: &[(ItemKind, f32)]) -> Vec<(ItemKind, f32)> {
+    let mut out = Vec::new();
+    for &(k, n) in stock {
+        let mut rest = n;
+        while rest > 1e-3 {
+            out.push((k, rest.min(1.0)));
+            rest -= 1.0;
+        }
+    }
+    out
 }
 
 /// Packs an object class (top 8 bits) and an entity id (low 24 bits).
@@ -80,6 +116,24 @@ impl Camera {
     /// Where the camera sits: the robot's position at eye height.
     pub fn origin(world: &World) -> [f32; 3] {
         [world.agent.x, world.agent_ground_m() + EYE_HEIGHT_M, world.agent.z]
+    }
+
+    /// Vertical field of view, degrees (from the horizontal one and the aspect).
+    pub fn vfov_deg(&self) -> f32 {
+        let half_w = (self.fov_deg.to_radians() * 0.5).tan();
+        (2.0 * (half_w * self.height.max(1) as f32 / self.width.max(1) as f32).atan()).to_degrees()
+    }
+
+    /// What the search planner needs of this camera on the robot now.
+    pub fn eye(&self, world: &World) -> crate::explore::Eye {
+        crate::explore::Eye {
+            x: world.agent.x,
+            z: world.agent.z,
+            height_m: world.agent_ground_m() + EYE_HEIGHT_M,
+            pitch_deg: self.pitch_deg,
+            vfov_deg: self.vfov_deg(),
+            range_m: crate::explore::SEARCH_RANGE_M.min(self.max_dist_m),
+        }
     }
 
     /// Ground-plane `(x, z)` of the surface point seen at pixel `(px, py)` when
@@ -160,6 +214,7 @@ enum Style {
     Fleck([u8; 3]),
     Stripes,
     Leaves,
+    Water,
 }
 
 #[derive(Clone, Copy)]
@@ -174,6 +229,8 @@ struct Scene<'a> {
     world: &'a World,
     prims: Vec<Prim>,
     by_cell: Vec<Vec<usize>>,
+    /// Nothing in the world reaches above this height, metres.
+    top_m: f32,
 }
 
 const SKY_TOP: [f32; 3] = [112.0, 168.0, 232.0];
@@ -181,16 +238,27 @@ const SKY_HORIZON: [f32; 3] = [200.0, 222.0, 240.0];
 const CURB_YELLOW: [u8; 3] = [232, 196, 48];
 const CURB_DARK: [u8; 3] = [48, 48, 52];
 const STONE: [u8; 3] = [120, 120, 124];
-const MAX_OBJECT_TOP_M: f32 = 3.0;
+/// Tallest object above the ground it stands on (a tree), metres.
+const MAX_OBJECT_TOP_M: f32 = 1.7;
+/// The sea surface lies this far below the land at height 0, metres.
+const WATER_DROP_M: f32 = 0.06;
 
 fn bx(cx: f32, cz: f32, y0: f32, y1: f32, hw: f32, hd: f32) -> Aabb {
     Aabb { min: [cx - hw, y0, cz - hd], max: [cx + hw, y1, cz + hd] }
 }
 
+fn item_style(kind: ItemKind) -> Style {
+    match kind {
+        ItemKind::Log | ItemKind::Stone => Style::Plain,
+        ItemKind::Coal => Style::Fleck([70, 70, 78]),
+        ItemKind::IronOre => Style::Fleck([220, 170, 140]),
+    }
+}
+
 impl<'a> Scene<'a> {
     fn build(world: &'a World) -> Scene<'a> {
         let t = &world.terrain;
-        let mut s = Scene { world, prims: Vec::new(), by_cell: vec![Vec::new(); t.w * t.d] };
+        let mut s = Scene { world, prims: Vec::new(), by_cell: vec![Vec::new(); t.w * t.d], top_m: t.max_top_m() + MAX_OBJECT_TOP_M + 0.3 };
 
         for n in &world.nodes {
             let Some((cx, cz)) = t.cell_of(n.x, n.z) else { continue };
@@ -221,21 +289,16 @@ impl<'a> Scene<'a> {
             let (ccx, ccz) = cell_center(cx, cz);
             let g = t.height_m(cx, cz) + t.curb_m(cx, cz);
             let spec = d.kind.spec();
-            let hw = spec.size_m[0] * 0.5;
+            let size = spec.piece_size_m(d.amount);
+            let hw = size[0] * 0.5;
             let limit = CELL_M * 0.5 - hw - 0.005;
             let x = d.x.clamp(ccx - limit, ccx + limit);
             let z = d.z.clamp(ccz - limit, ccz + limit);
-            let style = match d.kind {
-                ItemKind::Log => Style::Plain,
-                ItemKind::Stone => Style::Plain,
-                ItemKind::Coal => Style::Fleck([70, 70, 78]),
-                ItemKind::IronOre => Style::Fleck([220, 170, 140]),
-            };
             s.add(cx, cz, Prim {
-                aabb: bx(x, z, g, g + spec.size_m[1], hw, spec.size_m[2] * 0.5),
+                aabb: bx(x, z, g, g + size[1], hw, size[2] * 0.5),
                 id: pack_id(ObjectClass::Drop, d.id),
                 color: spec.color,
-                style,
+                style: item_style(d.kind),
             });
         }
 
@@ -247,6 +310,23 @@ impl<'a> Scene<'a> {
             let flag = if w.key == "warehouse" { [52, 104, 220] } else { [232, 120, 40] };
             s.add(cx, cz, Prim { aabb: bx(x, z, g, g + 1.1, 0.04, 0.04), id, color: [210, 210, 214], style: Style::Plain });
             s.add(cx, cz, Prim { aabb: Aabb { min: [x + 0.04, g + 0.78, z - 0.02], max: [x + 0.24, g + 1.08, z + 0.02] }, id, color: flag, style: Style::Plain });
+            // The pile: what has been delivered here, stacked beside the pole.
+            let pieces = stock_pieces(&w.stock);
+            let sid = pack_id(ObjectClass::Stock, w.id);
+            let mut heights = [[0.0f32; PILE_COLUMNS.len()]; 2];
+            for ((kind, amount), (cell, dx, dz, _)) in pieces.iter().zip(pile_slots(pieces.len())) {
+                let pcx = cx as i32 + cell;
+                if !t.in_bounds(pcx, cz as i32) {
+                    continue;
+                }
+                let (px, pz) = cell_center(pcx as usize, cz);
+                let pg = t.height_m(pcx as usize, cz) + t.curb_m(pcx as usize, cz);
+                let col = PILE_COLUMNS.iter().position(|c| (c.0, c.1) == (dx, dz)).unwrap_or(0);
+                let size = kind.spec().piece_size_m(*amount);
+                let base = pg + heights[(-cell) as usize][col];
+                heights[(-cell) as usize][col] += size[1];
+                s.add(pcx as usize, cz, Prim { aabb: bx(px + dx, pz + dz, base, base + size[1], size[0] * 0.5, size[2] * 0.5), id: sid, color: kind.spec().color, style: item_style(*kind) });
+            }
         }
         s
     }
@@ -326,8 +406,12 @@ fn trace(scene: &Scene, o: [f32; 3], d: [f32; 3], max_dist: f32) -> Option<Hit> 
         let (x0, z0) = (cx as f32 * CELL_M, cz as f32 * CELL_M);
         let h = t.height_m(ux, uz);
         let curb = t.curb_m(ux, uz);
-        let gcol = t.ground_at(ux, uz).color();
-        if h > 0.0 {
+        let ground = t.ground_at(ux, uz);
+        let gcol = ground.color();
+        if ground.is_water() {
+            // The sea: a flat surface a little below the shore.
+            consider(&Aabb { min: [x0, -0.4, z0], max: [x0 + CELL_M, -WATER_DROP_M, z0 + CELL_M] }, pack_id(ObjectClass::Ground, ci as u32), gcol, Style::Water);
+        } else if h > 0.0 {
             consider(&Aabb { min: [x0, 0.0, z0], max: [x0 + CELL_M, h, z0 + CELL_M] }, pack_id(ObjectClass::Ground, ci as u32), gcol, Style::Plain);
         } else {
             // Level ground: a thin slab so the top face is hit.
@@ -359,7 +443,7 @@ fn trace(scene: &Scene, o: [f32; 3], d: [f32; 3], max_dist: f32) -> Option<Hit> 
             return None;
         }
         // Above everything and still rising: nothing more to hit.
-        if o[1] + d[1] * t_exit > MAX_OBJECT_TOP_M + 1.0 && d[1] >= 0.0 {
+        if o[1] + d[1] * t_exit > scene.top_m && d[1] >= 0.0 {
             return None;
         }
         // Above everything and falling would still hit the ground, keep going.
@@ -403,6 +487,11 @@ fn shade_hit(hit: &Hit, o: [f32; 3], d: [f32; 3], max_dist: f32, seed: u64) -> [
             if band.rem_euclid(2) == 0 {
                 c = [CURB_DARK[0] as f32, CURB_DARK[1] as f32, CURB_DARK[2] as f32];
             }
+        }
+        Style::Water => {
+            // Ripples: brighter crests on a slow wave pattern.
+            let wave = ((p[0] * 2.1 + p[2] * 1.3).sin() * (p[2] * 2.7 - p[0] * 0.9).cos()).max(0.0);
+            c = mix(c, [150.0, 196.0, 230.0], 0.35 * wave);
         }
     }
     let face = match hit.axis {
@@ -682,11 +771,19 @@ pub fn render_top(world: &World, size_px: usize, span_m: f32) -> Frame {
             let c = match t.cell_of(x, z) {
                 None => [24, 24, 28],
                 Some((cx, cz)) => {
+                    // A cliff edge: a neighbour half a metre or more lower.
+                    let h = t.height_m(cx, cz);
+                    let cliff = [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)].iter().any(|&(dx, dz)| {
+                        let (nx, nz) = (cx as i32 + dx, cz as i32 + dz);
+                        t.in_bounds(nx, nz) && h - t.height_m(nx as usize, nz as usize) >= 0.5
+                    });
                     if t.curb_m(cx, cz) > 0.0 {
                         CURB_YELLOW
+                    } else if cliff {
+                        [40, 38, 36]
                     } else {
                         let g = t.ground_at(cx, cz).color();
-                        let k = 1.0 - (t.height_m(cx, cz) * 0.35).min(0.35);
+                        let k = 1.0 - (h * 0.35).min(0.35);
                         [(g[0] as f32 * k) as u8, (g[1] as f32 * k) as u8, (g[2] as f32 * k) as u8]
                     }
                 }
@@ -725,6 +822,17 @@ pub fn render_top(world: &World, size_px: usize, span_m: f32) -> Frame {
     for w in &world.waypoints {
         let c = if w.key == "warehouse" { [52, 104, 220] } else { [232, 120, 40] };
         dot(&mut rgb, w.x, w.z, ((0.3 / m_per_px) as i32).max(3), c);
+        // The pile: one small square per piece, beside the marker.
+        let pieces = stock_pieces(&w.stock);
+        let r = ((0.06 / m_per_px) as i32).max(1);
+        for (i, (k, _)) in pieces.iter().take(24).enumerate() {
+            let (px, py) = to_px(w.x - 0.45 - (i / 6) as f32 * 0.16, w.z - 0.4 + (i % 6) as f32 * 0.16);
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    put(&mut rgb, n, n, px + dx, py + dy, k.spec().color);
+                }
+            }
+        }
     }
     // Heading line and the robot itself.
     for s in 0..((0.9 / m_per_px) as i32).max(4) {
@@ -740,8 +848,8 @@ pub fn render_top(world: &World, size_px: usize, span_m: f32) -> Frame {
 
 /// Which ground kinds the renderer can draw; used by tests to make sure the
 /// palette stays distinct.
-pub fn ground_palette() -> [(Ground, [u8; 3]); 4] {
-    [Ground::Sand, Ground::Grass, Ground::Dirt, Ground::Rock].map(|g| (g, g.color()))
+pub fn ground_palette() -> [(Ground, [u8; 3]); 7] {
+    Ground::ALL.map(|g| (g, g.color()))
 }
 
 #[cfg(test)]
@@ -842,7 +950,7 @@ mod tests {
         let (ax, az) = (w.agent.x, w.agent.z);
         let (cx, cz) = w.terrain.cell_of(ax + 2.5, az + 0.9).unwrap();
         let (x, z) = cell_center(cx, cz);
-        w.drops.push(DropItem { id: 77, kind: ItemKind::Stone, x, z });
+        w.drops.push(DropItem::whole(77, ItemKind::Stone, x, z));
         let f = render(&w, &Camera { width: 192, height: 128, ..Camera::default() });
         let seen = visible_objects(&w, &f);
         let o = seen.iter().find(|o| o.entity == "d77").expect("the drop is in view");
@@ -853,7 +961,7 @@ mod tests {
         w.drops.clear();
         let (cx, cz) = w.terrain.cell_of(ax + 2.5, az - 0.9).unwrap();
         let (x, z) = cell_center(cx, cz);
-        w.drops.push(DropItem { id: 78, kind: ItemKind::Stone, x, z });
+        w.drops.push(DropItem::whole(78, ItemKind::Stone, x, z));
         let f = render(&w, &Camera { width: 192, height: 128, ..Camera::default() });
         let seen = visible_objects(&w, &f);
         let o = seen.iter().find(|o| o.entity == "d78").expect("the drop is in view");
@@ -866,7 +974,7 @@ mod tests {
         w.agent.yaw = 0.0;
         let (cx, cz) = w.terrain.cell_of(w.agent.x - 2.0, w.agent.z).unwrap();
         let (x, z) = cell_center(cx, cz);
-        w.drops.push(DropItem { id: 79, kind: ItemKind::Log, x, z });
+        w.drops.push(DropItem::whole(79, ItemKind::Log, x, z));
         let f = render(&w, &small());
         assert!(visible_objects(&w, &f).iter().all(|o| o.entity != "d79"));
     }
@@ -999,10 +1107,43 @@ mod tests {
     }
 
     #[test]
+    fn a_delivered_pile_stands_beside_the_flag_and_is_not_a_detection() {
+        let mut w = world();
+        let camp = w.waypoint_by_key("base_camp").unwrap().clone();
+        w.agent.x = camp.x + 2.0;
+        w.agent.z = camp.z;
+        w.agent.yaw = std::f32::consts::PI;
+        let cam = Camera { width: 192, height: 128, pitch_deg: -8.0, ..Camera::default() };
+        let stock_px = |w: &World| render(w, &cam).ids.iter().filter(|&&v| unpack_id(v).0 == ObjectClass::Stock).count();
+        assert_eq!(stock_px(&w), 0, "an empty camp has no pile");
+        let wp = w.waypoints.iter_mut().find(|p| p.key == "base_camp").unwrap();
+        wp.stock = vec![(ItemKind::Log, 3.0), (ItemKind::Stone, 1.5)];
+        assert!(stock_px(&w) > 30, "the pile shows");
+        let f = render(&w, &cam);
+        assert!(visible_objects(&w, &f).iter().all(|o| o.class != ObjectClass::Stock));
+        // One piece per whole item plus the broken rest; the slots stay inside two cells.
+        assert_eq!(stock_pieces(&[(ItemKind::Log, 3.0), (ItemKind::Stone, 1.5)]).len(), 5);
+        assert!(pile_slots(100).len() == 40 && pile_slots(100).iter().all(|s| s.0 == 0 || s.0 == -1));
+    }
+
+    #[test]
+    fn the_sea_renders_as_water_and_hides_nothing_behind_it() {
+        let mut hand = HandConfig::preset(FingerCount::Five);
+        hand.base = BaseKind::Track;
+        let w = World::new(WorldConfig { seed: 4, cells: 64, hand, terrain: crate::terrain::TerrainKind::Rugged, ..WorldConfig::default() }).unwrap();
+        let t = &w.terrain;
+        let water = (0..t.d).flat_map(|z| (0..t.w).map(move |x| (x, z))).filter(|&(x, z)| t.is_water(x, z)).count();
+        assert!(water > 0);
+        let top = render_top(&w, 128, 70.0);
+        let blue = top.rgb.chunks(3).filter(|c| c[2] as i32 > c[0] as i32 + 60 && c[2] > 140).count();
+        assert!(blue > 0, "the top view shows the sea");
+    }
+
+    #[test]
     fn ground_palette_is_distinct() {
         let p = ground_palette();
-        for i in 0..4 {
-            for j in i + 1..4 {
+        for i in 0..p.len() {
+            for j in i + 1..p.len() {
                 let d: i32 = (0..3).map(|k| (p[i].1[k] as i32 - p[j].1[k] as i32).abs()).sum();
                 assert!(d > 40, "{:?} vs {:?}", p[i].0, p[j].0);
             }

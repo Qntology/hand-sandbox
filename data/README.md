@@ -73,7 +73,7 @@
 | 아이템 크기·질량 | `ItemSpec` | 원목 0.15 m 정육면체 2.4 kg(밀도 약 700 kg/m³), 돌 0.10 m 2.6 kg, 석탄 0.10 m 1.4 kg, 철광석 0.10 m 4.0 kg | 일반적인 밀도에서 계산한 가정값 |
 | 적재 한계 | `BaseKind::carry_capacity_kg` | 바퀴 20, 메카넘 15, 트랙 30, 사람 발 25 kg | 가정. v0.3부터는 부품 프리셋의 지지 한계(다리 연속 토크, 섀시 구조)로 더 낮아질 수 있음 |
 | 배터리 용량 | 가슴 프리셋 `battery_wh` | 보급 160, 중급 324, 고급 420 Wh | 21700 셀 팩 계산(`docs/research/parts.md` §3). 프리셋이 없을 때의 옛 가정(순항 전력 × 1800 s)은 `body::compute`에만 남음 |
-| 손 관절 내구 | `JOINT_ENDURANCE_STRIKES` | 채취 타격 400회 | 가정 |
+| 관절 마모 (v0.5) | `hand_core::wear` | 감속기 정격 수명의 Miner 누적: 평기어 서보 10만 회 @ 정지 토크 1/5 (STS3215 시험), 유성 QDD 7,000 h @ 연속 토크 (Harmonic Drive CSF 대입), 사이클로이드 6,000 h (Nabtesco RV) | 데이터시트, 대입은 `docs/research/effects.md` §2.2. v0.4의 "채취 타격 400회" 가정을 대체 |
 
 ### 부품 프리셋과 밸런스 (v0.3)
 
@@ -89,7 +89,8 @@
 | 유지하는 안정 여유 | `MARGIN_KEEP` | 지지면 반길이의 20% | 설계 선택(로봇 ZMP 여유 표준 없음) |
 | 발목 전략 범위 | `Body::ankle_band` | 발 길이 10% (바퀴형 2 cm) | 추정(Horak & Nashner의 발목/고관절 전략을 단순화) |
 | 섀시 구조 적재 | `drive_limits` | 보급 8, 중급 30, 고급 100 kg | 고급은 AgileX Tracer 사양, 나머지는 추정 |
-| 구름 저항 · 발바닥 마찰 | `ROLLING_RESISTANCE`, `FOOT_FRICTION` | 0.03 · 0.6 | 가정 |
+| 지면별 마찰 · 구름 저항 · 보행 에너지 (v0.5) | `hand_core::surface::SURFACES` | 지면 8종 × 발·바퀴·트랙 (예: 마른 모래 μ 0.55, Crr 바퀴 0.30, η 2.1) | Wong, Gillespie, Bosch, Soule & Goldman, Lukić 등 (`docs/research/effects.md` §1). 풀밭의 발·트랙 μ, 젖은 모래의 발 μ·η, 트랙 Crr 일부, 메카넘 계수 0.8은 추정. v0.4의 단일 상수 0.03 · 0.6을 대체 |
+| 보행 전단 | `surface::GAIT_RCOF` | 0.223 | 사람 보통 속도 RCOF (Chang 2013), 로봇 발에 대입 |
 | 정지 거리 | `STOP_DISTANCE_M` | 0.5 m (한 셀) | 설계값 |
 | 관절 열 시정수 | `Actuator::thermal_tau_s` | 버스 서보 200 s, QDD 600–900 s | qdd100 자료로 맞춘 추정, 서보는 공개값 없음 |
 | 두 팔 들기 시간 | `TWO_ARM_LIFT_FACTOR` | 1.5배 | 가정 |

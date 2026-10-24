@@ -9,20 +9,19 @@
 //! Modelling assumptions (not measured values) are named constants here and
 //! listed in `data/README.md`:
 //! * [`BATTERY_RUNTIME_S`]: battery energy is cruise power times this runtime.
-//! * [`JOINT_ENDURANCE_STRIKES`]: mining strikes before the hand joints count
-//!   as fully worn.
 //! * [`BaseKind::carry_capacity_kg`]: cargo limit per base.
+//!
+//! Joint wear is the reducers' Miner damage (`wear`), joint heat the
+//! world's thermal state; both come in through [`BodyInputs`].
 
 use serde::{Deserialize, Serialize};
 
 use crate::balance::{Coupling, JointLoad};
 use crate::base::{BaseKind, BaseSpec};
+use crate::surface::{slip_probability, Contact};
 
 /// Battery energy equals cruise power times this many seconds (assumption).
 pub const BATTERY_RUNTIME_S: f64 = 1800.0;
-
-/// Mining strikes after which the hand joints count as fully worn (assumption).
-pub const JOINT_ENDURANCE_STRIKES: u32 = 400;
 
 impl BaseKind {
     /// Cargo limit in kilograms (assumption; see `data/README.md`).
@@ -41,7 +40,8 @@ pub fn battery_capacity_j(spec: &BaseSpec) -> f64 {
     spec.power_w as f64 * BATTERY_RUNTIME_S
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Ordered from best to worst, so `max` is the worse of two.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BodyLevel {
     Ok,
@@ -125,9 +125,23 @@ pub struct BalanceSummary {
     pub com_height_m: f32,
     /// Hottest joint's heat state (above 1 the joint is derated).
     pub heat_max: f32,
+    /// The joint closest to a limit and its index: the larger of torque over
+    /// peak and RMS (`√heat`) over the continuous rating.
+    #[serde(default)]
+    pub load_joint: Option<String>,
+    #[serde(default)]
+    pub load_index: f32,
+    #[serde(default)]
+    pub load_rms: f32,
     pub joints: Vec<JointLoad>,
     /// The N:N cells of this state.
     pub couplings: Vec<Coupling>,
+    /// Ground under the robot.
+    #[serde(default)]
+    pub ground: String,
+    /// Friction the contacts need on that ground against what it gives.
+    #[serde(default)]
+    pub contact: Option<Contact>,
 }
 
 /// Limits that the part presets set; without them the base's defaults apply.
@@ -164,6 +178,10 @@ pub struct BodyInputs {
     /// Friction capacity over required force of the latest grasp, if any.
     pub grip_margin: Option<f32>,
     pub joint_strikes: u32,
+    /// Life used by the working arm's joints and by the most worn joint (Miner damage, 1 = worn out).
+    pub arm_wear: f32,
+    pub wear_max: f32,
+    pub wear_joint: Option<String>,
     /// Current speed over the base's top speed, 0..1.
     pub speed_factor: f32,
     /// Smallest remaining margin to the base's slope or step limit on the
@@ -171,6 +189,11 @@ pub struct BodyInputs {
     pub terrain_margin: Option<f32>,
     /// Limits from the part presets (battery, cargo, speed, slope, step).
     pub limits: Option<BodyLimits>,
+    /// Robot mass without cargo, for the load over body mass.
+    pub body_mass_kg: Option<f32>,
+    /// Cargo the drive still pushes on the ground and slope here, when that
+    /// is less than the continuous limit (soft ground, a slope), and the ground.
+    pub capacity_here: Option<(f32, String)>,
     pub balance: Option<BalanceSummary>,
 }
 
@@ -184,6 +207,18 @@ fn part(id: &str, label_ko: &str, value: f32, max: f32, ratio: f32, detail: Stri
         ratio,
         level: BodyLevel::from_ratio(ratio),
         detail,
+    }
+}
+
+/// Level of a friction margin (available − required): the 1%, 5% and 50%
+/// points of the slip fit (`surface::slip_probability`). Applied to wheels and
+/// tracks too, as a convention.
+pub fn slip_level(margin: f32) -> BodyLevel {
+    match slip_probability(margin) {
+        p if p < 0.01 => BodyLevel::Ok,
+        p if p < 0.05 => BodyLevel::Warn,
+        p if p < 0.5 => BodyLevel::Bad,
+        _ => BodyLevel::Crit,
     }
 }
 
@@ -231,16 +266,22 @@ pub fn compute(inp: &BodyInputs) -> BodyStatus {
         format!("잔량 {:.0} / {:.0} kJ ({runtime_note})", (cap_j - used) / 1000.0, cap_j / 1000.0),
     );
 
-    // stomach: cargo (ratio is the remaining capacity)
+    // stomach: cargo (ratio is the remaining capacity, on this ground when the drive limits it)
     let carried = inp.carried_kg.max(0.0);
-    let load_ratio = 1.0 - carried / cap_kg;
+    let here = inp.capacity_here.as_ref().filter(|(kg, _)| *kg < cap_kg);
+    let room = here.map_or(cap_kg, |(kg, _)| *kg);
+    let load_ratio = 1.0 - carried / room.max(1e-3);
+    let frac = inp.body_mass_kg.filter(|m| *m > 0.0).map(|m| format!(" · 몸무게의 {:.0}%", 100.0 * carried / m)).unwrap_or_default();
     let stomach = part(
         "stomach",
         "배 · 적재",
         carried,
         cap_kg,
         load_ratio,
-        format!("적재 {carried:.1} / {cap_kg:.0} kg"),
+        match here {
+            Some((kg, ground)) => format!("적재 {carried:.1} / {cap_kg:.0} kg{frac} · {ground}에서는 구동력이 {kg:.1} kg까지"),
+            None => format!("적재 {carried:.1} / {cap_kg:.0} kg{frac}"),
+        },
     );
 
     // arm_l: grip margin (2.0 or more counts as full)
@@ -256,18 +297,15 @@ pub fn compute(inp: &BodyInputs) -> BodyStatus {
         None => part("arm_l", "손 · 파지", 2.0, 2.0, 1.0, "파지 대기".into()),
     };
 
-    // arm_r: joint wear
-    let wear = (inp.joint_strikes as f32 / JOINT_ENDURANCE_STRIKES as f32).clamp(0.0, 1.0);
+    // arm_r: the working arm's wear (reducer life used).
+    let wear = inp.arm_wear.clamp(0.0, 1.0);
     let arm_r = part(
         "arm_r",
         "손 · 관절",
         (1.0 - wear) * 100.0,
         100.0,
         1.0 - wear,
-        format!(
-            "채취 타격 {} / {} (내구 가정값)",
-            inp.joint_strikes, JOINT_ENDURANCE_STRIKES
-        ),
+        format!("작업 팔 감속기 수명 {:.2}% 사용 · 채취 타격 {}회", inp.arm_wear * 100.0, inp.joint_strikes),
     );
 
     // leg_l: drive. This is a speed gauge, not a health bar: a robot standing
@@ -292,7 +330,8 @@ pub fn compute(inp: &BodyInputs) -> BodyStatus {
     );
     leg_l.level = if depleted { BodyLevel::Crit } else { BodyLevel::Ok };
 
-    // leg_r: terrain margin
+    // leg_r: terrain margin (the route's slope and step limits, the ground's friction and drive limits included)
+    let ground = inp.balance.as_ref().map(|b| b.ground.as_str()).filter(|g| !g.is_empty());
     let leg_r = match inp.terrain_margin {
         Some(m) => part(
             "leg_r",
@@ -301,10 +340,11 @@ pub fn compute(inp: &BodyInputs) -> BodyStatus {
             100.0,
             m,
             format!(
-                "경사·턱 한계까지 여유 {:.0}% (한계: {:.0}°, {:.0} cm)",
+                "경사·턱 한계까지 여유 {:.0}% (기하 한계 {:.0}°, {:.0} cm{})",
                 m.clamp(0.0, 1.0) * 100.0,
                 spec.max_slope_deg,
-                spec.max_step_m * 100.0
+                spec.max_step_m * 100.0,
+                ground.map(|g| format!(" · {g}의 마찰·구동력 한계 포함")).unwrap_or_default()
             ),
         ),
         None => part("leg_r", "발 · 지형", 100.0, 100.0, 1.0, "경로 없음".into()),
@@ -317,42 +357,84 @@ pub fn compute(inp: &BodyInputs) -> BodyStatus {
         (p.level, p.ratio)
     };
     let mut effects = Vec::new();
-    let (joint_level, joint_ratio) = level_of("arm_r");
+    // Fatigue: short term the hottest joint's heat (above 1 it is derated),
+    // long term the most worn reducer.
+    let heat = inp.balance.as_ref().map_or(0.0, |b| b.heat_max);
+    let worn = inp.wear_max.max(inp.arm_wear);
+    let fatigue_level = BodyLevel::from_ratio(1.0 - heat.min(1.0)).max(BodyLevel::from_ratio(1.0 - worn.min(1.0)));
     effects.push(BodyEffect {
         id: "fatigue".into(),
         label_ko: "피로".into(),
-        level: joint_level,
-        detail: format!("손 관절 내구 {:.0}% 남음", joint_ratio * 100.0),
+        level: fatigue_level,
+        detail: format!(
+            "발열 {heat:.2} (1 넘으면 감액) · 수명 사용 {:.2}%{}",
+            worn * 100.0,
+            inp.wear_joint.as_ref().map(|j| format!(" ({j})")).unwrap_or_default()
+        ),
     });
     let (load_level, load_left) = level_of("stomach");
     effects.push(BodyEffect {
         id: "load".into(),
         label_ko: "하중".into(),
         level: load_level,
-        detail: format!("적재 여유 {:.0}%", load_left * 100.0),
+        detail: format!(
+            "적재 여유 {:.0}%{}",
+            load_left * 100.0,
+            inp.body_mass_kg.filter(|m| *m > 0.0).map(|m| format!(" · 몸무게의 {:.0}%", 100.0 * carried / m)).unwrap_or_default()
+        ),
     });
-    let (slip_level, slip_ratio) = level_of("leg_r");
-    effects.push(BodyEffect {
-        id: "slip".into(),
-        label_ko: "미끄러짐".into(),
-        level: slip_level,
-        detail: format!("지형 한계 여유 {:.0}%", slip_ratio * 100.0),
-    });
+    // Slip: the friction picture of the ground under the robot when the
+    // balance model has one, else the route's margin to the slope limit.
+    match inp.balance.as_ref().and_then(|b| b.contact.map(|c| (b, c))) {
+        Some((b, c)) => effects.push(BodyEffect {
+            id: "slip".into(),
+            label_ko: "미끄러짐".into(),
+            level: slip_level(c.margin),
+            detail: format!(
+                "{} · 마찰 이용률 {:.0}% (필요 {:.2} / 지면 {:.2}){}",
+                if b.ground.is_empty() { "지면" } else { b.ground.as_str() },
+                (c.utilisation * 100.0).min(999.0),
+                c.required_mu,
+                c.available_mu,
+                c.slip_probability.map(|p| format!(" · 한 걸음 미끄럼 확률 {:.1}%", p * 100.0)).unwrap_or_default()
+            ),
+        }),
+        None => {
+            let (slip_level, slip_ratio) = level_of("leg_r");
+            effects.push(BodyEffect {
+                id: "slip".into(),
+                label_ko: "미끄러짐".into(),
+                level: slip_level,
+                detail: format!("지형 한계 여유 {:.0}%", slip_ratio * 100.0),
+            });
+        }
+    }
     // Balance and joint strain, when the part presets are in play.
     if let Some(b) = &inp.balance {
+        // Stability: tipping (the ZMP's margin) and sliding (the friction
+        // margin) — whichever is closer to failing decides the level.
+        let tip = BodyLevel::from_ratio(b.margin);
+        let (level, slide) = match &b.contact {
+            Some(c) => (tip.max(slip_level(c.margin)), format!(" · 미끄러짐 여유 {:.0}%{}", (1.0 - c.utilisation).max(-9.99) * 100.0, if slip_level(c.margin) > tip { " — 미끄러짐이 먼저" } else { "" })),
+            None => (tip, String::new()),
+        };
         effects.push(BodyEffect {
             id: "balance".into(),
             label_ko: "자세 안정".into(),
-            level: BodyLevel::from_ratio(b.margin),
-            detail: format!("{} · 안정 여유 {:.0}% (피드포워드 없으면 {:.0}%)", b.source_ko, b.margin * 100.0, b.margin_noff * 100.0),
+            level,
+            detail: format!("{} · 넘어짐 여유 {:.0}% (피드포워드 없으면 {:.0}%){slide}", b.source_ko, b.margin * 100.0, b.margin_noff * 100.0),
         });
+        // Joint load: the motor sizing rules, peak against the peak rating and
+        // RMS against the continuous one, whichever is closer to its limit.
+        let index = b.load_index.max(b.worst_ratio);
         effects.push(BodyEffect {
             id: "strain".into(),
             label_ko: "관절 부하".into(),
-            level: BodyLevel::from_ratio(1.0 - b.worst_ratio),
-            detail: match &b.worst_joint {
-                Some(j) => format!("{j} 피크 대비 {:.0}% · 발열 {:.2}", b.worst_ratio * 100.0, b.heat_max),
-                None => "부하 없음".into(),
+            level: BodyLevel::from_ratio(1.0 - index),
+            detail: match (&b.load_joint, &b.worst_joint) {
+                (Some(j), _) => format!("{j} 한계 대비 {:.0}% (지금 피크 {:.0}%, RMS/연속 {:.2})", index * 100.0, b.worst_ratio * 100.0, b.load_rms),
+                (None, Some(j)) => format!("{j} 피크 대비 {:.0}%", b.worst_ratio * 100.0),
+                (None, None) => "부하 없음".into(),
             },
         });
     }
@@ -387,9 +469,14 @@ mod tests {
             carried_kg: 0.0,
             grip_margin: None,
             joint_strikes: 0,
+            arm_wear: 0.0,
+            wear_max: 0.0,
+            wear_joint: None,
             speed_factor: 1.0,
             terrain_margin: None,
             limits: None,
+            body_mass_kg: None,
+            capacity_here: None,
             balance: None,
         }
     }
@@ -473,14 +560,72 @@ mod tests {
     #[test]
     fn joint_wear_raises_fatigue_effect() {
         let mut inp = idle(BaseKind::Wheel);
-        inp.joint_strikes = JOINT_ENDURANCE_STRIKES;
+        inp.arm_wear = 1.0;
+        inp.joint_strikes = 9000;
         let s = compute(&inp);
         let fatigue = s.effects.iter().find(|e| e.id == "fatigue").unwrap();
         assert_eq!(fatigue.level, BodyLevel::Crit);
-        inp.joint_strikes = JOINT_ENDURANCE_STRIKES * 2;
-        // Strikes past the endurance clamp to fully worn, never negative.
+        assert!(s.parts[4].detail.contains("9000"));
+        inp.arm_wear = 2.0;
+        // Life used past the rating clamps to fully worn, never negative.
         let s = compute(&inp);
         assert_eq!(s.parts[4].ratio, 0.0);
+        // A worn joint elsewhere also tires the robot.
+        let mut leg = idle(BaseKind::HumanFoot);
+        leg.wear_max = 0.75;
+        leg.wear_joint = Some("knee".into());
+        let f = compute(&leg).effects.into_iter().find(|e| e.id == "fatigue").unwrap();
+        assert_eq!(f.level, BodyLevel::Bad);
+        assert!(f.detail.contains("knee"));
+        assert!(BodyLevel::Crit > BodyLevel::Ok, "max is the worse level");
+    }
+
+    fn balance(margin: f32, contact: Option<Contact>) -> BalanceSummary {
+        BalanceSummary {
+            plan: "mid".into(),
+            source: "slope".into(),
+            source_ko: "경사".into(),
+            state: "up_hi|move".into(),
+            margin,
+            margin_noff: margin,
+            trunk_lean_deg: 0.0,
+            head_tilt_deg: 0.0,
+            worst_joint: Some("drive".into()),
+            worst_ratio: 0.3,
+            effort_sum: 0.1,
+            mass_kg: 20.0,
+            com_height_m: 0.5,
+            heat_max: 0.2,
+            load_joint: Some("drive".into()),
+            load_index: 0.4,
+            load_rms: 0.4,
+            joints: vec![],
+            couplings: vec![],
+            ground: "풀밭".into(),
+            contact,
+        }
+    }
+
+    #[test]
+    fn the_ground_lowers_what_the_drive_carries_and_sliding_can_come_first() {
+        let mut inp = idle(BaseKind::Wheel);
+        inp.carried_kg = 4.0;
+        inp.body_mass_kg = Some(20.0);
+        inp.capacity_here = Some((5.0, "모래".into()));
+        let s = compute(&inp);
+        let stomach = s.parts.iter().find(|p| p.id == "stomach").unwrap();
+        assert!((stomach.ratio - 0.2).abs() < 1e-5, "4 of the 5 kg the drive pushes on sand");
+        assert!(stomach.detail.contains("모래") && stomach.detail.contains("몸무게의 20%"), "{}", stomach.detail);
+        // A wheel on a grass slope: far from tipping, close to sliding.
+        let c = crate::surface::contact(BaseKind::Wheel, crate::surface::Surface::Grass.props(), 13.0, 0.0, true);
+        inp.balance = Some(balance(0.8, Some(c)));
+        let s = compute(&inp);
+        let bal = s.effects.iter().find(|e| e.id == "balance").unwrap();
+        assert!(bal.level > BodyLevel::Ok && bal.detail.contains("미끄러짐이 먼저"), "{bal:?}");
+        let slip = s.effects.iter().find(|e| e.id == "slip").unwrap();
+        assert!(slip.detail.contains("풀밭") && slip.detail.contains("마찰 이용률"), "{}", slip.detail);
+        let strain = s.effects.iter().find(|e| e.id == "strain").unwrap();
+        assert!(strain.detail.contains("RMS/연속 0.40"), "{}", strain.detail);
     }
 
     #[test]
