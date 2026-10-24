@@ -6,14 +6,16 @@
 
 v0.3에서는 테스트를 **게임 로직**과 **ML 로직**으로 나눴습니다. 게임 로직이 퀘스트를 수행하며 영상과 고정 간격 키프레임을 찍고, 각 키프레임을 ML 로직(TIPSv2 DPT 깊이 → SigLIP2 의미 위치 → SAM 3.1 방식 마스크 추적)이 분석합니다. 이어서 같은 월드에서 ML 로직이 직접 결정합니다: 거리를 믿기 전에 **의무 삼각 측량 이동**을 하고, 대상 위치를 시계열 모델로 예측해 움직이고, 다시 찍습니다. 몸은 리서치한 부품 프리셋(머리·가슴·배·팔·다리/섀시)으로 조립되어 들 수 있는 물건, 속도, 경사·턱, 적재가 달라지고, 자세 밸런스는 사람 기준값 대비 N:N으로 SDS에 기록됩니다. 기획은 [`docs/PLAN-v0.3.md`](docs/PLAN-v0.3.md), 리서치는 [`docs/research/`](docs/research/)에 있습니다.
 
+v0.4에서는 세 가지가 더해졌습니다. ① **GPU 가속**: 앱과 개발 서버가 이 빌드의 첫 GPU(CUDA → ROCm → Vulkan → Metal, `HAND_DEVICE`로 고정)에서 시작하고, SigLIP2·TIPSv2 깊이·SAM 마스크·Granite TTM이 한 장치를 공유하며, 깊이·밀집 비전 임베딩·SAM 이미지 인코더는 키프레임을 묶어 한 번에 돌립니다. Windows용 `.bat`(아래)이 백엔드별 툴체인을 맞춥니다. ② **관절 동역학과 3인칭 뷰**: 프리셋의 질량·액추에이터로 관절을 실제로 움직이는 강체 동역학(`hand_core::dynamics`)과, 시점 선택 "3인칭 (관절 물리)"에서 관절마다 각도·토크/피크·포화·멈춤, CoM·동적 ZMP·지지면을 겹쳐 보는 추적 카메라. ③ **복합 N:N**: 여러 원인이 함께 작동하는 시나리오를 BESTest·Mini-BESTest·REBA·RULA·NIOSH의 가중치로 사람 기준과 비교하고, 퀘스트 중에도 실시간으로 채점합니다. 기획은 [`docs/PLAN-v0.4.md`](docs/PLAN-v0.4.md), 근거와 개선 기록은 [`docs/research/nn-scenarios.md`](docs/research/nn-scenarios.md)에 있습니다.
+
 v0.2부터는 **오픈월드 자원 채취 테스트베드**가 있습니다. 마인크래프트식 격자 월드(나무·바위·석탄·철광석)에서 로봇이 "철광석 2개 캐서 창고로 가져와"라는 명령을 받아 퀘스트(탐색 → 접근 → 채취 → 줍기 → 운반 → 인도)로 수행합니다. 렌더한 프레임을 WebP로 압축해 SigLIP2로 인식하고, SDS와 Granite TTM으로 인식 결과를 걸러 내며, 모든 판단을 해시 체인 로그로 남깁니다. 설계 근거와 logis-center·endmill-sandbox와의 대조는 [`docs/PLAN.md`](docs/PLAN.md)에 있습니다.
 
 ### 구성
 
 | 경로 | 역할 |
 | --- | --- |
-| `crates/hand-core` | 손 모델: 손가락 프리셋, 관절 옵션, 발(이동 베이스), 순기구학, 파지 시뮬레이션, 주행 모델, 부품 프리셋과 전신 밸런스(CoM·ZMP·관절 토크·N:N 결합) |
-| `crates/hand-ml` | candle 기반 SigLIP2(NaFlex) 임베딩, 사전 기반 제로샷 분류, 장치 선택 (CPU, CUDA, Metal, Vulkan, ROCm) |
+| `crates/hand-core` | 손 모델: 손가락 프리셋, 관절 옵션, 발(이동 베이스), 순기구학, 파지 시뮬레이션, 주행 모델, 부품 프리셋과 전신 밸런스(CoM·ZMP·관절 토크·N:N 결합), 관절 동역학(`dynamics`), 복합 N:N 시나리오(`nn`) |
+| `crates/hand-ml` | candle 기반 SigLIP2(NaFlex) 임베딩, 사전 기반 제로샷 분류, 장치 선택·캐시·배치 정책 (CPU, CUDA, Metal, Vulkan, ROCm) |
 | `crates/hand-data` | 합성 데이터 계층 정의, 도메인 무작위화, LanceDB 저장 |
 | `crates/world-sim` | 오픈월드: 격자 지형, 자원 노드, 아이템, 소프트웨어 레이캐스트 프레임(RGB·ID·깊이), WebP 캡처 |
 | `crates/hand-search` | 자연어 명령 해석: 단어사전, 조사 분리, 어휘 일치 + 임베딩 보강, 해석 과정(trace) |
@@ -32,7 +34,17 @@ v0.2부터는 **오픈월드 자원 채취 테스트베드**가 있습니다. �
 cargo test --workspace
 ```
 
-벤치마크는 실행하지 않습니다. 작업 단위의 기준은 문서화된 참조 수치와 정합성 테스트입니다.
+벤치마크는 실행하지 않습니다. 작업 단위의 기준은 문서화된 참조 수치와 정합성 테스트입니다. 메모리가 8 GB 안팎인 PC에서는 링크가 겹쳐 가상 메모리가 모자랄 수 있으니(`os error 1455`) `CARGO_BUILD_JOBS=2`로 돌리세요.
+
+Windows에서는 백엔드별 스크립트가 MSVC·CUDA·HIP SDK 환경을 맞추고 단계별 로그(`test_logs\<시각>_<백엔드>\`)를 남깁니다. `test_*.bat`에 인자를 주면 그 cargo 테스트 하나만 돌립니다.
+
+```bash
+test_cuda.bat                                   # 전체 단계 (단위, 프리셋→물리, 복합 N:N, 시나리오, 통합, GPU 대조, Lance)
+test_cuda.bat -p hand-vision --test gpu_backend  # GPU와 CPU 결과 대조만
+check_rocm.bat                                  # ROCm 빌드 확인 (HIP SDK 7.x 또는 ROCm Core 10.x 자동 선택)
+dev_vulkan.bat                                  # Vulkan 으로 Tauri 앱 실행
+serve_cuda.bat                                  # 개발 서버 (브라우저)
+```
 
 ### 앱 실행
 
@@ -50,7 +62,9 @@ cargo tauri dev --features rocm      # AMD ROCm / HIP SDK (HIP_PATH 설정)
 cargo tauri dev --features metal     # macOS
 ```
 
-Windows에서 CUDA를 쓰려면 다음 두 가지가 필요합니다.
+빌드에 GPU 기능이 있으면 앱은 첫 GPU(CUDA → ROCm → Vulkan → Metal)에서 시작합니다. `HAND_DEVICE=cpu|cuda|rocm|vulkan|metal|gpu[:번호]`로 고정할 수 있고, 왼쪽 ④ "사전 · 모델"에서 바꿀 수 있습니다. 같은 백엔드의 모델은 장치 하나를 공유하며, 배치 크기는 `HAND_BATCH_ROWS`, CUDA·ROCm 텍스트 고정 모양은 `HAND_FIXED_SHAPE=0|1`, SAM 인코더 배치는 `HAND_SAM_BATCH`로 바꿉니다.
+
+Windows에서는 아래 `.bat`이 다음 설정을 대신합니다(`dev_cuda.bat`, `dev_rocm.bat`, `dev_vulkan.bat`, `dev_cpu.bat` 등). 직접 할 때는 이렇습니다. CUDA를 쓰려면 다음 두 가지가 필요합니다.
 
 - MSVC 호스트 컴파일러(`cl.exe`)가 PATH에 있어야 합니다. Visual Studio 개발자 셸에서 실행하거나 `vcvars64.bat`을 먼저 실행하세요.
 - CUDA 13의 CCCL 헤더는 MSVC의 표준 전처리기를 요구합니다. nvcc에 아래 플래그를 넘깁니다.
@@ -65,7 +79,9 @@ GPU의 compute capability를 지정하면 커널 빌드가 한 아키텍처만 �
 export CUDA_COMPUTE_CAP=86
 ```
 
-ROCm과 Vulkan은 [Qntology/candle-rocm-vulkan](https://github.com/Qntology/candle-rocm-vulkan)의 candle 포크를 씁니다. 커밋 `2191c7ad`로 고정되어 있습니다(루트 `Cargo.toml`).
+ROCm과 Vulkan은 [Qntology/candle-rocm-vulkan](https://github.com/Qntology/candle-rocm-vulkan)의 candle 포크를 씁니다. 커밋 `2191c7ad`로 고정되어 있습니다(루트 `Cargo.toml`). ROCm 스크립트는 logis-center commerce와 같은 규칙으로 HIP SDK 7.x(legacy)와 ROCm Core SDK 10.x(core) 가운데 이 PC의 GPU를 지원하는 쪽을 고릅니다(`ROCM_VER`, `ROCM_PATH`, `CANDLE_ROCM_TRACK`, `ROCM_SEARCH_PATHS`).
+
+SAM 마스크 모델은 `lmz/candle-sam`의 `mobile_sam-tiny-vitt.safetensors`(MobileSAM, 4 GB GPU 권장) 또는 `sam_vit_b_01ec64.safetensors`를 `models/sam`(또는 `SAM_DIR`)에 두고 ④의 **SAM 마스크 켜기**로 연결합니다. 없으면 영역 확장 추적기가 그대로 돕니다.
 
 ### 월드 시뮬레이터
 
@@ -127,9 +143,9 @@ huggingface-cli download google/siglip2-base-patch16-naflex --local-dir models/s
 - 가중치 파일이 없으면 분류 기능은 명확한 오류 메시지를 보여 줍니다.
 - 월드의 SigLIP2 인식과 Granite TTM은 실제 가중치로 정확도를 재 본 적이 없습니다. 테스트는 가짜 임베더와 0·무작위 가중치로 연결만 확인했고, 정밀도 게이트의 임계값과 "게이트 전/후" 수치는 모의 오류 모델에서 나온 값입니다.
 - 월드는 소프트웨어 레이캐스터로 그려서 SigLIP2의 학습 분포와 많이 다릅니다. 제로샷 정확도는 가중치로 측정한 뒤에 판단해야 합니다.
-- GPU 경로(CUDA·Metal·Vulkan·ROCm)는 이 개발 환경에 GPU가 없어 컴파일 여부만 확인했습니다.
+- GPU 경로는 CUDA만 RTX 3050 Laptop(4 GB, CUDA 13.3)에서 실행해 CPU 결과와 대조했습니다(SigLIP2 ≤ 2.2e-7, TIPS ≤ 3.3e-6, SAM 인코더·디코더 ≤ 7.7e-5 상대 오차). ROCm·Vulkan·Metal은 빌드 준비만 했고 실행 검증은 하지 않았습니다. 모델은 모든 백엔드에서 F32입니다.
 - 한국어 명령은 어휘 사전 일치가 1차 경로입니다. 사전에 없는 표현의 임베딩 보강은 SigLIP2 텍스트 타워의 한국어 품질에 달려 있습니다.
 - Tauri 창에서 직접 돌려 보지는 않았습니다. UI는 개발용 서버 위에서 브라우저로 확인했습니다. 로그 시각은 UTC입니다.
 - TIPSv2 DPT 이식은 실제 체크포인트 헤더의 텐서 이름·형상(227개)을 전부 대조했지만, 가중치로 PyTorch와 수치를 비교하지는 않았습니다. SigLIP2 패치 히트맵(MAP 헤드 value 경로)이 NaFlex 체크포인트에서 잘 되는지도 가중치로 확인해야 합니다.
-- 밸런스 모델은 준정적 근사입니다(점 질량, 지지 다각형, 관절 토크). 동역학 시뮬레이터가 아니며, 사람 기준값 중 "유도" 표시된 것은 계산으로 얻은 값입니다.
+- 밸런스 모델은 준정적 근사입니다(점 질량, 지지 다각형, 관절 토크). 자세 사이의 전이는 관절 동역학(`hand_core::dynamics`)이 시뮬레이션하지만 상체만 강체로 움직이고 다리·바퀴는 지면 반력의 정역학이며, 관절 마찰·회전자 관성·전류 루프 지연은 없습니다. 사람 기준값 중 "유도" 표시된 것은 계산으로 얻은 값입니다.
 - 통합 테스트의 ML 수치(깊이 오차, 추적 IoU, 깊이 축척, 결정 횟수)는 대역 모델에서 나온 값이라 실제 모델 성능이 아닙니다.

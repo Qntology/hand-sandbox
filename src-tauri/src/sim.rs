@@ -12,7 +12,7 @@ use hand_runtime::Runtime;
 use serde_json::{json, Value};
 use tauri::State;
 
-use crate::state::{bank_dir, default_store_dir, model_dir, tips_dir, ttm_dir, AppState};
+use crate::state::{bank_dir, default_store_dir, model_dir, sam_dir, tips_dir, ttm_dir, AppState};
 
 type App<'a> = State<'a, Arc<AppState>>;
 
@@ -52,13 +52,19 @@ pub async fn test_db_mirror(state: App<'_>, store_dir: Option<String>) -> Result
 }
 
 /// Loads TIPSv2-B/14 DPT from [`tips_dir`] onto the selected device as the
-/// ML depth model.
+/// ML depth model (`enabled: false` goes back to the stand-in). Keyframes are
+/// batched per pass on that device.
 #[tauri::command]
-pub async fn tips_use(state: App<'_>) -> Result<Value, String> {
+pub async fn tips_use(state: App<'_>, enabled: Option<bool>) -> Result<Value, String> {
     let shared: Arc<AppState> = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
-        let (backend, ordinal) = shared.selected();
-        let device = backend.open(ordinal).map_err(|e| format!("{} 장치를 열 수 없습니다: {e:#}", backend.name()))?;
+        if enabled == Some(false) {
+            return shared.with_world(|rt| {
+                rt.use_depth_stand_in();
+                models_json(&shared, rt)
+            });
+        }
+        let device = selected_device(&shared)?;
         let dir = tips_dir();
         shared.with_world(|rt| {
             rt.use_tips(&dir, &device).map_err(|e| format!("{e:#}"))?;
@@ -67,6 +73,35 @@ pub async fn tips_use(state: App<'_>) -> Result<Value, String> {
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Loads SAM (MobileSAM or ViT-B, from [`sam_dir`]) onto the selected device
+/// as the mask tracker (`enabled: false` goes back to region growing).
+#[tauri::command]
+pub async fn sam_use(state: App<'_>, enabled: Option<bool>) -> Result<Value, String> {
+    let shared: Arc<AppState> = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
+        if enabled == Some(false) {
+            return shared.with_world(|rt| {
+                rt.use_region_tracker();
+                models_json(&shared, rt)
+            });
+        }
+        let device = selected_device(&shared)?;
+        let dir = sam_dir();
+        shared.with_world(|rt| {
+            rt.use_sam(&dir, &device).map_err(|e| format!("{e:#}"))?;
+            models_json(&shared, rt)
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The device picked in the UI (or at start-up), from the shared cache.
+fn selected_device(state: &AppState) -> Result<candle_core::Device, String> {
+    let (backend, ordinal) = state.selected();
+    state.device().map_err(|e| format!("{}:{ordinal} 장치를 열 수 없습니다: {e:#}", backend.name()))
 }
 
 #[tauri::command]
@@ -127,8 +162,10 @@ fn models_json(state: &AppState, rt: &Runtime) -> Result<Value, String> {
     v["ttm_files"] = json!({"dir": ttm.display().to_string(), "present": ttm.join("config.json").is_file()});
     let tips = tips_dir();
     v["tips_files"] = json!({"dir": tips.display().to_string(), "present": tips.join("model.safetensors").is_file()});
-    let ml = rt.ml_pipeline();
-    v["ml"] = json!({"depth": ml.depth_mode(), "locate": ml.locate_mode(), "track": ml.track_mode()});
+    let sam = sam_dir();
+    v["sam_files"] = json!({"dir": sam.display().to_string(), "present": hand_vision::SamModel::find_weights(&sam).is_some()});
+    let s = state.startup();
+    v["startup"] = json!({"backend": s.backend.name(), "ordinal": s.ordinal, "reason": s.reason});
     Ok(v)
 }
 
@@ -176,8 +213,7 @@ pub async fn ttm_use(state: App<'_>, enabled: bool) -> Result<Value, String> {
                 models_json(&shared, rt)
             });
         }
-        let (backend, ordinal) = shared.selected();
-        let device = backend.open(ordinal).map_err(|e| format!("{} 장치를 열 수 없습니다: {e:#}", backend.name()))?;
+        let device = selected_device(&shared)?;
         let dir = ttm_dir();
         shared.with_world(|rt| {
             rt.load_ttm(&dir, &device).map_err(|e| format!("{e:#}"))?;

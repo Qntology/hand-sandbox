@@ -24,7 +24,7 @@ export async function refreshDevices() {
   sel.value = `${d.selected}:${d.ordinal}`;
   const chip = $('sb-device');
   chip.textContent = `연산: ${d.selected.toUpperCase()} #${d.ordinal}`;
-  chip.title = d.backends.map((b) => `${b.backend}: ${b.detail}`).join('\n');
+  chip.title = [d.reason ? `시작 장치: ${d.reason}` : null, ...d.backends.map((b) => `${b.backend}: ${b.detail}`)].filter(Boolean).join('\n');
 }
 
 async function onDeviceChanged() {
@@ -119,13 +119,43 @@ function onTtmToggle() {
   );
 }
 
+function onTipsToggle() {
+  const on = state.models?.ml?.depth === 'tipsv2-b14-dpt';
+  return switchModel(
+    'tips_use',
+    { enabled: !on },
+    on ? '깊이 대역 모델로 돌아가는 중…' : 'TIPSv2 DPT 를 불러오는 중…',
+    (m) => (m.ml?.depth === 'tipsv2-b14-dpt' ? `TIPSv2 깊이를 연결했습니다 (${m.devices?.depth ?? '장치 미확인'})` : '깊이 대역 모델로 바꿨습니다'),
+  );
+}
+
+function onSamToggle() {
+  const on = !!state.models?.ml?.track && state.models.ml.track !== 'region-grow';
+  return switchModel(
+    'sam_use',
+    { enabled: !on },
+    on ? '영역 확장 추적기로 돌아가는 중…' : 'SAM 마스크 모델을 불러오는 중…',
+    (m) => (m.ml?.track && m.ml.track !== 'region-grow' ? `${m.ml.track} 마스크 추적을 연결했습니다 (${m.devices?.track ?? '장치 미확인'})` : '영역 확장 추적기로 바꿨습니다'),
+  );
+}
+
 function renderToggles() {
   const m = state.models;
   const sg = $('model-siglip-toggle');
   const tt = $('model-ttm-toggle');
+  const tp = $('model-tips-toggle');
+  const sm = $('model-sam-toggle');
   const known = !!m;
   sg.disabled = switching || !known;
   tt.disabled = switching || !known;
+  tp.disabled = switching || !known;
+  sm.disabled = switching || !known;
+  const tipsOn = m?.ml?.depth === 'tipsv2-b14-dpt';
+  const samOn = !!m?.ml?.track && m.ml.track !== 'region-grow';
+  tp.textContent = tipsOn ? 'TIPS 끄기 (대역으로)' : 'TIPS 깊이 켜기';
+  sm.textContent = samOn ? 'SAM 끄기 (영역 확장으로)' : 'SAM 마스크 켜기';
+  tp.setAttribute('aria-pressed', String(tipsOn));
+  sm.setAttribute('aria-pressed', String(samOn));
   sg.textContent = m?.embedding ? 'SigLIP2 끄기 (오라클로)' : 'SigLIP2 인식 켜기';
   tt.textContent = m?.ttm ? 'TTM 끄기' : 'TTM 켜기';
   sg.setAttribute('aria-pressed', String(m?.embedding === true));
@@ -133,6 +163,8 @@ function renderToggles() {
   const missing = [];
   if (m?.siglip_files && !m.siglip_files.present) missing.push(`SigLIP2: ${m.siglip_files.dir} (SIGLIP2_DIR 로 바꿀 수 있음)`);
   if (m?.ttm_files && !m.ttm_files.present) missing.push(`TTM: ${m.ttm_files.dir} (TTM_DIR 로 바꿀 수 있음)`);
+  if (m?.tips_files && !m.tips_files.present) missing.push(`TIPS: ${m.tips_files.dir} (TIPS_DIR 로 바꿀 수 있음)`);
+  if (m?.sam_files && !m.sam_files.present) missing.push(`SAM: ${m.sam_files.dir} (SAM_DIR 로 바꿀 수 있음)`);
   $('model-files').textContent = missing.length ? `모델 파일을 찾지 못했습니다 — ${missing.join(' · ')}. 켜기를 누르면 이유를 알려 드립니다.` : '';
 }
 
@@ -144,6 +176,10 @@ export function updateModelLines() {
   const rec = state.models?.recognizer;
   $('model-siglip').textContent = p ? `${SIGLIP[p.mode] ?? p.mode} · ${p.device}` : rec ? `${SIGLIP[rec] ?? rec} · 아직 인식 전` : '미확인 — 인식 실행 시 갱신';
   $('model-ttm').textContent = ttmText(f?.method, state.models);
+  const ml = state.models?.ml;
+  const dev = state.models?.devices;
+  $('model-depth').textContent = ml ? `${ml.depth} · ${dev?.depth ?? '-'}` : '미확인';
+  $('model-mask').textContent = ml ? `${ml.track} · ${dev?.track ?? '-'}` : '미확인';
   $('model-embed').textContent = c ? (c.mode === 'embedding' ? '임베딩 + 어휘' : '어휘 전용 (lexical)') : state.models ? (state.models.parser_embedding ? '임베딩 + 어휘 (연결됨)' : '어휘 전용 (lexical)') : '미확인 — 명령 실행 시 갱신';
   $('model-sds').textContent = sds?.recipe ?? '미확인';
   $('sb-sds').textContent = sds?.recipe ?? '-';
@@ -160,6 +196,8 @@ export function initDevice() {
   });
   $('model-siglip-toggle').addEventListener('click', onSiglipToggle);
   $('model-ttm-toggle').addEventListener('click', onTtmToggle);
+  $('model-tips-toggle').addEventListener('click', onTipsToggle);
+  $('model-sam-toggle').addEventListener('click', onSamToggle);
   $('model-refresh').addEventListener('click', async () => {
     await refreshModels({ quiet: false });
     renderToggles();

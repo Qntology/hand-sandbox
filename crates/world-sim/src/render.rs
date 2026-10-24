@@ -429,13 +429,90 @@ fn basis(yaw: f32, pitch: f32) -> ([f32; 3], [f32; 3], [f32; 3]) {
 
 /// Renders the robot's first-person view.
 pub fn render(world: &World, cam: &Camera) -> Frame {
+    let origin = [world.agent.x, world.agent_ground_m() + EYE_HEIGHT_M, world.agent.z];
+    render_with(world, cam, origin, world.agent.yaw, cam.pitch_deg.to_radians(), &[])
+}
+
+/// An oriented box in world coordinates (the robot's links in the third-person view).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Obb {
+    pub center: [f32; 3],
+    /// The box's axes as unit vectors (columns).
+    pub axes: [[f32; 3]; 3],
+    pub half: [f32; 3],
+    pub color: [u8; 3],
+}
+
+impl Obb {
+    /// Ray parameter and the local face axis of the nearest hit.
+    fn hit(&self, o: [f32; 3], d: [f32; 3]) -> Option<(f32, usize)> {
+        let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        let rel = [o[0] - self.center[0], o[1] - self.center[1], o[2] - self.center[2]];
+        let (mut t0, mut t1, mut axis) = (f32::NEG_INFINITY, f32::INFINITY, 0usize);
+        for k in 0..3 {
+            let (ok, dk) = (dot(self.axes[k], rel), dot(self.axes[k], d));
+            if dk.abs() < 1e-9 {
+                if ok.abs() > self.half[k] {
+                    return None;
+                }
+                continue;
+            }
+            let (a, b) = ((-self.half[k] - ok) / dk, (self.half[k] - ok) / dk);
+            let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+            if lo > t0 {
+                t0 = lo;
+                axis = k;
+            }
+            t1 = t1.min(hi);
+            if t0 > t1 {
+                return None;
+            }
+        }
+        (t1 > 0.0 && t0 > 0.0).then_some((t0, axis))
+    }
+}
+
+/// Where the third-person camera sits and where it looks.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct ChaseView {
+    pub origin: [f32; 3],
+    pub yaw: f32,
+    pub pitch: f32,
+}
+
+impl ChaseView {
+    /// Behind and above the robot, `orbit_deg` around it (0 = behind), looking
+    /// at its chest. Lifted out of the terrain when a hill is in the way.
+    pub fn around(world: &World, orbit_deg: f32, dist_m: f32, height_m: f32) -> ChaseView {
+        let a = world.agent.yaw + std::f32::consts::PI + orbit_deg.to_radians();
+        let ground = world.agent_ground_m();
+        let (cx, cz) = (world.agent.x + dist_m * a.cos(), world.agent.z + dist_m * a.sin());
+        let under = world.terrain.cell_of(cx, cz).map_or(0.0, |(x, z)| world.terrain.height_m(x, z) + world.terrain.curb_m(x, z));
+        let origin = [cx, (ground + height_m).max(under + 0.4), cz];
+        let target = [world.agent.x, ground + 0.75, world.agent.z];
+        let d = [target[0] - origin[0], target[1] - origin[1], target[2] - origin[2]];
+        ChaseView { origin, yaw: d[2].atan2(d[0]), pitch: d[1].atan2((d[0] * d[0] + d[2] * d[2]).sqrt()) }
+    }
+
+    /// Pixel and forward depth of a world point in this view.
+    pub fn project(&self, cam: &Camera, point: [f32; 3]) -> Option<(f32, f32, f32)> {
+        let c = Camera { pitch_deg: self.pitch.to_degrees(), ..*cam };
+        c.project(self.origin, self.yaw, point)
+    }
+}
+
+/// Renders the world from the chase camera with the robot's links drawn in.
+/// The id buffer is 0 on the robot: this view is for people, not for the recogniser.
+pub fn render_chase(world: &World, cam: &Camera, view: &ChaseView, robot: &[Obb]) -> Frame {
+    render_with(world, cam, view.origin, view.yaw, view.pitch, robot)
+}
+
+fn render_with(world: &World, cam: &Camera, origin: [f32; 3], yaw: f32, pitch: f32, robot: &[Obb]) -> Frame {
     let scene = Scene::build(world);
     let (w, h) = (cam.width.max(1), cam.height.max(1));
-    let pitch = cam.pitch_deg.to_radians();
-    let (fwd, right, up) = basis(world.agent.yaw, pitch);
+    let (fwd, right, up) = basis(yaw, pitch);
     let half_w = (cam.fov_deg.to_radians() * 0.5).tan();
     let half_h = half_w * h as f32 / w as f32;
-    let origin = [world.agent.x, world.agent_ground_m() + EYE_HEIGHT_M, world.agent.z];
     let seed = world.cfg.seed;
     let max_dist = cam.max_dist_m;
 
@@ -458,7 +535,19 @@ pub fn render(world: &World, cam: &Camera) -> Frame {
                 ];
                 let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
                 d = [d[0] / len, d[1] / len, d[2] / len];
-                match trace(&scene, origin, d, max_dist) {
+                let world_hit = trace(&scene, origin, d, max_dist);
+                let body = robot.iter().filter_map(|b| b.hit(origin, d).map(|(t, ax)| (t, ax, b))).min_by(|a, b| a.0.total_cmp(&b.0));
+                if let Some((t, ax, b)) = body.filter(|(t, _, _)| world_hit.as_ref().map_or(true, |h| *t < h.t)) {
+                    // Robot links: flat colour, faces shaded by which box axis was hit.
+                    let k = [1.0, 0.86, 0.72][ax] * (1.0 - 0.25 * (t / max_dist).clamp(0.0, 1.0));
+                    for c in 0..3 {
+                        row_rgb[i * 3 + c] = (b.color[c] as f32 * k).clamp(0.0, 255.0) as u8;
+                    }
+                    row_ids[i] = 0;
+                    row_depth[i] = t * (d[0] * fwd[0] + d[1] * fwd[1] + d[2] * fwd[2]);
+                    continue;
+                }
+                match world_hit {
                     Some(hit) => {
                         let c = shade_hit(&hit, origin, d, max_dist, seed);
                         row_rgb[i * 3..i * 3 + 3].copy_from_slice(&c);
@@ -533,6 +622,42 @@ impl World {
 
     pub fn render_top(&self, size_px: usize, span_m: f32) -> Frame {
         render_top(self, size_px, span_m)
+    }
+
+    /// A point of the robot's base frame (x forward, y left, z up from the
+    /// ground under the robot) in world coordinates (y up).
+    pub fn body_to_world(&self, p: [f32; 3]) -> [f32; 3] {
+        let (s, c) = self.agent.yaw.sin_cos();
+        let g = self.agent_ground_m();
+        [self.agent.x + c * p[0] + s * p[1], g + p[2], self.agent.z + s * p[0] - c * p[1]]
+    }
+
+    /// A direction of the base frame in world coordinates.
+    pub fn body_dir_to_world(&self, v: [f32; 3]) -> [f32; 3] {
+        let (s, c) = self.agent.yaw.sin_cos();
+        [c * v[0] + s * v[1], v[2], s * v[0] - c * v[1]]
+    }
+
+    /// The links of a body pose as world boxes, coloured by segment.
+    pub fn robot_boxes(&self, pose: &hand_core::dynamics::BodyPose) -> Vec<Obb> {
+        use hand_core::Segment;
+        pose.boxes
+            .iter()
+            .map(|b| Obb {
+                center: self.body_to_world(b.center),
+                axes: [self.body_dir_to_world(b.axes[0]), self.body_dir_to_world(b.axes[1]), self.body_dir_to_world(b.axes[2])],
+                half: b.half,
+                color: match b.segment {
+                    Segment::Head => [214, 218, 226],
+                    Segment::Chest => [74, 110, 168],
+                    Segment::Belly => [60, 72, 96],
+                    Segment::Arm => [228, 136, 52],
+                    Segment::Hand => [246, 206, 84],
+                    Segment::Leg => [120, 126, 138],
+                    Segment::Foot => [52, 56, 64],
+                },
+            })
+            .collect()
     }
 }
 

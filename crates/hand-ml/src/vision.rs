@@ -202,23 +202,25 @@ impl VisionTower {
         self.forward_batch(&[input])
     }
 
-    /// Embeddings `(batch, hidden)` before normalization for images that share
-    /// one patch grid. Rows are independent: attention never mixes images.
-    pub fn forward_batch(&self, inputs: &[&NaflexInput]) -> Result<Tensor> {
+    /// [`VisionTower::forward_dense`] for images that share one patch grid:
+    /// dense `(b, n, hidden)`, attention `(b, n)`, pooled `(b, hidden)`.
+    pub fn forward_dense_batch(&self, inputs: &[&NaflexInput]) -> Result<(Tensor, Tensor, Tensor)> {
+        let x = self.batch_tokens(inputs)?;
+        Ok((self.head.dense(&x)?, self.head.attention(&x)?, self.head.forward(&x)?))
+    }
+
+    /// Patch tokens `(b, n, hidden)` after the encoder and the final norm.
+    fn batch_tokens(&self, inputs: &[&NaflexInput]) -> Result<Tensor> {
         let first = match inputs.first() {
             Some(f) => f,
-            None => candle_core::bail!("forward_batch needs at least one image"),
+            None => candle_core::bail!("a vision batch needs at least one image"),
         };
         let (gh, gw, pd) = (first.grid_h, first.grid_w, first.patch_dim);
         let n = gh * gw;
         let mut flat: Vec<f32> = Vec::with_capacity(inputs.len() * n * pd);
         for i in inputs {
             if (i.grid_h, i.grid_w, i.patch_dim) != (gh, gw, pd) {
-                candle_core::bail!(
-                    "forward_batch images must share one patch grid ({gh}x{gw}), got {}x{}",
-                    i.grid_h,
-                    i.grid_w
-                );
+                candle_core::bail!("batched images must share one patch grid ({gh}x{gw}), got {}x{}", i.grid_h, i.grid_w);
             }
             flat.extend_from_slice(&i.patches);
         }
@@ -228,7 +230,12 @@ impl VisionTower {
         for layer in &self.layers {
             x = layer.forward(&x, None)?;
         }
-        let x = self.post_ln.forward(&x)?;
-        self.head.forward(&x)
+        self.post_ln.forward(&x)
+    }
+
+    /// Embeddings `(batch, hidden)` before normalization for images that share
+    /// one patch grid. Rows are independent: attention never mixes images.
+    pub fn forward_batch(&self, inputs: &[&NaflexInput]) -> Result<Tensor> {
+        self.head.forward(&self.batch_tokens(inputs)?)
     }
 }

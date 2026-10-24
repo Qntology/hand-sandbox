@@ -68,6 +68,13 @@ fn three_passes_record_keyframes_ml_tracks_decisions_and_success_rates() {
     }
     let nn = stats["nn"].as_array().unwrap();
     assert!(nn.iter().any(|c| c["source"] == "arm_lift" && !c["reference"].is_null()), "N:N cells with references");
+    // Both passes scored composite phases (brake with the log aboard) and the joint dynamics.
+    let live = rt.api_call("nn_status", &Value::Null).unwrap();
+    assert!(!live["phases"].as_array().unwrap().is_empty(), "composite phases scored during the test");
+    for s in live["scenarios"].as_array().unwrap() {
+        println!("[NN-SUM] integrated · {} {} 점수 {} · 사건 {} · 게이트 {}", s["scenario"], s["name_ko"], s["score"], s["events"], s["gated"]);
+    }
+    assert!(sds.ledgers.iter().any(|x| x.ledger == "body"), "dynamics scopes live in the body ledger");
     // The depth scale was learned from triangulation (stand-in scale is 0.8, so about 1/0.8 = 1.25).
     let scales: Vec<f64> = dec.iter().chain(game.iter()).filter_map(|k| k["ml"]["target"]["scale"].as_f64()).collect();
     assert!(!scales.is_empty());

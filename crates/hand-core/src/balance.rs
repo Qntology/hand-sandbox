@@ -404,13 +404,47 @@ impl Body {
         self.build(&Posture::quiet(0.0)).com[2]
     }
 
+    /// How one arm's mass splits: upper arm mass, its CoM distance from the
+    /// shoulder, forearm mass (CoM at 45% of the forearm). The upper part is
+    /// placed so a straight arm has the preset's CoM.
+    pub fn arm_split(&self) -> (f32, f32, f32) {
+        let m_fore = 0.25 * self.arm.mass_kg;
+        let m_up = self.arm.mass_kg - m_fore;
+        let r_up = ((self.arm.com_m * self.arm.mass_kg - m_fore * (UPPER_ARM_M + 0.45 * FOREARM_M)) / m_up).max(0.02);
+        (m_up, r_up, m_fore)
+    }
+
+    /// Support polygon `[x0, x1, y0, y1]` of a posture, before any base pitch
+    /// (`pitch` is the base's pitch for a wheeled robot, 0 for legs).
+    pub fn support_rect(&self, post: &Posture, pitch: f32) -> [f32; 4] {
+        if self.legged {
+            let c = post.slope_deg.to_radians().cos();
+            let (x0, x1) = (-0.25 * self.leg.foot_len_m * c, 0.75 * self.leg.foot_len_m * c);
+            if post.single_support {
+                let ys = -STANCE_WIDTH_M / 2.0;
+                [x0, x1, ys - self.leg.foot_width_m / 2.0, ys + self.leg.foot_width_m / 2.0]
+            } else {
+                [x0, x1, -self.support_width_m / 2.0, self.support_width_m / 2.0]
+            }
+        } else {
+            let h = 0.5 * self.support_len_m * pitch.cos();
+            [-h, h, -self.support_width_m / 2.0, self.support_width_m / 2.0]
+        }
+    }
+
+    /// Pitch of a wheeled base on the posture's slope and step, radians (0 for legs).
+    pub fn base_pitch(&self, post: &Posture) -> f32 {
+        if self.legged {
+            0.0
+        } else {
+            post.slope_deg.to_radians() + (post.step_m / self.support_len_m.max(0.1)).atan()
+        }
+    }
+
     fn arm_points(&self, side: usize, elev_deg: f32, elbow_deg: f32, load: f32) -> (Vec<Pt>, [f32; 3], [f32; 3]) {
         let y = if side == 0 { -SHOULDER_HALF_WIDTH_M } else { SHOULDER_HALF_WIDTH_M };
         let sh = [0.0, y, SHOULDER_M];
-        let m_fore = 0.25 * self.arm.mass_kg;
-        let m_up = self.arm.mass_kg - m_fore;
-        // Place the upper part so a straight arm has the preset's CoM.
-        let r_up = ((self.arm.com_m * self.arm.mass_kg - m_fore * (UPPER_ARM_M + 0.45 * FOREARM_M)) / m_up).max(0.02);
+        let (m_up, r_up, m_fore) = self.arm_split();
         let a = elev_deg.to_radians();
         let b = (elev_deg + elbow_deg).to_radians();
         let du = [a.sin(), 0.0, -a.cos()];
@@ -478,8 +512,7 @@ impl Body {
             }
         }
         // A wheeled base tilts with the ground; a step tilts it by the step over the wheelbase.
-        let slope = post.slope_deg.to_radians();
-        let pitch = if self.legged { 0.0 } else { slope + (post.step_m / self.support_len_m.max(0.1)).atan() };
+        let pitch = self.base_pitch(post);
         if pitch != 0.0 {
             for p in pts.iter_mut() {
                 // Nose up moves points above the ground backward.
@@ -493,19 +526,7 @@ impl Body {
                 com[k] += p.m * p.p[k] / mass;
             }
         }
-        let support = if self.legged {
-            let c = slope.cos();
-            let (x0, x1) = (-0.25 * self.leg.foot_len_m * c, 0.75 * self.leg.foot_len_m * c);
-            if post.single_support {
-                let ys = -STANCE_WIDTH_M / 2.0;
-                [x0, x1, ys - self.leg.foot_width_m / 2.0, ys + self.leg.foot_width_m / 2.0]
-            } else {
-                [x0, x1, -self.support_width_m / 2.0, self.support_width_m / 2.0]
-            }
-        } else {
-            let h = 0.5 * self.support_len_m * pitch.cos();
-            [-h, h, -self.support_width_m / 2.0, self.support_width_m / 2.0]
-        };
+        let support = self.support_rect(post, pitch);
         Eval { pts, mass, com, support, pitch }
     }
 
@@ -560,7 +581,19 @@ impl Body {
         let uncomp = self.build(post);
         let reference = self.build(&base_post);
         let home = self.home_x();
-        let delta = uncomp.com[0] - home;
+        // The robot knows its own planned acceleration and leans into it, as
+        // standing passengers do. The lean is in place before the acceleration
+        // starts (posture leads movement, `dynamics`), so the ZMP is at the CoM
+        // before and at `x_com − z·a/g` during it; the CoM target that keeps the
+        // worse of the two margins largest centres that pair in the support.
+        // A waist without a pitch joint cannot lean (max_lean 0).
+        let target = if post.accel_mps2 != 0.0 {
+            let s = uncomp.support;
+            0.5 * (s[0] + s[1]) + 0.5 * uncomp.com[2] * post.accel_mps2 / G
+        } else {
+            home
+        };
+        let delta = uncomp.com[0] - target;
         let band = self.ankle_band();
         let excess = delta - delta.clamp(-band, band);
         // Lean: the upper group's moment arm decides how much a degree buys.
@@ -856,6 +889,37 @@ impl Body {
         }
         let capacity_kg = capacity.min(self.base.carry_capacity_kg());
         DriveLimits { max_speed_mps: speed.max(0.01), max_slope_deg: slope.max(0.0), max_step_m: step.max(0.0), power_scale: m / ref_m, accel_limit_mps2: accel, capacity_kg, reasons }
+    }
+
+    /// The acceleration the drive planner commands to start (`dir > 0`) or to
+    /// stop (`dir < 0`) on `slope_deg` with `cargo_kg`: the ramp to cruise speed
+    /// in at least `min_ramp_s`, never harder than the balance allows.
+    ///
+    /// A start pushes the ZMP backward (`x_zmp = x_com − z·a/g`), a stop
+    /// forward, so each is limited by the room between the ZMP and the support
+    /// edge it moves toward, less the kept margin, on this slope (a wheeled
+    /// base pitches with it and its CoM moves downhill) with this cargo. An
+    /// uphill start is also limited by traction. The flat, symmetric limit of
+    /// `drive_limits` stays as the upper bound.
+    pub fn planned_accel(&self, spec: &BaseSpec, slope_deg: f32, cargo_kg: f32, dir: f32, min_ramp_s: f32) -> f32 {
+        self.planned_accel_within(&self.drive_limits(spec, cargo_kg), slope_deg, cargo_kg, dir, min_ramp_s)
+    }
+
+    /// [`Body::planned_accel`] with the drive limits already computed (the world caches them).
+    pub fn planned_accel_within(&self, l: &DriveLimits, slope_deg: f32, cargo_kg: f32, dir: f32, min_ramp_s: f32) -> f32 {
+        let p = Posture { source: if slope_deg.abs() >= 3.0 { Source::Slope } else { Source::Quiet }, slope_deg, ..Posture::quiet(cargo_kg) };
+        let r = self.solve(&p, &FeedForward::default(), 1e3);
+        let s = r.support;
+        let keep = MARGIN_KEEP * 0.5 * (s[1] - s[0]);
+        let room = if dir > 0.0 { r.zmp[0] - (s[0] + keep) } else { (s[1] - keep) - r.zmp[0] };
+        let mut a = (G * room.max(0.0) / r.com[2].max(0.1)).min(l.accel_limit_mps2);
+        if !self.legged && dir > 0.0 {
+            let m = self.mass_kg() + cargo_kg;
+            let slope = slope_deg.to_radians();
+            let trac = self.chassis.drive_force_n / m - G * (slope.sin() + ROLLING_RESISTANCE * slope.cos());
+            a = a.min(trac.max(0.0));
+        }
+        (l.max_speed_mps / min_ramp_s.max(1e-3)).min(a).max(0.05)
     }
 
     /// Lifts `load_kg` with one arm, or with both when one is not enough.

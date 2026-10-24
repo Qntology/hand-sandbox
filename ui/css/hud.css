@@ -115,3 +115,23 @@
 .viewport-canvas-wrap[data-h="short"] .vp-legend { max-height: 40%; width: 200px; bottom: 58px; }
 .viewport-canvas-wrap[data-h="short"] .quest-tracker { width: 200px; }
 @media (prefers-reduced-motion: reduce) { .zone[data-level="crit"] .z-base { animation: none; } }
+
+/* 3인칭 관절 물리: 관절 점·CoM·ZMP 오버레이와 관절 표 */
+.joint-layer { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.joint-panel { position: absolute; right: 10px; bottom: 58px; z-index: 7; width: 280px; max-height: 62%; overflow: auto; padding: 8px 10px; font-size: 0.66rem; color: var(--text); }
+.joint-panel .jp-head { display: flex; justify-content: space-between; gap: 6px; margin-bottom: 4px; }
+.joint-panel .jp-head span { color: var(--text-dim); text-align: right; }
+.joint-panel canvas { display: block; width: 100%; height: 90px; background: var(--bg-plot); border-radius: 4px; }
+.jp-table { width: 100%; border-collapse: collapse; margin-top: 6px; font-variant-numeric: tabular-nums; }
+.jp-table th { text-align: left; font-weight: 600; color: var(--text-muted); padding: 1px 2px; }
+.jp-table td { padding: 1px 2px; border-top: 1px solid var(--border); white-space: nowrap; }
+.jp-table td.r { text-align: right; }
+.jp-table tr.sat td { color: var(--warning); }
+.jp-table tr.stall td, .jp-table tr.over td { color: var(--danger); }
+.jp-table tr.statics td:first-child::after { content: ' ·정역학'; color: var(--text-muted); }
+.jp-table tr.structure td:first-child::after { content: ' ·구조'; color: var(--text-muted); }
+.jp-bar { display: inline-block; width: 46px; height: 6px; background: var(--bg-active); border-radius: 3px; overflow: hidden; vertical-align: middle; }
+.jp-bar > i { display: block; height: 100%; }
+.jp-notes { margin: 6px 0 0; padding-left: 14px; color: var(--text-dim); }
+.viewport-canvas-wrap[data-w="tiny"] .joint-panel { display: none; }
+#orbit-range { width: 96px; flex: 0 0 96px; }

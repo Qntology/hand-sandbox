@@ -15,10 +15,12 @@
 pub mod balance;
 pub mod base;
 pub mod body;
+pub mod dynamics;
 pub mod finger;
 pub mod hand;
 pub mod joint;
 pub mod math;
+pub mod nn;
 pub mod parts;
 pub mod sim;
 

@@ -22,7 +22,7 @@ use hand_core::parts::Segment;
 use hand_core::{BaseKind, BodyPlan};
 use hand_quest::Quest;
 use hand_sds::{Level, Scope, Track};
-use hand_vision::{triangulate, Bearing};
+use hand_vision::{triangulate, Bearing, Rgb};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -254,6 +254,15 @@ impl Runtime {
         let prev_pass = std::mem::replace(&mut self.pass, "game".into());
         let run = t.game.as_ref().map(|g| g.run_id.clone()).unwrap_or_default();
         let prev_run = std::mem::replace(&mut self.run_id, run);
+        // Depth, semantic location and the mask encoder for this step's
+        // keyframes in batched calls; the loop below then only tracks.
+        if let Some(g) = t.game.as_ref() {
+            let rgbs: Vec<Rgb> = (t.perceive_next..end).filter_map(|i| g.keyframes.get(i).and_then(|k| k.rgb().ok())).collect();
+            let refs: Vec<&Rgb> = rgbs.iter().collect();
+            if let Err(e) = self.ml.prefetch(&refs) {
+                t.notes.push(format!("일괄 추론 실패, 키프레임마다 다시 계산: {e}"));
+            }
+        }
         for i in t.perceive_next..end {
             let Some(mut kf) = t.game.as_mut().and_then(|g| g.keyframes.get_mut(i)).map(|k| std::mem::replace(k, placeholder(k))) else { continue };
             let res = self.ml_analyse(&mut kf, &wanted, None);

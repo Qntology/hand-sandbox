@@ -58,6 +58,16 @@ pub trait MaskTracker: Send {
     /// Follows the existing tracks into this keyframe and starts tracks for
     /// prompts that do not fall on one. Returns the live tracks.
     fn update(&mut self, rgb: &Rgb, depth: Option<&DepthMap>, prompts: &[PointPrompt]) -> Result<Vec<TrackedMask>>;
+    /// Called with keyframes that [`MaskTracker::update`] will see next, so a
+    /// model with an image encoder can encode them in one batch ahead of the
+    /// sequential tracking. The default does nothing.
+    fn prepare(&mut self, _frames: &[&Rgb]) -> Result<()> {
+        Ok(())
+    }
+    /// Device the tracker runs on.
+    fn device(&self) -> String {
+        "cpu".into()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

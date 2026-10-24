@@ -14,7 +14,7 @@
 //! error, mask IoU, true range). Those numbers go to evaluation columns and
 //! SDS evaluation axes only; the decision never reads them.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use anyhow::Result;
 use hand_search::{EntityKind, Lexicon};
@@ -270,6 +270,26 @@ pub struct MlPipeline {
     labels: Vec<LabelPrompt>,
     /// Vision label to resource id (`iron_ore_node` → `iron_ore`).
     link: HashMap<String, String>,
+    /// Depth and semantic points that [`MlPipeline::prefetch`] computed in
+    /// batches, by image hash, waiting for [`MlPipeline::analyse`].
+    pre: HashMap<u64, Prefetched>,
+    pre_order: VecDeque<u64>,
+}
+
+/// Most keyframes whose batched results wait for `analyse`.
+pub const PREFETCH_MAX: usize = 32;
+
+#[derive(Default)]
+struct Prefetched {
+    depth: Option<DepthMap>,
+    points: Option<Vec<SemanticPoint>>,
+}
+
+/// FNV-1a over the size and the pixels of a keyframe.
+pub fn frame_key(rgb: &Rgb) -> u64 {
+    use hand_ml::parallel::{fnv1a, FNV_OFFSET};
+    let h = fnv1a(fnv1a(FNV_OFFSET, &rgb.width.to_le_bytes()), &rgb.height.to_le_bytes());
+    fnv1a(h, &rgb.data)
 }
 
 impl MlPipeline {
@@ -285,7 +305,67 @@ impl MlPipeline {
             })
             .collect();
         let link = lex.vision.iter().map(|e| (e.id.clone(), e.link.clone())).collect();
-        MlPipeline { depth: DepthEngine::StandIn(DepthStandIn::new(seed)), locate: LocateEngine::StandIn(LocateStandIn::new(seed)), tracker: Box::new(RegionTracker::default()), labels, link }
+        MlPipeline {
+            depth: DepthEngine::StandIn(DepthStandIn::new(seed)),
+            locate: LocateEngine::StandIn(LocateStandIn::new(seed)),
+            tracker: Box::new(RegionTracker::default()),
+            labels,
+            link,
+            pre: HashMap::new(),
+            pre_order: VecDeque::new(),
+        }
+    }
+
+    /// Runs the stages that batch (depth, semantic location, the mask
+    /// model's image encoder) for keyframes [`MlPipeline::analyse`] will see
+    /// next: one batched call per model instead of one call per keyframe, on
+    /// whatever device each model was loaded to. Tracking itself stays
+    /// sequential because each keyframe's prompts depend on the last one's
+    /// tracks. The stand-ins need the ground truth and cost nothing, so they
+    /// are left to `analyse`. Returns how many keyframes were computed.
+    pub fn prefetch(&mut self, frames: &[&Rgb]) -> Result<usize> {
+        let mut seen = std::collections::HashSet::new();
+        let todo: Vec<(u64, &Rgb)> = frames
+            .iter()
+            .map(|f| (frame_key(f), *f))
+            .filter(|(k, _)| !self.pre.contains_key(k) && seen.insert(*k))
+            .take(PREFETCH_MAX)
+            .collect();
+        let sel: Vec<&Rgb> = todo.iter().map(|(_, f)| *f).collect();
+        if sel.is_empty() {
+            return Ok(0);
+        }
+        self.tracker.prepare(&sel)?;
+        let depths = match &mut self.depth {
+            DepthEngine::Model(m) => Some(m.infer_batch(&sel)?),
+            DepthEngine::StandIn(_) => None,
+        };
+        let points = match &mut self.locate {
+            LocateEngine::Model(m) => Some(m.locate_batch(&sel, &self.labels)?),
+            LocateEngine::StandIn(_) => None,
+        };
+        if depths.is_none() && points.is_none() {
+            return Ok(0);
+        }
+        let mut depths = depths.map(|v| v.into_iter().map(Some).collect::<Vec<_>>());
+        let mut points = points.map(|v| v.into_iter().map(Some).collect::<Vec<_>>());
+        for (i, (key, _)) in todo.iter().enumerate() {
+            let p = Prefetched { depth: depths.as_mut().and_then(|d| d[i].take()), points: points.as_mut().and_then(|p| p[i].take()) };
+            if self.pre.insert(*key, p).is_none() {
+                self.pre_order.push_back(*key);
+            }
+        }
+        while self.pre_order.len() > PREFETCH_MAX {
+            if let Some(old) = self.pre_order.pop_front() {
+                self.pre.remove(&old);
+            }
+        }
+        Ok(todo.len())
+    }
+
+    /// Keyframes waiting with prefetched results.
+    pub fn prefetched(&self) -> usize {
+        self.pre.len()
     }
 
     pub fn depth_mode(&self) -> String {
@@ -306,6 +386,21 @@ impl MlPipeline {
         self.tracker.mode().to_string()
     }
 
+    /// Device each model runs on (`cpu` for the stand-ins).
+    pub fn depth_device(&self) -> String {
+        match &self.depth {
+            DepthEngine::Model(m) => m.device(),
+            DepthEngine::StandIn(_) => "cpu".into(),
+        }
+    }
+
+    pub fn locate_device(&self) -> String {
+        match &self.locate {
+            LocateEngine::Model(m) => m.device(),
+            LocateEngine::StandIn(_) => "cpu".into(),
+        }
+    }
+
     pub fn reset(&mut self) {
         self.tracker.reset();
     }
@@ -319,15 +414,20 @@ impl MlPipeline {
     /// is after; `floor` maps a label to the score below which its semantic
     /// point is not used as a prompt (the SDS-learned floor, or a default).
     pub fn analyse(&mut self, rgb: &Rgb, intr: &Intrinsics, pose: &Pose, truth: Option<&KeyTruth>, wanted: &[String], floor: &dyn Fn(&str) -> f32, prefer_track: Option<u32>) -> Result<MlFrame> {
-        let depth = match (&mut self.depth, truth) {
-            (DepthEngine::Model(m), _) => m.infer(rgb)?,
-            (DepthEngine::StandIn(s), Some(t)) => s.run(t),
-            (DepthEngine::StandIn(_), None) => anyhow::bail!("깊이 대역 모델에는 정답 버퍼가 필요합니다"),
+        let key = frame_key(rgb);
+        let pre = self.pre.remove(&key).unwrap_or_default();
+        self.pre_order.retain(|k| *k != key);
+        let depth = match (pre.depth, &mut self.depth, truth) {
+            (Some(d), DepthEngine::Model(_), _) => d,
+            (_, DepthEngine::Model(m), _) => m.infer(rgb)?,
+            (_, DepthEngine::StandIn(s), Some(t)) => s.run(t),
+            (_, DepthEngine::StandIn(_), None) => anyhow::bail!("깊이 대역 모델에는 정답 버퍼가 필요합니다"),
         };
-        let points = match (&mut self.locate, truth) {
-            (LocateEngine::Model(m), _) => m.locate(rgb, &self.labels)?,
-            (LocateEngine::StandIn(s), Some(t)) => s.run(t, &self.labels),
-            (LocateEngine::StandIn(_), None) => anyhow::bail!("의미 위치 대역 모델에는 정답 버퍼가 필요합니다"),
+        let points = match (pre.points, &mut self.locate, truth) {
+            (Some(p), LocateEngine::Model(_), _) => p,
+            (_, LocateEngine::Model(m), _) => m.locate(rgb, &self.labels)?,
+            (_, LocateEngine::StandIn(s), Some(t)) => s.run(t, &self.labels),
+            (_, LocateEngine::StandIn(_), None) => anyhow::bail!("의미 위치 대역 모델에는 정답 버퍼가 필요합니다"),
         };
         let prompts: Vec<PointPrompt> = points
             .iter()

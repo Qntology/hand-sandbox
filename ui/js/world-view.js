@@ -3,6 +3,7 @@
 import { call } from './api.js';
 import { bus, state } from './state.js';
 import { $, clear, el, fmt, observeResize } from './util.js';
+import { drawJointOverlay, renderJointPanel } from './joint-view.js';
 
 const POLL_MS = 160;
 const RETRY_MS = 2500;
@@ -64,6 +65,11 @@ async function drawFrame(f) {
   const sizeChanged = !state.frame || state.frame.width !== f.width || state.frame.height !== f.height;
   state.frame = { width: f.width, height: f.height, bytes: f.bytes, encode_ms: f.encode_ms, tick: f.tick };
   state.detections = f.detections ?? [];
+  // 3인칭: 관절 물리 오버레이(Rust 가 픽셀로 투영한 관절·CoM·ZMP)와 관절 표.
+  const chase = !!f.overlay;
+  $('joint-layer').hidden = !chase;
+  drawJointOverlay(f.overlay ?? null, f.width, f.height);
+  renderJointPanel(chase ? f.overlay : null);
   if (sizeChanged) layoutFrame();
   if (!drewOnce) {
     drewOnce = true;
@@ -120,7 +126,8 @@ async function poll(force = false) {
   if (pending || state.centerTab !== 'world' || document.hidden || !state.snapshot) return;
   if (!force && Date.now() < retryAt) return;
   const p = framePreset();
-  const view = $('view-select').value;
+  const sel = $('view-select').value;
+  const view = sel === 'chase' ? `chase:${$('orbit-range').value}` : sel;
   const key = `${state.snapshot.tick}|${p.width}x${p.height}q${p.quality}|${view}`;
   if (!force && key === lastKey) return;
   pending = true;
@@ -176,7 +183,14 @@ export function initWorldView() {
   initToggles();
   observeResize($('world-wrap'), layoutFrame);
   layoutFrame();
-  $('view-select').addEventListener('change', () => poll(true));
+  const orbitShown = () => {
+    const chase = $('view-select').value === 'chase';
+    $('orbit-range').hidden = !chase;
+    $('orbit-label').hidden = !chase;
+  };
+  $('view-select').addEventListener('change', () => { orbitShown(); poll(true); });
+  $('orbit-range').addEventListener('input', () => poll(true));
+  orbitShown();
   $('frame-preset').addEventListener('change', () => poll(true));
   bus.on('world-new', () => { lastKey = ''; retryAt = 0; poll(true); });
   bus.on('world-error', (m) => showEmpty(`월드를 만들지 못했습니다: ${m}`, true, () => $('world-new').click()));

@@ -18,6 +18,8 @@ hand-core = { path = "../crates/hand-core" }
 hand-ml = { path = "../crates/hand-ml" }
 hand-data = { path = "../crates/hand-data" }
 hand-runtime = { path = "../crates/hand-runtime" }
+hand-vision = { path = "../crates/hand-vision" }
+candle-core = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -28,7 +30,7 @@ tokio = { workspace = true }
 [features]
 default = []
 # GPU backends. Each one switches on the matching candle backend in hand-ml.
-cuda = ["hand-ml/cuda"]
-metal = ["hand-ml/metal"]
-vulkan = ["hand-ml/vulkan"]
-rocm = ["hand-ml/rocm"]
+cuda = ["hand-ml/cuda", "hand-runtime/cuda"]
+metal = ["hand-ml/metal", "hand-runtime/metal"]
+vulkan = ["hand-ml/vulkan", "hand-runtime/vulkan"]
+rocm = ["hand-ml/rocm", "hand-runtime/rocm"]

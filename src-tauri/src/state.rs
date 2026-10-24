@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
-use hand_ml::{probe_backends, Anchors, Backend, BackendStatus, Dictionary, Siglip2};
+use hand_ml::{probe_backends, Anchors, Backend, BackendStatus, Dictionary, Selection, Siglip2};
 use hand_runtime::{Runtime, RuntimeConfig};
 
 /// Logistics dictionary compiled into the app.
@@ -27,6 +27,8 @@ pub struct VisionEngine {
 
 pub struct AppState {
     device: Mutex<(Backend, usize)>,
+    /// How the start-up device was chosen (`HAND_DEVICE`, first GPU, CPU fallback).
+    startup: Selection,
     probed: OnceLock<Vec<BackendStatus>>,
     vision: Mutex<Option<Arc<VisionEngine>>>,
     /// The simulated world and robot. Built on the first world command.
@@ -35,8 +37,12 @@ pub struct AppState {
 
 impl AppState {
     pub fn new() -> Self {
+        // The first GPU this build has and that opens, unless HAND_DEVICE says otherwise
+        // (logis-center `new_gpu_device`). The probe leaves the device in the cache.
+        let startup = hand_ml::preferred();
         AppState {
-            device: Mutex::new((Backend::Cpu, 0)),
+            device: Mutex::new((startup.backend, startup.ordinal)),
+            startup,
             probed: OnceLock::new(),
             vision: Mutex::new(None),
             world: Mutex::new(None),
@@ -62,12 +68,22 @@ impl AppState {
         *self.device.lock().expect("device lock")
     }
 
+    pub fn startup(&self) -> &Selection {
+        &self.startup
+    }
+
+    /// The selected device, from the shared cache (one handle per backend).
+    pub fn device(&self) -> Result<candle_core::Device> {
+        let (backend, ordinal) = self.selected();
+        backend.device(ordinal)
+    }
+
     /// Selects a device. The vision engine reloads on the next classification.
     pub fn select(&self, backend: Backend, ordinal: usize) -> Result<()> {
         if !backend.compiled() {
             anyhow::bail!("{} is not compiled into this build", backend.name());
         }
-        backend.open(ordinal)?;
+        backend.device(ordinal)?;
         *self.device.lock().expect("device lock") = (backend, ordinal);
         *self.vision.lock().expect("vision lock") = None;
         Ok(())
@@ -83,7 +99,7 @@ impl AppState {
             }
         }
         let dir = model_dir()?;
-        let device = backend.open(ordinal)?;
+        let device = backend.device(ordinal)?;
         let model = Arc::new(
             Siglip2::load(&dir, &device).with_context(|| format!("loading SigLIP2 from {}", dir.display()))?,
         );
@@ -159,6 +175,15 @@ pub fn tips_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("models").join("tipsv2-b14-dpt")
 }
 
+/// Folder with the SAM weights (`mobile_sam-tiny-vitt.safetensors` or
+/// `sam_vit_b_01ec64.safetensors`). `SAM_DIR` wins; otherwise `models/sam`.
+pub fn sam_dir() -> PathBuf {
+    if let Ok(p) = std::env::var(hand_vision::sam::DIR_ENV) {
+        return PathBuf::from(p);
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("models").join("sam")
+}
+
 /// Where the embedded phrase vectors of the world's recogniser are kept between runs.
 pub fn bank_dir() -> PathBuf {
     runtime_dir().join("bank")
@@ -188,9 +213,10 @@ mod tests {
     #[test]
     fn selecting_uncompiled_backend_fails_cleanly() {
         let s = AppState::new();
+        let before = s.selected();
         if !Backend::Vulkan.compiled() {
             assert!(s.select(Backend::Vulkan, 0).is_err());
-            assert_eq!(s.selected(), (Backend::Cpu, 0));
+            assert_eq!(s.selected(), before);
         }
     }
 }

@@ -13,5 +13,14 @@ image = { workspace = true }
 rayon = { workspace = true }
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
+candle-transformers = { workspace = true }
 hand-ml = { path = "../hand-ml" }
 hand-ts = { path = "../hand-ts" }
+
+[features]
+default = []
+# GPU backends for the depth (TIPS), semantic location (SigLIP2) and mask (SAM) models.
+cuda = ["hand-ml/cuda"]
+metal = ["hand-ml/metal"]
+vulkan = ["hand-ml/vulkan"]
+rocm = ["hand-ml/rocm"]

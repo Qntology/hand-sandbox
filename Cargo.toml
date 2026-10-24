@@ -38,6 +38,8 @@ webp = "0.3"
 # candle 0.11.0 and is pinned to one commit so every backend builds against the same core.
 candle-core = "0.11.0"
 candle-nn = "0.11.0"
+# Segment Anything (SAM / MobileSAM) for the mask track. Its candle-core is the patched fork below.
+candle-transformers = "0.11.0"
 
 [patch.crates-io]
 candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "2191c7ad898d866c4db5380ea1fc13a98f435e0c" }
@@ -58,6 +60,10 @@ opt-level = 3
 
 # The ML stand-ins and the region tracker run per keyframe in the integrated test.
 [profile.dev.package.hand-vision]
+opt-level = 3
+
+# The joint dynamics run a 2 ms rigid-body simulation per posture change inside the world tests.
+[profile.dev.package.hand-core]
 opt-level = 3
 
 [profile.release]
