@@ -16,13 +16,15 @@ use std::collections::VecDeque;
 
 use hand_quest::{QuestResult, State};
 use hand_sds::{Level, Scope, Track};
-use hand_search::Plan;
+use hand_search::{DropTarget, Plan};
 use hand_ts::{Predictor, TtmPredictor};
-use hand_vision::{DecideCfg, Decider, Decision};
+use hand_vision::{DecideCfg, Decider, Decision, TriStep};
 use serde_json::json;
-use world_sim::world::{DELIVER_REACH_M, MINE_REACH_M, PICKUP_REACH_M};
-use world_sim::{Action, ActionError, ItemKind, NodeKind, TimedEvent, WorldEvent};
+use world_sim::explore::{line_of_sight, Coverage, TARGET_H_M};
+use world_sim::world::{AMOUNT_EPS, DELIVER_REACH_M, EYE_HEIGHT_M, MINE_REACH_M, PICKUP_REACH_M};
+use world_sim::{amount_text, Action, ActionError, ItemKind, NodeKind, TimedEvent, WorldEvent};
 
+use crate::cargo::{self, CargoAction, CargoCtx};
 use crate::driver::action_error_ko;
 
 /// A node counts as the one the ML logic meant when it is this close to the
@@ -43,13 +45,15 @@ pub(crate) enum MlPhase {
     Carry,
     Deliver,
     Goto,
+    Unload,
 }
 
 pub(crate) struct MlTarget {
     pub resource: String,
     pub item: ItemKind,
     pub wanted: u32,
-    pub picked: u32,
+    /// Items lifted into the bay (half a stone is 0.5).
+    pub picked: f32,
     pub label_ko: String,
     /// Vision labels of the nodes that yield it.
     pub labels: Vec<String>,
@@ -82,9 +86,17 @@ pub(crate) struct MlTask {
     wasted: u32,
     touch_ok: u32,
     touch_miss: u32,
-    delivered: Vec<(String, u32)>,
+    delivered: Vec<(String, f32)>,
     /// Keyframe whose decision the queued actions carry out.
     pending_kf: Option<usize>,
+    /// What the camera has looked at (terrain occludes), for choosing viewpoints.
+    coverage: Coverage,
+    visited: Vec<(f32, f32)>,
+    split_piece: Option<u32>,
+    trips: u32,
+    drop_items: Vec<DropTarget>,
+    unloaded: Vec<(String, f32)>,
+    unload_started: bool,
 }
 
 enum Flow {
@@ -108,6 +120,7 @@ impl MlTask {
             MlPhase::Carry => 4 * n,
             MlPhase::Deliver => 4 * n + 1,
             MlPhase::Goto => 0,
+            MlPhase::Unload => usize::from(self.destination.is_some()),
         }
     }
 
@@ -119,24 +132,35 @@ impl MlTask {
 impl Runtime {
     fn ml_task_from(&self, quest: &str, plan: &Plan) -> Result<MlTask, (String, String)> {
         let mut targets = Vec::new();
+        let mut drop_items = Vec::new();
         let (kind, destination, list) = match plan {
             Plan::Fetch { targets: ts, destination } => ("fetch", Some(destination.place.clone()), ts.clone()),
             Plan::Collect { targets: ts } => ("collect", None, ts.clone()),
             Plan::Goto { place } => ("goto", Some(place.place.clone()), vec![]),
+            Plan::Drop { items, place } => {
+                drop_items = items.clone();
+                ("drop", place.as_ref().map(|p| p.place.clone()), vec![])
+            }
             Plan::Stop => return Err(("stop".into(), "중지 명령은 퀘스트가 아닙니다".into())),
         };
         for t in &list {
             let item = ItemKind::from_id(&t.resource).ok_or_else(|| ("unknown_target".to_string(), format!("'{}'은(는) 이 월드에 없는 자원입니다", t.resource)))?;
-            targets.push(MlTarget { resource: t.resource.clone(), item, wanted: t.quantity.max(1), picked: 0, label_ko: item.spec().label_ko.into(), labels: self.ml.source_labels_for(&t.resource) });
+            targets.push(MlTarget { resource: t.resource.clone(), item, wanted: t.quantity.max(1), picked: 0.0, label_ko: item.spec().label_ko.into(), labels: self.ml.source_labels_for(&t.resource) });
         }
         let n_steps = self.quests.get(quest).map_or(0, |q| q.steps.len());
+        let phase = match kind {
+            "goto" => MlPhase::Goto,
+            "drop" if destination.is_some() => MlPhase::Goto,
+            "drop" => MlPhase::Unload,
+            _ => MlPhase::Look,
+        };
         Ok(MlTask {
             quest: quest.into(),
             kind,
             targets,
             destination,
             cur: 0,
-            phase: if kind == "goto" { MlPhase::Goto } else { MlPhase::Look },
+            phase,
             decider: Decider::new(DecideCfg { reach_m: ARRIVE_SURFACE_M, ..DecideCfg::default() }),
             queue: VecDeque::new(),
             running: false,
@@ -165,6 +189,13 @@ impl Runtime {
             touch_miss: 0,
             delivered: vec![],
             pending_kf: None,
+            coverage: Coverage::new(&self.world.terrain),
+            visited: vec![],
+            split_piece: None,
+            trips: 0,
+            drop_items,
+            unloaded: vec![],
+            unload_started: false,
         })
     }
 
@@ -251,18 +282,26 @@ impl Runtime {
             match &te.event {
                 WorldEvent::ActionDone { ok, reason, .. } => t.done = Some((*ok, reason.clone())),
                 WorldEvent::NodeBroken { node, kind, drops } => t.broken = Some((node.clone(), *kind, drops.clone())),
-                WorldEvent::ItemPicked { item, .. } => {
+                WorldEvent::ItemPicked { item, amount, .. } => {
                     if let Some(x) = t.targets.iter_mut().find(|x| x.item == *item) {
-                        x.picked += 1;
+                        x.picked += *amount;
                     }
                 }
-                WorldEvent::Delivered { item, count, .. } => {
+                WorldEvent::Delivered { item, amount, .. } => {
                     let id = item.id().to_string();
                     match t.delivered.iter_mut().find(|(k, _)| *k == id) {
-                        Some(e) => e.1 += *count,
-                        None => t.delivered.push((id, *count)),
+                        Some(e) => e.1 += *amount,
+                        None => t.delivered.push((id, *amount)),
                     }
                 }
+                WorldEvent::ItemDropped { item, amount, .. } => {
+                    let id = item.id().to_string();
+                    match t.unloaded.iter_mut().find(|(k, _)| *k == id) {
+                        Some(e) => e.1 += *amount,
+                        None => t.unloaded.push((id, *amount)),
+                    }
+                }
+                WorldEvent::ItemSplit { piece, .. } => t.split_piece = piece.get(1..).and_then(|s| s.parse().ok()),
                 WorldEvent::BatteryDepleted => return fail("battery_depleted", "배터리가 방전되어 멈췄습니다"),
                 _ => {}
             }
@@ -318,6 +357,7 @@ impl Runtime {
             MlPhase::Collect => self.ml_collect(t),
             MlPhase::Carry | MlPhase::Goto => self.ml_carry(t),
             MlPhase::Deliver => self.ml_deliver(t),
+            MlPhase::Unload => self.ml_unload(t),
         }
     }
 
@@ -341,6 +381,7 @@ impl Runtime {
             Ok(o) => o,
             Err(e) => return fail("perception_failed", format!("ML 파이프라인 실패: {e}")),
         };
+        self.mark_coverage(&mut t.coverage);
         let label = out.frame.target.as_ref().map(|x| x.label.clone()).or_else(|| wanted.first().cloned()).unwrap_or_default();
         let ttm = self.gates.ttm();
         let tp = ttm.as_deref().map(TtmPredictor);
@@ -376,6 +417,7 @@ impl Runtime {
             Decision::Approach { .. } => "approach",
             Decision::Arrive { .. } => "arrive",
             Decision::Hold { .. } => "hold",
+            Decision::Explore { .. } => "explore",
         };
         let base = format!("{:?}", self.world.hand.base.kind).to_lowercase();
         let dscope = Scope::new(Track::Decide, kind, &base);
@@ -418,9 +460,41 @@ impl Runtime {
         match &rep.decision {
             Decision::Search { turn_deg } => t.queue.push_back(Action::Turn { yaw_deg: yaw_deg + turn_deg }),
             Decision::Triangulate(s) => {
-                t.queue.push_back(Action::MoveTo { x: s.to.0, z: s.to.1, reach_m: 0.0 });
-                t.queue.push_back(Action::Face { x: s.face.0, z: s.face.1 });
+                // The baseline has to be drivable and keep the target in sight over the terrain.
+                let (step, how) = self.feasible_step(s, (kf.pose.x, kf.pose.z));
+                if how == "mirrored" || how == "mirrored_short" {
+                    t.decider.set_side(-t.decider.side());
+                }
+                if !how.is_empty() {
+                    if let Some(d) = kf.decision.as_mut() {
+                        d.note = format!("{} · 기선 {}", d.note, match how {
+                            "mirrored" => "반대쪽으로 (지형이 막음)",
+                            "short" => "짧게 (지형이 막음)",
+                            "mirrored_short" => "반대쪽으로 짧게 (지형이 막음)",
+                            _ => "확인 못 함",
+                        });
+                    }
+                }
+                t.queue.push_back(Action::MoveTo { x: step.to.0, z: step.to.1, reach_m: 0.0 });
+                t.queue.push_back(Action::Face { x: step.face.0, z: step.face.1 });
             }
+            Decision::Explore { .. } => match self.search_viewpoint(&t.coverage, &t.visited) {
+                Some(v) => {
+                    t.visited.push((self.world.agent.x, self.world.agent.z));
+                    t.visited.push((v.x, v.z));
+                    if let Some(d) = kf.decision.as_mut() {
+                        d.note = format!("{} · 시점 ({:.1}, {:.1}) 안 본 곳 {}칸 · 약 {:.0}초", d.note, v.x, v.z, v.gain, v.time_s);
+                    }
+                    t.queue.push_back(Action::MoveTo { x: v.x, z: v.z, reach_m: 0.0 });
+                    t.queue.push_back(Action::Turn { yaw_deg: v.face_yaw.to_degrees() });
+                }
+                None => {
+                    if let Some(d) = kf.decision.as_mut() {
+                        d.note = format!("{} · 갈 수 있는 곳에서 볼 땅을 다 봄", d.note);
+                    }
+                    t.queue.push_back(Action::Turn { yaw_deg: yaw_deg + 50.0 });
+                }
+            },
             Decision::Approach { to, face, .. } => {
                 t.queue.push_back(Action::MoveTo { x: to.0, z: to.1, reach_m: 0.3 });
                 t.queue.push_back(Action::Face { x: face.0, z: face.1 });
@@ -530,10 +604,66 @@ impl Runtime {
         Flow::Continue
     }
 
+    /// A triangulation step the base can drive to and from which the target
+    /// stays in sight over the terrain: as planned, mirrored across the line
+    /// of sight, or shortened. The second value says which (empty: as planned).
+    fn feasible_step(&self, s: &TriStep, from: (f32, f32)) -> (TriStep, &'static str) {
+        let ok = |st: &TriStep| -> bool {
+            let reach = self.world.terrain.cell_of(st.to.0, st.to.1).is_some_and(|c| self.world.plan_route(world_sim::nav::Goal::Cell(c)).is_some());
+            reach && line_of_sight(&self.world.terrain, st.to, EYE_HEIGHT_M, st.face, TARGET_H_M)
+        };
+        if ok(s) {
+            return (s.clone(), "");
+        }
+        let (ux, uz) = {
+            let (dx, dz) = (s.face.0 - from.0, s.face.1 - from.1);
+            let n = dx.hypot(dz).max(1e-3);
+            (dx / n, dz / n)
+        };
+        let mirror = |st: &TriStep| -> TriStep {
+            let (vx, vz) = (st.to.0 - from.0, st.to.1 - from.1);
+            let along = vx * ux + vz * uz;
+            TriStep { to: (from.0 + 2.0 * along * ux - vx, from.1 + 2.0 * along * uz - vz), ..st.clone() }
+        };
+        let shrink = |st: &TriStep, k: f32| -> TriStep {
+            TriStep { to: (from.0 + k * (st.to.0 - from.0), from.1 + k * (st.to.1 - from.1)), step_m: st.step_m * k, baseline_perp_m: st.baseline_perp_m * k, ..st.clone() }
+        };
+        let m = mirror(s);
+        if ok(&m) {
+            return (m, "mirrored");
+        }
+        for k in [0.6f32, 0.35] {
+            let a = shrink(s, k);
+            if ok(&a) {
+                return (a, "short");
+            }
+            let b = shrink(&m, k);
+            if ok(&b) {
+                return (b, "mirrored_short");
+            }
+        }
+        (s.clone(), "unchecked")
+    }
+
+    /// Mass of this quest's items in the bay (what a trip would deliver).
+    fn ml_quest_cargo_kg(&self, t: &MlTask) -> f32 {
+        t.targets
+            .iter()
+            .map(|x| {
+                let given: f32 = t.delivered.iter().filter(|(k, _)| *k == x.resource).map(|(_, a)| *a).sum();
+                self.world.carried_amount(x.item).min((x.picked - given).max(0.0)) * x.item.spec().mass_kg
+            })
+            .sum()
+    }
+
     fn ml_collect(&mut self, t: &mut MlTask) -> Flow {
+        // A piece just broken off is picked next; the rest stays after it.
+        if let Some(p) = t.split_piece.take() {
+            t.drops.insert(t.drop_idx, p);
+        }
         let (picked, wanted) = (t.target().picked, t.target().wanted);
-        if picked >= wanted || t.drop_idx >= t.drops.len() {
-            if picked >= wanted {
+        if picked + AMOUNT_EPS >= wanted as f32 || t.drop_idx >= t.drops.len() {
+            if picked + AMOUNT_EPS >= wanted as f32 {
                 if t.cur + 1 < t.targets.len() {
                     let step = 4 * t.cur + 3;
                     if let Some(q) = self.quests.get_mut(&t.quest) {
@@ -553,22 +683,48 @@ impl Runtime {
                 self.ml_goto(t, MlPhase::Carry, "");
                 return Flow::Continue;
             }
-            self.ml_goto(t, MlPhase::Look, &format!("{picked}/{wanted}개, 더 찾음"));
+            self.ml_goto(t, MlPhase::Look, &format!("{}/{wanted}개, 더 찾음", amount_text(picked)));
             t.look_since_s = self.world.time_s;
             return Flow::Continue;
         }
         let id = t.drops[t.drop_idx];
-        let Some((dx, dz)) = self.world.drop_item(id).map(|d| (d.x, d.z)) else {
+        let Some(d) = self.world.drop_item(id).cloned() else {
             t.drop_idx += 1;
             return Flow::Continue;
         };
-        let dist = (dx - self.world.agent.x).hypot(dz - self.world.agent.z);
+        let dist = (d.x - self.world.agent.x).hypot(d.z - self.world.agent.z);
         if dist > PICKUP_REACH_M - 0.1 {
-            t.queue.push_back(Action::MoveTo { x: dx, z: dz, reach_m: 0.4 });
+            t.queue.push_back(Action::MoveTo { x: d.x, z: d.z, reach_m: 0.4 });
             return Flow::Continue;
         }
-        t.drop_idx += 1;
-        t.queue.push_back(Action::PickUp { drop: id });
+        let dest = t.destination.as_deref().and_then(|k| self.world.waypoint_by_key(k)).map(|w| (w.id, w.x, w.z));
+        let ctx = CargoCtx { quest_cargo_kg: self.ml_quest_cargo_kg(t), destination: dest.map(|w| (w.1, w.2)) };
+        let dec = cargo::decide(&self.world, &d, &ctx);
+        if dec.action != CargoAction::Take {
+            self.log("quest", Level::Info, format!("[ML] 적재 판단 · {} ({})", dec.summary_ko, dec.action.label_ko()), Some(json!({"drop": id, "action": dec.action})));
+        }
+        match dec.action {
+            CargoAction::Take => {
+                t.drop_idx += 1;
+                t.queue.push_back(Action::PickUp { drop: id });
+            }
+            CargoAction::Split { portion } => t.queue.push_back(Action::Split { drop: id, portion }),
+            CargoAction::Shuttle => {
+                let Some((wid, wx, wz)) = dest else { return fail("capacity_exceeded", dec.summary_ko) };
+                if t.trips >= self.cfg.max_trips {
+                    return fail("too_many_trips", format!("[ML] {}회 왕복해도 다 나르지 못했습니다", t.trips));
+                }
+                t.trips += 1;
+                t.queue.push_back(Action::MoveTo { x: wx, z: wz, reach_m: DELIVER_REACH_M - 0.5 });
+                for x in &t.targets {
+                    if self.world.carried_amount(x.item) > AMOUNT_EPS {
+                        t.queue.push_back(Action::Deliver { waypoint: wid, item: Some(x.item) });
+                    }
+                }
+                t.queue.push_back(Action::MoveTo { x: d.x, z: d.z, reach_m: 0.4 });
+            }
+            CargoAction::Refuse => return fail(dec.code.unwrap_or("lift_overload"), format!("[ML] {}", dec.summary_ko)),
+        }
         Flow::Continue
     }
 
@@ -577,6 +733,10 @@ impl Runtime {
         let Some((x, z)) = self.world.waypoint_by_key(&dest).map(|w| (w.x, w.z)) else { return fail("unknown_target", "목적지를 찾을 수 없습니다") };
         let reach = DELIVER_REACH_M - 0.5;
         if (x - self.world.agent.x).hypot(z - self.world.agent.z) <= reach + 0.2 {
+            if t.phase == MlPhase::Goto && t.kind == "drop" {
+                self.ml_goto(t, MlPhase::Unload, "");
+                return Flow::Continue;
+            }
             if t.phase == MlPhase::Goto {
                 return Flow::Done;
             }
@@ -595,10 +755,36 @@ impl Runtime {
         let Some(wid) = self.world.waypoint_by_key(&dest).map(|w| w.id) else { return fail("unknown_target", "목적지를 찾을 수 없습니다") };
         let item = t.targets[t.deliver_idx].item;
         t.deliver_idx += 1;
-        if self.world.carried_count(item) == 0 {
+        if self.world.carried_amount(item) <= AMOUNT_EPS {
             return Flow::Continue;
         }
         t.queue.push_back(Action::Deliver { waypoint: wid, item: Some(item) });
+        Flow::Continue
+    }
+
+    /// Sets down what a drop quest names, as the game pass does.
+    fn ml_unload(&mut self, t: &mut MlTask) -> Flow {
+        if t.unload_started {
+            return if t.unloaded.is_empty() { fail("nothing_to_drop", "[ML] 적재함에 내려놓을 물건이 없습니다") } else { Flow::Done };
+        }
+        t.unload_started = true;
+        if t.drop_items.is_empty() {
+            if self.world.agent.carried.is_empty() {
+                return fail("nothing_to_drop", "[ML] 적재함에 내려놓을 물건이 없습니다");
+            }
+            t.queue.push_back(Action::Drop { item: None, amount: None });
+            return Flow::Continue;
+        }
+        for it in &t.drop_items {
+            let Some(item) = ItemKind::from_id(&it.resource) else { continue };
+            let have = self.world.carried_amount(item);
+            if have > AMOUNT_EPS {
+                t.queue.push_back(Action::Drop { item: Some(item), amount: it.quantity.map(|q| (q as f32).min(have)) });
+            }
+        }
+        if t.queue.is_empty() {
+            return fail("nothing_to_drop", "[ML] 적재함에 내려놓으라는 물건이 없습니다");
+        }
         Flow::Continue
     }
 
@@ -616,8 +802,16 @@ impl Runtime {
                 None => format!("[ML] 완료 — 결정 {}회 · {:.1}초", t.decisions, self.world.time_s - t.started_time_s),
                 Some((_, m)) => format!("[ML] 실패: {m}"),
             },
-            items: if t.kind == "fetch" { t.delivered.clone() } else { t.targets.iter().map(|x| (x.resource.clone(), x.picked)).collect() },
+            items: {
+                let whole = |list: &[(String, f32)]| list.iter().map(|(k, a)| (k.clone(), (a + AMOUNT_EPS).floor() as u32)).collect::<Vec<_>>();
+                match t.kind {
+                    "fetch" => whole(&t.delivered),
+                    "drop" => whole(&t.unloaded),
+                    _ => t.targets.iter().map(|x| (x.resource.clone(), (x.picked + AMOUNT_EPS).floor() as u32)).collect(),
+                }
+            },
             wasted_actions: t.wasted,
+            trips: t.trips + u32::from(t.kind == "fetch" && !t.delivered.is_empty()),
         };
         let tick = self.world.tick;
         if let Some(q) = self.quests.get_mut(&t.quest) {

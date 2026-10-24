@@ -6,20 +6,31 @@
 //! reach, and breaking it tells which kind it really was. That outcome feeds
 //! the SDS, which is how the gates learn from mistakes.
 //!
-//! Two things it is told rather than perceives, both assumptions of this
-//! simulator: where the waypoints are (they are on the map), and which drops a
-//! node just released (the event says so, and they land within reach).
+//! Three things it is told rather than perceives, all assumptions of this
+//! simulator: where the waypoints are (they are on the map), the terrain (a
+//! surveyed site map: routes and lines of sight are planned on it, objects
+//! are not on it), and which drops a node just released (the event says so,
+//! and they land within reach).
+//!
+//! When nothing is in sight after a full turn, the next place to look from is
+//! the reachable viewpoint that shows the most ground not seen yet
+//! (`world_sim::explore`): behind a mesa or a ridge rather than the nearest
+//! grid point. Before each pick-up the cargo decision (`crate::cargo`) says
+//! whether to take the piece, make a trip with what is aboard first, or break
+//! the piece and take part of it.
 
 use hand_quest::{QuestResult, State};
 use hand_sds::{Level, Scope, Track};
-use hand_search::Plan;
+use hand_search::{DropTarget, Plan};
 use serde_json::json;
+use world_sim::explore::{Coverage, Viewpoint};
 use world_sim::nav::Goal;
-use world_sim::world::{DELIVER_REACH_M, MINE_REACH_M, PICKUP_REACH_M};
-use world_sim::{Action, ActionError, ItemKind, NodeKind, TimedEvent, WorldEvent};
+use world_sim::world::{AMOUNT_EPS, DELIVER_REACH_M, EYE_HEIGHT_M, MINE_REACH_M, PICKUP_REACH_M};
+use world_sim::{amount_text, Action, ActionError, ItemKind, NodeKind, TimedEvent, WorldEvent};
 
 use hand_search::text::eul_reul;
 
+use crate::cargo::{self, CargoAction, CargoCtx, CargoDecision};
 use crate::perception::EntKind;
 use crate::precision::LmState;
 use crate::runtime::Runtime;
@@ -33,6 +44,7 @@ pub(crate) enum Phase {
     Carry,
     Deliver,
     Goto,
+    Unload,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -42,6 +54,10 @@ pub(crate) enum MoveFor {
     Drop,
     Carry,
     Goto,
+    /// A round trip: out to the destination with the load that is aboard.
+    Shuttle,
+    /// A round trip: back to where the rest is lying.
+    Return,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -51,6 +67,8 @@ pub(crate) enum Act {
     Mine(u32),
     Pick(u32),
     Deliver(ItemKind),
+    Split(u32),
+    Unload,
 }
 
 #[derive(Clone, Debug)]
@@ -58,8 +76,23 @@ pub(crate) struct TaskTarget {
     pub resource: String,
     pub item: ItemKind,
     pub wanted: u32,
-    pub picked: u32,
+    /// Items lifted into the bay so far (half a stone is 0.5).
+    pub picked: f32,
     pub label_ko: String,
+}
+
+/// Where a round trip stands.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum TripStage {
+    Out,
+    Unload,
+    Back,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Trip {
+    pub back: (f32, f32),
+    pub stage: TripStage,
 }
 
 pub(crate) enum Flow {
@@ -82,6 +115,8 @@ pub(crate) struct Task {
     pub act: Option<Act>,
     pub done: Option<(bool, Option<String>)>,
     pub broken: Option<(String, NodeKind, Vec<String>)>,
+    /// The piece the last split broke off.
+    pub split_piece: Option<u32>,
     pub started_tick: u64,
     pub started_time_s: f64,
     pub started_energy_j: f64,
@@ -98,25 +133,50 @@ pub(crate) struct Task {
     pub target_lm: Option<u32>,
     pub approach_tries: u32,
     pub approach_scan_cd: u32,
+    /// What the camera has looked at during this quest (terrain occludes).
+    pub coverage: Coverage,
+    /// Heading to turn to after reaching a viewpoint.
+    pub face_after: Option<f32>,
     // collecting
     pub drops: Vec<u32>,
     pub drop_idx: usize,
     pub rounds: u32,
     pub pick_retry: bool,
+    pub trip: Option<Trip>,
+    /// Round trips made before the last carry.
+    pub trips: u32,
+    pub last_cargo: Option<(u32, String)>,
     // delivering
     pub deliver_idx: usize,
+    // setting down (drop quests)
+    pub drop_items: Vec<DropTarget>,
+    pub unload_idx: usize,
+    pub unloaded: Vec<(String, f32)>,
+    pub unload_place: Option<String>,
     /// Times each quest step was entered (index as in the quest).
     pub attempts: Vec<u32>,
     // result
     pub touch_ok: u32,
     pub touch_miss: u32,
     pub wasted: u32,
-    pub delivered: Vec<(String, u32)>,
+    pub delivered: Vec<(String, f32)>,
+}
+
+fn add_amount(list: &mut Vec<(String, f32)>, id: &str, a: f32) {
+    match list.iter_mut().find(|(k, _)| k == id) {
+        Some(e) => e.1 += a,
+        None => list.push((id.to_string(), a)),
+    }
+}
+
+fn amount_of(list: &[(String, f32)], id: &str) -> f32 {
+    list.iter().filter(|(k, _)| k == id).map(|(_, a)| *a).sum()
 }
 
 impl Task {
     pub(crate) fn from_plan(quest: &str, plan: &Plan, world: &world_sim::World) -> Result<Task, (String, String)> {
         let mut targets = Vec::new();
+        let mut drop_items = Vec::new();
         let (kind, destination) = match plan {
             Plan::Fetch { targets: ts, destination } => {
                 for t in ts {
@@ -131,6 +191,13 @@ impl Task {
                 ("collect", None)
             }
             Plan::Goto { place } => ("goto", Some(place.place.clone())),
+            Plan::Drop { items, place } => {
+                for t in items {
+                    ItemKind::from_id(&t.resource).ok_or_else(|| ("unknown_target".to_string(), format!("'{}'은(는) 이 월드에 없는 물건입니다", t.resource)))?;
+                }
+                drop_items = items.clone();
+                ("drop", place.as_ref().map(|p| p.place.clone()))
+            }
             Plan::Stop => return Err(("stop".into(), "중지 명령은 퀘스트가 아닙니다".into())),
         };
         if let Some(d) = &destination {
@@ -138,10 +205,16 @@ impl Task {
                 return Err(("unknown_target".into(), format!("지도에 '{d}' 지점이 없습니다")));
             }
         }
-        let phase = if kind == "goto" { Phase::Goto } else { Phase::Locate };
+        let phase = match kind {
+            "goto" => Phase::Goto,
+            "drop" if destination.is_some() => Phase::Goto,
+            "drop" => Phase::Unload,
+            _ => Phase::Locate,
+        };
         let n_steps = match kind {
             "fetch" => 4 * targets.len() + 2,
             "collect" => 4 * targets.len(),
+            "drop" if destination.is_some() => 2,
             _ => 1,
         };
         Ok(Task {
@@ -154,6 +227,7 @@ impl Task {
             act: None,
             done: None,
             broken: None,
+            split_piece: None,
             started_tick: world.tick,
             started_time_s: world.time_s,
             started_energy_j: world.agent.energy_used_j,
@@ -169,11 +243,20 @@ impl Task {
             target_lm: None,
             approach_tries: 0,
             approach_scan_cd: 0,
+            coverage: Coverage::new(&world.terrain),
+            face_after: None,
             drops: Vec::new(),
             drop_idx: 0,
             rounds: 0,
             pick_retry: false,
+            trip: None,
+            trips: 0,
+            last_cargo: None,
             deliver_idx: 0,
+            drop_items,
+            unload_idx: 0,
+            unloaded: Vec::new(),
+            unload_place: None,
             attempts: {
                 let mut a = vec![0u32; n_steps];
                 a[0] = 1;
@@ -196,6 +279,7 @@ impl Task {
             Phase::Carry => 4 * n,
             Phase::Deliver => 4 * n + 1,
             Phase::Goto => 0,
+            Phase::Unload => usize::from(self.destination.is_some()),
         }
     }
 
@@ -219,7 +303,7 @@ impl Task {
 
 fn make_target(t: &hand_search::Target) -> Result<TaskTarget, (String, String)> {
     let item = ItemKind::from_id(&t.resource).ok_or_else(|| ("unknown_target".to_string(), format!("'{}'은(는) 이 월드에 없는 자원입니다", t.resource)))?;
-    Ok(TaskTarget { resource: t.resource.clone(), item, wanted: t.quantity.max(1), picked: 0, label_ko: item.spec().label_ko.to_string() })
+    Ok(TaskTarget { resource: t.resource.clone(), item, wanted: t.quantity.max(1), picked: 0.0, label_ko: item.spec().label_ko.to_string() })
 }
 
 pub(crate) fn action_error_ko(e: &ActionError) -> String {
@@ -235,6 +319,9 @@ pub(crate) fn action_error_ko(e: &ActionError) -> String {
         }
         ActionError::NothingToDeliver => "인도할 물건이 없습니다".into(),
         ActionError::LiftOverload { limiting, margin } => format!("팔·자세가 들 수 없습니다 ({limiting}, 균형 여유 {margin:.2})"),
+        ActionError::NothingToDrop => "적재함에 내려놓을 물건이 없습니다".into(),
+        ActionError::NotDivisible => "이 물건은 손으로 쪼갤 수 없습니다".into(),
+        ActionError::PieceTooSmall { amount } => format!("조각이 너무 작아 더 쪼갤 수 없습니다 ({} 개)", amount_text(*amount)),
     }
 }
 
@@ -301,18 +388,17 @@ impl Runtime {
             match &te.event {
                 WorldEvent::ActionDone { ok, reason, .. } => t.done = Some((*ok, reason.clone())),
                 WorldEvent::NodeBroken { node, kind, drops } => t.broken = Some((node.clone(), *kind, drops.clone())),
-                WorldEvent::ItemPicked { item, .. } => {
+                WorldEvent::ItemPicked { item, amount, .. } => {
                     if let Some(x) = t.targets.iter_mut().find(|x| x.item == *item) {
-                        x.picked += 1;
+                        x.picked += *amount;
                     }
                 }
-                WorldEvent::Delivered { item, count, .. } => {
-                    let id = item.id().to_string();
-                    match t.delivered.iter_mut().find(|(k, _)| *k == id) {
-                        Some(e) => e.1 += *count,
-                        None => t.delivered.push((id, *count)),
-                    }
+                WorldEvent::Delivered { item, amount, .. } => add_amount(&mut t.delivered, item.id(), *amount),
+                WorldEvent::ItemDropped { item, amount, waypoint, .. } => {
+                    add_amount(&mut t.unloaded, item.id(), *amount);
+                    t.unload_place = waypoint.clone();
                 }
+                WorldEvent::ItemSplit { piece, .. } => t.split_piece = parse_id(piece),
                 WorldEvent::BatteryDepleted => return fail("battery_depleted", "배터리가 방전되어 멈췄습니다"),
                 _ => {}
             }
@@ -378,6 +464,7 @@ impl Runtime {
             Phase::Carry => self.do_carry(t),
             Phase::Deliver => self.do_deliver(t),
             Phase::Goto => self.do_goto(t),
+            Phase::Unload => self.do_unload(t),
         }
     }
 
@@ -406,6 +493,19 @@ impl Runtime {
             .filter(|l| l.confirmed && l.state == LmState::Active && l.kind == EntKind::Source && &l.link == want)
             .min_by(|a, b| a.distance_to(ax, az).total_cmp(&b.distance_to(ax, az)))
             .map(|l| l.id)
+    }
+
+    /// Marks what the camera sees from here into the quest's coverage.
+    pub(crate) fn mark_coverage(&self, cov: &mut Coverage) {
+        let eye = self.cam.eye(&self.world);
+        cov.look(&self.world.terrain, &eye, self.world.agent.yaw, self.cam.fov_deg);
+    }
+
+    /// The next viewpoint for a search (see `world_sim::explore`).
+    pub(crate) fn search_viewpoint(&self, cov: &Coverage, avoid: &[(f32, f32)]) -> Option<Viewpoint> {
+        let blocked = self.world.blocked_cells();
+        let start = self.world.terrain.cell_of(self.world.agent.x, self.world.agent.z)?;
+        world_sim::explore::next_viewpoint(&self.world.terrain, &self.world.drive_spec(), &|x, z| blocked.contains(&(x, z)), start, cov, EYE_HEIGHT_M, self.cam.pitch_deg, self.cam.vfov_deg(), avoid)
     }
 
     fn do_locate(&mut self, t: &mut Task) -> Flow {
@@ -437,6 +537,7 @@ impl Runtime {
                 self.log("vision", Level::Error, format!("인식 실패: {e}"), None);
                 return fail("perception_failed", format!("인식기가 실패했습니다: {e}"));
             }
+            self.mark_coverage(&mut t.coverage);
             t.scans_here += 1;
             t.scan_cooldown = self.cfg.scan_every_ticks;
             return Flow::Continue;
@@ -447,14 +548,14 @@ impl Runtime {
             let yaw = self.world.agent.yaw.to_degrees() + self.cfg.rotate_deg;
             t.rotations += 1;
             t.scans_here = 0;
-            let note = format!("탐색 중 · 회전 {}/{}회 · 이동 {}회", t.rotations, rot_max, t.relocations);
+            let note = format!("탐색 중 · 회전 {}/{}회 · 이동 {}회 · 지형 {:.0}% 확인", t.rotations, rot_max, t.relocations, t.coverage.land_frac(&self.world.terrain) * 100.0);
             self.progress(t, t.rotations as f32 / (rot_max + 1) as f32, Some(note));
             return match self.issue(t, Action::Turn { yaw_deg: yaw }, Act::Turn) {
                 Ok(()) => Flow::Continue,
                 Err(e) => fail(e.code(), action_error_ko(&e)),
             };
         }
-        // A full turn without finding it: move to the nearest unvisited spot.
+        // A full turn without finding it: go where the most unseen ground is in view.
         t.visited.push((self.world.agent.x, self.world.agent.z));
         t.relocations += 1;
         if t.relocations > self.cfg.max_relocations {
@@ -464,40 +565,25 @@ impl Runtime {
         t.rotations = 0;
         t.scans_here = 0;
         loop {
-            let Some((x, z)) = self.next_search_point(t) else {
+            let Some(v) = self.search_viewpoint(&t.coverage, &t.visited) else {
                 let name = t.target().label_ko.clone();
-                return fail("locate_timeout", format!("{name}{} 찾지 못했습니다 (더 갈 곳이 없음)", eul_reul(&name)));
+                let seen = t.coverage.land_frac(&self.world.terrain) * 100.0;
+                return fail("locate_timeout", format!("{name}{} 찾지 못했습니다 (갈 수 있는 곳에서 볼 수 있는 땅을 다 봄 · {seen:.0}%)", eul_reul(&name)));
             };
-            t.visited.push((x, z));
-            self.log("quest", Level::Info, format!("{} 탐색: ({x:.0}, {z:.0})로 이동", t.target().label_ko), None);
-            match self.issue(t, Action::MoveTo { x, z, reach_m: 1.0 }, Act::Move(MoveFor::Search)) {
+            t.visited.push((v.x, v.z));
+            t.face_after = Some(v.face_yaw);
+            self.log(
+                "quest",
+                Level::Info,
+                format!("{} 탐색: 시점 ({:.1}, {:.1})로 이동 — 안 본 곳 {}칸, 약 {:.0}초", t.target().label_ko, v.x, v.z, v.gain, v.time_s),
+                Some(json!({"viewpoint": [v.x, v.z], "gain": v.gain, "time_s": v.time_s, "seen_frac": t.coverage.land_frac(&self.world.terrain)})),
+            );
+            match self.issue(t, Action::MoveTo { x: v.x, z: v.z, reach_m: 0.0 }, Act::Move(MoveFor::Search)) {
                 Ok(()) => return Flow::Continue,
                 Err(ActionError::NoPath) | Err(ActionError::UnknownTarget) => continue,
                 Err(e) => return fail(e.code(), action_error_ko(&e)),
             }
         }
-    }
-
-    /// Nearest point of an 8 m grid that has not been visited, nearest first.
-    fn next_search_point(&self, t: &Task) -> Option<(f32, f32)> {
-        let (w, d) = self.world.terrain.size_m();
-        let step = 8.0;
-        let mut best: Option<((f32, f32), f32)> = None;
-        let mut gx = step * 0.5;
-        while gx < w - 2.0 {
-            let mut gz = step * 0.5;
-            while gz < d - 2.0 {
-                if t.visited.iter().all(|(vx, vz)| ((vx - gx).powi(2) + (vz - gz).powi(2)).sqrt() > step * 0.6) {
-                    let dist = ((gx - self.world.agent.x).powi(2) + (gz - self.world.agent.z).powi(2)).sqrt();
-                    if best.map_or(true, |(_, bd)| dist < bd) {
-                        best = Some(((gx, gz), dist));
-                    }
-                }
-                gz += step;
-            }
-            gx += step;
-        }
-        best.map(|(p, _)| p)
     }
 
     fn do_approach(&mut self, t: &mut Task) -> Flow {
@@ -592,35 +678,64 @@ impl Runtime {
         }
     }
 
+    /// Mass of this quest's items in the bay (what a trip would deliver).
+    fn quest_cargo_kg(&self, t: &Task) -> f32 {
+        t.targets
+            .iter()
+            .map(|x| {
+                let mine = (x.picked - amount_of(&t.delivered, &x.resource)).max(0.0);
+                self.world.carried_amount(x.item).min(mine) * x.item.spec().mass_kg
+            })
+            .sum()
+    }
+
+    /// Logs a cargo decision once per piece and action, and records it in the SDS.
+    fn note_cargo(&mut self, t: &mut Task, id: u32, dec: &CargoDecision) {
+        let key = (id, format!("{}:{:.3}", dec.action.key(), dec.portion));
+        if t.last_cargo.as_ref() == Some(&key) {
+            return;
+        }
+        t.last_cargo = Some(key);
+        let level = if dec.action == CargoAction::Take { Level::Debug } else { Level::Info };
+        let gates: Vec<serde_json::Value> = dec.gates.iter().map(|g| json!({"id": g.id, "value": g.value, "limit": g.limit, "severity": g.severity, "action": g.action.key(), "message": g.message})).collect();
+        self.log("quest", level, format!("적재 판단 · {} ({})", dec.summary_ko, dec.action.label_ko()), Some(json!({"drop": id, "action": dec.action, "rule": dec.rule_action, "gates": gates})));
+        let scope = Scope::new(Track::Motion, "cargo", &dec.item);
+        self.sds.record_baseline(&scope, "portion", dec.portion as f64);
+        self.sds.record_agreement(&scope, "whole", dec.action == CargoAction::Take);
+    }
+
     fn do_collect(&mut self, t: &mut Task) -> Flow {
+        if let Some(flow) = self.trip_step(t) {
+            return flow;
+        }
         loop {
             let (need_more, name) = {
                 let x = t.target();
-                (x.picked < x.wanted, x.label_ko.clone())
+                (x.picked + AMOUNT_EPS < x.wanted as f32, x.label_ko.clone())
             };
             if !need_more || t.drop_idx >= t.drops.len() {
                 let (picked, wanted) = (t.target().picked, t.target().wanted);
-                if picked >= wanted {
+                if picked + AMOUNT_EPS >= wanted as f32 {
                     return self.next_target(t);
                 }
                 t.rounds += 1;
                 if t.rounds > self.cfg.max_rounds {
-                    return fail("not_enough", format!("{name} {wanted}개 중 {picked}개만 모았습니다 (더 캘 곳을 찾지 못함)"));
+                    return fail("not_enough", format!("{name} {wanted}개 중 {}개만 모았습니다 (더 캘 곳을 찾지 못함)", amount_text(picked)));
                 }
-                self.goto_phase(t, Phase::Locate, &format!("{name} {picked}/{wanted}개, 더 찾음"));
+                self.goto_phase(t, Phase::Locate, &format!("{name} {}/{wanted}개, 더 찾음", amount_text(picked)));
                 t.reset_locate();
                 t.locate_since_s = self.world.time_s;
                 return Flow::Continue;
             }
             let id = t.drops[t.drop_idx];
-            let Some((dx, dz)) = self.world.drop_item(id).map(|d| (d.x, d.z)) else {
+            let Some(d) = self.world.drop_item(id).cloned() else {
                 t.drop_idx += 1;
                 continue;
             };
-            let dist = ((dx - self.world.agent.x).powi(2) + (dz - self.world.agent.z).powi(2)).sqrt();
+            let dist = ((d.x - self.world.agent.x).powi(2) + (d.z - self.world.agent.z).powi(2)).sqrt();
             if dist > PICKUP_REACH_M - 0.1 {
-                t.act_predicted_s = self.world.plan_route(Goal::Within { x: dx, z: dz, reach_m: 0.4 }).map(|p| p.time_s);
-                return match self.issue(t, Action::MoveTo { x: dx, z: dz, reach_m: 0.4 }, Act::Move(MoveFor::Drop)) {
+                t.act_predicted_s = self.world.plan_route(Goal::Within { x: d.x, z: d.z, reach_m: 0.4 }).map(|p| p.time_s);
+                return match self.issue(t, Action::MoveTo { x: d.x, z: d.z, reach_m: 0.4 }, Act::Move(MoveFor::Drop)) {
                     Ok(()) => Flow::Continue,
                     Err(ActionError::NoPath) => {
                         self.log("quest", Level::Warn, format!("떨어진 {name}에게 갈 경로가 없어 건너뜀"), None);
@@ -630,11 +745,37 @@ impl Runtime {
                     Err(e) => fail(e.code(), action_error_ko(&e)),
                 };
             }
+            // The cargo decision: take it, make a trip first, or break it.
+            let ctx = CargoCtx { quest_cargo_kg: self.quest_cargo_kg(t), destination: self.waypoint_of(t).map(|(_, x, z, _)| (x, z)) };
+            let dec = cargo::decide(&self.world, &d, &ctx);
+            self.note_cargo(t, id, &dec);
+            match dec.action {
+                CargoAction::Take => {}
+                CargoAction::Split { portion } => {
+                    let (picked, wanted) = (t.target().picked, t.target().wanted);
+                    self.progress(t, picked / wanted as f32, Some(format!("{}개 · {name} 쪼개는 중 ({:.0}%만 들 수 있음)", amount_text(picked), portion * 100.0)));
+                    return match self.issue(t, Action::Split { drop: id, portion }, Act::Split(id)) {
+                        Ok(()) => Flow::Continue,
+                        Err(e) => fail(e.code(), action_error_ko(&e)),
+                    };
+                }
+                CargoAction::Shuttle => {
+                    if t.trips >= self.cfg.max_trips {
+                        return fail("too_many_trips", format!("{}회 왕복해도 다 나르지 못했습니다", t.trips));
+                    }
+                    t.trips += 1;
+                    t.trip = Some(Trip { back: (d.x, d.z), stage: TripStage::Out });
+                    let dest = self.waypoint_of(t).map(|w| w.3).unwrap_or_default();
+                    self.log("quest", Level::Info, format!("{} · 왕복 {}회차: 실은 짐을 {dest}에 내려놓고 {name}에게 돌아옴", t.quest, t.trips), Some(json!({"trip": t.trips, "carried_kg": self.world.carried_kg(), "capacity_kg": self.world.capacity_kg()})));
+                    return self.trip_step(t).unwrap_or(Flow::Continue);
+                }
+                CargoAction::Refuse => return fail(dec.code.unwrap_or("lift_overload"), dec.summary_ko.clone()),
+            }
             return match self.issue(t, Action::PickUp { drop: id }, Act::Pick(id)) {
                 Ok(()) => Flow::Continue,
                 Err(ActionError::OutOfReach { .. }) if !t.pick_retry => {
                     t.pick_retry = true;
-                    match self.issue(t, Action::MoveTo { x: dx, z: dz, reach_m: 0.2 }, Act::Move(MoveFor::Drop)) {
+                    match self.issue(t, Action::MoveTo { x: d.x, z: d.z, reach_m: 0.2 }, Act::Move(MoveFor::Drop)) {
                         Ok(()) => Flow::Continue,
                         Err(e) => fail(e.code(), action_error_ko(&e)),
                     }
@@ -644,11 +785,60 @@ impl Runtime {
                     let picked = t.target().picked;
                     fail(
                         "capacity_exceeded",
-                        format!("적재 한도를 넘습니다 — 이 베이스는 {name}{} {}개까지 실을 수 있습니다 (현재 {picked}개 실음)", eul_reul(&name), picked + fit as u32),
+                        format!("적재 한도를 넘습니다 — 이 베이스는 {name}{} {}개까지 실을 수 있습니다 (현재 {}개 실음)", eul_reul(&name), amount_text(picked + fit), amount_text(picked)),
                     )
                 }
                 Err(e) => fail(e.code(), action_error_ko(&e)),
             };
+        }
+    }
+
+    /// Advances a round trip: out to the destination, the quest's items onto
+    /// its pile, back to the rest. `None` when no trip is going on.
+    fn trip_step(&mut self, t: &mut Task) -> Option<Flow> {
+        let trip = t.trip?;
+        let (wid, x, z, place) = self.waypoint_of(t)?;
+        let reach = DELIVER_REACH_M - 0.5;
+        let name = t.target().label_ko.clone();
+        match trip.stage {
+            TripStage::Out => {
+                if (x - self.world.agent.x).hypot(z - self.world.agent.z) <= reach + 0.2 {
+                    t.trip = Some(Trip { stage: TripStage::Unload, ..trip });
+                    return self.trip_step(t);
+                }
+                t.act_distance0 = (x - self.world.agent.x).hypot(z - self.world.agent.z);
+                self.progress(t, t.target().picked / t.target().wanted as f32, Some(format!("왕복 {}회차 · {place}로 운반 중", t.trips)));
+                Some(match self.issue(t, Action::MoveTo { x, z, reach_m: reach }, Act::Move(MoveFor::Shuttle)) {
+                    Ok(()) => Flow::Continue,
+                    Err(ActionError::NoPath) => fail("no_path", format!("{place}까지 갈 경로가 없습니다 (짐을 실은 채로는 지나갈 수 없는 지형)")),
+                    Err(e) => fail(e.code(), action_error_ko(&e)),
+                })
+            }
+            TripStage::Unload => {
+                let next = t.targets.iter().find(|x| self.world.carried_amount(x.item) > AMOUNT_EPS && x.picked > amount_of(&t.delivered, &x.resource) + AMOUNT_EPS).map(|x| x.item);
+                match next {
+                    Some(item) => Some(match self.issue(t, Action::Deliver { waypoint: wid, item: Some(item) }, Act::Deliver(item)) {
+                        Ok(()) => Flow::Continue,
+                        Err(e) => fail(e.code(), action_error_ko(&e)),
+                    }),
+                    None => {
+                        t.trip = Some(Trip { stage: TripStage::Back, ..trip });
+                        self.trip_step(t)
+                    }
+                }
+            }
+            TripStage::Back => {
+                let (bx, bz) = trip.back;
+                if (bx - self.world.agent.x).hypot(bz - self.world.agent.z) <= PICKUP_REACH_M - 0.1 {
+                    t.trip = None;
+                    return None;
+                }
+                self.progress(t, t.target().picked / t.target().wanted as f32, Some(format!("왕복 {}회차 · {name}에게 돌아가는 중", t.trips)));
+                Some(match self.issue(t, Action::MoveTo { x: bx, z: bz, reach_m: 0.4 }, Act::Move(MoveFor::Return)) {
+                    Ok(()) => Flow::Continue,
+                    Err(e) => fail(e.code(), action_error_ko(&e)),
+                })
+            }
         }
     }
 
@@ -706,7 +896,7 @@ impl Runtime {
         let Some((wid, ..)) = self.waypoint_of(t) else { return fail("unknown_target", "목적지를 찾을 수 없습니다") };
         while t.deliver_idx < t.targets.len() {
             let item = t.targets[t.deliver_idx].item;
-            if self.world.carried_count(item) == 0 {
+            if self.world.carried_amount(item) <= AMOUNT_EPS {
                 t.deliver_idx += 1;
                 continue;
             }
@@ -723,7 +913,7 @@ impl Runtime {
         let reach = DELIVER_REACH_M - 0.5;
         let dist = ((x - self.world.agent.x).powi(2) + (z - self.world.agent.z).powi(2)).sqrt();
         if dist <= reach + 0.2 {
-            return Flow::Done;
+            return self.after_goto(t);
         }
         t.act_predicted_s = self.world.plan_route(Goal::Within { x, z, reach_m: reach }).map(|p| p.time_s);
         t.act_distance0 = dist;
@@ -734,6 +924,52 @@ impl Runtime {
         }
     }
 
+    /// At the place: a walk ends, a drop quest sets its items down.
+    fn after_goto(&mut self, t: &mut Task) -> Flow {
+        if t.kind == "drop" {
+            self.goto_phase(t, Phase::Unload, "");
+            return Flow::Continue;
+        }
+        Flow::Done
+    }
+
+    /// Sets down what a drop quest names (everything when it names nothing).
+    fn do_unload(&mut self, t: &mut Task) -> Flow {
+        if t.drop_items.is_empty() {
+            if t.unload_idx > 0 {
+                return Flow::Done;
+            }
+            t.unload_idx = 1;
+            return match self.issue(t, Action::Drop { item: None, amount: None }, Act::Unload) {
+                Ok(()) => Flow::Continue,
+                Err(e) => fail(e.code(), action_error_ko(&e)),
+            };
+        }
+        while t.unload_idx < t.drop_items.len() {
+            let it = t.drop_items[t.unload_idx].clone();
+            t.unload_idx += 1;
+            let Some(item) = ItemKind::from_id(&it.resource) else { continue };
+            let have = self.world.carried_amount(item);
+            if have <= AMOUNT_EPS {
+                self.log("quest", Level::Warn, format!("적재함에 {}{} 없어 건너뜀", item.spec().label_ko, hand_search::text::i_ga(item.spec().label_ko)), None);
+                continue;
+            }
+            let amount = it.quantity.map(|q| (q as f32).min(have));
+            if let Some(q) = it.quantity.filter(|q| (*q as f32) > have + AMOUNT_EPS) {
+                self.log("quest", Level::Warn, format!("{} {q}개를 내려놓으라 했지만 {}개만 있어 그만큼 내려놓음", item.spec().label_ko, amount_text(have)), None);
+            }
+            return match self.issue(t, Action::Drop { item: Some(item), amount }, Act::Unload) {
+                Ok(()) => Flow::Continue,
+                Err(e) => fail(e.code(), action_error_ko(&e)),
+            };
+        }
+        if t.unloaded.is_empty() {
+            let names: Vec<&str> = t.drop_items.iter().filter_map(|x| ItemKind::from_id(&x.resource)).map(|k| k.spec().label_ko).collect();
+            return fail("nothing_to_drop", format!("적재함에 {}{} 없습니다", names.join(", "), hand_search::text::i_ga(names.last().copied().unwrap_or("물건"))));
+        }
+        Flow::Done
+    }
+
     // ----- while an action runs -----
 
     fn while_running(&mut self, t: &mut Task, act: &Act) {
@@ -741,7 +977,9 @@ impl Runtime {
             Act::Move(MoveFor::Approach(_)) => {
                 if t.approach_scan_cd == 0 {
                     t.approach_scan_cd = self.cfg.approach_scan_every_ticks;
-                    let _ = self.scan_now("approach");
+                    if self.scan_now("approach").is_ok() {
+                        self.mark_coverage(&mut t.coverage);
+                    }
                 } else {
                     t.approach_scan_cd -= 1;
                 }
@@ -757,7 +995,8 @@ impl Runtime {
                 if let Some((_, x, z, _)) = self.waypoint_of(t) {
                     let d = ((x - self.world.agent.x).powi(2) + (z - self.world.agent.z).powi(2)).sqrt();
                     let p = 1.0 - (d / t.act_distance0.max(0.1)).clamp(0.0, 1.0);
-                    self.progress(t, p, Some(format!("남은 거리 {d:.1} m")));
+                    let trips = if t.trips > 0 { format!(" · 왕복 {}회 뒤 마지막 운반", t.trips) } else { String::new() };
+                    self.progress(t, p, Some(format!("남은 거리 {d:.1} m{trips}")));
                 }
             }
             Act::Mine(node) => {
@@ -799,6 +1038,12 @@ impl Runtime {
             Act::Move(MoveFor::Search) => {
                 t.scan_cooldown = 0;
                 t.scans_here = 0;
+                // Look first where the planner expected the most unseen ground.
+                if let Some(yaw) = t.face_after.take() {
+                    if let Err(e) = self.issue(t, Action::Turn { yaw_deg: yaw.to_degrees() }, Act::Turn) {
+                        return fail(e.code(), action_error_ko(&e));
+                    }
+                }
                 Flow::Continue
             }
             Act::Move(MoveFor::Approach(_)) => {
@@ -810,6 +1055,16 @@ impl Runtime {
                 self.calibrate_move(t, elapsed);
                 Flow::Continue
             }
+            Act::Move(MoveFor::Shuttle) => {
+                if let Some(tr) = t.trip {
+                    t.trip = Some(Trip { stage: TripStage::Unload, ..tr });
+                }
+                Flow::Continue
+            }
+            Act::Move(MoveFor::Return) => {
+                t.trip = None;
+                Flow::Continue
+            }
             Act::Move(MoveFor::Carry) => {
                 self.calibrate_move(t, elapsed);
                 self.goto_phase(t, Phase::Deliver, "");
@@ -817,20 +1072,30 @@ impl Runtime {
             }
             Act::Move(MoveFor::Goto) => {
                 self.calibrate_move(t, elapsed);
-                Flow::Done
+                self.after_goto(t)
             }
             Act::Mine(node) => self.after_mine(t, node, elapsed),
             Act::Pick(_) => {
                 t.drop_idx += 1;
                 t.pick_retry = false;
                 let (picked, wanted) = (t.target().picked, t.target().wanted);
-                self.progress(t, picked as f32 / wanted as f32, Some(format!("{picked}/{wanted}개")));
+                self.progress(t, (picked / wanted as f32).min(1.0), Some(format!("{}/{wanted}개", amount_text(picked))));
+                Flow::Continue
+            }
+            Act::Split(_) => {
+                // The broken-off piece is picked next; the rest stays in the list after it.
+                if let Some(p) = t.split_piece.take() {
+                    t.drops.insert(t.drop_idx, p);
+                }
                 Flow::Continue
             }
             Act::Deliver(_) => {
-                t.deliver_idx += 1;
+                if t.trip.is_none() {
+                    t.deliver_idx += 1;
+                }
                 Flow::Continue
             }
+            Act::Unload => Flow::Continue,
         }
     }
 
@@ -899,7 +1164,12 @@ impl Runtime {
     // ----- ending -----
 
     fn result_of(&self, t: &Task, summary: String) -> QuestResult {
-        let items: Vec<(String, u32)> = if t.kind == "fetch" { t.delivered.clone() } else { t.targets.iter().map(|x| (x.resource.clone(), x.picked)).collect() };
+        let whole = |list: &[(String, f32)]| list.iter().map(|(k, a)| (k.clone(), (a + AMOUNT_EPS).floor() as u32)).collect::<Vec<_>>();
+        let items: Vec<(String, u32)> = match t.kind {
+            "fetch" => whole(&t.delivered),
+            "drop" => whole(&t.unloaded),
+            _ => t.targets.iter().map(|x| (x.resource.clone(), (x.picked + AMOUNT_EPS).floor() as u32)).collect(),
+        };
         QuestResult {
             ticks: self.world.tick - t.started_tick,
             time_s: self.world.time_s - t.started_time_s,
@@ -908,29 +1178,39 @@ impl Runtime {
             summary,
             items,
             wasted_actions: t.wasted,
+            trips: t.trips + u32::from(t.kind == "fetch" && !t.delivered.is_empty()),
         }
     }
 
     fn finish_task(&mut self, t: Task) {
-        let items_ko = |items: &[(String, u32)]| -> String {
+        let items_ko = |items: &[(String, f32)]| -> String {
             items
                 .iter()
-                .map(|(r, n)| format!("{} {n}개", ItemKind::from_id(r).map(|k| k.spec().label_ko.to_string()).unwrap_or_else(|| r.clone())))
+                .map(|(r, n)| format!("{} {}개", ItemKind::from_id(r).map(|k| k.spec().label_ko.to_string()).unwrap_or_else(|| r.clone()), amount_text(*n)))
                 .collect::<Vec<_>>()
                 .join(", ")
         };
         let dest_ko = t.destination.as_deref().and_then(|k| self.world.waypoint_by_key(k)).map(|w| w.label_ko.clone()).unwrap_or_default();
         let mut r = self.result_of(&t, String::new());
         let tail = format!(
-            "{:.1}초 · {:.0} J{}{}",
+            "{:.1}초 · {:.0} J{}{}{}",
             r.time_s,
             r.energy_j,
             r.precision.map(|p| format!(" · 접촉 확인 정밀도 {:.0}%", p * 100.0)).unwrap_or_default(),
-            if r.wasted_actions > 0 { format!(" · 헛수고 {}회", r.wasted_actions) } else { String::new() }
+            if r.wasted_actions > 0 { format!(" · 헛수고 {}회", r.wasted_actions) } else { String::new() },
+            if r.trips > 1 { format!(" · {}회 왕복", r.trips) } else { String::new() }
         );
+        let picked: Vec<(String, f32)> = t.targets.iter().map(|x| (x.resource.clone(), x.picked)).collect();
         r.summary = match t.kind {
-            "fetch" => format!("{}{} {dest_ko}에 인도했습니다 — {tail}", items_ko(&r.items), eul_reul(&items_ko(&r.items))),
-            "collect" => format!("{} 채취 완료 — {tail}", items_ko(&r.items)),
+            "fetch" => format!("{}{} {dest_ko}에 인도했습니다 — {tail}", items_ko(&t.delivered), eul_reul(&items_ko(&t.delivered))),
+            "collect" => format!("{} 채취 완료 — {tail}", items_ko(&picked)),
+            "drop" => {
+                let at = match &t.unload_place {
+                    Some(w) => self.world.waypoints.iter().find(|p| world_sim::snapshot::waypoint_id(p.id) == *w).map(|p| format!("{}에 쌓음", p.label_ko)).unwrap_or_default(),
+                    None => "땅에 내려놓음".to_string(),
+                };
+                format!("{}{} 내려놓았습니다 ({at}) — {tail}", items_ko(&t.unloaded), eul_reul(&items_ko(&t.unloaded)))
+            }
             _ => format!("{dest_ko}에 도착했습니다 — {tail}"),
         };
         let last = t.step_of(&t.phase);
@@ -944,6 +1224,9 @@ impl Runtime {
         let scope = Scope::new(Track::Motion, t.kind, "");
         self.sds.record_baseline(&scope, "duration_s", r.time_s);
         self.sds.record_baseline(&scope, "energy_j", r.energy_j);
+        if t.kind == "fetch" {
+            self.sds.record_baseline(&scope, "trips", r.trips as f64);
+        }
         self.log("quest", Level::Info, format!("퀘스트 {} 완료: {}", t.quest, r.summary), Some(json!({"quest": t.quest, "tick": tick, "result": r})));
         self.record_quest_run(&t.quest, &t.attempts);
         self.flush_sds();

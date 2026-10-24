@@ -5,10 +5,14 @@
 //! difference becomes a `Slope` segment and a curb difference becomes a `Step`
 //! segment. So what the planner calls passable is exactly what the "foot"
 //! preview calls passable, and edge time and energy come from the same formula.
+//! On top of that the ground of the cell being entered sets its own limit:
+//! the friction its contacts get and, for a known drive, the force left after
+//! rolling resistance (`hand_core::surface::climb_limit_deg`).
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
+use hand_core::surface::{climb_limit_deg, energy_factor};
 use hand_core::{simulate_drive, BaseSpec, Terrain as Segment};
 
 use crate::terrain::{cell_center, Terrain, CELL_M};
@@ -31,6 +35,10 @@ pub struct EdgePlan {
     pub slope_deg: f32,
     /// Smallest remaining margin to the slope and step limits, 0..1.
     pub margin: f32,
+    /// Steepest slope the base holds on the ground of the cell entered, degrees.
+    pub ground_limit_deg: f32,
+    /// Driving energy on that ground over firm ground (rolling resistance, walking terrain factor).
+    pub energy_factor: f32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -52,6 +60,10 @@ pub enum Goal {
 
 /// Judges one move. `None` when the base cannot pass.
 pub fn edge(spec: &BaseSpec, t: &Terrain, a: Cell, b: Cell) -> Option<EdgePlan> {
+    // No base drives or walks into the sea.
+    if t.is_water(b.0, b.1) {
+        return None;
+    }
     let (ax, az) = cell_center(a.0, a.1);
     let (bx, bz) = cell_center(b.0, b.1);
     let horizontal = ((ax - bx).powi(2) + (az - bz).powi(2)).sqrt();
@@ -74,6 +86,14 @@ pub fn edge(spec: &BaseSpec, t: &Terrain, a: Cell, b: Cell) -> Option<EdgePlan> 
     if !ground_only.passable {
         return None;
     }
+    // The ground of the cell entered: its friction and the drive's force left after rolling resistance.
+    let props = t.ground_at(b.0, b.1).surface().props();
+    let ground_limit = climb_limit_deg(spec.kind, props, spec.drive_accel_mps2);
+    if slope_deg > ground_limit {
+        return None;
+    }
+    let speed = horizontal / ground_only.time_s.max(1e-6);
+    let energy_factor = energy_factor(spec.kind, props, spec.mass_kg.unwrap_or(0.0), speed, spec.power_w);
     let mut pause = 0.0;
     if step > 1e-6 {
         let full = simulate_drive(spec, &[ground, Segment::Step { height_m: step }]);
@@ -82,7 +102,7 @@ pub fn edge(spec: &BaseSpec, t: &Terrain, a: Cell, b: Cell) -> Option<EdgePlan> 
         }
         pause = full.time_s - ground_only.time_s;
     }
-    let slope_margin = 1.0 - slope_deg / spec.max_slope_deg;
+    let slope_margin = 1.0 - slope_deg / spec.max_slope_deg.min(ground_limit).max(1e-3);
     let step_margin = if step > 1e-6 { 1.0 - step / spec.max_step_m } else { 1.0 };
     Some(EdgePlan {
         from: a,
@@ -93,6 +113,8 @@ pub fn edge(spec: &BaseSpec, t: &Terrain, a: Cell, b: Cell) -> Option<EdgePlan> 
         step_m: step,
         slope_deg,
         margin: slope_margin.min(step_margin).clamp(0.0, 1.0),
+        ground_limit_deg: ground_limit,
+        energy_factor,
     })
 }
 
@@ -188,7 +210,48 @@ fn rebuild(came: &[Option<(usize, EdgePlan)>], t: &Terrain, goal_idx: usize, sta
     cells.extend(edges.iter().map(|e| e.to));
     let time_s: f32 = edges.iter().map(|e| e.move_time_s + e.pause_s).sum();
     let distance_m: f32 = edges.iter().map(|e| e.horizontal_m).sum();
-    Plan { cells, edges, time_s, energy_j: spec.power_w * time_s, distance_m }
+    let energy_j = spec.power_w * edges.iter().map(|e| e.move_time_s * e.energy_factor + e.pause_s).sum::<f32>();
+    Plan { cells, edges, time_s, energy_j, distance_m }
+}
+
+/// Drive time from `start` to every cell (Dijkstra over the same edges as
+/// [`plan`]), seconds; infinite where the base cannot get. Cells costlier
+/// than `max_s` are left infinite.
+pub fn travel_times(spec: &BaseSpec, t: &Terrain, blocked: &dyn Fn(usize, usize) -> bool, start: Cell, max_s: f32) -> Vec<f32> {
+    let n = t.w * t.d;
+    let mut best = vec![f32::INFINITY; n];
+    let mut heap: BinaryHeap<(Reverse<u32>, usize)> = BinaryHeap::new();
+    let si = t.idx(start.0, start.1);
+    best[si] = 0.0;
+    heap.push((Reverse(0), si));
+    while let Some((Reverse(k), ci)) = heap.pop() {
+        let g = f32::from_bits(k);
+        if g > best[ci] {
+            continue;
+        }
+        let c = (ci % t.w, ci / t.w);
+        for (dx, dz) in NEIGHBORS {
+            let (nx, nz) = (c.0 as i32 + dx, c.1 as i32 + dz);
+            if !t.in_bounds(nx, nz) {
+                continue;
+            }
+            let nc = (nx as usize, nz as usize);
+            if blocked(nc.0, nc.1) {
+                continue;
+            }
+            if dx != 0 && dz != 0 && (blocked((c.0 as i32 + dx) as usize, c.1) || blocked(c.0, (c.1 as i32 + dz) as usize)) {
+                continue;
+            }
+            let Some(e) = edge(spec, t, c, nc) else { continue };
+            let cost = g + e.move_time_s + e.pause_s;
+            let ni = t.idx(nc.0, nc.1);
+            if cost < best[ni] && cost <= max_s {
+                best[ni] = cost;
+                heap.push((Reverse(cost.max(0.0).to_bits()), ni));
+            }
+        }
+    }
+    best
 }
 
 /// Straight-line distance in metres between the centres of two cells.
@@ -282,6 +345,29 @@ mod tests {
         assert!(((lx - tx).powi(2) + (lz - tz).powi(2)).sqrt() <= 0.9);
         assert!(p.cells.len() <= 8, "stops about 2 cells short instead of walking to the target");
         assert!(plan(&spec, &t, &blocked, (4, 10), Goal::Cell((10, 10))).is_none());
+    }
+
+    #[test]
+    fn the_ground_entered_sets_its_own_climb_limit_and_energy() {
+        use crate::kinds::Ground;
+        let mut t = flat(16, 16);
+        // 10 cm over 0.5 m: an 11.3° slope.
+        t.set_height_cm(8, 4, 10);
+        let weak = BaseSpec { drive_accel_mps2: Some(4.6), mass_kg: Some(10.0), ..BaseKind::Wheel.spec() };
+        t.set_ground(8, 4, Ground::Rock);
+        let rock = edge(&weak, &t, (7, 4), (8, 4)).expect("rock: friction and drive suffice");
+        t.set_ground(8, 4, Ground::Sand);
+        let sand = edge(&BaseKind::Wheel.spec(), &t, (7, 4), (8, 4)).expect("sand: the friction limit alone (atan 0.25 = 14°) allows 11°");
+        assert!(sand.ground_limit_deg < 15.0 && sand.margin < rock.margin);
+        assert!(edge(&weak, &t, (7, 4), (8, 4)).is_none(), "a weak drive spends its force on the sand's rolling resistance");
+        // Level sand: passable, but the rolling resistance costs energy; legs pay the walking factor.
+        t.set_height_cm(8, 4, 0);
+        let level = edge(&weak, &t, (7, 4), (8, 4)).unwrap();
+        assert!(level.energy_factor > 1.2, "{}", level.energy_factor);
+        let walk = edge(&BaseKind::HumanFoot.spec(), &t, (7, 4), (8, 4)).unwrap();
+        assert!((walk.energy_factor - 2.1).abs() < 1e-6);
+        t.set_ground(8, 4, Ground::Gravel);
+        assert!(edge(&weak, &t, (7, 4), (8, 4)).unwrap().energy_factor < level.energy_factor);
     }
 
     #[test]

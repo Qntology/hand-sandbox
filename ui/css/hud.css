@@ -26,6 +26,7 @@
 .bh-title { font-size: 0.58rem; font-weight: 600; letter-spacing: var(--track-caps); color: var(--text-muted); text-transform: uppercase; }
 .bh-toggle { width: 20px; height: 20px; display: inline-flex; align-items: center; justify-content: center; background: transparent; border: 1px solid var(--border-light); border-radius: var(--radius-sm); color: var(--text-dim); font-size: 9px; cursor: pointer; }
 .bh-toggle:hover { background: var(--bg-hover); color: var(--text-bright); }
+.bh-head #bh-reset { margin-left: auto; margin-right: -6px; font-size: 11px; }
 .body-hud.folded .bh-body, .body-hud.folded .bh-effects, .body-hud.folded .bh-meta, .body-hud.folded .bh-note { display: none; }
 .bh-body { display: flex; gap: 10px; align-items: flex-start; }
 #body-svg { width: 128px; height: auto; flex-shrink: 0; display: block; overflow: visible; }

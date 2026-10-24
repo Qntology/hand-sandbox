@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::kinds::Ground;
-use crate::rng::{fbm, hash2};
+use crate::rng::{fbm, hash2, Rng};
 
 /// Edge length of one cell in metres.
 pub const CELL_M: f32 = 0.5;
@@ -20,6 +20,56 @@ pub const MAX_NEIGHBOR_DIFF_CM: i32 = 20;
 
 /// A circular area flattened to ground level, in metres: `(x, z, radius)`.
 pub type FlatZone = (f32, f32, f32);
+
+/// Which landscape the world is built on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerrainKind {
+    /// Rolling hills and the curb wall (the v0.2–v0.4 map).
+    #[default]
+    Open,
+    /// The open map plus a sea bay, mesas walled by cliffs and rock ridges:
+    /// places that block the camera and the base, so targets have to be
+    /// searched for from other viewpoints.
+    Rugged,
+}
+
+impl TerrainKind {
+    pub fn id(self) -> &'static str {
+        match self {
+            TerrainKind::Open => "open",
+            TerrainKind::Rugged => "rugged",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<TerrainKind> {
+        match id {
+            "open" => Some(TerrainKind::Open),
+            "rugged" => Some(TerrainKind::Rugged),
+            _ => None,
+        }
+    }
+}
+
+/// Height of a cliff-walled mesa top above the ground, centimetres (est:
+/// above the 1.2 m robot's eye, so it hides what is behind and on top).
+pub const MESA_CM: i32 = 160;
+/// Height of a rock ridge, centimetres (est: taller than the camera at 0.5 m).
+pub const RIDGE_CM: i32 = 140;
+/// Rise per cell of the ramp onto the climbable mesa, centimetres: 15 cm over
+/// 0.5 m is 16.7°, past the wheel (15°) and mecanum (8°) limits and inside the
+/// track (30°) and walking (20°) ones.
+pub const RAMP_RISE_CM: i32 = 15;
+
+/// What the rugged stamping put where, for the world's resource placement and the logs.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RuggedLayout {
+    /// `(x, z, radius)` of each mesa, metres, and whether a ramp leads up.
+    pub mesas: Vec<(f32, f32, f32, bool)>,
+    /// End points of each ridge, metres.
+    pub ridges: Vec<((f32, f32), (f32, f32))>,
+    pub water_cells: usize,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Terrain {
@@ -79,7 +129,7 @@ impl Terrain {
             for cx in 0..w {
                 let h = heights_cm[cz * w + cx] as i32;
                 let jitter = (hash2(seed, cx as i32, cz as i32) & 0xF) as i32;
-                // Sand is only used for the waypoint pads (set by the world).
+                // Gravel is only used for the waypoint pads (set by the world), sand for the beach.
                 ground.push(if h < 70 && jitter == 0 {
                     Ground::Dirt
                 } else if h < 70 {
@@ -172,6 +222,223 @@ impl Terrain {
         }
     }
 
+    /// Highest terrain top (height plus curb), metres.
+    pub fn max_top_m(&self) -> f32 {
+        (0..self.w * self.d).map(|i| (self.heights_cm[i] as i32 + self.curb_cm[i] as i32) as f32 / 100.0).fold(0.0, f32::max)
+    }
+
+    pub fn is_water(&self, cx: usize, cz: usize) -> bool {
+        self.ground[self.idx(cx, cz)].is_water()
+    }
+
+    /// Adds the rugged features: a sea bay in the corner far from both
+    /// waypoints with a wet-sand shore, cliff-walled mesas (the first with a
+    /// ramp that only tracks and legs can climb) and rock ridges. Nothing is
+    /// placed within the clear zones, nor within `corridor_m` of the protected
+    /// polyline (the way between the waypoints), so the waypoints stay connected.
+    pub fn stamp_rugged(&mut self, seed: u64, clear: &[FlatZone], polyline: &[(f32, f32)], corridor_m: f32) -> RuggedLayout {
+        let (w, d) = (self.w, self.d);
+        let (size_x, size_z) = self.size_m();
+        let span = size_x.min(size_z);
+        let mut layout = RuggedLayout::default();
+        let mut fixed = vec![false; w * d];
+        let near_polyline = |x: f32, z: f32, r: f32| polyline.windows(2).any(|s| seg_dist(x, z, s[0], s[1]) < r);
+        let near_clear = |x: f32, z: f32, r: f32| clear.iter().any(|&(cx, cz, cr)| ((x - cx).powi(2) + (z - cz).powi(2)).sqrt() < cr + r);
+
+        // 1. The sea: a bay around the (max x, min z) corner with a ragged coast.
+        let corner = (size_x * 1.02, -0.02 * size_z);
+        let reach = 0.36 * span;
+        for cz in 0..d {
+            for cx in 0..w {
+                let (x, z) = cell_center(cx, cz);
+                let coast = reach + 0.12 * span * (fbm(seed ^ 0x5EA, x * 0.18, z * 0.18, 2) - 0.5);
+                let dist = ((x - corner.0).powi(2) + (z - corner.1).powi(2)).sqrt();
+                if dist < coast && !near_clear(x, z, 1.0) && !near_polyline(x, z, corridor_m) {
+                    let i = self.idx(cx, cz);
+                    self.heights_cm[i] = 0;
+                    self.curb_cm[i] = 0;
+                    self.ground[i] = Ground::Water;
+                    fixed[i] = true;
+                    layout.water_cells += 1;
+                }
+            }
+        }
+        // The beach: land near the water slopes down to it and stays wet.
+        let shore = self.water_distance_m(8.0);
+        for i in 0..w * d {
+            if fixed[i] || shore[i] > 2.5 {
+                continue;
+            }
+            let h = self.heights_cm[i] as f32 * (shore[i] / 2.5);
+            self.heights_cm[i] = ((h / HEIGHT_QUANT_CM as f32).round() as i32 * HEIGHT_QUANT_CM) as i16;
+            // The waves keep the first metre wet; behind it the beach is dry, loose sand.
+            if self.curb_cm[i] == 0 {
+                self.ground[i] = if shore[i] <= 1.05 { Ground::WetSand } else { Ground::Sand };
+            }
+        }
+        let shore_at = |x: f32, z: f32| -> f32 {
+            let (cx, cz) = (((x / CELL_M) as usize).min(w - 1), ((z / CELL_M) as usize).min(d - 1));
+            shore[cz * w + cx]
+        };
+        let mut rng = Rng::new(seed ^ 0xC11F_F5EA_0BAD_CAFE);
+        // 2. Mesas: a flat rock top walled by cliffs.
+        let mut tries = 0;
+        while layout.mesas.len() < 2 && tries < 400 {
+            tries += 1;
+            let r = rng.range_f32(2.2, 3.4);
+            let (x, z) = (rng.range_f32(0.18, 0.82) * size_x, rng.range_f32(0.18, 0.82) * size_z);
+            let water_near = shore_at(x, z) < r + 2.0;
+            let other_near = layout.mesas.iter().any(|&(mx, mz, mr, _)| ((x - mx).powi(2) + (z - mz).powi(2)).sqrt() < r + mr + 3.0);
+            if water_near || other_near || near_clear(x, z, r + 2.5) || near_polyline(x, z, r + corridor_m) {
+                continue;
+            }
+            let ramp = layout.mesas.is_empty();
+            for cz in 0..d {
+                for cx in 0..w {
+                    let (px, pz) = cell_center(cx, cz);
+                    let rim = r + 0.45 * (hash2(seed ^ 0x3E5A, cx as i32, cz as i32) & 0xFF) as f32 / 255.0;
+                    if ((px - x).powi(2) + (pz - z).powi(2)).sqrt() <= rim {
+                        let i = self.idx(cx, cz);
+                        self.heights_cm[i] = MESA_CM as i16;
+                        self.curb_cm[i] = 0;
+                        self.ground[i] = Ground::Rock;
+                        fixed[i] = true;
+                    }
+                }
+            }
+            if ramp {
+                self.stamp_ramp(x, z, r, rng.range_f32(0.0, std::f32::consts::TAU), &mut fixed);
+            }
+            layout.mesas.push((x, z, r, ramp));
+        }
+        // 3. Rock ridges: one cell thick, taller than the camera.
+        let mut tries = 0;
+        while layout.ridges.len() < 3 && tries < 600 {
+            tries += 1;
+            let (x0, z0) = (rng.range_f32(0.12, 0.88) * size_x, rng.range_f32(0.12, 0.88) * size_z);
+            let a = rng.range_f32(0.0, std::f32::consts::TAU);
+            let len = rng.range_f32(5.0, 9.0);
+            let (x1, z1) = (x0 + len * a.cos(), z0 + len * a.sin());
+            let cells = line_cells(x0, z0, x1, z1);
+            let ok = !cells.is_empty()
+                && cells.iter().all(|&(cx, cz)| {
+                    if cx >= w || cz >= d {
+                        return false;
+                    }
+                    let (px, pz) = cell_center(cx, cz);
+                    let i = cz * w + cx;
+                    !fixed[i]
+                        && self.curb_cm[i] == 0
+                        && !near_clear(px, pz, 2.0)
+                        && !near_polyline(px, pz, corridor_m)
+                        && layout.mesas.iter().all(|&(mx, mz, mr, _)| ((px - mx).powi(2) + (pz - mz).powi(2)).sqrt() > mr + 2.0)
+                        && shore[i] > 2.0
+                });
+            if !ok {
+                continue;
+            }
+            for (cx, cz) in cells {
+                let i = cz * w + cx;
+                self.heights_cm[i] = (self.heights_cm[i] as i32 + RIDGE_CM) as i16;
+                self.ground[i] = Ground::Rock;
+                fixed[i] = true;
+            }
+            layout.ridges.push(((x0, z0), (x1, z1)));
+        }
+        self.relax_except(&fixed);
+        layout
+    }
+
+    /// Distance from every cell centre to the nearest water cell, metres,
+    /// capped at `cap_m` (8-neighbour chamfer distance).
+    pub fn water_distance_m(&self, cap_m: f32) -> Vec<f32> {
+        let (w, d) = (self.w, self.d);
+        let mut dist = vec![cap_m; w * d];
+        let mut queue = std::collections::VecDeque::new();
+        for i in 0..w * d {
+            if self.ground[i].is_water() {
+                dist[i] = 0.0;
+                queue.push_back(i);
+            }
+        }
+        while let Some(i) = queue.pop_front() {
+            let (cx, cz) = ((i % w) as i32, (i / w) as i32);
+            for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)] {
+                let (nx, nz) = (cx + dx, cz + dz);
+                if !self.in_bounds(nx, nz) {
+                    continue;
+                }
+                let j = nz as usize * w + nx as usize;
+                let step = if dx != 0 && dz != 0 { CELL_M * std::f32::consts::SQRT_2 } else { CELL_M };
+                let nd = dist[i] + step;
+                if nd < dist[j] {
+                    dist[j] = nd;
+                    queue.push_back(j);
+                }
+            }
+        }
+        dist
+    }
+
+    /// A ramp two cells wide from the rim of the mesa at `(x, z, r)` outward
+    /// along `heading`, falling [`RAMP_RISE_CM`] per cell to the ground.
+    fn stamp_ramp(&mut self, x: f32, z: f32, r: f32, heading: f32, fixed: &mut [bool]) {
+        let (dx, dz) = (heading.cos(), heading.sin());
+        let (nx, nz) = (-dz, dx);
+        let mut h = MESA_CM;
+        let mut s = r + 0.6;
+        while h > 0 {
+            h -= RAMP_RISE_CM;
+            for off in [-0.25f32, 0.25] {
+                let (px, pz) = (x + dx * s + nx * off, z + dz * s + nz * off);
+                let Some((cx, cz)) = self.cell_of(px, pz) else { return };
+                let i = self.idx(cx, cz);
+                if self.ground[i].is_water() {
+                    return;
+                }
+                let ground = self.heights_cm[i] as i32;
+                if h <= ground {
+                    continue;
+                }
+                self.heights_cm[i] = h as i16;
+                self.curb_cm[i] = 0;
+                self.ground[i] = Ground::Rock;
+                fixed[i] = true;
+            }
+            s += CELL_M;
+        }
+    }
+
+    /// The neighbour limit of [`Terrain::generate`], applied again after the
+    /// rugged features, leaving the features (cliffs on purpose) alone.
+    fn relax_except(&mut self, fixed: &[bool]) {
+        let (w, d) = (self.w, self.d);
+        for _ in 0..8 {
+            let mut changed = false;
+            for cz in 0..d {
+                for cx in 0..w {
+                    let i = cz * w + cx;
+                    if fixed[i] {
+                        continue;
+                    }
+                    for (nx, nz) in neighbors4(cx, cz, w, d) {
+                        let j = nz * w + nx;
+                        if fixed[j] {
+                            continue;
+                        }
+                        if self.heights_cm[i] as i32 - self.heights_cm[j] as i32 > MAX_NEIGHBOR_DIFF_CM {
+                            self.heights_cm[i] = (self.heights_cm[j] as i32 + MAX_NEIGHBOR_DIFF_CM) as i16;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
     pub fn cell_of(&self, x: f32, z: f32) -> Option<(usize, usize)> {
         if x < 0.0 || z < 0.0 {
             return None;
@@ -201,6 +468,39 @@ impl Terrain {
 /// Centre of a cell in metres.
 pub fn cell_center(cx: usize, cz: usize) -> (f32, f32) {
     ((cx as f32 + 0.5) * CELL_M, (cz as f32 + 0.5) * CELL_M)
+}
+
+/// Distance from a point to a segment, metres.
+pub fn seg_dist(x: f32, z: f32, a: (f32, f32), b: (f32, f32)) -> f32 {
+    let (vx, vz) = (b.0 - a.0, b.1 - a.1);
+    let len2 = vx * vx + vz * vz;
+    let t = if len2 < 1e-9 { 0.0 } else { (((x - a.0) * vx + (z - a.1) * vz) / len2).clamp(0.0, 1.0) };
+    ((x - a.0 - t * vx).powi(2) + (z - a.1 - t * vz).powi(2)).sqrt()
+}
+
+/// Cells a straight line between two points crosses (no gaps diagonally:
+/// a ridge built on it blocks a ray as well as a base).
+fn line_cells(x0: f32, z0: f32, x1: f32, z1: f32) -> Vec<(usize, usize)> {
+    if x0.min(x1) < 0.0 || z0.min(z1) < 0.0 {
+        return vec![];
+    }
+    let n = (((x1 - x0).abs().max((z1 - z0).abs())) / (CELL_M * 0.25)).ceil().max(1.0) as usize;
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for k in 0..=n {
+        let t = k as f32 / n as f32;
+        let c = (((x0 + (x1 - x0) * t) / CELL_M) as usize, ((z0 + (z1 - z0) * t) / CELL_M) as usize);
+        if let Some(&last) = out.last() {
+            if last == c {
+                continue;
+            }
+            // A diagonal move would leave a corner gap: fill it.
+            if last.0 != c.0 && last.1 != c.1 {
+                out.push((c.0, last.1));
+            }
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn neighbors4(cx: usize, cz: usize, w: usize, d: usize) -> impl Iterator<Item = (usize, usize)> {

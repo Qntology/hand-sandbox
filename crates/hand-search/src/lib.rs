@@ -28,7 +28,7 @@ use serde::Serialize;
 
 pub use lexical::{Category, Hit, Via};
 pub use lexicon::{EntityKind, Lexicon, Node, Phrase, VisionEntity};
-pub use parse::{ParsedCommand, Parser, PlaceRef, Plan, Problem, Target};
+pub use parse::{DropTarget, ParsedCommand, Parser, PlaceRef, Plan, Problem, Target};
 pub use semantic::{PhraseEmbedder, SemanticBank, SemanticOpts};
 pub use vision::{EntityScore, VisionBank};
 

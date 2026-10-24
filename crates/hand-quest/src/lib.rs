@@ -20,6 +20,8 @@ pub enum StepKind {
     Deliver,
     /// Walk to a place, for a plan with no items.
     Goto,
+    /// Set down what is already carried.
+    Unload,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -72,6 +74,8 @@ pub struct QuestResult {
     pub items: Vec<(String, u32)>,
     /// Mining or pick-up actions that gave something other than what was asked.
     pub wasted_actions: u32,
+    /// Round trips made because the load did not fit in one (the last trip included).
+    pub trips: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -157,6 +161,32 @@ impl Quest {
                 let p = labels.place_ko(&place.place);
                 steps.push(step(StepKind::Goto, format!("{p}{} 이동", hand_search::text::euro(&p)), None));
                 title = format!("{p}{} 이동", hand_search::text::euro(&p));
+            }
+            Plan::Drop { items, place } => {
+                let what = if items.is_empty() {
+                    "적재함 전부".to_string()
+                } else {
+                    items
+                        .iter()
+                        .map(|t| match t.quantity {
+                            Some(n) => format!("{} {n}개", labels.resource_ko(&t.resource)),
+                            None => format!("{} 전부", labels.resource_ko(&t.resource)),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                match place {
+                    Some(pl) => {
+                        let p = labels.place_ko(&pl.place);
+                        steps.push(step(StepKind::Goto, format!("{p}{} 이동", hand_search::text::euro(&p)), None));
+                        steps.push(step(StepKind::Unload, format!("{p}에 {what} 내려놓기"), None));
+                        title = format!("{what} → {p}에 내려놓기");
+                    }
+                    None => {
+                        steps.push(step(StepKind::Unload, format!("{what} 내려놓기"), None));
+                        title = format!("{what} 내려놓기");
+                    }
+                }
             }
             Plan::Stop => return Err(QuestError::NoItems),
         }
@@ -407,6 +437,21 @@ mod tests {
     }
 
     #[test]
+    fn a_drop_plan_unloads_here_or_after_going_there() {
+        use hand_search::DropTarget;
+        let one = DropTarget { resource: "log".into(), quantity: Some(1), via: Via::Exact, score: 1.0, text: "원목".into() };
+        let q = Quest::from_plan("q".into(), &Plan::Drop { items: vec![one.clone()], place: None }, &Ko, 0).unwrap();
+        assert_eq!(q.steps.iter().map(|s| s.kind).collect::<Vec<_>>(), vec![StepKind::Unload]);
+        assert_eq!(q.title, "원목 1개 내려놓기");
+        let all = Quest::from_plan("q".into(), &Plan::Drop { items: vec![], place: Some(place("warehouse")) }, &Ko, 0).unwrap();
+        assert_eq!(all.steps.iter().map(|s| s.kind).collect::<Vec<_>>(), vec![StepKind::Goto, StepKind::Unload]);
+        assert_eq!(all.title, "적재함 전부 → 창고에 내려놓기");
+        let v = serde_json::to_value(&all).unwrap();
+        assert_eq!(v["steps"][1]["kind"], "unload");
+        assert_eq!(v["plan"]["kind"], "drop");
+    }
+
+    #[test]
     fn steps_move_one_at_a_time_to_done() {
         let mut q = Quest::from_plan("q1".into(), &fetch(), &Ko, 0).unwrap();
         q.start(3).unwrap();
@@ -418,7 +463,7 @@ mod tests {
             assert_eq!(q.current(), Some(i + 1));
         }
         assert!(q.complete_step(5).unwrap(), "the last step reports that the quest can finish");
-        let r = QuestResult { ticks: 10, time_s: 1.0, energy_j: 2.0, precision: Some(1.0), summary: "ok".into(), items: vec![], wasted_actions: 0 };
+        let r = QuestResult { ticks: 10, time_s: 1.0, energy_j: 2.0, precision: Some(1.0), summary: "ok".into(), items: vec![], wasted_actions: 0, trips: 0 };
         q.finish(r).unwrap();
         assert_eq!(q.state, State::Done);
         assert!(q.is_finished());
@@ -432,7 +477,7 @@ mod tests {
         assert_eq!(q.start(1).unwrap_err(), QuestError::NotPending);
         assert_eq!(q.complete_step(2).unwrap_err(), QuestError::StepNotActive(2));
         assert_eq!(q.complete_step(99).unwrap_err(), QuestError::BadStep(99));
-        let r = QuestResult { ticks: 0, time_s: 0.0, energy_j: 0.0, precision: None, summary: String::new(), items: vec![], wasted_actions: 0 };
+        let r = QuestResult { ticks: 0, time_s: 0.0, energy_j: 0.0, precision: None, summary: String::new(), items: vec![], wasted_actions: 0, trips: 0 };
         assert!(q.finish(r).is_err(), "unfinished steps block finish");
     }
 

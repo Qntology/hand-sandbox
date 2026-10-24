@@ -120,6 +120,11 @@ const handlers = {
   body_presets: async () => { throw '부품 프리셋 물리는 실제 Rust 런타임에서 계산합니다'; },
   body_plan_eval: async () => { throw '부품 프리셋 물리는 실제 Rust 런타임에서 계산합니다'; },
   ttm_use: async () => { throw '브라우저 모의 백엔드에서는 Granite TTM 을 불러올 수 없습니다. Tauri 앱에서 사용하세요'; },
+  test_cancel: async () => ({ active: false }),
+  inventory_drop: mw.inventoryDrop,
+  world_reset: mw.worldReset,
+  body_reset: mw.bodyReset,
+  world_terrain: async () => { throw '모의 백엔드에는 지형 격자가 없습니다'; },
 };
 
 export async function invoke(cmd, args = {}) {

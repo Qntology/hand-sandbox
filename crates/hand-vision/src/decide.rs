@@ -16,6 +16,11 @@
 //!    outside the forecast band is held and re-triangulated rather than
 //!    followed.
 //! 4. Move a bounded hop toward the forecast and face it, or arrive.
+//!
+//! With nothing tracked the decision turns to look; after a full turn with
+//! nothing in sight it asks for another viewpoint (`Explore`): on a map where
+//! ridges and mesas hide the target, turning on the spot cannot find it. Where
+//! to go is the executor's call (it knows the terrain, not the target).
 
 use hand_ts::{forecast, Predictor};
 use serde::{Deserialize, Serialize};
@@ -89,6 +94,8 @@ pub enum Decision {
     Arrive { at: (f32, f32) },
     /// Look again without moving.
     Hold { reason: String },
+    /// A full turn showed nothing: look from somewhere else.
+    Explore { turned_deg: f32 },
 }
 
 impl Decision {
@@ -99,6 +106,7 @@ impl Decision {
             Decision::Approach { hop_m, .. } => format!("move({hop_m:.1} m)"),
             Decision::Arrive { .. } => "arrive".into(),
             Decision::Hold { reason } => format!("hold({reason})"),
+            Decision::Explore { turned_deg } => format!("explore(after {turned_deg:.0}°)"),
         }
     }
 }
@@ -150,11 +158,24 @@ pub struct Decider {
     prediction: Option<Prediction>,
     side: f32,
     lost: u32,
+    /// Search turning since the last sighting or viewpoint change, degrees.
+    turned_deg: f32,
 }
 
 impl Decider {
     pub fn new(cfg: DecideCfg) -> Decider {
-        Decider { cfg, rays: Vec::new(), est_x: Vec::new(), est_z: Vec::new(), last_fix: None, prediction: None, side: 1.0, lost: 0 }
+        Decider { cfg, rays: Vec::new(), est_x: Vec::new(), est_z: Vec::new(), last_fix: None, prediction: None, side: 1.0, lost: 0, turned_deg: 0.0 }
+    }
+
+    /// The side the next triangulation step goes to (+1 the camera's right, −1 its left).
+    pub fn side(&self) -> f32 {
+        self.side
+    }
+
+    /// Keeps stepping to `side` from now on (the executor found the other
+    /// side blocked by terrain and took this one).
+    pub fn set_side(&mut self, side: f32) {
+        self.side = if side < 0.0 { -1.0 } else { 1.0 };
     }
 
     /// Forgets the target (a new one is wanted, or the last one was wrong).
@@ -217,11 +238,20 @@ impl Decider {
                     return rep;
                 }
             }
+            // A whole turn without the target: another viewpoint, not another turn.
+            if self.turned_deg + self.cfg.search_turn_deg * 0.5 >= 360.0 {
+                rep.decision = Decision::Explore { turned_deg: self.turned_deg };
+                rep.note = format!("{:.0}° 돌아도 대상 없음: 다른 시점으로 이동", self.turned_deg);
+                self.turned_deg = 0.0;
+                return rep;
+            }
+            self.turned_deg += self.cfg.search_turn_deg.abs();
             rep.decision = Decision::Search { turn_deg: self.cfg.search_turn_deg };
             rep.note = "대상 없음: 회전 탐색".into();
             return rep;
         };
         self.lost = 0;
+        self.turned_deg = 0.0;
         if let Some(p) = predicted {
             rep.residual_deg = Some(wrap_angle(s.heading - pose.yaw).to_degrees() - p.bearing_rel_deg);
         }
@@ -437,5 +467,26 @@ mod tests {
         d.observe(&turned, None, true, &[], None);
         let third = d.observe(&turned, None, true, &[], None);
         assert_eq!(third.decision, Decision::Search { turn_deg: DecideCfg::default().search_turn_deg });
+    }
+
+    #[test]
+    fn a_full_turn_without_a_sighting_asks_for_another_viewpoint() {
+        let mut d = Decider::new(DecideCfg::default());
+        let pose = Pose { x: 0.0, z: 0.0, yaw: 0.0, eye_m: 0.5 };
+        let mut turns = 0.0;
+        let explore = loop {
+            match d.observe(&pose, None, false, &[], None).decision {
+                Decision::Search { turn_deg } => turns += turn_deg,
+                Decision::Explore { turned_deg } => break turned_deg,
+                other => panic!("{other:?}"),
+            }
+            assert!(turns < 720.0, "never asks to move");
+        };
+        assert!(explore + DecideCfg::default().search_turn_deg >= 360.0 - 1e-3, "after about a full turn: {explore}");
+        // A sighting starts the count again.
+        let t = (5.0, 1.0);
+        let r = d.observe(&pose, Some(sight(0, pose, t, 3)), false, &[], None);
+        assert!(matches!(r.decision, Decision::Triangulate(_)));
+        assert!(matches!(d.observe(&pose, None, false, &[], None).decision, Decision::Search { .. }));
     }
 }

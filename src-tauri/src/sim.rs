@@ -17,10 +17,13 @@ use crate::state::{bank_dir, default_store_dir, model_dir, sam_dir, tips_dir, tt
 type App<'a> = State<'a, Arc<AppState>>;
 
 #[tauri::command]
-pub async fn world_new(state: App<'_>, seed: u64, size: usize, config: Option<HandConfig>, base: Option<String>, body: Option<BodyPlan>) -> Result<Value, String> {
+pub async fn world_new(state: App<'_>, seed: u64, size: usize, config: Option<HandConfig>, base: Option<String>, body: Option<BodyPlan>, terrain: Option<String>) -> Result<Value, String> {
     state.with_world(|rt| {
         if let Some(b) = body {
             rt.cfg.body = b;
+        }
+        if let Some(t) = terrain.as_deref().filter(|t| !t.is_empty()) {
+            rt.cfg.terrain = hand_runtime::world_terrain_kind(t)?;
         }
         rt.api_world_new(seed, size, config, base.as_deref())
     })
@@ -114,9 +117,11 @@ pub async fn world_frame(state: App<'_>, width: u32, height: u32, quality: f32, 
     state.with_world(|rt| rt.api_world_frame(width, height, quality, view.as_deref().unwrap_or("agent")))
 }
 
+/// `record: true` records the command as a live integrated test (or queues it
+/// behind the recording that runs).
 #[tauri::command]
-pub async fn command_submit(state: App<'_>, text: String) -> Result<Value, String> {
-    state.with_world(|rt| rt.api_command_submit(&text))
+pub async fn command_submit(state: App<'_>, text: String, record: Option<bool>) -> Result<Value, String> {
+    state.with_world(|rt| rt.api_command_submit_rec(&text, record.unwrap_or(false)))
 }
 
 #[tauri::command]

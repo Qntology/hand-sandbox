@@ -13,6 +13,10 @@
 //! Every balance state the world enters leaves `balance|<source>><target>|<state>`
 //! cells (with the research reference where there is one), `effort|<segment>|<source>|<state>`
 //! joint loads, and the `ff` calibration that becomes the next feed-forward gain.
+//! While the robot travels or mines, its condition is also run as an effects
+//! benchmark scenario (`hand_core::effects`): `balance|fx:<effect>|<ground>|<state>`
+//! cells against the measurements, the limits as agreements, and the reducers'
+//! wear as `effort|wear|<state>` baselines.
 
 use std::collections::BTreeMap;
 
@@ -230,6 +234,35 @@ impl Runtime {
         self.db.record_keyframe(row);
     }
 
+    /// The five effects of a world state, scored by the benchmark's own cells:
+    /// likeness and floor cells as references, limits as agreements, the rest
+    /// as baselines (the engine never reads these back).
+    fn record_effects(&mut self, post: &hand_core::Posture, state: &str) {
+        use hand_core::effects::{evaluate, live_scenario, Rule};
+        let Some(s) = live_scenario(&self.world.body, post) else { return };
+        let fx = evaluate(&self.world.body, &s);
+        if fx.skipped.is_some() {
+            return;
+        }
+        let at = format!("{}|{state}", post.ground.id());
+        for c in &fx.cells {
+            let Some(v) = c.value else { continue };
+            let scope = Scope::new(Track::Balance, &format!("fx:{}", c.effect.id()), &at);
+            match c.rule {
+                Rule::Like { reference, tolerance } | Rule::AtLeast { reference, tolerance } => self.sds.record_reference(&scope, c.axis, v as f64, reference as f64, tolerance as f64),
+                Rule::AtMost { limit } => {
+                    self.sds.record_baseline(&scope, c.axis, v as f64);
+                    self.sds.record_agreement(&scope, &format!("{}_ok", c.axis), v <= limit);
+                }
+                Rule::Raw => self.sds.record_baseline(&scope, c.axis, v as f64),
+            }
+        }
+        let scope = Scope::new(Track::Effort, "wear", state);
+        for (joint, d) in self.world.wear.clone() {
+            self.sds.record_baseline(&scope, &format!("{joint}:life_used"), d as f64);
+        }
+    }
+
     /// Balance states from the world into the SDS `balance`/`effort` tracks
     /// and the test records; the learned feed-forward gains go back to the world.
     pub(crate) fn record_balance_events(&mut self) {
@@ -244,6 +277,7 @@ impl Runtime {
             // Composite N:N: the development scenario phases this state counts as,
             // scored with their research weights (`hand_core::nn`).
             let Some(d) = &ev.dynamics else { continue };
+            self.record_effects(&ev.posture, &ev.state);
             for (spec, phase) in hand_core::nn::matching_phases(&nn_lib, &ev.posture) {
                 let cells = hand_core::nn::cells(&self.world.body, &ev.posture, &ev.report, Some(d));
                 let pr = hand_core::nn::score_phase(phase, &spec.seg_w, cells, &ev.report, Some(d));
@@ -338,12 +372,14 @@ impl Runtime {
             hand_search::Plan::Fetch { .. } => "fetch",
             hand_search::Plan::Collect { .. } => "collect",
             hand_search::Plan::Goto { .. } => "goto",
+            hand_search::Plan::Drop { .. } => "drop",
             hand_search::Plan::Stop => "stop",
         };
         let (target, destination) = match &q.plan {
             hand_search::Plan::Fetch { targets, destination } => (targets.iter().map(|t| t.resource.clone()).collect::<Vec<_>>().join("+"), Some(destination.place.clone())),
             hand_search::Plan::Collect { targets } => (targets.iter().map(|t| t.resource.clone()).collect::<Vec<_>>().join("+"), None),
             hand_search::Plan::Goto { place } => (place.place.clone(), Some(place.place.clone())),
+            hand_search::Plan::Drop { items, place } => (items.iter().map(|t| t.resource.clone()).collect::<Vec<_>>().join("+"), place.as_ref().map(|p| p.place.clone())),
             hand_search::Plan::Stop => (String::new(), None),
         };
         let ok = q.state == hand_quest::State::Done;

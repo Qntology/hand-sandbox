@@ -26,7 +26,8 @@ const SHIM: &str = r#"<script>
 // 개발 서버 shim: 월드 명령은 이 서버(실제 Rust 런타임)로, 나머지는 브라우저 모의 백엔드로 보낸다.
 (() => {
   const WORLD = new Set(['world_new','sim_step','world_frame','command_submit','quest_list','perception_scan','body_status','sds_status','ts_forecast','log_tail','models_status',
-    'test_start','test_step','test_status','test_keyframe','test_video','test_stats','test_cancel','body_presets','body_plan_eval','body_plan_set','world_body','test_db_mirror']);
+    'test_start','test_step','test_status','test_keyframe','test_video','test_stats','test_cancel','body_presets','body_plan_eval','body_plan_set','world_body','test_db_mirror',
+    'inventory_drop','world_reset','body_reset','world_terrain','nn_status','physics_status']);
   let mock = null;
   window.__TAURI__ = { core: { invoke: async (cmd, args) => {
     if (!WORLD.has(cmd)) {

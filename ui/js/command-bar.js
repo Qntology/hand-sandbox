@@ -1,4 +1,6 @@
 // 게임 채팅줄 같은 명령 입력: Enter → command_submit, 한 줄 결과/오류, ↑↓ 기록.
+// 뷰포트 툴바의 '테스트 실행'도 같은 submitCommand 를 쓴다. '자동 기록'이 켜져 있으면 명령이
+// 통합 테스트로 기록되고(지금 월드에서 1 게임 → 2 ML 인식 → 3 ML 결정), 기록 중에 낸 명령은 차례를 기다린다.
 import { call } from './api.js';
 import { bus, state } from './state.js';
 import { $, fmt, storageGet, storageSet } from './util.js';
@@ -44,6 +46,47 @@ function showToast(kind, text) {
   toastTimer = setTimeout(() => { t.hidden = true; }, kind === 'err' ? 9000 : 7000);
 }
 
+/** '자동 기록' 체크(툴바). 모의 백엔드는 기록하지 않는다. */
+export function recordOn() {
+  return !state.mock && !!$('tl-record')?.checked;
+}
+
+/**
+ * 명령 한 줄을 낸다(입력줄 · 툴바 공용). 퀘스트가 생기거나 기다리면 재생을 시작한다.
+ * opts.quietHistory: 기록(↑↓)에 남기지 않는다(툴바의 중지 등).
+ */
+export async function submitCommand(raw, opts = {}) {
+  const text = raw.trim();
+  if (!text) return null;
+  try {
+    const record = recordOn();
+    const r = await call('command_submit', { text, record }, { quiet: true });
+    state.lastCommand = { ...r, text };
+    bus.emit('command', state.lastCommand);
+    if (r.ok) {
+      const head = r.queued ? `⏳ 대기 ${r.queued}번째 — 지금 기록이 끝나면 시작` : `✓ ${summarize(r.parsed)} · 퀘스트 ${r.quest_id ?? '—'}`;
+      let msg = `${head} · 신뢰도 ${fmt.pct(r.parsed?.confidence ?? NaN)} · ${MODE_KO[r.mode] ?? r.mode}`;
+      if (r.recording) msg += ' · 통합 테스트 기록 중';
+      if (!opts.quietHistory) pushHistory(text);
+      if (!r.stopped && $('tl-cmd')) $('tl-cmd').value = text;
+      await refreshQuests();
+      if (!state.playing && (r.quest_id || r.queued || r.recording)) {
+        setPlaying(true);
+        msg += ' · 재생 시작';
+      }
+      showToast('ok', msg);
+      setStatus(`명령 실행: ${summarize(r.parsed)}${r.queued ? ' (대기)' : ''}`);
+    } else {
+      showToast('err', `✕ ${r.error ?? '명령을 해석하지 못했습니다'}`);
+    }
+    return r;
+  } catch (e) {
+    showToast('err', `✕ ${e.message}`);
+    setStatus(`command_submit: ${e.message}`, true);
+    return null;
+  }
+}
+
 async function submit(raw) {
   const text = raw.trim();
   if (!text || busy) return;
@@ -51,26 +94,8 @@ async function submit(raw) {
   $('command-send').disabled = true;
   $('command-input').readOnly = true;
   try {
-    const r = await call('command_submit', { text }, { quiet: true });
-    state.lastCommand = { ...r, text };
-    bus.emit('command', state.lastCommand);
-    if (r.ok) {
-      let msg = `✓ ${summarize(r.parsed)} · 퀘스트 ${r.quest_id ?? '—'} · 신뢰도 ${fmt.pct(r.parsed?.confidence ?? NaN)} · ${MODE_KO[r.mode] ?? r.mode}`;
-      pushHistory(text);
-      $('command-input').value = '';
-      await refreshQuests();
-      if (!state.playing && r.quest_id) {
-        setPlaying(true);
-        msg += ' · 재생 시작';
-      }
-      showToast('ok', msg);
-      setStatus(`명령 실행: ${summarize(r.parsed)}`);
-    } else {
-      showToast('err', `✕ ${r.error ?? '명령을 해석하지 못했습니다'}`);
-    }
-  } catch (e) {
-    showToast('err', `✕ ${e.message}`);
-    setStatus(`command_submit: ${e.message}`, true);
+    const r = await submitCommand(text);
+    if (r?.ok) $('command-input').value = '';
   } finally {
     busy = false;
     $('command-send').disabled = false;

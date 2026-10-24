@@ -18,11 +18,11 @@ use hand_core::dynamics::{self, BodyPose, DynCfg, DynDigest, Rollout};
 use hand_core::{compute_body, grasp, BalanceSummary, BodyInputs, BodyLimits, BodyPlan, BodyStatus, ConfigError, GraspSetup, Hand, HandConfig, Payload};
 use serde::{Deserialize, Serialize};
 
-use crate::kinds::{Ground, ItemKind, NodeKind};
+use crate::kinds::{Ground, ItemKind, NodeKind, MIN_PIECE};
 use crate::nav::{self, Cell, EdgePlan, Goal};
 use crate::rng::Rng;
 use crate::snapshot::*;
-use crate::terrain::{cell_center, FlatZone, Terrain, CELL_M};
+use crate::terrain::{cell_center, FlatZone, RuggedLayout, Terrain, TerrainKind, CELL_M};
 
 /// Length of one simulation tick, seconds.
 pub const TICK_S: f32 = 0.1;
@@ -56,6 +56,12 @@ pub const TWO_ARM_LIFT_FACTOR: f32 = 1.5;
 pub const ACCEL_TIME_S: f32 = 0.5;
 /// A balance state that lasts is recorded again every this many ticks.
 const BALANCE_RESAMPLE_TICKS: u64 = 50;
+/// Time to set carried items down on the ground or a waypoint's pile, seconds (assumption, as [`DELIVER_TIME_S`]).
+pub const DROP_TIME_S: f32 = 1.0;
+/// Items set down on the ground land this far in front of the robot, metres (est: forearm reach).
+pub const DROP_AHEAD_M: f32 = 0.45;
+/// Amounts within this of a whole number count as whole.
+pub const AMOUNT_EPS: f32 = 1e-3;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorldConfig {
@@ -66,11 +72,14 @@ pub struct WorldConfig {
     /// Part presets of the robot's body (`hand_core::parts`).
     #[serde(default)]
     pub body: BodyPlan,
+    /// The landscape: the open map, or the rugged one with sea, cliffs and ridges.
+    #[serde(default)]
+    pub terrain: TerrainKind,
 }
 
 impl Default for WorldConfig {
     fn default() -> Self {
-        WorldConfig { seed: 7, cells: 64, hand: HandConfig::preset(hand_core::FingerCount::Five), body: BodyPlan::default() }
+        WorldConfig { seed: 7, cells: 64, hand: HandConfig::preset(hand_core::FingerCount::Five), body: BodyPlan::default(), terrain: TerrainKind::Open }
     }
 }
 
@@ -99,12 +108,26 @@ pub struct Node {
     pub max_hp: f32,
 }
 
+/// An item lying on the ground. `amount` is how much of one item the piece
+/// is (1 = a whole stone; a stone broken in half leaves two pieces of 0.5).
 #[derive(Clone, Debug)]
 pub struct DropItem {
     pub id: u32,
     pub kind: ItemKind,
     pub x: f32,
     pub z: f32,
+    pub amount: f32,
+}
+
+impl DropItem {
+    /// A whole item.
+    pub fn whole(id: u32, kind: ItemKind, x: f32, z: f32) -> DropItem {
+        DropItem { id, kind, x, z, amount: 1.0 }
+    }
+
+    pub fn mass_kg(&self) -> f32 {
+        self.kind.spec().mass_kg * self.amount
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -114,7 +137,14 @@ pub struct Waypoint {
     pub label_ko: String,
     pub x: f32,
     pub z: f32,
-    pub stock: Vec<(ItemKind, u32)>,
+    /// What has been put down here, in items (fractions are broken pieces).
+    pub stock: Vec<(ItemKind, f32)>,
+}
+
+impl Waypoint {
+    pub fn stock_of(&self, item: ItemKind) -> f32 {
+        self.stock.iter().filter(|(k, _)| *k == item).map(|(_, n)| *n).sum()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -122,7 +152,8 @@ pub struct Agent {
     pub x: f32,
     pub z: f32,
     pub yaw: f32,
-    pub carried: Vec<(ItemKind, u32)>,
+    /// Items in the cargo bay, in items (fractions are broken pieces).
+    pub carried: Vec<(ItemKind, f32)>,
     pub energy_used_j: f64,
     pub strikes: u32,
     pub speed_mps: f32,
@@ -145,6 +176,13 @@ pub enum Action {
     PickUp { drop: u32 },
     /// Put carried items into a waypoint's stock; `item` limits it to one kind.
     Deliver { waypoint: u32, item: Option<ItemKind> },
+    /// Set carried items down here: into the pile of a waypoint within
+    /// [`DELIVER_REACH_M`], else on the ground in front of the robot. `item`
+    /// limits it to one kind, `amount` to that many items (all when `None`).
+    Drop { item: Option<ItemKind>, amount: Option<f32> },
+    /// Break a divisible piece lying on the ground: a new piece with
+    /// `portion` of it appears beside it, the rest stays.
+    Split { drop: u32, portion: f32 },
 }
 
 impl Action {
@@ -159,7 +197,23 @@ impl Action {
                 Some(i) => format!("deliver({},{})", waypoint_id(*waypoint), i.id()),
                 None => format!("deliver({})", waypoint_id(*waypoint)),
             },
+            Action::Drop { item, amount } => match (item, amount) {
+                (Some(i), Some(a)) => format!("drop({}×{a:.2})", i.id()),
+                (Some(i), None) => format!("drop({})", i.id()),
+                (None, _) => "drop(all)".to_string(),
+            },
+            Action::Split { drop, portion } => format!("split({},{portion:.2})", drop_id(*drop)),
         }
+    }
+}
+
+/// An amount as people say it: `2`, `0.5`, `1.25`.
+pub fn amount_text(a: f32) -> String {
+    if (a - a.round()).abs() < AMOUNT_EPS {
+        format!("{}", a.round() as i64)
+    } else {
+        let s = format!("{a:.2}");
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
     }
 }
 
@@ -177,6 +231,11 @@ pub enum ActionError {
     NothingToDeliver,
     /// The arms (or the balance) cannot lift the item: a joint over its peak, or a negative margin.
     LiftOverload { limiting: String, margin: f32 },
+    NothingToDrop,
+    /// The item cannot be broken by hand (a log).
+    NotDivisible,
+    /// The piece, or what would be left of it, is below [`MIN_PIECE`].
+    PieceTooSmall { amount: f32 },
 }
 
 impl ActionError {
@@ -191,6 +250,9 @@ impl ActionError {
             ActionError::CapacityExceeded { .. } => "capacity_exceeded",
             ActionError::NothingToDeliver => "nothing_to_deliver",
             ActionError::LiftOverload { .. } => "lift_overload",
+            ActionError::NothingToDrop => "nothing_to_drop",
+            ActionError::NotDivisible => "not_divisible",
+            ActionError::PieceTooSmall { .. } => "piece_too_small",
         }
     }
 }
@@ -202,8 +264,13 @@ pub enum WorldEvent {
     ActionDone { action: String, ok: bool, reason: Option<String> },
     CurbClimbed { height_m: f32 },
     NodeBroken { node: String, kind: NodeKind, drops: Vec<String> },
-    ItemPicked { drop: String, item: ItemKind, mass_kg: f32, grip_margin: f32 },
-    Delivered { waypoint: String, item: ItemKind, count: u32 },
+    /// `amount` of one item was lifted into the bay (`mass_kg` is that piece's mass).
+    ItemPicked { drop: String, item: ItemKind, mass_kg: f32, grip_margin: f32, amount: f32 },
+    Delivered { waypoint: String, item: ItemKind, amount: f32 },
+    /// Carried items set down: on a waypoint's pile (`waypoint`) or on the ground as pieces (`drops`).
+    ItemDropped { item: ItemKind, amount: f32, waypoint: Option<String>, drops: Vec<String> },
+    /// A piece broken off `drop`: the new piece `piece` holds `amount` items.
+    ItemSplit { drop: String, piece: String, item: ItemKind, amount: f32, left: f32 },
     BatteryDepleted,
 }
 
@@ -232,6 +299,8 @@ enum WorkKind {
     Mine { node: u32 },
     Pick { drop: u32, two_arms: bool },
     Deliver { waypoint: u32, item: Option<ItemKind> },
+    Drop { item: Option<ItemKind>, amount: Option<f32>, waypoint: Option<u32> },
+    Split { drop: u32, portion: f32 },
 }
 
 #[derive(Clone, Debug)]
@@ -273,10 +342,48 @@ pub struct World {
     pub ff_enabled: bool,
     /// Heat state per joint, `(τ/τ_cont)²` low-passed with the actuator's time constant.
     pub heat: BTreeMap<String, f32>,
+    /// Life used per joint (Miner damage over the reducer's rating, `hand_core::wear`; 1 = worn out).
+    pub wear: BTreeMap<String, f32>,
     /// Joint dynamics of the last posture change (`hand_core::dynamics`): the
     /// presets' masses and actuators moving the joints, for the third-person view.
     pub motion: Option<Motion>,
     last_posture: Posture,
+    /// Where the rugged features went (`None` on the open map).
+    pub layout: Option<RuggedLayout>,
+}
+
+impl Clone for World {
+    /// A copy that runs on its own: the integrated test replays a recorded
+    /// start state in it while the live world waits.
+    fn clone(&self) -> World {
+        World {
+            cfg: self.cfg.clone(),
+            hand: self.hand.clone(),
+            terrain: self.terrain.clone(),
+            nodes: self.nodes.clone(),
+            drops: self.drops.clone(),
+            waypoints: self.waypoints.clone(),
+            agent: self.agent.clone(),
+            tick: self.tick,
+            time_s: self.time_s,
+            grasps: self.grasps.clone(),
+            active: self.active.clone(),
+            rng: self.rng.clone(),
+            next_drop: self.next_drop,
+            body: self.body.clone(),
+            limits: Mutex::new(self.limits.lock().unwrap_or_else(|e| e.into_inner()).clone()),
+            balance: self.balance.clone(),
+            balance_since: self.balance_since,
+            balance_events: self.balance_events.clone(),
+            ff_gains: self.ff_gains.clone(),
+            ff_enabled: self.ff_enabled,
+            heat: self.heat.clone(),
+            wear: self.wear.clone(),
+            motion: self.motion.clone(),
+            last_posture: self.last_posture,
+            layout: self.layout.clone(),
+        }
+    }
 }
 
 /// A simulated posture change and when it started.
@@ -298,9 +405,13 @@ fn wrap_angle(a: f32) -> f32 {
     a
 }
 
-fn add_stock(list: &mut Vec<(ItemKind, u32)>, kind: ItemKind, n: u32) {
+fn add_stock(list: &mut Vec<(ItemKind, f32)>, kind: ItemKind, n: f32) {
     if let Some(e) = list.iter_mut().find(|(k, _)| *k == kind) {
         e.1 += n;
+        // Two halves make a whole: keep sums free of float dust.
+        if (e.1 - e.1.round()).abs() < AMOUNT_EPS {
+            e.1 = e.1.round();
+        }
     } else {
         list.push((kind, n));
     }
@@ -327,13 +438,13 @@ impl World {
         }
         let mut terrain = Terrain::generate(cfg.seed, cells, cells, &zones);
 
-        // Sand pads under the waypoints.
+        // Compacted gravel pads under the waypoints.
         for (px, pz) in [base_pos, wh_pos] {
             for cz in 0..cells {
                 for cx in 0..cells {
                     let (x, z) = cell_center(cx, cz);
                     if ((x - px).powi(2) + (z - pz).powi(2)).sqrt() <= 2.0 {
-                        terrain.set_ground(cx, cz, Ground::Sand);
+                        terrain.set_ground(cx, cz, Ground::Gravel);
                     }
                 }
             }
@@ -356,6 +467,14 @@ impl World {
             };
             terrain.set_curb_cm(wall_cx, cz, cm);
         }
+
+        // The rugged map: sea, cliffs and ridges away from the way a wheel
+        // takes between the waypoints (through the gap in the curb wall).
+        let layout = (cfg.terrain == TerrainKind::Rugged).then(|| {
+            let gap = (wall_x, (gap_from as f32 + 1.0) * CELL_M);
+            let clear: Vec<FlatZone> = vec![(base_pos.0, base_pos.1, 3.5), (wh_pos.0, wh_pos.1, 3.5)];
+            terrain.stamp_rugged(cfg.seed, &clear, &[base_pos, (base_pos.0, gap.1), gap, wh_pos], 2.2)
+        });
 
         let mut rng = Rng::new(cfg.seed ^ 0xA5A5_5A5A_1234_8765);
         let mut occupied: HashSet<Cell> = HashSet::new();
@@ -390,6 +509,7 @@ impl World {
                     || near_wall
                     || in_zone(x, z)
                     || terrain.curb_m(cx, cz) > 0.0
+                    || terrain.is_water(cx, cz)
                     || occupied.contains(&(cx, cz))
                 {
                     continue;
@@ -399,6 +519,42 @@ impl World {
                 nodes.push(Node { id: next_node, kind, x, z, hp, max_hp: hp });
                 next_node += 1;
                 placed += 1;
+            }
+        }
+        // On the rugged map some nodes end up on mesas or behind water: seen
+        // from afar, out of reach. Every kind keeps two a wheel can get to, so
+        // a quest has a way to succeed (a decoy on a mesa is the hard part).
+        if layout.is_some() {
+            let wheel = hand_core::BaseKind::Wheel.spec();
+            let start = terrain.cell_of(base_pos.0, base_pos.1).unwrap_or((0, 0));
+            let taken: HashSet<Cell> = occupied.clone();
+            let times = nav::travel_times(&wheel, &terrain, &|x, z| taken.contains(&(x, z)), start, f32::INFINITY);
+            let reachable = |cx: usize, cz: usize| -> bool {
+                (-1i32..=1).any(|dz| (-1i32..=1).any(|dx| {
+                    let (nx, nz) = (cx as i32 + dx, cz as i32 + dz);
+                    terrain.in_bounds(nx, nz) && times[terrain.idx(nx as usize, nz as usize)].is_finite()
+                }))
+            };
+            for kind in NodeKind::ALL {
+                let mut ok = nodes.iter().filter(|n| n.kind == kind).filter(|n| terrain.cell_of(n.x, n.z).map_or(false, |(cx, cz)| reachable(cx, cz))).count();
+                let mut tries = 0;
+                while ok < 2 && tries < 4000 {
+                    tries += 1;
+                    let (cx, cz) = (rng.below(cells as u32) as usize, rng.below(cells as u32) as usize);
+                    let (x, z) = cell_center(cx, cz);
+                    let i = terrain.idx(cx, cz);
+                    if !times[i].is_finite() || occupied.contains(&(cx, cz)) || in_zone(x, z) || cx.abs_diff(wall_cx) <= 1 || terrain.curb_m(cx, cz) > 0.0 {
+                        continue;
+                    }
+                    if kind == NodeKind::Tree && terrain.height_cm(cx, cz) >= 70 {
+                        continue;
+                    }
+                    occupied.insert((cx, cz));
+                    let hp = kind.break_time_s();
+                    nodes.push(Node { id: next_node, kind, x, z, hp, max_hp: hp });
+                    next_node += 1;
+                    ok += 1;
+                }
             }
         }
 
@@ -464,9 +620,47 @@ impl World {
             ff_gains: BTreeMap::new(),
             ff_enabled: true,
             heat: BTreeMap::new(),
+            wear: BTreeMap::new(),
             motion: None,
             last_posture: Posture::quiet(0.0),
+            layout,
         })
+    }
+
+    /// The world as the seed made it (terrain, nodes, nothing on the ground,
+    /// empty piles, the robot at the base camp), with the robot's body as it
+    /// is now: the battery charge, joint heat and wear stay. Nothing changes
+    /// if the world cannot be rebuilt.
+    pub fn reset_world_keep_body(&mut self) -> Result<(), ConfigError> {
+        let mut fresh = World::new(self.cfg.clone())?;
+        fresh.agent.energy_used_j = self.agent.energy_used_j;
+        fresh.agent.strikes = self.agent.strikes;
+        fresh.agent.strike_acc = self.agent.strike_acc;
+        fresh.heat = std::mem::take(&mut self.heat);
+        fresh.wear = std::mem::take(&mut self.wear);
+        fresh.ff_gains = std::mem::take(&mut self.ff_gains);
+        fresh.ff_enabled = self.ff_enabled;
+        // The clock keeps running: logs and records stay in order.
+        fresh.tick = self.tick;
+        fresh.time_s = self.time_s;
+        *self = fresh;
+        Ok(())
+    }
+
+    /// The body back to rested: full battery, cold joints, no wear, the last
+    /// grasp and terrain readings forgotten. The robot stays where it is with
+    /// what it carries, and a running action goes on.
+    pub fn reset_body(&mut self) {
+        self.agent.energy_used_j = 0.0;
+        self.agent.strikes = 0;
+        self.agent.strike_acc = 0.0;
+        self.agent.grip_margin = None;
+        self.agent.terrain_margin = None;
+        self.heat.clear();
+        self.wear.clear();
+        self.balance = None;
+        self.motion = None;
+        self.last_posture = Posture::quiet(self.carried_kg());
     }
 
     // ----- lookups -----
@@ -500,11 +694,57 @@ impl World {
     }
 
     pub fn carried_kg(&self) -> f32 {
-        self.agent.carried.iter().map(|(k, n)| k.spec().mass_kg * *n as f32).sum()
+        self.agent.carried.iter().map(|(k, n)| k.spec().mass_kg * *n).sum()
     }
 
+    /// Whole items of a kind in the bay (a half stone does not count).
     pub fn carried_count(&self, item: ItemKind) -> u32 {
-        self.agent.carried.iter().find(|(k, _)| *k == item).map_or(0, |e| e.1)
+        (self.carried_amount(item) + AMOUNT_EPS).floor() as u32
+    }
+
+    /// Items of a kind in the bay, broken pieces included.
+    pub fn carried_amount(&self, item: ItemKind) -> f32 {
+        self.agent.carried.iter().filter(|(k, _)| *k == item).map(|e| e.1).sum()
+    }
+
+    /// What one hand's grasp test says about a piece of `amount` items:
+    /// smaller pieces of a brittle item weigh less and are smaller.
+    pub fn grasp_for(&self, item: ItemKind, amount: f32) -> GraspInfo {
+        if (amount - 1.0).abs() < AMOUNT_EPS {
+            return self.grasp_info(item).clone();
+        }
+        let s = item.spec();
+        let out = grasp(
+            &self.hand,
+            &Payload { name: s.label_en.into(), size_m: s.piece_size_m(amount), mass_kg: s.mass_kg * amount, friction: ITEM_FRICTION },
+            &GraspSetup::default(),
+        );
+        let r = &out.result;
+        let margin = if r.required_n > 1e-6 { r.friction_capacity_n / r.required_n } else { 99.0 };
+        GraspInfo { item, stable: r.stable, margin: margin.min(99.0), max_payload_kg: r.max_payload_kg, grasp_type: format!("{:?}", r.grasp_type).to_lowercase() }
+    }
+
+    /// Friction capacity of one hand for a piece, newtons.
+    pub fn grip_capacity_for(&self, item: ItemKind, amount: f32) -> f32 {
+        let g = self.grasp_for(item, amount);
+        g.margin * item.spec().mass_kg * amount * hand_core::balance::G * GRIP_SAFETY
+    }
+
+    /// Time to break a piece of `amount` items in two with this hand (est:
+    /// the fracture surface grows as the piece's cross-section, `amount^(2/3)`;
+    /// the hand strikes at the mining rate).
+    pub fn split_time_s(&self, item: ItemKind, amount: f32) -> f32 {
+        item.split_time_s() * amount.max(MIN_PIECE).powf(2.0 / 3.0) / self.mining_rate().max(0.05)
+    }
+
+    /// The waypoint whose pile a drop here would go on.
+    pub fn waypoint_in_reach(&self) -> Option<u32> {
+        self.waypoints
+            .iter()
+            .map(|w| (w.id, ((w.x - self.agent.x).powi(2) + (w.z - self.agent.z).powi(2)).sqrt()))
+            .filter(|(_, d)| *d <= DELIVER_REACH_M)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(id, _)| id)
     }
 
     /// Cargo limit: the base's own limit, lowered by what the legs or the
@@ -533,16 +773,39 @@ impl World {
     }
 
     /// The base spec the routes and the drive use: the mechanism's spec with the
-    /// body's limits applied and the drive power scaled with the mass.
+    /// body's limits applied, the drive power scaled with the mass, and the
+    /// chassis force over the loaded mass (each ground's climb limit).
     pub fn drive_spec(&self) -> hand_core::BaseSpec {
-        let l = self.limits();
+        self.drive_spec_for(self.carried_kg())
+    }
+
+    /// The drive spec with `cargo_kg` aboard (the cargo decision asks before loading).
+    pub fn drive_spec_for(&self, cargo_kg: f32) -> hand_core::BaseSpec {
+        let l = if (cargo_kg - self.carried_kg()).abs() < 1e-6 { self.limits() } else { self.body.drive_limits(&self.hand.base, cargo_kg) };
+        let mass = self.body.mass_kg() + cargo_kg;
         hand_core::BaseSpec {
             max_speed_mps: l.max_speed_mps,
             max_slope_deg: l.max_slope_deg,
             max_step_m: l.max_step_m,
             power_w: self.hand.base.power_w * l.power_scale,
+            drive_accel_mps2: (!self.body.legged).then(|| self.body.chassis.drive_force_n / mass),
+            mass_kg: Some(mass),
             ..self.hand.base
         }
+    }
+
+    /// The ground of a cell (gravel, as the pads, outside the map).
+    pub fn ground_at(&self, cell: Cell) -> Ground {
+        if cell.0 < self.terrain.w && cell.1 < self.terrain.d {
+            self.terrain.ground_at(cell.0, cell.1)
+        } else {
+            Ground::Gravel
+        }
+    }
+
+    /// The ground under the robot.
+    pub fn ground_here(&self) -> Ground {
+        self.ground_at(self.agent_cell())
     }
 
     /// Time to reach cruise speed: at least [`ACCEL_TIME_S`], longer when the
@@ -553,15 +816,15 @@ impl World {
     }
 
     /// The drive planner's start (`dir > 0`) or stop (`dir < 0`) acceleration on
-    /// `slope_deg` with the current cargo (`Body::planned_accel`).
-    pub fn planned_accel(&self, slope_deg: f32, dir: f32) -> f32 {
-        self.body.planned_accel_within(&self.limits(), slope_deg, self.carried_kg(), dir, ACCEL_TIME_S)
+    /// `slope_deg` and `ground` with the current cargo (`Body::planned_accel`).
+    pub fn planned_accel(&self, slope_deg: f32, ground: Ground, dir: f32) -> f32 {
+        self.body.planned_accel_within(&self.limits(), slope_deg, self.carried_kg(), ground.surface(), dir, ACCEL_TIME_S)
     }
 
     /// Distance to stop from cruise speed with the planned deceleration, metres.
-    pub fn braking_distance_m(&self, slope_deg: f32) -> f32 {
+    pub fn braking_distance_m(&self, slope_deg: f32, ground: Ground) -> f32 {
         let v = self.drive_spec().max_speed_mps;
-        v * v / (2.0 * self.planned_accel(slope_deg, -1.0))
+        v * v / (2.0 * self.planned_accel(slope_deg, ground, -1.0))
     }
 
     /// Path left on a move, metres.
@@ -615,7 +878,7 @@ impl World {
     }
 
     /// Cells that hold a resource node (the base cannot drive through them).
-    fn blocked_cells(&self) -> HashSet<Cell> {
+    pub fn blocked_cells(&self) -> HashSet<Cell> {
         self.nodes.iter().filter_map(|n| self.terrain.cell_of(n.x, n.z)).collect()
     }
 
@@ -673,17 +936,17 @@ impl World {
                 Active::Work(WorkState { kind: WorkKind::Mine { node: *node }, remaining_s: n.hp })
             }
             Action::PickUp { drop } => {
-                let (dx, dz, kind) = {
+                let (dx, dz, kind, amount) = {
                     let d = self.drop_item(*drop).ok_or(ActionError::UnknownTarget)?;
-                    (d.x, d.z, d.kind)
+                    (d.x, d.z, d.kind, d.amount)
                 };
                 self.check_reach(dx, dz, PICKUP_REACH_M)?;
-                let info = self.grasp_info(kind).clone();
+                let info = self.grasp_for(kind, amount);
                 self.agent.grip_margin = Some(info.margin);
                 if !info.stable {
                     return Err(ActionError::GraspUnstable { margin: info.margin });
                 }
-                let item_kg = kind.spec().mass_kg;
+                let item_kg = kind.spec().mass_kg * amount;
                 if self.carried_kg() + item_kg > self.capacity_kg() + 1e-4 {
                     return Err(ActionError::CapacityExceeded {
                         carried_kg: self.carried_kg(),
@@ -692,17 +955,39 @@ impl World {
                     });
                 }
                 // Can the arms lift it, and does the robot stay balanced while they do?
-                let (rep, two_arms) = self.body.lift(item_kg, self.carried_kg(), &self.ff_for(Source::ArmLift), self.grip_capacity_n(kind));
+                let (rep, two_arms) = self.body.lift(item_kg, self.carried_kg(), &self.ff_for(Source::ArmLift), self.grip_capacity_for(kind, amount));
                 if !rep.feasible {
                     return Err(ActionError::LiftOverload { limiting: rep.limiting.clone().unwrap_or_default(), margin: rep.margin });
                 }
                 let t = if two_arms { PICKUP_TIME_S * TWO_ARM_LIFT_FACTOR } else { PICKUP_TIME_S };
                 Active::Work(WorkState { kind: WorkKind::Pick { drop: *drop, two_arms }, remaining_s: t })
             }
+            Action::Drop { item, amount } => {
+                let have: f32 = self.agent.carried.iter().filter(|(k, n)| *n > AMOUNT_EPS && item.map_or(true, |i| i == *k)).map(|(_, n)| *n).sum();
+                if have <= AMOUNT_EPS || amount.is_some_and(|a| a <= AMOUNT_EPS) {
+                    return Err(ActionError::NothingToDrop);
+                }
+                Active::Work(WorkState { kind: WorkKind::Drop { item: *item, amount: *amount, waypoint: self.waypoint_in_reach() }, remaining_s: DROP_TIME_S })
+            }
+            Action::Split { drop, portion } => {
+                let (dx, dz, kind, amount) = {
+                    let d = self.drop_item(*drop).ok_or(ActionError::UnknownTarget)?;
+                    (d.x, d.z, d.kind, d.amount)
+                };
+                self.check_reach(dx, dz, PICKUP_REACH_M)?;
+                if !kind.spec().divisible {
+                    return Err(ActionError::NotDivisible);
+                }
+                let piece = amount * portion;
+                if !(0.0..1.0).contains(portion) || piece < MIN_PIECE - AMOUNT_EPS || amount - piece < MIN_PIECE - AMOUNT_EPS {
+                    return Err(ActionError::PieceTooSmall { amount: piece.min(amount - piece) });
+                }
+                Active::Work(WorkState { kind: WorkKind::Split { drop: *drop, portion: *portion }, remaining_s: self.split_time_s(kind, amount) })
+            }
             Action::Deliver { waypoint, item } => {
                 let w = self.waypoint(*waypoint).ok_or(ActionError::UnknownTarget)?;
                 self.check_reach(w.x, w.z, DELIVER_REACH_M)?;
-                let any = self.agent.carried.iter().any(|(k, n)| *n > 0 && item.map_or(true, |i| i == *k));
+                let any = self.agent.carried.iter().any(|(k, n)| *n > AMOUNT_EPS && item.map_or(true, |i| i == *k));
                 if !any {
                     return Err(ActionError::NothingToDeliver);
                 }
@@ -867,7 +1152,8 @@ impl World {
         self.agent.x = fx + (tx - fx) * f;
         self.agent.z = fz + (tz - fz) * f;
         self.agent.speed_mps = e.horizontal_m / e.move_time_s;
-        self.add_energy(power * t as f64);
+        // The ground being entered: rolling resistance or the walking terrain factor.
+        self.add_energy(power * e.energy_factor as f64 * t as f64);
         if m.progress_s >= e.move_time_s - 1e-6 {
             self.agent.x = tx;
             self.agent.z = tz;
@@ -904,6 +1190,18 @@ impl World {
                     *done = Some((false, Some("unknown_target".into())));
                     return 0.0;
                 }
+            },
+            WorkKind::Split { drop, .. } => match self.drop_item(drop) {
+                Some(d) => (d.x, d.z),
+                None => {
+                    *done = Some((false, Some("unknown_target".into())));
+                    return 0.0;
+                }
+            },
+            // Onto a pile: face it; onto the ground: set down ahead, no turn.
+            WorkKind::Drop { waypoint, .. } => match waypoint.and_then(|w| self.waypoint(w)) {
+                Some(p) => (p.x, p.z),
+                None => (self.agent.x + self.agent.yaw.cos(), self.agent.z + self.agent.yaw.sin()),
             },
         };
         let heading = (tz - self.agent.z).atan2(tx - self.agent.x);
@@ -949,6 +1247,26 @@ impl World {
                     *done = Some((true, None));
                 }
             }
+            WorkKind::Drop { item, amount, waypoint } => {
+                w.remaining_s -= t;
+                if w.remaining_s <= 1e-6 {
+                    self.complete_drop(item, amount, waypoint, events);
+                    *done = Some((true, None));
+                }
+            }
+            WorkKind::Split { drop, portion } => {
+                // Breaking a piece is striking: it wears the joints like mining.
+                self.agent.strike_acc += t;
+                while self.agent.strike_acc >= 1.0 {
+                    self.agent.strike_acc -= 1.0;
+                    self.agent.strikes += 1;
+                }
+                w.remaining_s -= t;
+                if w.remaining_s <= 1e-6 {
+                    self.complete_split(drop, portion, events);
+                    *done = Some((true, None));
+                }
+            }
         }
         t
     }
@@ -963,7 +1281,7 @@ impl World {
             let a = (i as f32 / spec.drop_count as f32) * std::f32::consts::TAU + self.rng.range_f32(0.0, 1.0);
             let r = if spec.drop_count == 1 { 0.0 } else { 0.13 };
             let (x, z) = (node.x + r * a.cos(), node.z + r * a.sin());
-            let d = DropItem { id: self.next_drop, kind: spec.drop, x, z };
+            let d = DropItem::whole(self.next_drop, spec.drop, x, z);
             self.next_drop += 1;
             ids.push(drop_id(d.id));
             self.drops.push(d);
@@ -974,28 +1292,92 @@ impl World {
     fn complete_pick(&mut self, id: u32, events: &mut Vec<TimedEvent>) {
         if let Some(pos) = self.drops.iter().position(|d| d.id == id) {
             let d = self.drops.remove(pos);
-            add_stock(&mut self.agent.carried, d.kind, 1);
+            add_stock(&mut self.agent.carried, d.kind, d.amount);
             let margin = self.agent.grip_margin.unwrap_or(0.0);
-            events.push(self.stamp(WorldEvent::ItemPicked { drop: drop_id(id), item: d.kind, mass_kg: d.kind.spec().mass_kg, grip_margin: margin }));
+            events.push(self.stamp(WorldEvent::ItemPicked { drop: drop_id(id), item: d.kind, mass_kg: d.mass_kg(), grip_margin: margin, amount: d.amount }));
         }
     }
 
     fn complete_deliver(&mut self, waypoint: u32, item: Option<ItemKind>, events: &mut Vec<TimedEvent>) {
-        let mut moved: Vec<(ItemKind, u32)> = Vec::new();
+        let mut moved: Vec<(ItemKind, f32)> = Vec::new();
         self.agent.carried.retain_mut(|(k, n)| {
-            if *n > 0 && item.map_or(true, |i| i == *k) {
+            if *n > AMOUNT_EPS && item.map_or(true, |i| i == *k) {
                 moved.push((*k, *n));
                 false
             } else {
-                *n > 0
+                *n > AMOUNT_EPS
             }
         });
         for (k, n) in moved {
             if let Some(w) = self.waypoints.iter_mut().find(|w| w.id == waypoint) {
                 add_stock(&mut w.stock, k, n);
             }
-            events.push(self.stamp(WorldEvent::Delivered { waypoint: waypoint_id(waypoint), item: k, count: n }));
+            events.push(self.stamp(WorldEvent::Delivered { waypoint: waypoint_id(waypoint), item: k, amount: n }));
         }
+    }
+
+    /// Takes up to `amount` (all when `None`) of the matching kinds out of the bay.
+    fn take_cargo(&mut self, item: Option<ItemKind>, amount: Option<f32>) -> Vec<(ItemKind, f32)> {
+        let mut left = amount.unwrap_or(f32::INFINITY);
+        let mut taken: Vec<(ItemKind, f32)> = Vec::new();
+        for (k, n) in self.agent.carried.iter_mut() {
+            if left <= AMOUNT_EPS || *n <= AMOUNT_EPS || !item.map_or(true, |i| i == *k) {
+                continue;
+            }
+            let a = n.min(left);
+            *n -= a;
+            left -= a;
+            taken.push((*k, a));
+        }
+        self.agent.carried.retain(|(_, n)| *n > AMOUNT_EPS);
+        taken
+    }
+
+    fn complete_drop(&mut self, item: Option<ItemKind>, amount: Option<f32>, waypoint: Option<u32>, events: &mut Vec<TimedEvent>) {
+        let taken = self.take_cargo(item, amount);
+        for (k, a) in taken {
+            if let Some(wid) = waypoint {
+                if let Some(w) = self.waypoints.iter_mut().find(|w| w.id == wid) {
+                    add_stock(&mut w.stock, k, a);
+                }
+                events.push(self.stamp(WorldEvent::ItemDropped { item: k, amount: a, waypoint: Some(waypoint_id(wid)), drops: vec![] }));
+                continue;
+            }
+            // On the ground ahead: one piece per whole item and one for the rest.
+            let ahead = (self.agent.x + DROP_AHEAD_M * self.agent.yaw.cos(), self.agent.z + DROP_AHEAD_M * self.agent.yaw.sin());
+            let on_land = |w: &World, x: f32, z: f32| w.terrain.cell_of(x, z).is_some_and(|(cx, cz)| !w.terrain.is_water(cx, cz) && !w.blocked_cells().contains(&(cx, cz)));
+            let (bx, bz) = if on_land(self, ahead.0, ahead.1) { ahead } else { (self.agent.x, self.agent.z) };
+            let mut pieces = Vec::new();
+            let mut rest = a;
+            while rest > AMOUNT_EPS {
+                pieces.push(rest.min(1.0));
+                rest -= 1.0;
+            }
+            let (sx, sz) = (-self.agent.yaw.sin(), self.agent.yaw.cos());
+            let mut ids = Vec::new();
+            for (j, p) in pieces.iter().enumerate() {
+                let off = (j as f32 - (pieces.len() as f32 - 1.0) * 0.5) * 0.13;
+                let d = DropItem { id: self.next_drop, kind: k, x: bx + sx * off, z: bz + sz * off, amount: *p };
+                self.next_drop += 1;
+                ids.push(drop_id(d.id));
+                self.drops.push(d);
+            }
+            events.push(self.stamp(WorldEvent::ItemDropped { item: k, amount: a, waypoint: None, drops: ids }));
+        }
+    }
+
+    fn complete_split(&mut self, id: u32, portion: f32, events: &mut Vec<TimedEvent>) {
+        let Some(d) = self.drops.iter_mut().find(|d| d.id == id) else { return };
+        let piece = d.amount * portion;
+        d.amount -= piece;
+        let (kind, left, x, z) = (d.kind, d.amount, d.x, d.z);
+        // The broken-off piece lands beside the rest, toward the robot.
+        let (ax, az) = (self.agent.x - x, self.agent.z - z);
+        let n = ax.hypot(az).max(1e-3);
+        let new = DropItem { id: self.next_drop, kind, x: x + 0.12 * ax / n, z: z + 0.12 * az / n, amount: piece };
+        self.next_drop += 1;
+        events.push(self.stamp(WorldEvent::ItemSplit { drop: drop_id(id), piece: drop_id(new.id), item: kind, amount: piece, left }));
+        self.drops.push(new);
     }
 
     // ----- views -----
@@ -1009,21 +1391,23 @@ impl World {
             for cx in 0..t.w {
                 heights.push(t.height_cm(cx, cz) as i16);
                 curbs.push((t.curb_m(cx, cz) * 100.0).round() as u8);
-                ground.push(match t.ground_at(cx, cz) {
-                    Ground::Sand => 0,
-                    Ground::Grass => 1,
-                    Ground::Dirt => 2,
-                    Ground::Rock => 3,
-                });
+                ground.push(t.ground_at(cx, cz).code());
             }
         }
-        TerrainGrid { cells_w: t.w, cells_d: t.d, cell_m: CELL_M, heights_cm: heights, curb_cm: curbs, ground }
+        TerrainGrid { cells_w: t.w, cells_d: t.d, cell_m: CELL_M, heights_cm: heights, curb_cm: curbs, ground, kind: self.cfg.terrain }
     }
 
-    fn carry_views(list: &[(ItemKind, u32)]) -> Vec<CarryView> {
+    fn carry_views(list: &[(ItemKind, f32)]) -> Vec<CarryView> {
         list.iter()
-            .filter(|(_, n)| *n > 0)
-            .map(|(k, n)| CarryView { item: *k, label_ko: k.spec().label_ko.into(), count: *n, mass_kg: k.spec().mass_kg * *n as f32 })
+            .filter(|(_, n)| *n > AMOUNT_EPS)
+            .map(|(k, n)| CarryView {
+                item: *k,
+                label_ko: k.spec().label_ko.into(),
+                count: (*n + AMOUNT_EPS).floor() as u32,
+                amount: *n,
+                mass_kg: k.spec().mass_kg * *n,
+                unit_kg: k.spec().mass_kg,
+            })
             .collect()
     }
 
@@ -1066,13 +1450,19 @@ impl World {
             drops: self
                 .drops
                 .iter()
-                .map(|dr| DropView { id: drop_id(dr.id), item: dr.kind, label_ko: dr.kind.spec().label_ko.into(), pos: at(dr.x, dr.z) })
+                .map(|dr| DropView { id: drop_id(dr.id), item: dr.kind, label_ko: dr.kind.spec().label_ko.into(), pos: at(dr.x, dr.z), amount: dr.amount })
                 .collect(),
+            terrain: self.cfg.terrain,
         }
     }
 
     /// The posture the current action asks for, and its terrain/phase bucket.
     pub fn posture_now(&self) -> (Posture, String) {
+        let (post, state) = self.posture_action();
+        (Posture { ground: self.ground_here().surface(), ..post }, state)
+    }
+
+    fn posture_action(&self) -> (Posture, String) {
         let cargo = self.carried_kg();
         let bucket = |deg: f32, step: f32| -> String {
             if step > 0.0 {
@@ -1088,21 +1478,22 @@ impl World {
                 let Some(e) = m.edges.get(m.idx) else { return (Posture::quiet(cargo), "flat|move".into()) };
                 let rise = self.terrain.height_m(e.to.0, e.to.1) - self.terrain.height_m(e.from.0, e.from.1);
                 let slope = if rise >= 0.0 { e.slope_deg } else { -e.slope_deg };
-                let mut p = Posture { slope_deg: slope, ..Posture::quiet(cargo) };
+                let ground = self.ground_here();
+                let mut p = Posture { slope_deg: slope, moving: true, ..Posture::quiet(cargo) };
                 let b = bucket(slope, if m.pause_left > 0.0 { e.step_m } else { 0.0 });
                 let mut b_brake = false;
                 if m.pause_left > 0.0 {
                     p.source = Source::StepUp;
                     p.step_m = e.step_m;
                     p.single_support = self.body.legged;
-                } else if m.elapsed_s < self.drive_spec().max_speed_mps / self.planned_accel(slope, 1.0) {
-                    // The planner starts no harder than the ZMP's room toward the back edge allows on this slope.
+                } else if m.elapsed_s < self.drive_spec().max_speed_mps / self.planned_accel(slope, ground, 1.0) {
+                    // The planner starts no harder than the ZMP's room toward the back edge and the ground's friction allow on this slope.
                     p.source = Source::Accel;
-                    p.accel_mps2 = self.planned_accel(slope, 1.0);
-                } else if self.remaining_m(m) < self.braking_distance_m(slope) {
+                    p.accel_mps2 = self.planned_accel(slope, ground, 1.0);
+                } else if self.remaining_m(m) < self.braking_distance_m(slope, ground) {
                     // The last stretch of a move is the stop, planned against the front edge.
                     p.source = Source::Accel;
-                    p.accel_mps2 = -self.planned_accel(slope, -1.0);
+                    p.accel_mps2 = -self.planned_accel(slope, ground, -1.0);
                     b_brake = true;
                 } else if self.body.legged {
                     p.source = Source::FootLift;
@@ -1115,13 +1506,16 @@ impl World {
             Some((_, Active::Work(w))) => match &w.kind {
                 WorkKind::Mine { .. } => (Posture::arm_raise(cargo), "flat|mine".into()),
                 WorkKind::Pick { drop, two_arms } => {
-                    let kg = self.drop_item(*drop).map_or(0.0, |d| d.kind.spec().mass_kg);
+                    let kg = self.drop_item(*drop).map_or(0.0, |d| d.mass_kg());
                     (Posture::arm_lift(kg, *two_arms, cargo), "flat|pick".into())
                 }
-                WorkKind::Deliver { .. } => {
-                    let kg = self.agent.carried.iter().map(|(k, _)| k.spec().mass_kg).fold(0.0f32, f32::max);
-                    (Posture::arm_lift(kg, false, (cargo - kg).max(0.0)), "flat|deliver".into())
+                WorkKind::Deliver { .. } | WorkKind::Drop { .. } => {
+                    // The heaviest single piece in the bay is the one the arms handle.
+                    let kg = self.agent.carried.iter().map(|(k, n)| k.spec().mass_kg * n.min(1.0)).fold(0.0f32, f32::max);
+                    let tag = if matches!(w.kind, WorkKind::Drop { .. }) { "flat|drop" } else { "flat|deliver" };
+                    (Posture::arm_lift(kg, false, (cargo - kg).max(0.0)), tag.into())
                 }
+                WorkKind::Split { .. } => (Posture::arm_raise(cargo), "flat|split".into()),
             },
             _ => (Posture::quiet(cargo), "flat|idle".into()),
         }
@@ -1132,23 +1526,18 @@ impl World {
     fn update_balance(&mut self, dt: f32) {
         let (post, state) = self.posture_now();
         let grip = match &self.active {
-            Some((_, Active::Work(WorkState { kind: WorkKind::Pick { drop, .. }, .. }))) => self.drop_item(*drop).map(|d| self.grip_capacity_n(d.kind)),
+            Some((_, Active::Work(WorkState { kind: WorkKind::Pick { drop, .. }, .. }))) => self.drop_item(*drop).map(|d| self.grip_capacity_for(d.kind, d.amount)),
             _ => None,
         }
         .unwrap_or(1e3);
         let rep = self.body.solve(&post, &self.ff_for(post.source), grip);
         for j in &rep.joints {
-            let tau_s = match j.joint.as_str() {
-                n if n.starts_with("shoulder") => self.body.arm.shoulder.thermal_tau_s,
-                n if n.starts_with("elbow") => self.body.arm.elbow.thermal_tau_s,
-                "waist" => self.body.belly.pitch.map_or(600.0, |a| a.thermal_tau_s),
-                "neck" => self.body.head.neck.thermal_tau_s,
-                "knee" | "hip_roll" => self.body.leg.knee.thermal_tau_s,
-                "ankle" => self.body.leg.ankle.thermal_tau_s,
-                _ => continue,
-            };
+            let Some(act) = self.joint_actuator(&j.joint) else { continue };
+            // Short term: heat follows effort² with the actuator's time constant.
             let h = self.heat.entry(j.joint.clone()).or_insert(0.0);
-            *h += (dt / tau_s).min(1.0) * (j.effort * j.effort - *h);
+            *h += (dt / act.thermal_tau_s).min(1.0) * (j.effort * j.effort - *h);
+            // Long term: the reducer's life used at this torque.
+            *self.wear.entry(j.joint.clone()).or_insert(0.0) += hand_core::wear::damage(&act, j.torque_nm, dt);
         }
         let key = format!("{}|{state}", post.source.id());
         let changed = self.balance.as_ref().map_or(true, |(k, _)| *k != key);
@@ -1184,6 +1573,39 @@ impl World {
         }
     }
 
+    /// The preset actuator that drives a joint of the balance model.
+    pub fn joint_actuator(&self, joint: &str) -> Option<hand_core::parts::Actuator> {
+        match joint {
+            n if n.starts_with("shoulder") => Some(self.body.arm.shoulder),
+            n if n.starts_with("elbow") => Some(self.body.arm.elbow),
+            "waist" => self.body.belly.pitch,
+            "neck" => Some(self.body.head.neck),
+            "knee" | "hip_roll" => Some(self.body.leg.knee),
+            "ankle" => Some(self.body.leg.ankle),
+            _ => None,
+        }
+    }
+
+    /// The joint closest to a limit: the larger of its torque over the peak
+    /// rating and its RMS over the continuous rating (`√heat`, the motor
+    /// sizing rules) — joint, that index, peak ratio, RMS ratio.
+    pub fn joint_load(&self) -> Option<(String, f32, f32, f32)> {
+        let (_, r) = self.balance.as_ref()?;
+        r.joints
+            .iter()
+            .filter(|j| !j.joint.starts_with("grip"))
+            .map(|j| {
+                let rms = self.heat.get(&j.joint).copied().unwrap_or(0.0).max(0.0).sqrt();
+                (j.joint.clone(), j.peak_ratio.max(rms), j.peak_ratio, rms)
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+    }
+
+    /// The most worn joint and its Miner damage.
+    pub fn most_worn(&self) -> Option<(String, f32)> {
+        self.wear.iter().max_by(|a, b| a.1.total_cmp(b.1)).map(|(k, v)| (k.clone(), *v))
+    }
+
     /// Summary of the current balance for the body status.
     pub fn balance_summary(&self) -> Option<BalanceSummary> {
         let (key, r) = self.balance.as_ref()?;
@@ -1203,8 +1625,13 @@ impl World {
             mass_kg: r.mass_kg,
             com_height_m: r.com[2],
             heat_max: self.heat.values().copied().fold(0.0, f32::max),
+            load_joint: self.joint_load().map(|l| l.0),
+            load_index: self.joint_load().map_or(0.0, |l| l.1),
+            load_rms: self.joint_load().map_or(0.0, |l| l.3),
             joints: r.joints.clone(),
             couplings: r.couplings.clone(),
+            ground: self.ground_here().label_ko().into(),
+            contact: Some(r.contact),
         })
     }
 
@@ -1220,14 +1647,25 @@ impl World {
             carried_kg: self.carried_kg(),
             grip_margin: self.agent.grip_margin,
             joint_strikes: self.agent.strikes,
+            arm_wear: ["shoulder_r", "elbow_r"].iter().filter_map(|j| self.wear.get(*j)).copied().fold(0.0, f32::max),
+            wear_max: self.most_worn().map_or(0.0, |w| w.1),
+            wear_joint: self.most_worn().map(|w| w.0),
             speed_factor: (self.agent.speed_mps / self.drive_spec().max_speed_mps).clamp(0.0, 1.0),
             terrain_margin: self.agent.terrain_margin,
             limits: Some({
                 let l = self.limits();
                 BodyLimits { battery_j: self.battery_capacity_j(), capacity_kg: l.capacity_kg, max_speed_mps: l.max_speed_mps, max_slope_deg: l.max_slope_deg, max_step_m: l.max_step_m }
             }),
+            body_mass_kg: Some(self.body.mass_kg()),
+            capacity_here: Some((self.capacity_here(), self.ground_here().label_ko().to_string())),
             balance: self.balance_summary(),
         }
+    }
+
+    /// Cargo the base carries on the ground and slope under it (`Body::capacity_on`).
+    pub fn capacity_here(&self) -> f32 {
+        let slope = self.posture_now().0.slope_deg;
+        self.body.capacity_on(&self.hand.base, self.ground_here().surface(), slope).min(self.capacity_kg())
     }
 
     pub fn body_status(&self, vision_confidence: Option<f32>, frame_ms: Option<f32>) -> BodyStatus {
@@ -1243,7 +1681,7 @@ mod tests {
     fn world(fingers: FingerCount, base: BaseKind) -> World {
         let mut hand = HandConfig::preset(fingers);
         hand.base = base;
-        World::new(WorldConfig { seed: 7, cells: 64, hand, body: BodyPlan::default() }).unwrap()
+        World::new(WorldConfig { seed: 7, cells: 64, hand, body: BodyPlan::default(), terrain: TerrainKind::Open }).unwrap()
     }
 
     fn run(w: &mut World, max_s: f32) -> Vec<TimedEvent> {
@@ -1396,7 +1834,7 @@ mod tests {
         run(&mut w, 10.0);
         assert_eq!(w.carried_count(ItemKind::Log), 0);
         let stock = &w.waypoint(wh.id).unwrap().stock;
-        assert_eq!(stock, &vec![(ItemKind::Log, 1)]);
+        assert_eq!(stock, &vec![(ItemKind::Log, 1.0)]);
     }
 
     #[test]
@@ -1455,7 +1893,7 @@ mod tests {
             .into_iter()
             .find(|&k| !w.grasp_info(k).stable)
             .expect("the two-finger hand cannot hold every item (see item_catalogue_spans_what_the_hands_can_hold)");
-        w.drops.push(DropItem { id: 500, kind: bad, x: w.agent.x + 0.4, z: w.agent.z });
+        w.drops.push(DropItem::whole(500, bad, w.agent.x + 0.4, w.agent.z));
         match w.command(Action::PickUp { drop: 500 }) {
             Err(ActionError::GraspUnstable { margin }) => assert!(margin < 1.0 + 1e-3),
             other => panic!("{other:?}"),
@@ -1467,8 +1905,8 @@ mod tests {
         let mut w = world(FingerCount::Five, BaseKind::Mecanum);
         let item = ItemKind::ALL.into_iter().find(|&k| w.grasp_info(k).stable).expect("some item is holdable");
         let cap = w.capacity_kg();
-        add_stock(&mut w.agent.carried, item, (cap / item.spec().mass_kg) as u32);
-        w.drops.push(DropItem { id: 501, kind: item, x: w.agent.x + 0.4, z: w.agent.z });
+        add_stock(&mut w.agent.carried, item, (cap / item.spec().mass_kg).floor());
+        w.drops.push(DropItem::whole(501, item, w.agent.x + 0.4, w.agent.z));
         assert!(matches!(w.command(Action::PickUp { drop: 501 }), Err(ActionError::CapacityExceeded { .. })));
     }
 
@@ -1521,13 +1959,13 @@ mod tests {
     fn world_with(body: BodyPlan, base: BaseKind) -> World {
         let mut hand = HandConfig::preset(FingerCount::Five);
         hand.base = base;
-        World::new(WorldConfig { seed: 7, cells: 64, hand, body }).unwrap()
+        World::new(WorldConfig { seed: 7, cells: 64, hand, body, terrain: TerrainKind::Open }).unwrap()
     }
 
     #[test]
     fn the_arm_preset_decides_what_can_be_picked_up() {
         let place = |w: &mut World, kind: ItemKind| {
-            w.drops.push(DropItem { id: 600, kind, x: w.agent.x + 0.4, z: w.agent.z });
+            w.drops.push(DropItem::whole(600, kind, w.agent.x + 0.4, w.agent.z));
             w.command(Action::PickUp { drop: 600 })
         };
         let mut budget = world_with(BodyPlan { arm: hand_core::Tier::Budget, ..BodyPlan::default() }, BaseKind::Track);
@@ -1560,6 +1998,219 @@ mod tests {
         assert!((cold.mining_rate() - 0.5).abs() < 1e-6, "a joint at heat 2 halves the strike rate");
     }
 
+    fn rugged(seed: u64, base: BaseKind) -> World {
+        let mut hand = HandConfig::preset(FingerCount::Five);
+        hand.base = base;
+        World::new(WorldConfig { seed, cells: 64, hand, body: BodyPlan::default(), terrain: TerrainKind::Rugged }).unwrap()
+    }
+
+    #[test]
+    fn the_rugged_map_has_sea_cliffs_and_ridges_and_stays_connected() {
+        for seed in 1..=12u64 {
+            let w = rugged(seed, BaseKind::Wheel);
+            let l = w.layout.as_ref().expect("rugged layout");
+            assert!(l.water_cells > 20, "seed {seed}: a sea");
+            assert!(!l.mesas.is_empty() && !l.ridges.is_empty(), "seed {seed}: {l:?}");
+            // The waypoints stay connected for the weakest common base.
+            let wh = w.waypoint_by_key("warehouse").unwrap();
+            assert!(w.plan_route(Goal::Within { x: wh.x, z: wh.z, reach_m: 1.0 }).is_some(), "seed {seed}: no wheel route to the warehouse");
+            // A cliff is a height jump no base climbs.
+            let t = &w.terrain;
+            let cliff = (0..t.d).any(|z| (0..t.w - 1).any(|x| (t.height_cm(x, z) - t.height_cm(x + 1, z)).abs() >= 100));
+            assert!(cliff, "seed {seed}: no cliff");
+            // Every kind keeps two nodes a wheel can reach.
+            let start = t.cell_of(w.agent.x, w.agent.z).unwrap();
+            let blocked = w.blocked_cells();
+            let times = nav::travel_times(&BaseKind::Wheel.spec(), t, &|x, z| blocked.contains(&(x, z)), start, f32::INFINITY);
+            for k in NodeKind::ALL {
+                let ok = w.nodes.iter().filter(|n| n.kind == k).filter(|n| {
+                    let (cx, cz) = t.cell_of(n.x, n.z).unwrap();
+                    (-1i32..=1).any(|dz| (-1i32..=1).any(|dx| t.in_bounds(cx as i32 + dx, cz as i32 + dz) && times[t.idx((cx as i32 + dx) as usize, (cz as i32 + dz) as usize)].is_finite()))
+                }).count();
+                assert!(ok >= 2, "seed {seed}: {k:?} has {ok} reachable nodes");
+                assert!(w.nodes.iter().all(|n| !t.is_water(t.cell_of(n.x, n.z).unwrap().0, t.cell_of(n.x, n.z).unwrap().1)), "no node in the sea");
+            }
+        }
+        // Same seed, same map; the open map is untouched by the option.
+        let (a, b) = (rugged(5, BaseKind::Track), rugged(5, BaseKind::Track));
+        assert_eq!(a.terrain_grid(), b.terrain_grid());
+        assert!(world(FingerCount::Five, BaseKind::Track).layout.is_none());
+    }
+
+    #[test]
+    fn pads_are_gravel_the_beach_is_dry_sand_behind_wet_sand_and_the_ground_reaches_the_posture() {
+        let w = rugged(4, BaseKind::Wheel);
+        let t = &w.terrain;
+        let camp = w.waypoint_by_key("base_camp").unwrap();
+        assert_eq!(w.ground_at(t.cell_of(camp.x, camp.z).unwrap()), Ground::Gravel);
+        let count = |g: Ground| (0..t.d).flat_map(|z| (0..t.w).map(move |x| (x, z))).filter(|&(x, z)| t.ground_at(x, z) == g).count();
+        assert!(count(Ground::WetSand) > 0 && count(Ground::Sand) > 0, "a beach with both bands");
+        let shore = t.water_distance_m(8.0);
+        for z in 0..t.d {
+            for x in 0..t.w {
+                match t.ground_at(x, z) {
+                    Ground::WetSand => assert!(shore[t.idx(x, z)] <= 1.05 + 1e-3),
+                    Ground::Sand => assert!(shore[t.idx(x, z)] > 1.05 && shore[t.idx(x, z)] <= 2.5 + 1e-3),
+                    _ => {}
+                }
+            }
+        }
+        // Standing on the pad, the posture knows its ground and the friction it gets.
+        let (p, _) = w.posture_now();
+        assert_eq!(p.ground, hand_core::Surface::Gravel);
+        // The same move costs a wheel more on sand than on gravel.
+        let mut flat = world(FingerCount::Five, BaseKind::Wheel);
+        let cell = flat.terrain.cell_of(flat.agent.x, flat.agent.z).unwrap();
+        let ahead = (cell.0 + 2, cell.1);
+        let cost = |g: Ground| {
+            let mut w = flat.clone();
+            for c in [(cell.0 + 1, cell.1), ahead] {
+                w.terrain.set_ground(c.0, c.1, g);
+            }
+            w.plan_route(Goal::Cell(ahead)).map(|p| p.energy_j / p.time_s.max(1e-6))
+        };
+        let (gravel, sand) = (cost(Ground::Gravel).unwrap(), cost(Ground::Sand).unwrap());
+        assert!(sand > gravel * 1.2, "sand {sand} W vs gravel {gravel} W");
+        flat.terrain.set_ground(ahead.0, ahead.1, Ground::Sand);
+        flat.command(Action::MoveTo { x: cell_center(ahead.0, ahead.1).0, z: cell_center(ahead.0, ahead.1).1, reach_m: 0.0 }).unwrap();
+        for _ in 0..200 {
+            flat.tick();
+            if flat.ground_here() == Ground::Sand {
+                break;
+            }
+        }
+        let s = flat.body_status(None, None);
+        let slip = s.effects.iter().find(|e| e.id == "slip").unwrap();
+        assert!(slip.detail.contains("모래") && slip.detail.contains("마찰 이용률"), "{}", slip.detail);
+    }
+
+    #[test]
+    fn nothing_drives_into_the_sea_and_the_ramp_is_for_tracks_and_legs() {
+        let w = rugged(3, BaseKind::Track);
+        let t = &w.terrain;
+        let water = (0..t.d).flat_map(|z| (0..t.w).map(move |x| (x, z))).find(|&(x, z)| t.is_water(x, z)).unwrap();
+        assert!(w.plan_route(Goal::Cell(water)).is_none());
+        // The ramp rises 15 cm a cell: a track climbs it, a wheel's 15° does not.
+        let e = (0..t.d).flat_map(|z| (0..t.w - 1).map(move |x| (x, z))).find(|&(x, z)| {
+            let d = t.height_cm(x + 1, z) - t.height_cm(x, z);
+            d == crate::terrain::RAMP_RISE_CM && t.ground_at(x + 1, z) == Ground::Rock && t.height_cm(x + 1, z) > 0
+        });
+        if let Some((x, z)) = e {
+            assert!(nav::edge(&BaseKind::Track.spec(), t, (x, z), (x + 1, z)).is_some());
+            assert!(nav::edge(&BaseKind::Wheel.spec(), t, (x, z), (x + 1, z)).is_none());
+        }
+    }
+
+    #[test]
+    fn carried_items_can_be_set_down_on_the_ground_or_on_a_pile() {
+        let mut w = world(FingerCount::Five, BaseKind::Track);
+        assert_eq!(w.command(Action::Drop { item: None, amount: None }), Err(ActionError::NothingToDrop));
+        add_stock(&mut w.agent.carried, ItemKind::Log, 2.0);
+        add_stock(&mut w.agent.carried, ItemKind::Coal, 1.0);
+        // At the base camp: onto its pile.
+        w.command(Action::Drop { item: Some(ItemKind::Log), amount: Some(1.0) }).unwrap();
+        let ev = run(&mut w, 5.0);
+        assert!(ev.iter().any(|e| matches!(&e.event, WorldEvent::ItemDropped { waypoint: Some(_), .. })));
+        assert_eq!(w.waypoint_by_key("base_camp").unwrap().stock_of(ItemKind::Log), 1.0);
+        assert_eq!(w.carried_count(ItemKind::Log), 1);
+        // Away from the waypoints: on the ground ahead, one piece per item.
+        w.agent.x += 5.0;
+        w.agent.yaw = 0.0;
+        let before = w.drops.len();
+        w.command(Action::Drop { item: None, amount: None }).unwrap();
+        let ev = run(&mut w, 5.0);
+        assert!(ev.iter().any(|e| matches!(&e.event, WorldEvent::ItemDropped { waypoint: None, .. })));
+        assert_eq!(w.drops.len(), before + 2, "a log and a coal lump");
+        assert!(w.agent.carried.is_empty() && w.carried_kg() == 0.0);
+        let d = w.drops.last().unwrap();
+        assert!((d.x - w.agent.x).abs() < DROP_AHEAD_M + 0.2 && d.x > w.agent.x, "ahead of the robot");
+    }
+
+    #[test]
+    fn a_stone_breaks_in_half_and_the_half_is_easier_to_hold() {
+        let mut w = world(FingerCount::Two, BaseKind::Track);
+        w.agent.yaw = 0.0;
+        w.drops.push(DropItem::whole(700, ItemKind::Stone, w.agent.x + 0.4, w.agent.z));
+        w.drops.push(DropItem::whole(701, ItemKind::Log, w.agent.x - 0.4, w.agent.z));
+        assert_eq!(w.command(Action::Split { drop: 701, portion: 0.5 }), Err(ActionError::NotDivisible));
+        assert!(matches!(w.command(Action::Split { drop: 700, portion: 0.05 }), Err(ActionError::PieceTooSmall { .. })));
+        let whole = w.grasp_for(ItemKind::Stone, 1.0);
+        let half = w.grasp_for(ItemKind::Stone, 0.5);
+        assert!(half.margin > whole.margin, "half {} vs whole {}", half.margin, whole.margin);
+        let t0 = w.time_s;
+        w.command(Action::Split { drop: 700, portion: 0.5 }).unwrap();
+        let ev = run(&mut w, 30.0);
+        let split = ev.iter().find_map(|e| match &e.event { WorldEvent::ItemSplit { piece, amount, left, .. } => Some((piece.clone(), *amount, *left)), _ => None }).expect("split");
+        assert!((split.1 - 0.5).abs() < 1e-5 && (split.2 - 0.5).abs() < 1e-5);
+        // Two fingers strike at 2/5 of the full hand's rate.
+        assert!(((w.time_s - t0) as f32 - w.split_time_s(ItemKind::Stone, 1.0)).abs() < 0.3);
+        let piece: u32 = split.0[1..].parse().unwrap();
+        assert!((w.drop_item(piece).unwrap().amount - 0.5).abs() < 1e-5);
+        assert!((w.drop_item(700).unwrap().mass_kg() - 1.3).abs() < 1e-4);
+        if half.stable {
+            w.command(Action::PickUp { drop: piece }).unwrap();
+            run(&mut w, 10.0);
+            assert!((w.carried_amount(ItemKind::Stone) - 0.5).abs() < 1e-5);
+            assert_eq!(w.carried_count(ItemKind::Stone), 0, "half a stone is not a whole one");
+        }
+    }
+
+    #[test]
+    fn a_bus_servo_arm_wears_in_hours_and_a_qdd_arm_barely() {
+        let mine = |plan: BodyPlan| {
+            let mut w = world_with(plan, BaseKind::Track);
+            mine_nearest(&mut w, NodeKind::Boulder);
+            let s = w.body_status(None, None);
+            (w.wear.get("shoulder_r").copied().unwrap_or(0.0), w.agent.strikes, s)
+        };
+        let (budget, strikes, s) = mine(BodyPlan::uniform(hand_core::Tier::Budget));
+        let (mid, _, _) = mine(BodyPlan::default());
+        assert!(strikes > 0 && budget > 0.0 && mid > 0.0);
+        assert!(budget > 100.0 * mid, "spur-gear servos against a planetary QDD: {budget} vs {mid}");
+        let arm = s.parts.iter().find(|p| p.id == "arm_r").unwrap();
+        assert!(arm.detail.contains("수명") && arm.ratio < 1.0, "{}", arm.detail);
+        let strain = s.effects.iter().find(|e| e.id == "strain").unwrap();
+        assert!(strain.detail.contains("RMS"), "{}", strain.detail);
+    }
+
+    #[test]
+    fn the_world_and_the_body_reset_on_their_own() {
+        let mut w = world(FingerCount::Five, BaseKind::Track);
+        let nodes = w.nodes.len();
+        mine_nearest(&mut w, NodeKind::Tree);
+        add_stock(&mut w.agent.carried, ItemKind::Log, 1.0);
+        w.heat.insert("elbow_r".into(), 1.4);
+        let (energy, strikes) = (w.agent.energy_used_j, w.agent.strikes);
+        let worn = w.wear.get("shoulder_r").copied().unwrap_or(0.0);
+        assert!(energy > 0.0 && strikes > 0 && w.nodes.len() < nodes && worn > 0.0);
+        w.reset_world_keep_body().unwrap();
+        assert_eq!(w.wear.get("shoulder_r"), Some(&worn), "the reducers keep their wear");
+        assert_eq!(w.nodes.len(), nodes, "the tree is back");
+        assert!(w.drops.is_empty() && w.agent.carried.is_empty());
+        assert_eq!((w.agent.energy_used_j, w.agent.strikes), (energy, strikes), "the body keeps its wear");
+        assert_eq!(w.heat.get("elbow_r"), Some(&1.4));
+        let camp = w.waypoint_by_key("base_camp").unwrap().clone();
+        assert!((w.agent.x - camp.x).abs() < 1e-4);
+        add_stock(&mut w.agent.carried, ItemKind::Coal, 1.0);
+        w.agent.x += 2.0;
+        w.reset_body();
+        assert_eq!((w.agent.energy_used_j, w.agent.strikes), (0.0, 0));
+        assert!(w.heat.is_empty() && w.wear.is_empty() && w.battery_ratio() == 1.0);
+        assert_eq!(w.carried_count(ItemKind::Coal), 1, "the body reset keeps the cargo");
+        assert!((w.agent.x - camp.x - 2.0).abs() < 1e-4, "and the place");
+    }
+
+    #[test]
+    fn a_cloned_world_runs_on_its_own() {
+        let mut a = world(FingerCount::Five, BaseKind::Track);
+        let mut b = a.clone();
+        mine_nearest(&mut b, NodeKind::Tree);
+        assert!(b.nodes.len() < a.nodes.len() && b.tick > a.tick);
+        a.tick();
+        assert_eq!(a.tick, 1);
+        assert_eq!(a.capacity_kg(), b.capacity_kg());
+    }
+
     #[test]
     fn a_walking_mid_robot_carries_little_and_a_tracked_one_carries_more() {
         let foot = world_with(BodyPlan::default(), BaseKind::HumanFoot);
@@ -1571,7 +2222,7 @@ mod tests {
         // Cargo makes the base slower and uses more power.
         let mut loaded = world_with(BodyPlan::default(), BaseKind::Track);
         let (v0, p0) = (loaded.drive_spec().max_speed_mps, loaded.drive_spec().power_w);
-        add_stock(&mut loaded.agent.carried, ItemKind::IronOre, 3);
+        add_stock(&mut loaded.agent.carried, ItemKind::IronOre, 3.0);
         assert!(loaded.drive_spec().power_w > p0);
         assert!(loaded.drive_spec().max_speed_mps <= v0);
         let s = loaded.body_status(None, None);

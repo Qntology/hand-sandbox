@@ -43,16 +43,16 @@ export async function refreshBody() {
   }
 }
 
-export async function newWorld(seed, size) {
+export async function newWorld(seed, size, terrain = state.terrain ?? 'rugged') {
   setPlaying(false);
   try {
-    const snap = await call('world_new', { seed, size, config: state.config, base: state.config.base, body: state.bodyPlan ?? null });
+    const snap = await call('world_new', { seed, size, terrain, config: state.config, base: state.config.base, body: state.bodyPlan ?? null });
     state.worldConfigKey = JSON.stringify(state.config);
     state.detections = [];
     applySnapshot(snap, true);
     bus.emit('world-new', snap);
     await Promise.allSettled([refreshQuests(), refreshBody()]);
-    setStatus(`월드를 만들었습니다 (시드 ${snap.seed}, ${snap.bounds[0]} × ${snap.bounds[1]} m)`);
+    setStatus(`월드를 만들었습니다 (시드 ${snap.seed}, ${snap.bounds[0]} × ${snap.bounds[1]} m${snap.terrain === 'rugged' ? ', 복합 지형' : ''})`);
     return true;
   } catch (e) {
     bus.emit('world-error', e.message);
@@ -62,13 +62,25 @@ export async function newWorld(seed, size) {
 
 export async function step(ticks) {
   const r = await call('sim_step', { ticks });
-  applySnapshot(r.snapshot);
+  // The ML decision pass of a recording swaps in a copy of the start state: the trail starts over.
+  const swapped = state.snapshot && r.test?.phase !== state.livePhase && (r.test?.phase === 'decide' || state.livePhase === 'decide');
+  state.livePhase = r.test?.phase ?? null;
+  applySnapshot(r.snapshot, swapped);
   state.quests = r.quests;
   state.body = r.body;
   bus.emit('quests', r.quests);
   bus.emit('body', r.body);
   bus.emit('sim-events', r.events ?? []);
+  bus.emit('sim-test', r.test ?? null);
   return r;
+}
+
+/** world_reset · body_reset 의 응답을 화면에 반영한다. */
+export function applyReset(r, what) {
+  if (r.snapshot) applySnapshot(r.snapshot, what === 'world');
+  if (r.quests) { state.quests = r.quests; bus.emit('quests', r.quests); }
+  if (r.body) { state.body = r.body; bus.emit('body', r.body); }
+  if (what === 'world') bus.emit('world-new', r.snapshot);
 }
 
 async function tick() {
@@ -115,7 +127,5 @@ export function initSim() {
     }
   });
   $('sim-speed').addEventListener('change', (e) => { state.speed = Number(e.target.value); });
-  // 통합 테스트는 월드를 직접 진행시킨다. 재생 루프가 끼어들지 않게 멈춘다.
-  bus.on('test-start', () => setPlaying(false));
   state.speed = Number($('sim-speed').value);
 }

@@ -8,6 +8,10 @@
 //! * [`body`] turns simulation variables into a body-part status display.
 //! * [`parts`] holds researched part presets (head, chest, belly, arm, leg or
 //!   chassis) and [`balance`] the whole-body balance and joint effort they give.
+//! * [`surface`] holds the grounds (friction, rolling resistance, walking
+//!   cost) the balance, the drive and the routes use, [`wear`] the reducers'
+//!   life, and [`effects`] the environment N:N benchmark of the five body
+//!   effects (slip, load, fatigue, joint load, posture stability).
 //!
 //! Units: metres, seconds, kilograms, newtons, and radians inside the model
 //! (degrees only appear in the UI).
@@ -16,6 +20,7 @@ pub mod balance;
 pub mod base;
 pub mod body;
 pub mod dynamics;
+pub mod effects;
 pub mod finger;
 pub mod hand;
 pub mod joint;
@@ -23,16 +28,19 @@ pub mod math;
 pub mod nn;
 pub mod parts;
 pub mod sim;
+pub mod surface;
+pub mod wear;
 
 pub use balance::{reference, Body, BalanceReport, Coupling, DriveLimits, FeedForward, JointLoad, Posture, RefCtx, Reference, Source};
 pub use parts::{BodyPlan, Segment, Tier};
 pub use base::{simulate_drive, BaseKind, BaseSpec, DriveReport, Terrain};
 pub use body::{
     battery_capacity_j, compute as compute_body, BalanceSummary, BodyEffect, BodyInputs, BodyLevel, BodyLimits, BodyPart,
-    BodyStatus, JOINT_ENDURANCE_STRIKES,
+    BodyStatus,
 };
 pub use finger::FingerSpec;
 pub use hand::{ConfigError, FingerCount, Hand, HandConfig, JointOptions};
 pub use joint::{Actuation, JointAngles, JointKind, JointSpec};
 pub use math::Vec3;
+pub use surface::{Surface, SurfaceProps};
 pub use sim::{grasp, Contact, ContactSource, GraspOutcome, GraspResult, GraspSetup, GraspType, HandSim, Payload};

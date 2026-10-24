@@ -40,6 +40,17 @@ pub struct PlaceRef {
     pub text: String,
 }
 
+/// Something to set down from the robot's own cargo.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct DropTarget {
+    pub resource: String,
+    /// Items to set down; `None` (no number said) sets down all of that kind.
+    pub quantity: Option<u32>,
+    pub via: Via,
+    pub score: f32,
+    pub text: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Plan {
@@ -49,6 +60,9 @@ pub enum Plan {
     Collect { targets: Vec<Target> },
     /// Walk to a place.
     Goto { place: PlaceRef },
+    /// Set down what is already carried: the named items (everything when
+    /// `items` is empty), here or, with `place`, after going there.
+    Drop { items: Vec<DropTarget>, place: Option<PlaceRef> },
     /// Abort what is running.
     Stop,
 }
@@ -350,6 +364,7 @@ impl Parser {
         }
 
         // 6. plan
+        let gathers = ["harvest", "pickup", "deliver"].iter().any(|v| verbs.contains(v));
         let plan = if problem.is_some() {
             None
         } else if verbs.contains("stop") {
@@ -357,6 +372,14 @@ impl Parser {
                 warnings.push("정지 명령과 채취 명령이 함께 있어 정지만 실행합니다.".to_string());
             }
             Some(Plan::Stop)
+        } else if verbs.contains("drop") && !gathers {
+            // Set down what is carried; a number limits it, no number means all of it.
+            let items: Vec<DropTarget> = resources
+                .iter()
+                .map(|&k| DropTarget { resource: hits[k].node.clone(), quantity: qty[k].map(|n| n.min(MAX_QUANTITY)), via: hits[k].via, score: hits[k].score, text: hits[k].text.clone() })
+                .collect();
+            trace.push(TraceLine::new("roles", format!("drop {} from the cargo{}", if items.is_empty() { "everything".to_string() } else { format!("{} kind(s)", items.len()) }, destination.map(|k| format!(" at {:?}", hits[k].text)).unwrap_or_default())));
+            Some(Plan::Drop { items, place: destination.map(place_ref) })
         } else if !targets.is_empty() {
             match destination {
                 Some(k) => Some(Plan::Fetch { targets: targets.clone(), destination: place_ref(k) }),
@@ -369,11 +392,9 @@ impl Parser {
                 }
                 None => Some(Plan::Collect { targets: targets.clone() }),
             }
-        } else if destination.is_some()
-            && !["harvest", "pickup", "deliver"].iter().any(|v| verbs.contains(v))
-        {
+        } else if destination.is_some() && !gathers {
             destination.map(|k| Plan::Goto { place: place_ref(k) })
-        } else if ["harvest", "pickup", "deliver"].iter().any(|v| verbs.contains(v)) {
+        } else if gathers {
             // The verbs ask to gather or carry something, but no known resource was named.
             let unknown = if out.unmatched.is_empty() {
                 String::new()

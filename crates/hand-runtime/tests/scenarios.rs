@@ -20,7 +20,7 @@ fn runtime(seed: u64, noise: NoiseCfg) -> Runtime {
 }
 
 fn stock(rt: &Runtime, place: &str, item: ItemKind) -> u32 {
-    rt.world().waypoint_by_key(place).map(|w| w.stock.iter().filter(|(k, _)| *k == item).map(|(_, n)| *n).sum()).unwrap_or(0)
+    rt.world().waypoint_by_key(place).map(|w| (w.stock_of(item) + 1e-3).floor() as u32).unwrap_or(0)
 }
 
 fn quest_log(rt: &Runtime) -> String {
@@ -182,17 +182,44 @@ fn a_resource_that_does_not_exist_ends_in_a_search_timeout() {
 }
 
 #[test]
-fn a_full_load_is_reported_with_the_number_that_would_fit() {
+fn a_load_that_does_not_fit_is_carried_in_round_trips() {
+    // Before v0.5 this quest failed: the bay held iron ore up to about one
+    // stone below the limit, so the second stone did not fit. Now the cargo
+    // decision carries the first stone to the warehouse and comes back.
     let mut rt = runtime(7, NoiseCfg::none());
     let cap = rt.world().capacity_kg();
-    // fill the hand with iron ore up to about one stone's weight below the limit
-    let n = ((cap - 1.0) / ItemKind::IronOre.spec().mass_kg).floor() as u32;
+    let n = ((cap - 1.0) / ItemKind::IronOre.spec().mass_kg).floor();
+    assert!(cap - n * ItemKind::IronOre.spec().mass_kg < 2.0 * ItemKind::Stone.spec().mass_kg, "two stones do not fit beside the ore");
     rt.world_mut().agent.carried.push((ItemKind::IronOre, n));
+    let q = run_command(&mut rt, "돌 2개를 창고로 가져와", 40_000);
+    assert_done(&rt, &q);
+    assert_eq!(stock(&rt, "warehouse", ItemKind::Stone), 2);
+    let r = q.result.as_ref().unwrap();
+    assert!(r.trips >= 2, "a round trip was made: {r:?}");
+    assert!(r.summary.contains("왕복"), "{}", r.summary);
+    // The ore is not this quest's cargo: it stays aboard.
+    assert!((rt.world().carried_amount(ItemKind::IronOre) - n).abs() < 1e-4);
+    assert!(quest_log(&rt).contains("왕복 1회차"));
+}
+
+#[test]
+fn a_bay_full_of_other_cargo_is_reported_with_a_hint_to_set_it_down() {
+    let mut rt = runtime(7, NoiseCfg::none());
+    let cap = rt.world().capacity_kg();
+    // Ore and coal up to less than a coal lump below the limit. A stone does
+    // not fit, a trip would not help (the cargo is not the quest's), and
+    // breaking the stone to squeeze it beside someone else's cargo is not done.
+    let (iron, coal) = (ItemKind::IronOre.spec().mass_kg, ItemKind::Coal.spec().mass_kg);
+    let n = (cap / iron).floor();
+    let m = ((cap - n * iron) / coal).floor();
+    rt.world_mut().agent.carried.extend([(ItemKind::IronOre, n), (ItemKind::Coal, m)]);
+    let room = cap - n * iron - m * coal;
+    assert!(room < ItemKind::Stone.spec().mass_kg, "{room} kg of room");
     let q = run_command(&mut rt, "돌 2개를 창고로 가져와", 30_000);
     assert_eq!(q.state, State::Failed, "{}", quest_log(&rt));
     let f = q.failure.as_ref().unwrap();
     assert_eq!(f.code, "capacity_exceeded", "{f:?}");
-    assert!(f.message_ko.contains("적재 한도"), "{}", f.message_ko);
+    assert!(f.message_ko.contains("적재 한도") && f.message_ko.contains("내려놓"), "{}", f.message_ko);
 }
 
 #[test]

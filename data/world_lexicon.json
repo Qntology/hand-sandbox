@@ -61,7 +61,14 @@
       "bias": "가져오다, 가져가다, 갖다 놓다, 옮기다, 운반하다, 나르다, 배달하다, 전달하다, 납품하다, 보내다, 놓다, 두다, bring, carry, deliver, move, haul, transport, fetch, drop off, put, 運ぶ, 持ってくる, 搬运, 运送, 带来",
       "prejudice": "",
       "exact_match": ["운반", "배달", "납품", "전달", "반입", "이동시키", "가져오", "가져가", "옮기", "나르", "bring", "carry", "deliver", "move", "haul", "transport", "fetch", "drop off", "put", "運ぶ", "搬运", "运送", "带来"],
-      "surface": ["가져와", "가져와라", "가져와줘", "가져와주세요", "가져와요", "가져와봐", "가져다", "가져다줘", "가져다놔", "가져다놔라", "가져다놓아", "가져가", "가져가서", "가져가라", "가져가줘", "갖다", "갖다놔", "갖다놔라", "갖다놓아", "갖다줘", "갖다와", "갖고와", "갖고와라", "갖고가", "갖고가서", "옮겨", "옮겨서", "옮겨줘", "옮겨라", "옮겨놔", "옮겨와", "이동시켜", "이동시켜줘", "날라", "날라서", "날라줘", "날라와", "놓아", "놔", "놔둬", "두고", "둬", "내려놔", "내려놓아", "보내", "보내줘", "넣어", "넣어줘"]
+      "surface": ["가져와", "가져와라", "가져와줘", "가져와주세요", "가져와요", "가져와봐", "가져다", "가져다줘", "가져다놔", "가져다놔라", "가져다놓아", "가져가", "가져가서", "가져가라", "가져가줘", "갖다", "갖다놔", "갖다놔라", "갖다놓아", "갖다줘", "갖다와", "갖고와", "갖고와라", "갖고가", "갖고가서", "옮겨", "옮겨서", "옮겨줘", "옮겨라", "옮겨놔", "옮겨와", "이동시켜", "이동시켜줘", "날라", "날라서", "날라줘", "날라와", "놓아", "놔", "놔둬", "두고", "둬", "보내", "보내줘", "넣어", "넣어줘"]
+    },
+    "drop": {
+      "semantic": "set down what is already in the hand or the cargo bay, here or at a named place, without gathering anything new",
+      "bias": "내려놓다, 버리다, 비우다, 하역하다, 내려두다, drop, put down, set down, unload, discard, dump, empty the inventory, 下ろす, 置く, 放下, 卸货",
+      "prejudice": "",
+      "exact_match": ["내려놓", "내려두", "버리", "하역", "drop", "put down", "set down", "unload", "discard", "dump", "下ろす", "放下", "卸货"],
+      "surface": ["내려놔", "내려놔라", "내려놔줘", "내려놔요", "내려놔주세요", "내려놓아", "내려놓아줘", "내려놓아라", "버려", "버려라", "버려줘", "버려요", "비워", "비워라", "비워줘", "비워요", "비우기", "드롭"]
     },
     "go": {
       "semantic": "walk to a place without carrying anything",
@@ -82,7 +89,7 @@
     "semantic": "politeness, urgency and connecting words that carry no object or place",
     "bias": "please, quickly, now, then, and",
     "prejudice": "",
-    "exact_match": ["좀", "빨리", "얼른", "제발", "어서", "그리고", "그럼", "그냥", "한번", "일단", "꼭", "다시", "저기", "음", "자", "해줘", "해주세요", "주세요", "줘", "해라", "해", "그", "이", "저", "please", "pls", "the", "a", "an", "some", "and", "then", "now", "quickly", "hey", "ok", "okay"]
+    "exact_match": ["좀", "빨리", "얼른", "제발", "어서", "그리고", "그럼", "그냥", "한번", "일단", "꼭", "다시", "저기", "음", "자", "해줘", "해주세요", "주세요", "줘", "해라", "해", "그", "이", "저", "모두", "전부", "다", "몽땅", "싹", "가진", "갖고있는", "들고", "있는", "든", "인벤토리", "가방", "적재함", "please", "pls", "the", "a", "an", "some", "and", "then", "now", "quickly", "hey", "ok", "okay", "all", "everything", "my", "inventory"]
   },
   "negation": {
     "semantic": "words that rule the neighbouring noun out",
