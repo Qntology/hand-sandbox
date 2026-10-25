@@ -249,7 +249,7 @@ fn bx(cx: f32, cz: f32, y0: f32, y1: f32, hw: f32, hd: f32) -> Aabb {
 
 fn item_style(kind: ItemKind) -> Style {
     match kind {
-        ItemKind::Log | ItemKind::Stone => Style::Plain,
+        ItemKind::Log | ItemKind::Stone | ItemKind::Parcel => Style::Plain,
         ItemKind::Coal => Style::Fleck([70, 70, 78]),
         ItemKind::IronOre => Style::Fleck([220, 170, 140]),
     }

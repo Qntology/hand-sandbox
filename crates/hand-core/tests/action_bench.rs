@@ -11,7 +11,8 @@ use hand_core::effects::Rule;
 use hand_core::parts::BodyPlan;
 use hand_core::{BaseKind, FingerCount};
 
-const PLANS: [&str; 3] = ["budget", "mid", "pro"];
+/// The named presets benchmarked: the three tiers, and the wheeled base with a torso lift (v0.7), the one wheeled body that reaches the floor.
+const PLANS: [&str; 4] = ["budget", "mid", "pro", "wheel_lift"];
 const BASES: [BaseKind; 3] = [BaseKind::HumanFoot, BaseKind::Wheel, BaseKind::Track];
 /// The evaluation seed of the held-out draws (draw new ones per release, never tune against them).
 const HOLDOUT_SEED: u64 = 20261024;
@@ -77,7 +78,7 @@ fn actions_against_the_measurements() {
             let body = Body::new(&BodyPlan::named(plan).unwrap(), base, FingerCount::Five);
             for s in library() {
                 let r = evaluate(&body, &s);
-                print_result(plan, base, &r, matches!(plan, "mid" | "pro"));
+                print_result(plan, base, &r, matches!(plan, "mid" | "pro" | "wheel_lift"));
                 assert!(r.score.is_finite() && (0.0..=100.0).contains(&r.score), "{} {}", r.id, r.score);
                 assert!(r.cells.iter().all(|c| c.value.map_or(true, f32::is_finite)), "{}", r.id);
                 if r.skipped.is_none() {

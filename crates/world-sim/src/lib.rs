@@ -18,6 +18,7 @@ pub mod capture;
 pub mod explore;
 pub mod kinds;
 pub mod nav;
+pub mod odometry;
 pub mod render;
 pub mod rng;
 pub mod snapshot;
@@ -26,6 +27,7 @@ pub mod world;
 
 pub use capture::{decode_webp, encode_webp, Encoded};
 pub use kinds::{Ground, ItemKind, ItemSpec, NodeKind, NodeSpec};
+pub use odometry::{OdomCfg, Odometry};
 pub use render::{Camera, Frame, ObjectClass, VisibleObject};
 pub use snapshot::{GraspInfo, TerrainGrid, WorldSnapshot};
 pub use terrain::TerrainKind;

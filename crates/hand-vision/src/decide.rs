@@ -360,6 +360,52 @@ impl Decider {
     }
 }
 
+impl Decider {
+    /// The 1σ of the target's position the decision would act on now, metres
+    /// (its last good fix), if it has one.
+    pub fn fix_sigma_m(&self) -> Option<f32> {
+        self.last_fix.as_ref().map(|f| f.sigma_m)
+    }
+
+    /// A decision without a keyframe (the ML tracks are off): the move the
+    /// forecast of the fixes asks for, from the pose the robot believes it
+    /// has. `extra_sigma_m` is what the robot's own drift since the last look
+    /// adds to the fix's spread. `None` without a good fix (then it must look).
+    pub fn predict(&mut self, pose: &Pose, extra: &[&dyn Predictor], extra_sigma_m: f32) -> Option<DecisionReport> {
+        let good = self.last_fix.clone().filter(|f| f.sigma_m <= (self.cfg.max_sigma_frac * f.range_m).max(0.25))?;
+        let (x, z, band, method) = self.forecast_position(extra)?;
+        let sigma = good.sigma_m.hypot(extra_sigma_m);
+        let range = (x - pose.x).hypot(z - pose.z);
+        let mut rep = DecisionReport {
+            decision: Decision::Hold { reason: "blind".into() },
+            estimate: Some(Estimate { x, z, range_m: range, sigma_m: sigma, source: "forecast".into() }),
+            fix: None,
+            fix_error: None,
+            depth_scale: None,
+            residual_deg: None,
+            prediction: None,
+            forecast_method: method,
+            band: Some(band),
+            note: String::new(),
+        };
+        self.prediction = None;
+        if range <= self.cfg.reach_m + 0.25 {
+            rep.decision = Decision::Arrive { at: (x, z) };
+            rep.note = format!("눈 감고 예측으로 도달: 거리 {range:.2} m (±{sigma:.2} m)");
+            return Some(rep);
+        }
+        let hop = (range - self.cfg.reach_m).min(self.cfg.hop_max_m);
+        let h = (z - pose.z).atan2(x - pose.x);
+        let to = (pose.x + hop * h.cos(), pose.z + hop * h.sin());
+        // The next keyframe should show it dead ahead if the forecast held.
+        self.prediction = Some(Prediction { bearing_rel_deg: 0.0, range_m: range - hop });
+        rep.prediction = self.prediction;
+        rep.decision = Decision::Approach { to, hop_m: hop, face: (x, z) };
+        rep.note = format!("눈 감고 예측 위치 ({x:.1}, {z:.1}) ±{sigma:.2} m 쪽으로 {hop:.1} m (ML 꺼짐)");
+        Some(rep)
+    }
+}
+
 /// A fix says something about the depth model's scale when at least three
 /// rays agree (two always meet, even if one is on another object), its range
 /// error is small (at most 15%), the target is neither at the feet nor near

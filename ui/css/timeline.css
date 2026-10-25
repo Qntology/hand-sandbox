@@ -52,6 +52,17 @@
 .tl-tile .zdot.z3 { background: var(--danger); }
 .tl-act-tick { position: absolute; width: 1px; height: 4px; background: var(--text-muted); pointer-events: none; }
 .tl-act-tick.fail { background: var(--danger); }
+/* 시각 줄: 언제 봤는지(패턴 · 행위 직전 · 응시)와 기억만으로 한 행위 — 위 칸 게임 · 아래 칸 ML 결정 */
+.tl-lane.h-vis { height: 48px; }
+.tl-vis { position: absolute; width: 3px; height: 14px; border-radius: 1px; background: var(--text-muted); cursor: default; }
+.tl-vis.pattern { background: var(--signal); }
+.tl-vis.pre_act { background: var(--success); height: 18px; }
+.tl-vis.glance { background: var(--warning); height: 18px; }
+.tl-vis.place { background: var(--violet); }
+.tl-vis.blind { background: transparent; border: 1px solid var(--danger); width: 7px; height: 12px; border-radius: 6px; }
+.tl-vis.search, .tl-vis.locate, .tl-vis.approach, .tl-vis.retouch { background: var(--bg-active); }
+.tl-vis-err { position: absolute; left: 0; pointer-events: none; }
+.tl-vis-err path { fill: none; stroke: var(--violet); stroke-width: 1.2; opacity: 0.85; }
 /* 검사기: 행위의 부위 포커스 */
 .fv-panel { margin-bottom: 8px; }
 .fv-event { font-size: 0.64rem; margin-bottom: 4px; line-height: 1.45; color: var(--text); }

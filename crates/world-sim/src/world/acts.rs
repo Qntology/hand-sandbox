@@ -14,6 +14,7 @@
 use super::*;
 use hand_core::act::focus::{self, FocusCtx, FocusFrame};
 use hand_core::act::material::{self, ItemMaterial};
+use hand_core::act::reach::ReachMode;
 use hand_core::act::{gait, grasp as agrasp, push as apush, ActEvent, ActKind, ActRollout};
 use hand_core::kin::{self as hkin, KinLoads, KinPose};
 
@@ -24,6 +25,9 @@ pub const GET_UP_S: f32 = 6.0;
 pub const PUSH_START_SLACK_M: f32 = 0.40;
 /// Speed of the short shuffle that puts an item at the planned stand-off before a pick, m/s (est).
 pub const SHUFFLE_MPS: f32 = 0.2;
+/// Farthest a reach to the side shuffles (forward or across, without turning)
+/// to bring the item to its place beside the right foot, metres (est: a short side step).
+pub const SIDE_SHUFFLE_MAX_M: f32 = 0.5;
 /// Mean height of a piece on a waypoint's pile, metres (the 0.10–0.15 m items).
 pub const PILE_PIECE_H_M: f32 = 0.12;
 
@@ -86,13 +90,14 @@ pub fn material_of(kind: ItemKind) -> ItemMaterial {
         ItemKind::Stone => ItemMaterial::Stone,
         ItemKind::Coal => ItemMaterial::Coal,
         ItemKind::IronOre => ItemMaterial::IronOre,
+        ItemKind::Parcel => ItemMaterial::Cardboard,
     }
 }
 
 /// The stereo camera of each head preset: focal length (px), baseline (m) and
 /// subpixel error (research §1.4: the D435 is 424 px, 50 mm, 0.08 px; the
 /// OAK-D Lite's 75 mm baseline at 640 px over 73°, subpixel as the D435's, est).
-fn camera_of(sensor: &str) -> (f32, f32, f32) {
+pub fn camera_of(sensor: &str) -> (f32, f32, f32) {
     if sensor.contains("OAK") {
         (432.0, 0.075, 0.08)
     } else {
@@ -127,22 +132,65 @@ impl World {
 
     /// Plays a pick-up out: the reach plan, the grasp, the lift. Fails right
     /// away when the body cannot bring its hand down to the item.
-    pub(super) fn start_grasp(&mut self, drop: u32, two_arms: bool) -> Result<f32, ActionError> {
+    ///
+    /// The robot puts itself and its hand where it believes the item is
+    /// (`aim`, its believed frame; the item itself when it sees it): the
+    /// shuffle brings that point to the planned stand-off, and what its memory
+    /// got wrong is the hand's aim offset. In front it then turns to that
+    /// point; beside the right foot (`side`) it does not turn. Returns the
+    /// time it takes and the point it turns to face.
+    pub(super) fn start_grasp(&mut self, drop: u32, two_arms: bool, aim: Option<(f32, f32)>, side: bool, memory_sigma_m: f32) -> Result<(f32, Option<(f32, f32)>), ActionError> {
         let d = self.drop_item(drop).cloned().ok_or(ActionError::UnknownTarget)?;
         let spec = d.kind.spec();
         let size = spec.piece_size_m(d.amount);
         let seed = self.act_rng.next_u64();
         let ground = self.ground_at(self.terrain.cell_of(d.x, d.z).unwrap_or((0, 0))).surface();
-        let inp = agrasp::GraspInput { body: &self.body, hand: &self.hand, material: material_of(d.kind), mass_kg: d.mass_kg(), size_m: size, ground, two_arms, cargo_kg: self.carried_kg(), aim_sigma_m: self.aim_sigma_m(), seed };
+        // Where the robot's body takes "where I believe the item is".
+        let at = aim.map(|(x, z)| self.true_of(x, z)).unwrap_or((d.x, d.z));
+        let heading = if side { self.agent.yaw } else { (at.1 - self.agent.z).atan2(at.0 - self.agent.x) };
+        let (sh, ch) = heading.sin_cos();
+        // Believed minus actual, in the frame the robot will reach in (x forward, y left).
+        let (ox, oz) = (at.0 - d.x, at.1 - d.z);
+        let offset = [ox * ch + oz * sh, ox * sh - oz * ch];
+        let mode = if side { ReachMode::Side } else { ReachMode::Front };
+        let inp = agrasp::GraspInput {
+            body: &self.body,
+            hand: &self.hand,
+            material: material_of(d.kind),
+            mass_kg: d.mass_kg(),
+            size_m: size,
+            ground,
+            two_arms,
+            cargo_kg: self.carried_kg(),
+            aim_sigma_m: self.aim_sigma_m(),
+            seed,
+            mode,
+            aim_offset_m: offset,
+            memory_sigma_m,
+        };
         let mut rollout = agrasp::grasp(&inp);
-        if rollout.outcome.code == Some("reach_ground") {
+        if matches!(rollout.outcome.code, Some("reach_ground") | Some("reach_side")) {
             let need = size[1] + hand_core::act::reach::PALM_CLEARANCE_M;
             return Err(ActionError::CannotReach { lowest_m: rollout.metric("lowest_palm_z").unwrap_or(0.0), need_m: need, reason: rollout.outcome.reason_ko.clone().unwrap_or_default() });
         }
-        // A short shuffle puts the item at the planned stand-off first.
-        let plan_x = rollout.samples.first().and_then(|s| s.object).map_or(0.3, |o| o[0]);
-        let dist = (d.x - self.agent.x).hypot(d.z - self.agent.z);
-        let shuffle = (dist - plan_x).abs() / SHUFFLE_MPS;
+        // A short shuffle puts the (believed) item at the planned stand-off first.
+        let planned = rollout.samples.first().and_then(|s| s.object).map_or([0.3, 0.0, 0.0], |o| o);
+        let (step_x, step_z, step) = if side {
+            // Forward or across, without turning: the believed item's place in the robot's frame against the plan's.
+            let (rx, rz) = (at.0 - self.agent.x, at.1 - self.agent.z);
+            let (fwd, left) = (rx * ch + rz * sh, rx * sh - rz * ch);
+            let (df, dl) = (fwd - planned[0], left - planned[1]);
+            let n = df.hypot(dl);
+            if n > SIDE_SHUFFLE_MAX_M {
+                return Err(ActionError::OutOfReach { distance_m: n, reach_m: SIDE_SHUFFLE_MAX_M });
+            }
+            (df * ch + dl * sh, df * sh - dl * ch, n)
+        } else {
+            let dist = (at.0 - self.agent.x).hypot(at.1 - self.agent.z);
+            let k = (dist - planned[0]) / dist.max(1e-3);
+            ((at.0 - self.agent.x) * k, (at.1 - self.agent.z) * k, (dist - planned[0]).abs())
+        };
+        let shuffle = step / SHUFFLE_MPS;
         if shuffle > 0.05 {
             for s in rollout.samples.iter_mut() {
                 s.t += shuffle;
@@ -152,14 +200,12 @@ impl World {
             }
             rollout.duration_s += shuffle;
             rollout.metrics.push(("shuffle_s", shuffle));
-            // The robot steps to the stand-off along the line to the item.
-            let k = (dist - plan_x) / dist.max(1e-3);
-            self.agent.x += (d.x - self.agent.x) * k;
-            self.agent.z += (d.z - self.agent.z) * k;
+            self.agent.x += step_x;
+            self.agent.z += step_z;
         }
         let dur = rollout.duration_s;
-        self.act = Some(ActPlay::new(rollout, self.time_s, Some((d.kind, d.amount)), (self.agent.x, self.agent.z, self.agent.yaw)));
-        Ok(dur)
+        self.act = Some(ActPlay::new(rollout, self.time_s, Some((d.kind, d.amount)), (self.agent.x, self.agent.z, heading)));
+        Ok((dur, (!side).then_some(at)))
     }
 
     /// Plays a release out for every piece being set down, one after another; returns the total time.
@@ -209,6 +255,19 @@ impl World {
         let t = p.t();
         let out: Vec<WorldEvent> = p.rollout.events_between(p.played_s, t).map(|e| act_event(p.rollout.kind, e)).collect();
         p.played_s = t;
+        for ev in out {
+            events.push(self.stamp(ev));
+        }
+    }
+
+    /// Plays the action out to its end: its work is done, and what is left of
+    /// its time is the rounding of the ticks (the last moment sits on the end).
+    pub(super) fn act_finish(&mut self, events: &mut Vec<TimedEvent>) {
+        let Some(p) = self.act.as_mut() else { return };
+        let end = p.rollout.duration_s;
+        let out: Vec<WorldEvent> = p.rollout.events_between(p.played_s, end).map(|e| act_event(p.rollout.kind, e)).collect();
+        p.elapsed_s = p.elapsed_s.max(end);
+        p.played_s = end;
         for ev in out {
             events.push(self.stamp(ev));
         }
@@ -281,6 +340,8 @@ impl World {
             }
             self.walk.slips += 1;
             let (fell, slide) = gait::slip_outcome(&g, mu);
+            // The foot slid without the legs' kinematics seeing it: the odometry counts it as travel.
+            self.odom.foot_slid(slide);
             let side = if self.walk.stance == 0 { "오른" } else { "왼" };
             if fell {
                 let label = format!("{side}발이 미끄러져 넘어짐: 마찰 {mu:.2} < 필요 {:.2}, {:.0} mm", g.rcof, slide * 1000.0);
@@ -374,6 +435,24 @@ impl World {
         } else {
             Err(plan.reason_ko.unwrap_or_else(|| "바닥에 손이 닿지 않음".into()))
         }
+    }
+
+    /// Where an item of `kind` (a piece of `amount` items) lies relative to the
+    /// robot when its right hand reaches it beside the right foot without
+    /// turning (`hand_core::act::reach::plan_side` with the cargo aboard):
+    /// forward and left (negative: right), metres. `None` when this body
+    /// cannot reach it there. Planned once per item, piece and cargo.
+    pub fn side_reach(&self, kind: ItemKind, amount: f32) -> Option<(f32, f32)> {
+        let key = (kind, (amount * 1000.0).round() as i32, (self.carried_kg() * 10.0).round() as i32);
+        if let Some(v) = self.side_cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+            return *v;
+        }
+        let size = kind.spec().piece_size_m(amount);
+        let goal = hand_core::act::reach::ReachGoal::ground_object(size[1], kind.spec().mass_kg * amount, false, self.carried_kg());
+        let plan = hand_core::act::reach::plan_side(&self.body, &goal, 0.5 * size[2]);
+        let v = plan.ok.then_some((plan.object_x, plan.object_y));
+        self.side_cache.lock().unwrap_or_else(|e| e.into_inner()).insert(key, v);
+        v
     }
 
     /// A pushed item that lies within reach of a waypoint goes onto its pile:

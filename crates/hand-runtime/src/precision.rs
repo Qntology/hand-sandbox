@@ -27,6 +27,7 @@ use serde::Serialize;
 
 use crate::config::GateCfg;
 use crate::perception::{Candidate, EntKind};
+use crate::vision::{DriftRate, Memory};
 
 const CONFLICT_RADIUS_M: f32 = 0.4;
 const STALE_TICKS: u64 = 400;
@@ -73,11 +74,50 @@ pub struct Landmark {
     /// other are taken as a real change of level (the robot got closer, the
     /// light changed) and replace the history.
     pub held_run: Vec<f64>,
+    /// 1σ of the position when it was last fused, metres, and the odometer
+    /// then: the landmark is a memory that spreads as the robot moves (`vision`).
+    pub sigma_m: f32,
+    pub odo_m: f32,
 }
 
 impl Landmark {
     pub fn distance_to(&self, x: f32, z: f32) -> f32 {
         ((self.x - x).powi(2) + (self.z - z).powi(2)).sqrt()
+    }
+
+    /// The landmark as a memory.
+    pub fn memory(&self) -> Memory {
+        Memory::seen(self.x, self.z, self.sigma_m, self.odo_m, self.last_tick)
+    }
+}
+
+/// What the gates need to keep landmarks as memories (`vision`).
+#[derive(Clone, Debug)]
+pub struct MemCtx {
+    /// The odometer now, metres.
+    pub odo_m: f32,
+    pub rate: DriftRate,
+    /// The base, for the SDS scope of what re-sightings show.
+    pub base: String,
+    /// The head camera: focal length (px), stereo baseline (m), subpixel error.
+    pub camera: (f32, f32, f32),
+    /// The scatter re-sightings without travel showed (SDS), metres per axis; 0 before any.
+    pub obs_floor_m: f32,
+}
+
+impl MemCtx {
+    /// No motion and the D435's camera: sightings at one range weigh the same (as before v0.7).
+    pub fn still() -> MemCtx {
+        MemCtx { odo_m: 0.0, rate: DriftRate { per_m: 0.0, walk_m: 0.0, source: "spec" }, base: String::new(), camera: (424.0, 0.050, 0.08), obs_floor_m: 0.0 }
+    }
+
+    /// 1σ of a sighting at `depth_m`, metres per axis: the stereo depth law
+    /// along the ray and one pixel across it, or what re-sightings showed.
+    pub fn sigma_obs(&self, depth_m: f32) -> f32 {
+        let (f, b, sub) = self.camera;
+        let along = hand_core::act::material::stereo_depth_sigma(depth_m, f, b, sub);
+        let across = depth_m / f.max(1.0);
+        (along * along + across * across).sqrt().max(self.obs_floor_m).max(0.005)
     }
 }
 
@@ -115,6 +155,14 @@ impl Judged {
     /// Name of the first gate that blocked, if any.
     pub fn blocked_by(&self) -> Option<&'static str> {
         self.gates.iter().find(|g| g.applied && !g.passed).map(|g| g.gate)
+    }
+
+    /// The detection itself holds (its score and its margin pass), whatever
+    /// the gates that need a history said (repeated sightings, the score's
+    /// time series, a landmark of another label nearby): enough to find again
+    /// a piece the robot already knows is there, not to believe a new one.
+    pub fn sound(&self) -> bool {
+        self.gates.iter().filter(|g| g.applied && !g.passed).all(|g| matches!(g.gate, "confirm" | "temporal" | "conflict"))
     }
 }
 
@@ -171,6 +219,32 @@ pub fn past_errors(sds: &SdsStore, label: &str) -> Vec<HistoryMse> {
     METHODS.iter().filter_map(|m| sds.fusion_mse(&scope, m).map(|(mse, n)| HistoryMse { method: (*m).to_string(), mse, n })).collect()
 }
 
+/// What a re-sighting says about the robot's memory (SDS `memory` track).
+/// The squared 2-D innovation is, on average, the two sightings' scatter in
+/// both axes (`2·σ0² + 2·σ_obs²`), the random walk in both (`2·w²·d`) and the
+/// odometer's one-dimensional scale drift `(r·d)²` (the memory's model,
+/// `vision::Memory::sigma_m`). So a sighting after a walk of `d` (far enough
+/// to tell drift from scatter) gives an unbiased sample of `r²`, and one
+/// without travel a sample of the camera's per-axis variance; both are kept
+/// as variances (a square root per sighting would bias the mean low), and the
+/// innovation over the spread the memory predicted is about 1 when the model is right.
+fn record_memory(sds: &mut SdsStore, mem: &MemCtx, label: &str, travelled: f32, innov: f32, predicted: f32, sigma0: f32, sigma_obs: f32) {
+    if mem.base.is_empty() {
+        return;
+    }
+    let sq = innov * innov;
+    let scatter = 2.0 * (sigma0 * sigma0 + sigma_obs * sigma_obs);
+    let walk_var = mem.rate.walk_m * mem.rate.walk_m * travelled.max(0.0);
+    if travelled >= 2.0 {
+        sds.record_baseline(&Scope::new(Track::Memory, &mem.base, "drift"), "drift_var_per_m2", ((sq - scatter - 2.0 * walk_var) / (travelled * travelled)) as f64);
+    } else if travelled < 0.2 {
+        sds.record_baseline(&Scope::new(Track::Memory, &mem.base, "obs"), "scatter_var_m2", (0.5 * sq - sigma0 * sigma0) as f64);
+    }
+    // The spread the memory predicted, as the same sum (its σ already holds σ0, one walk and the drift).
+    let spread = (sigma0 * sigma0 + predicted * predicted + 2.0 * sigma_obs * sigma_obs + walk_var).sqrt().max(1e-4);
+    sds.record_baseline(&Scope::new(Track::Memory, label, &mem.base), "innovation_z", (innov / spread) as f64);
+}
+
 impl PrecisionGates {
     pub fn new(cfg: GateCfg) -> PrecisionGates {
         PrecisionGates { cfg, next_id: 1, landmarks: Vec::new(), series: HashMap::new(), margins: HashMap::new(), ttm: None, counters: GateCounters::default() }
@@ -200,6 +274,13 @@ impl PrecisionGates {
 
     pub fn landmarks(&self) -> &[Landmark] {
         &self.landmarks
+    }
+
+    /// Moves every landmark by `f` (from its position and its odometer: a fix of the robot's pose).
+    pub fn shift_landmarks(&mut self, f: impl Fn(f32, f32, f32) -> (f32, f32)) {
+        for l in self.landmarks.iter_mut() {
+            (l.x, l.z) = f(l.x, l.z, l.odo_m);
+        }
     }
 
     pub fn landmark(&self, id: u32) -> Option<&Landmark> {
@@ -329,6 +410,8 @@ impl PrecisionGates {
             unreachable: 0,
             history: Vec::new(),
             held_run: Vec::new(),
+            sigma_m: 0.0,
+            odo_m: 0.0,
         });
         id
     }
@@ -341,13 +424,19 @@ impl PrecisionGates {
         }
     }
 
-    /// Judges the candidates of one scan, in order.
+    /// Judges the candidates of one scan, in order, with the robot standing still.
     pub fn judge(&mut self, cands: Vec<Candidate>, tick: u64, sds: &mut SdsStore) -> Vec<Judged> {
-        self.prune(tick);
-        cands.into_iter().map(|c| self.judge_one(c, tick, sds)).collect()
+        self.judge_with(cands, tick, sds, &MemCtx::still())
     }
 
-    fn judge_one(&mut self, c: Candidate, tick: u64, sds: &mut SdsStore) -> Judged {
+    /// Judges the candidates of one scan; a landmark seen again is fused with
+    /// its memory by their variances (`mem`: how far the robot has moved since).
+    pub fn judge_with(&mut self, cands: Vec<Candidate>, tick: u64, sds: &mut SdsStore, mem: &MemCtx) -> Vec<Judged> {
+        self.prune(tick);
+        cands.into_iter().map(|c| self.judge_one(c, tick, sds, mem)).collect()
+    }
+
+    fn judge_one(&mut self, c: Candidate, tick: u64, sds: &mut SdsStore, mem: &MemCtx) -> Judged {
         let vscope = Scope::new(Track::Vision, &c.label, "");
         sds.record_baseline(&vscope, "score_all", c.score as f64);
         sds.record_baseline(&vscope, "margin", c.margin as f64);
@@ -476,10 +565,10 @@ impl PrecisionGates {
         // Update the landmark before the confirmation gate reads it.
         if let Some(id) = tid {
             let (x, z) = c.world.unwrap_or((0.0, 0.0));
+            let sigma_obs = mem.sigma_obs(c.depth_m);
             if let Some(l) = self.landmarks.iter_mut().find(|l| l.id == id) {
                 let first = l.seen == 0;
                 l.seen += 1;
-                l.last_tick = tick;
                 if record_ok {
                     l.history.push(c.score as f64);
                     if l.history.len() > HISTORY_CAP {
@@ -487,10 +576,25 @@ impl PrecisionGates {
                     }
                     l.score = if first { c.score } else { 0.5 * l.score + 0.5 * c.score };
                     l.margin = if first { c.margin } else { 0.5 * l.margin + 0.5 * c.margin };
-                    let w = if first { 1.0 } else { 0.5 };
-                    l.x = l.x * (1.0 - w) + x * w;
-                    l.z = l.z * (1.0 - w) + z * w;
+                    if first || l.sigma_m <= 0.0 {
+                        l.x = x;
+                        l.z = z;
+                        l.sigma_m = sigma_obs;
+                    } else {
+                        // The memory and the new sighting, each by its variance: after a walk the sighting counts for more.
+                        let before = l.memory();
+                        let travelled = mem.odo_m - before.odo_m;
+                        let predicted = before.sigma_m(mem.odo_m, mem.rate);
+                        let (fused, innov) = before.fuse(x, z, sigma_obs, mem.odo_m, tick, mem.rate);
+                        record_memory(sds, mem, &c.label, travelled, innov, predicted, before.sigma0_m, sigma_obs);
+                        l.x = fused.x;
+                        l.z = fused.z;
+                        // The camera's own bias does not average away (est: at most four sightings' worth).
+                        l.sigma_m = fused.sigma0_m.max(0.5 * sigma_obs);
+                    }
+                    l.odo_m = mem.odo_m;
                 }
+                l.last_tick = tick;
                 if base_ok {
                     l.good += 1;
                 }

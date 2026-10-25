@@ -59,6 +59,20 @@ pub struct AgentView {
     pub capacity_kg: f32,
     pub battery_ratio: f32,
     pub action: Option<String>,
+    /// Where the robot believes it is (its odometry), and how far that is off
+    /// the truth (the view shows it; the robot does not know the error).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub belief: Option<BeliefView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BeliefView {
+    pub x: f32,
+    pub z: f32,
+    pub yaw_deg: f32,
+    pub error_m: f32,
+    /// Distance travelled since the robot last fixed its position.
+    pub since_fix_m: f32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

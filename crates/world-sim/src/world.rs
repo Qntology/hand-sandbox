@@ -20,13 +20,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::kinds::{Ground, ItemKind, NodeKind, MIN_PIECE};
 use crate::nav::{self, Cell, EdgePlan, Goal};
+use crate::odometry::{OdomCfg, Odometry};
 use crate::render;
 use crate::rng::Rng;
 use crate::snapshot::*;
 use crate::terrain::{cell_center, FlatZone, RuggedLayout, Terrain, TerrainKind, CELL_M};
 
 mod acts;
-pub use acts::{material_of, ActPlay, PushState, WalkState, GET_UP_S, PUSH_START_SLACK_M};
+pub use acts::{camera_of, material_of, ActPlay, PushState, WalkState, GET_UP_S, PUSH_START_SLACK_M, SIDE_SHUFFLE_MAX_M};
 
 /// Length of one simulation tick, seconds.
 pub const TICK_S: f32 = 0.1;
@@ -64,6 +65,13 @@ pub const DROP_TIME_S: f32 = 1.0;
 pub const DROP_AHEAD_M: f32 = 0.45;
 /// Amounts within this of a whole number count as whole.
 pub const AMOUNT_EPS: f32 = 1e-3;
+/// The base camp's parcel lies this far ahead of the robot's start along the way
+/// to the warehouse, and this far to its right, metres (a scenario: seen in
+/// front at the start, picked from the side in passing).
+pub const CAMP_PARCEL_AHEAD_M: f32 = 2.0;
+pub const CAMP_PARCEL_RIGHT_M: f32 = 0.30;
+/// Parcels per cell of the map by default (about one per 175 m²).
+pub const PARCELS_PER_CELL: f32 = 1.0 / 700.0;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorldConfig {
@@ -77,11 +85,18 @@ pub struct WorldConfig {
     /// The landscape: the open map, or the rugged one with sea, cliffs and ridges.
     #[serde(default)]
     pub terrain: TerrainKind,
+    /// The robot's dead reckoning (`odometry`): on, its believed pose drifts as a real one's does.
+    #[serde(default)]
+    pub odometry: OdomCfg,
+    /// Parcels lying in the world: `None` the default (scattered over the map
+    /// and one in front of the base camp), `Some(0)` none.
+    #[serde(default)]
+    pub parcels: Option<usize>,
 }
 
 impl Default for WorldConfig {
     fn default() -> Self {
-        WorldConfig { seed: 7, cells: 64, hand: HandConfig::preset(hand_core::FingerCount::Five), body: BodyPlan::default(), terrain: TerrainKind::Open }
+        WorldConfig { seed: 7, cells: 64, hand: HandConfig::preset(hand_core::FingerCount::Five), body: BodyPlan::default(), terrain: TerrainKind::Open, odometry: OdomCfg::default(), parcels: None }
     }
 }
 
@@ -175,7 +190,20 @@ pub enum Action {
     /// Turn to face a point.
     Face { x: f32, z: f32 },
     Mine { node: u32 },
-    PickUp { drop: u32 },
+    /// Pick an item up. The hand goes where the robot believes it is (`aim`,
+    /// in its believed frame; `None`: where it lies, seen as it reaches), in
+    /// front after facing it, or beside the right foot without turning
+    /// (`side`: the camera does not see it there). `memory_sigma_m` is the
+    /// 1σ the robot gives that memory (0 when it sees the item).
+    PickUp {
+        drop: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        aim: Option<(f32, f32)>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        side: bool,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        memory_sigma_m: f32,
+    },
     /// Put carried items into a waypoint's stock; `item` limits it to one kind.
     Deliver { waypoint: u32, item: Option<ItemKind> },
     /// Set carried items down here: into the pile of a waypoint within
@@ -191,14 +219,27 @@ pub enum Action {
     Push { drop: u32, x: f32, z: f32 },
 }
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+fn is_zero(x: &f32) -> bool {
+    *x == 0.0
+}
+
 impl Action {
+    /// A pick-up of an item the robot sees, in front of it (the pick before v0.7).
+    pub fn pick(drop: u32) -> Action {
+        Action::PickUp { drop, aim: None, side: false, memory_sigma_m: 0.0 }
+    }
+
     pub fn label(&self) -> String {
         match self {
             Action::MoveTo { x, z, reach_m } => format!("move_to({x:.1},{z:.1},reach={reach_m:.1})"),
             Action::Turn { yaw_deg } => format!("turn({yaw_deg:.0})"),
             Action::Face { x, z } => format!("face({x:.1},{z:.1})"),
             Action::Mine { node } => format!("mine({})", node_id(*node)),
-            Action::PickUp { drop } => format!("pick_up({})", drop_id(*drop)),
+            Action::PickUp { drop, side, .. } => format!("{}({})", if *side { "pick_up_side" } else { "pick_up" }, drop_id(*drop)),
             Action::Deliver { waypoint, item } => match item {
                 Some(i) => format!("deliver({},{})", waypoint_id(*waypoint), i.id()),
                 None => format!("deliver({})", waypoint_id(*waypoint)),
@@ -316,7 +357,8 @@ struct MoveState {
 #[derive(Clone, Debug)]
 enum WorkKind {
     Mine { node: u32 },
-    Pick { drop: u32, two_arms: bool },
+    /// `face`: where the robot turns before it bends (the item where it believes it is); `None` for a reach to the side.
+    Pick { drop: u32, two_arms: bool, face: Option<(f32, f32)> },
     Deliver { waypoint: u32, item: Option<ItemKind> },
     Drop { item: Option<ItemKind>, amount: Option<f32>, waypoint: Option<u32> },
     Split { drop: u32, portion: f32 },
@@ -379,6 +421,12 @@ pub struct World {
     pub fallen_until: Option<f64>,
     /// A legged robot's steps along the current move.
     pub walk: WalkState,
+    /// The robot's dead reckoning: the pose it believes it has.
+    pub odom: Odometry,
+    /// Share of this tick's distance the wheels counted without travelling it (their slip).
+    odom_over: f32,
+    /// Side reaches planned so far, by item, piece (thousandths) and cargo (tenths of a kg).
+    side_cache: Mutex<std::collections::HashMap<(ItemKind, i32, i32), Option<(f32, f32)>>>,
 }
 
 impl Clone for World {
@@ -416,6 +464,9 @@ impl Clone for World {
             act_rng: self.act_rng.clone(),
             fallen_until: self.fallen_until,
             walk: self.walk.clone(),
+            odom: self.odom.clone(),
+            odom_over: self.odom_over,
+            side_cache: Mutex::new(self.side_cache.lock().unwrap_or_else(|e| e.into_inner()).clone()),
         }
     }
 }
@@ -610,15 +661,48 @@ impl World {
             strike_acc: 0.0,
         };
 
+        // Parcels: light boxes lying about, found by looking (no node yields them).
+        // Their own random stream, so the nodes and the game's draws stay as they were.
+        let mut drops = Vec::new();
+        let mut next_drop = 1u32;
+        let n_parcels = cfg.parcels.unwrap_or(((cells * cells) as f32 * PARCELS_PER_CELL).round().max(3.0) as usize);
+        if n_parcels > 0 {
+            let mut prng = Rng::new(cfg.seed ^ 0x9A2C_E1B0_77D3_4F15);
+            // One in front of the base camp, a little right of the way to the warehouse.
+            let (s, c) = yaw.sin_cos();
+            let (px, pz) = (base_pos.0 + CAMP_PARCEL_AHEAD_M * c - CAMP_PARCEL_RIGHT_M * s, base_pos.1 + CAMP_PARCEL_AHEAD_M * s + CAMP_PARCEL_RIGHT_M * c);
+            drops.push(DropItem::whole(next_drop, ItemKind::Parcel, px, pz));
+            next_drop += 1;
+            let wheel = hand_core::BaseKind::Wheel.spec();
+            let start = terrain.cell_of(base_pos.0, base_pos.1).unwrap_or((0, 0));
+            let taken: HashSet<Cell> = occupied.clone();
+            let times = nav::travel_times(&wheel, &terrain, &|x, z| taken.contains(&(x, z)), start, f32::INFINITY);
+            let mut tries = 0;
+            while drops.len() < n_parcels && tries < 4000 {
+                tries += 1;
+                let (cx, cz) = (prng.below(cells as u32) as usize, prng.below(cells as u32) as usize);
+                let (x, z) = cell_center(cx, cz);
+                // On land a wheel can get to, off the waypoints' pads and the curb wall, one per cell.
+                if !times[terrain.idx(cx, cz)].is_finite() || occupied.contains(&(cx, cz)) || in_zone(x, z) || cx.abs_diff(wall_cx) <= 1 || terrain.curb_m(cx, cz) > 0.0 {
+                    continue;
+                }
+                occupied.insert((cx, cz));
+                let (jx, jz) = (prng.range_f32(-0.12, 0.12), prng.range_f32(-0.12, 0.12));
+                drops.push(DropItem::whole(next_drop, ItemKind::Parcel, x + jx, z + jz));
+                next_drop += 1;
+            }
+        }
+
         let grasps = ItemKind::ALL.iter().map(|&k| top_grasp_info(&hand, k, 1.0)).collect();
 
         let (cfg_body, base_kind, fingers, cfg_seed) = (cfg.body, cfg.hand.base, cfg.hand.fingers, cfg.seed);
+        let odom = Odometry::new(cfg.odometry, cfg_seed, base_kind == hand_core::BaseKind::HumanFoot, (agent.x, agent.z, agent.yaw));
         Ok(World {
             cfg,
             hand,
             terrain,
             nodes,
-            drops: vec![],
+            drops,
             waypoints,
             agent,
             tick: 0,
@@ -626,7 +710,7 @@ impl World {
             grasps,
             active: None,
             rng,
-            next_drop: 1,
+            next_drop,
             body: Body::new(&cfg_body, base_kind, fingers),
             limits: Mutex::new(None),
             balance: None,
@@ -644,6 +728,9 @@ impl World {
             act_rng: Rng::new(cfg_seed ^ 0x51D3_A6C2_7F10_88E5),
             fallen_until: None,
             walk: WalkState::default(),
+            odom,
+            odom_over: 0.0,
+            side_cache: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -692,6 +779,46 @@ impl World {
 
     pub fn grasp_table(&self) -> &[GraspInfo] {
         &self.grasps
+    }
+
+    // ----- the robot's own sense of where it is (`odometry`) -----
+
+    /// Where the robot believes it is: x, z, yaw (its dead reckoning).
+    pub fn believed_pose(&self) -> (f32, f32, f32) {
+        self.odom.pose()
+    }
+
+    fn true_pose(&self) -> (f32, f32, f32) {
+        (self.agent.x, self.agent.z, self.agent.yaw)
+    }
+
+    /// A point of the world in the robot's believed frame: where the robot
+    /// puts something its camera or its hand finds there.
+    pub fn belief_of(&self, x: f32, z: f32) -> (f32, f32) {
+        self.odom.belief_of(self.true_pose(), (x, z))
+    }
+
+    /// A point of the believed frame in the world: where the robot's body
+    /// goes when it goes where it believes that point is.
+    pub fn true_of(&self, x: f32, z: f32) -> (f32, f32) {
+        self.odom.true_of(self.true_pose(), (x, z))
+    }
+
+    /// A believed heading as the world's.
+    pub fn true_yaw_of(&self, yaw: f32) -> f32 {
+        self.odom.true_yaw(self.agent.yaw, yaw)
+    }
+
+    /// How far the robot's belief is off its true position, metres. For the
+    /// record and the benchmark only: nothing that decides may read it.
+    pub fn belief_error_m(&self) -> f32 {
+        (self.odom.x - self.agent.x).hypot(self.odom.z - self.agent.z)
+    }
+
+    /// The robot moves its believed position by what a landmark of the map
+    /// showed it (a waypoint seen where the map has it).
+    pub fn relocalize(&mut self, dx: f32, dz: f32) {
+        self.odom.correct(dx, dz);
     }
 
     pub fn node(&self, id: u32) -> Option<&Node> {
@@ -804,6 +931,7 @@ impl World {
             drive_accel_mps2: (!self.body.legged).then(|| self.body.chassis.drive_force_n / mass),
             mass_kg: Some(mass),
             walk_com_z_m: self.body.legged.then(|| hand_core::act::gait::walking_com_z(&self.body)),
+            walk_foot_m: self.body.legged.then_some(self.body.leg.foot_len_m),
             ..self.hand.base
         }
     }
@@ -932,6 +1060,7 @@ impl World {
         if self.fallen_until.is_some_and(|t| self.time_s < t) {
             return Err(ActionError::Fallen);
         }
+        let before = (self.agent.x, self.agent.z, self.agent.yaw);
         let state = match &action {
             Action::MoveTo { x, z, reach_m } => {
                 let goal = if *reach_m <= 0.0 {
@@ -943,6 +1072,7 @@ impl World {
                     Goal::Within { x: *x, z: *z, reach_m: *reach_m }
                 };
                 let plan = self.plan_route(goal).ok_or(ActionError::NoPath)?;
+                self.odom.new_move();
                 Active::Move(MoveState { edges: plan.edges, idx: 0, pause_left: 0.0, progress_s: 0.0, announced_pause: false, elapsed_s: 0.0 })
             }
             Action::Turn { yaw_deg } => Active::Turn { target: wrap_angle(yaw_deg.to_radians()) },
@@ -952,7 +1082,7 @@ impl World {
                 self.check_reach(n.x, n.z, MINE_REACH_M)?;
                 Active::Work(WorkState { kind: WorkKind::Mine { node: *node }, remaining_s: n.hp })
             }
-            Action::PickUp { drop } => {
+            Action::PickUp { drop, aim, side, memory_sigma_m } => {
                 let (dx, dz, kind, amount) = {
                     let d = self.drop_item(*drop).ok_or(ActionError::UnknownTarget)?;
                     (d.x, d.z, d.kind, d.amount)
@@ -982,8 +1112,8 @@ impl World {
                     two_arms = true;
                 }
                 // Bend down, close, lift, stow: the action's own time series (`hand_core::act::grasp`).
-                let t = self.start_grasp(*drop, two_arms)?;
-                Active::Work(WorkState { kind: WorkKind::Pick { drop: *drop, two_arms }, remaining_s: t })
+                let (t, face) = self.start_grasp(*drop, two_arms, *aim, *side, *memory_sigma_m)?;
+                Active::Work(WorkState { kind: WorkKind::Pick { drop: *drop, two_arms, face }, remaining_s: t })
             }
             Action::Drop { item, amount } => {
                 let have: f32 = self.agent.carried.iter().filter(|(k, n)| *n > AMOUNT_EPS && item.map_or(true, |i| i == *k)).map(|(_, n)| *n).sum();
@@ -1023,6 +1153,12 @@ impl World {
             }
             Action::Push { drop, x, z } => Active::Push(self.start_push(*drop, *x, *z)?),
         };
+        // A start can move the body at once (a pick's shuffle to its stand-off,
+        // a push lining up its heading): the odometry counts that too.
+        let after = (self.agent.x, self.agent.z, self.agent.yaw);
+        if after != before {
+            self.odom.update(before, after, 0.0, 0.0);
+        }
         let label = action.label();
         self.active = Some((action, state));
         Ok(vec![self.stamp(WorldEvent::ActionStarted { action: label })])
@@ -1066,6 +1202,7 @@ impl World {
     /// Advances the world by `dt` seconds.
     pub fn step(&mut self, dt: f32) -> Vec<TimedEvent> {
         self.update_balance(dt);
+        let before = (self.agent.x, self.agent.z, self.agent.yaw);
         let mut events = Vec::new();
         let mut remaining = dt;
         let mut guard = 0;
@@ -1082,6 +1219,10 @@ impl World {
         if self.active.is_none() {
             self.agent.speed_mps = 0.0;
         }
+        // The robot's own sensors count the motion of this tick, with their errors.
+        let after = (self.agent.x, self.agent.z, self.agent.yaw);
+        self.odom.update(before, after, dt, self.odom_over);
+        self.odom_over = 0.0;
         self.time_s += dt as f64;
         events
     }
@@ -1176,6 +1317,11 @@ impl World {
             return t;
         }
 
+        // A slipping wheel or track counts distance it did not travel (the drive model's cruise slip on this ground).
+        if !self.body.legged {
+            let props = self.ground_at(e.to).surface().props();
+            self.odom_over = hand_core::act::cruise_slip(&self.drive_spec(), props, e.slope_deg).map_or(0.0, |s| s / (1.0 - s).max(0.05));
+        }
         let left = e.move_time_s - m.progress_s;
         let t = left.min(remaining);
         m.progress_s += t;
@@ -1216,9 +1362,11 @@ impl World {
                     return 0.0;
                 }
             },
-            WorkKind::Pick { drop, .. } => match self.drop_item(drop) {
-                Some(d) => (d.x, d.z),
-                None => {
+            // Toward the item where the robot believes it is; a reach to the side does not turn.
+            WorkKind::Pick { drop, face, .. } => match (self.drop_item(drop), face) {
+                (Some(_), Some(p)) => p,
+                (Some(_), None) => (self.agent.x + self.agent.yaw.cos(), self.agent.z + self.agent.yaw.sin()),
+                (None, _) => {
                     *done = Some((false, Some("unknown_target".into())));
                     return 0.0;
                 }
@@ -1276,6 +1424,7 @@ impl World {
             WorkKind::Pick { drop, .. } => {
                 w.remaining_s -= t;
                 if w.remaining_s <= 1e-6 {
+                    self.act_finish(events);
                     let play = self.end_act();
                     match play.as_ref().map(|p| (p.rollout.outcome.ok, p.rollout.outcome.code)) {
                         Some((false, code)) => {
@@ -1294,6 +1443,7 @@ impl World {
             WorkKind::Deliver { waypoint, item } => {
                 w.remaining_s -= t;
                 if w.remaining_s <= 1e-6 {
+                    self.act_finish(events);
                     self.end_act();
                     self.complete_deliver(waypoint, item, events);
                     *done = Some((true, None));
@@ -1302,6 +1452,7 @@ impl World {
             WorkKind::Drop { item, amount, waypoint } => {
                 w.remaining_s -= t;
                 if w.remaining_s <= 1e-6 {
+                    self.act_finish(events);
                     let play = self.end_act();
                     self.complete_drop(item, amount, waypoint, play.as_ref(), events);
                     *done = Some((true, None));
@@ -1490,6 +1641,10 @@ impl World {
                 capacity_kg: self.capacity_kg(),
                 battery_ratio: self.battery_ratio(),
                 action: self.current_action(),
+                belief: self.odom.cfg.enabled.then(|| {
+                    let (x, z, yaw) = self.believed_pose();
+                    BeliefView { x, z, yaw_deg: yaw.to_degrees(), error_m: self.belief_error_m(), since_fix_m: self.odom.since_fix_m }
+                }),
             },
             waypoints: self
                 .waypoints
@@ -1565,7 +1720,7 @@ impl World {
             }
             Some((_, Active::Work(w))) => match &w.kind {
                 WorkKind::Mine { .. } => (Posture::arm_raise(cargo), "flat|mine".into()),
-                WorkKind::Pick { drop, two_arms } => {
+                WorkKind::Pick { drop, two_arms, .. } => {
                     let kg = self.drop_item(*drop).map_or(0.0, |d| d.mass_kg());
                     (Posture::arm_lift(kg, *two_arms, cargo), "flat|pick".into())
                 }
@@ -1773,10 +1928,62 @@ mod tests {
     use super::*;
     use hand_core::{BaseKind, FingerCount};
 
+    /// A world without the placed parcels: these tests are about the nodes and their drops.
     fn world(fingers: FingerCount, base: BaseKind) -> World {
         let mut hand = HandConfig::preset(fingers);
         hand.base = base;
-        World::new(WorldConfig { seed: 7, cells: 64, hand, body: BodyPlan::default(), terrain: TerrainKind::Open }).unwrap()
+        World::new(WorldConfig { seed: 7, cells: 64, hand, body: BodyPlan::default(), terrain: TerrainKind::Open, parcels: Some(0), ..WorldConfig::default() }).unwrap()
+    }
+
+    #[test]
+    fn parcels_lie_about_and_one_waits_in_front_of_the_base_camp() {
+        let mut hand = HandConfig::preset(FingerCount::Five);
+        hand.base = BaseKind::HumanFoot;
+        let w = World::new(WorldConfig { hand, ..WorldConfig::default() }).unwrap();
+        let parcels: Vec<&DropItem> = w.drops.iter().filter(|d| d.kind == ItemKind::Parcel).collect();
+        assert_eq!(parcels.len(), w.drops.len(), "only parcels lie about at the start");
+        assert!(parcels.len() >= 3, "{}", parcels.len());
+        // The first one: ahead of the robot on its way to the warehouse, a little to its right.
+        let p = parcels[0];
+        let (s, c) = w.agent.yaw.sin_cos();
+        let (rx, rz) = (p.x - w.agent.x, p.z - w.agent.z);
+        let (ahead, right) = (rx * c + rz * s, -rx * s + rz * c);
+        assert!((ahead - CAMP_PARCEL_AHEAD_M).abs() < 1e-3 && (right - CAMP_PARCEL_RIGHT_M).abs() < 1e-3, "{ahead} {right}");
+        // None on a node's cell or in the water; the same seed puts them in the same places.
+        let blocked = w.blocked_cells();
+        assert!(parcels.iter().all(|d| w.terrain.cell_of(d.x, d.z).is_some_and(|c| !blocked.contains(&c) && !w.terrain.is_water(c.0, c.1))));
+        let again = World::new(WorldConfig { hand, ..WorldConfig::default() }).unwrap();
+        assert!(w.drops.iter().zip(&again.drops).all(|(a, b)| (a.x, a.z, a.id) == (b.x, b.z, b.id)));
+        // New drops get ids after them.
+        assert!(w.next_drop > parcels.iter().map(|d| d.id).max().unwrap());
+        // The nodes do not move for them (their own random stream).
+        let bare = World::new(WorldConfig { hand, parcels: Some(0), ..WorldConfig::default() }).unwrap();
+        assert!(w.nodes.iter().zip(&bare.nodes).all(|(a, b)| (a.x, a.z) == (b.x, b.z)));
+    }
+
+    #[test]
+    fn the_belief_drifts_while_the_robot_drives_and_maps_back() {
+        let mut w = World::new(WorldConfig { parcels: Some(0), ..WorldConfig::default() }).unwrap();
+        assert!(w.belief_error_m() < 1e-6, "it starts on its pad");
+        let camp = w.waypoint_by_key("base_camp").unwrap().clone();
+        let goal = (camp.x + 6.0, camp.z + 2.0);
+        w.command(Action::MoveTo { x: goal.0, z: goal.1, reach_m: 0.0 }).unwrap();
+        run(&mut w, 120.0);
+        let err = w.belief_error_m();
+        assert!(err > 1e-4 && err < 0.5, "{err}");
+        assert!((w.odom.travelled_m - 6.3).abs() < 1.5, "{}", w.odom.travelled_m);
+        // What it believes about itself is where it is in its own frame, and a point maps back.
+        let (bx, bz, _) = w.believed_pose();
+        let me = w.belief_of(w.agent.x, w.agent.z);
+        assert!((me.0 - bx).abs() < 1e-4 && (me.1 - bz).abs() < 1e-4);
+        let p = w.true_of(10.0, 9.0);
+        let q = w.belief_of(p.0, p.1);
+        assert!((q.0 - 10.0).abs() < 1e-3 && (q.1 - 9.0).abs() < 1e-3);
+        // Exact odometry: the belief is the truth.
+        let mut e = World::new(WorldConfig { parcels: Some(0), odometry: OdomCfg::exact(), ..WorldConfig::default() }).unwrap();
+        e.command(Action::MoveTo { x: goal.0, z: goal.1, reach_m: 0.0 }).unwrap();
+        run(&mut e, 120.0);
+        assert!(e.belief_error_m() < 1e-3);
     }
 
     fn run(w: &mut World, max_s: f32) -> Vec<TimedEvent> {
@@ -1918,7 +2125,7 @@ mod tests {
         let drop = w.drops[0].clone();
         w.command(Action::MoveTo { x: drop.x, z: drop.z, reach_m: 0.5 }).unwrap();
         run(&mut w, 60.0);
-        w.command(Action::PickUp { drop: drop.id }).unwrap();
+        w.command(Action::pick(drop.id)).unwrap();
         let ev = run(&mut w, 20.0);
         assert!(ev.iter().any(|e| matches!(e.event, WorldEvent::ItemPicked { .. })), "{ev:?}");
         assert_eq!(w.carried_count(ItemKind::Log), 1);
@@ -1995,7 +2202,7 @@ mod tests {
             .find(|&k| 2.0 * w.grasp_info(k).margin < 1.0)
             .expect("the two-finger hand cannot hold every item (see item_catalogue_spans_what_the_hands_can_hold)");
         w.drops.push(DropItem::whole(500, bad, w.agent.x + 0.4, w.agent.z));
-        match w.command(Action::PickUp { drop: 500 }) {
+        match w.command(Action::pick(500)) {
             Err(ActionError::GraspUnstable { margin }) => assert!(margin < 1.0 + 1e-3),
             other => panic!("{other:?}"),
         }
@@ -2008,7 +2215,7 @@ mod tests {
         let cap = w.capacity_kg();
         add_stock(&mut w.agent.carried, item, (cap / item.spec().mass_kg).floor());
         w.drops.push(DropItem::whole(501, item, w.agent.x + 0.4, w.agent.z));
-        assert!(matches!(w.command(Action::PickUp { drop: 501 }), Err(ActionError::CapacityExceeded { .. })));
+        assert!(matches!(w.command(Action::pick(501)), Err(ActionError::CapacityExceeded { .. })));
     }
 
     #[test]
@@ -2060,14 +2267,14 @@ mod tests {
     fn world_with(body: BodyPlan, base: BaseKind) -> World {
         let mut hand = HandConfig::preset(FingerCount::Five);
         hand.base = base;
-        World::new(WorldConfig { seed: 7, cells: 64, hand, body, terrain: TerrainKind::Open }).unwrap()
+        World::new(WorldConfig { seed: 7, cells: 64, hand, body, terrain: TerrainKind::Open, ..WorldConfig::default() }).unwrap()
     }
 
     #[test]
     fn the_arm_preset_decides_what_can_be_picked_up() {
         let place = |w: &mut World, kind: ItemKind| {
             w.drops.push(DropItem::whole(600, kind, w.agent.x + 0.4, w.agent.z));
-            w.command(Action::PickUp { drop: 600 })
+            w.command(Action::pick(600))
         };
         let mut budget = world_with(BodyPlan { arm: hand_core::Tier::Budget, ..BodyPlan::default() }, BaseKind::HumanFoot);
         match place(&mut budget, ItemKind::Log) {
@@ -2108,7 +2315,7 @@ mod tests {
     fn rugged(seed: u64, base: BaseKind) -> World {
         let mut hand = HandConfig::preset(FingerCount::Five);
         hand.base = base;
-        World::new(WorldConfig { seed, cells: 64, hand, body: BodyPlan::default(), terrain: TerrainKind::Rugged }).unwrap()
+        World::new(WorldConfig { seed, cells: 64, hand, body: BodyPlan::default(), terrain: TerrainKind::Rugged, ..WorldConfig::default() }).unwrap()
     }
 
     #[test]
@@ -2257,7 +2464,7 @@ mod tests {
         assert!((w.drop_item(piece).unwrap().amount - 0.5).abs() < 1e-5);
         assert!((w.drop_item(700).unwrap().mass_kg() - 1.3).abs() < 1e-4);
         if half.stable {
-            w.command(Action::PickUp { drop: piece }).unwrap();
+            w.command(Action::pick(piece)).unwrap();
             run(&mut w, 20.0);
             assert!((w.carried_amount(ItemKind::Stone) - 0.5).abs() < 1e-5);
             assert_eq!(w.carried_count(ItemKind::Stone), 0, "half a stone is not a whole one");

@@ -421,7 +421,7 @@ fn eval_grasp(body: &Body, s: &AxScenario) -> AxResult {
     let two = !one;
     let mut runs = Vec::new();
     for seed in 0..s.trials as u64 {
-        runs.push(g::grasp(&GraspInput { body, hand: &hand, material: o.material, mass_kg: o.mass_kg, size_m: [o.size_m; 3], ground: s.ground, two_arms: two, cargo_kg: cargo, aim_sigma_m: aim_sigma(body), seed }));
+        runs.push(g::grasp(&GraspInput::front(body, &hand, o.material, o.mass_kg, [o.size_m; 3], s.ground, two, cargo, aim_sigma(body), seed)));
     }
     let ok: Vec<&crate::act::ActRollout> = runs.iter().filter(|r| r.outcome.ok).collect();
     let rate = ok.len() as f32 / runs.len().max(1) as f32;
@@ -453,8 +453,8 @@ fn eval_grasp(body: &Body, s: &AxScenario) -> AxResult {
         .map(|e| e * 1000.0)
         .collect();
     cells.push(cell(Layer::TimeSeries, "place_err_mm", Some("hand"), mean(&place), like(PLACE_ERR_MM), CITE_PLACE));
-    // Part: the bottom of the bend that reached the object.
-    let plan = reach::plan(body, &ReachGoal::ground_object(o.size_m, o.mass_kg, two, cargo));
+    // Part: the bottom of the bend that reached the object (the engine's own plan: in front, or a wide squat over a load it cannot hold there).
+    let plan = reach::plan_or_straddle(body, &ReachGoal::ground_object(o.size_m, o.mass_kg, two, cargo), 0.5 * o.size_m);
     part_cells(body, &plan, &mut cells);
     // Coupling: the feet's margin while the hands lift, the neck's camera pitch.
     let margin = m("min_margin");
@@ -490,7 +490,7 @@ fn eval_bend(body: &Body, s: &AxScenario) -> AxResult {
     let hand = hand_of(body);
     let cargo = s.cargo_frac * body.mass_kg();
     let (_, one) = g::top_grasp_ok(&hand, [o.size_m; 3], o.mass_kg, crate::act::material::pad_on(o.material).mean);
-    let plan = reach::plan(body, &ReachGoal::ground_object(o.size_m, o.mass_kg, !one, cargo));
+    let plan = reach::plan_or_straddle(body, &ReachGoal::ground_object(o.size_m, o.mass_kg, !one, cargo), 0.5 * o.size_m);
     let mut cells = Vec::new();
     if !plan.ok {
         cells.push(cell(Layer::Outcome, "reach_ground", Some("waist"), Some(1.0), Rule::AtMost { limit: 0.0 }, "바닥의 물체에 손이 닿아야 굽혀 집을 수 있음"));
@@ -498,7 +498,7 @@ fn eval_bend(body: &Body, s: &AxScenario) -> AxResult {
     cells.push(cell(Layer::Outcome, "lowest_palm_m", Some("hand"), Some(plan.lowest_palm_z), Rule::Raw, ""));
     part_cells(body, &plan, &mut cells);
     // When the bend's peak moment comes: the rise's samples of one grasp.
-    let r = g::grasp(&GraspInput { body, hand: &hand, material: o.material, mass_kg: o.mass_kg, size_m: [o.size_m; 3], ground: s.ground, two_arms: !one, cargo_kg: cargo, aim_sigma_m: 0.0, seed: 1 });
+    let r = g::grasp(&GraspInput::front(body, &hand, o.material, o.mass_kg, [o.size_m; 3], s.ground, !one, cargo, 0.0, 1));
     let peak_t = (|| {
         let lift: Vec<&crate::act::ActSample> = r.samples.iter().filter(|x| x.phase == "lift").collect();
         let t0 = lift.first()?.t;

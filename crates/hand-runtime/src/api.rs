@@ -140,6 +140,8 @@ pub fn snapshot_json(s: &WorldSnapshot) -> Value {
             "capacity_kg": r3(s.agent.capacity_kg),
             "battery_ratio": r3(s.agent.battery_ratio),
             "action": s.agent.action,
+            // Where the robot believes it is (its odometry) and how far that is off: the map shows both.
+            "belief": s.agent.belief.as_ref().map(|b| json!({"pos": [r3(b.x), r3(d - b.z)], "yaw_deg": r3(wrap_deg(-b.yaw_deg)), "error_m": r3(b.error_m), "since_fix_m": r3(b.since_fix_m)})),
         },
         "waypoints": s.waypoints.iter().map(|w| json!({
             "id": w.key,

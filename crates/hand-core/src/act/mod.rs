@@ -338,7 +338,7 @@ pub fn locomotion_factor_with(spec: &crate::base::BaseSpec, ground: &crate::surf
     match spec.kind {
         BaseKind::HumanFoot => {
             let Some(z) = spec.walk_com_z_m else { return Some(1.0) };
-            let g = gait::plan_z(z, spec.max_speed_mps, crate::surface::available_mu(spec.kind, ground), slope_deg.max(0.0));
+            let g = gait::plan_z(z, spec.walk_foot_m.unwrap_or(gait::NOMINAL_FOOT_M), spec.max_speed_mps, crate::surface::available_mu(spec.kind, ground), slope_deg.max(0.0));
             Some((g.speed / g.speed_cmd.max(1e-3)).clamp(0.05, 1.0))
         }
         _ => {
@@ -354,6 +354,26 @@ pub fn locomotion_factor_with(spec: &crate::base::BaseSpec, ground: &crate::surf
             drive::slip_on(gs, need, l).map(|s| (1.0 - s).max(0.02))
         }
     }
+}
+
+/// The slip ratio a wheeled or tracked base cruises at up `slope_deg`
+/// (downhill counts as flat) on `ground`: the traction its rolling resistance
+/// and the slope need, as [`locomotion_factor_with`] finds it
+/// (`drive::slip_on`). `None` for legs and where the drive spins. Wheel
+/// odometry counts this slip as distance it did not travel.
+pub fn cruise_slip(spec: &crate::base::BaseSpec, ground: &crate::surface::SurfaceProps, slope_deg: f32) -> Option<f32> {
+    use crate::balance::G;
+    use crate::base::BaseKind;
+    if spec.kind == BaseKind::HumanFoot {
+        return None;
+    }
+    let th = slope_deg.max(0.0).to_radians();
+    let mu = crate::surface::available_mu(spec.kind, ground);
+    let per_kg = G * (crate::surface::rolling_resistance(spec.kind, ground) * th.cos() + th.sin());
+    let need = per_kg / (G * mu * th.cos()).max(1e-3);
+    let gs = crate::surface::Surface::from_id(ground.id).unwrap_or_default();
+    let l = if spec.kind == BaseKind::Track { spec.footprint_m } else { drive::wheel_contact_m(gs) };
+    drive::slip_on(gs, need, l)
 }
 
 #[cfg(test)]

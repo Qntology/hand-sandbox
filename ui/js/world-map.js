@@ -1,5 +1,5 @@
 // 미니맵: 지형(world_terrain: 바다·절벽·높이), WorldSnapshot(경계·노드·드롭·웨이포인트·에이전트)과
-// 지나온 경로(trail)를 그린다. 웨이포인트 이름 옆 숫자는 그곳 더미에 쌓인 개수다.
+// 지나온 경로(trail)를 그린다. 보라 빈 화살표는 로봇이 믿는 자기 위치(오도메트리)다. 웨이포인트 이름 옆 숫자는 그곳 더미에 쌓인 개수다.
 // 월드 화면의 '경로' 토글이 이 오버레이를 켜고 끈다.
 import { call } from './api.js';
 import { bus, state } from './state.js';
@@ -124,6 +124,29 @@ function draw() {
   }
   const [ax, ay] = snap.agent.pos;
   const yaw = (snap.agent.yaw_deg * Math.PI) / 180;
+  // Where the robot believes it is (its odometry): a hollow arrow, joined to the true one.
+  const belief = snap.agent.belief;
+  if (belief && belief.error_m > 0.02) {
+    const [bxp, byp] = belief.pos;
+    ctx.strokeStyle = cssVar('--violet');
+    ctx.lineWidth = 1;
+    ctx.setLineDash([2, 2]);
+    ctx.beginPath();
+    ctx.moveTo(X(ax), Y(ay));
+    ctx.lineTo(X(bxp), Y(byp));
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.save();
+    ctx.translate(X(bxp), Y(byp));
+    ctx.rotate(-(belief.yaw_deg * Math.PI) / 180);
+    ctx.beginPath();
+    ctx.moveTo(6, 0);
+    ctx.lineTo(-4, 3.6);
+    ctx.lineTo(-4, -3.6);
+    ctx.closePath();
+    ctx.stroke();
+    ctx.restore();
+  }
   ctx.save();
   ctx.translate(X(ax), Y(ay));
   ctx.rotate(-yaw);
@@ -136,7 +159,7 @@ function draw() {
   ctx.fill();
   ctx.restore();
   $('mm-left').textContent = `${bx} × ${by} m`;
-  $('mm-right').textContent = `(${ax.toFixed(1)}, ${ay.toFixed(1)})`;
+  $('mm-right').textContent = belief ? `(${ax.toFixed(1)}, ${ay.toFixed(1)}) · 믿음 오차 ${belief.error_m.toFixed(2)} m` : `(${ax.toFixed(1)}, ${ay.toFixed(1)})`;
 }
 
 export function initWorldMap() {

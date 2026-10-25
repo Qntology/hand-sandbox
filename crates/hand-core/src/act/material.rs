@@ -17,10 +17,12 @@ pub enum ItemMaterial {
     Stone,
     Coal,
     IronOre,
+    /// Corrugated board (a parcel box).
+    Cardboard,
 }
 
 impl ItemMaterial {
-    pub const ALL: [ItemMaterial; 4] = [ItemMaterial::Wood, ItemMaterial::Stone, ItemMaterial::Coal, ItemMaterial::IronOre];
+    pub const ALL: [ItemMaterial; 5] = [ItemMaterial::Wood, ItemMaterial::Stone, ItemMaterial::Coal, ItemMaterial::IronOre, ItemMaterial::Cardboard];
 
     pub fn id(self) -> &'static str {
         match self {
@@ -28,6 +30,7 @@ impl ItemMaterial {
             ItemMaterial::Stone => "stone",
             ItemMaterial::Coal => "coal",
             ItemMaterial::IronOre => "iron_ore",
+            ItemMaterial::Cardboard => "cardboard",
         }
     }
 
@@ -37,6 +40,7 @@ impl ItemMaterial {
             ItemMaterial::Stone => "돌",
             ItemMaterial::Coal => "석탄",
             ItemMaterial::IronOre => "철광석",
+            ItemMaterial::Cardboard => "골판지",
         }
     }
 }
@@ -63,6 +67,9 @@ pub fn pad_on(item: ItemMaterial) -> Friction {
         ItemMaterial::Coal => 0.45,
         // A rough mineral lump like stone [substituted].
         ItemMaterial::IronOre => 0.83,
+        // Rubber on other materials, the cargo-securing design value [direct, CTU Code 2014 Annex 7];
+        // rubber on clean dry cardboard 0.5–0.8 [direct, no origin given].
+        ItemMaterial::Cardboard => 0.60,
     };
     Friction { mean, cov: PAD_MU_COV }
 }
@@ -72,10 +79,23 @@ pub fn pad_on(item: ItemMaterial) -> Friction {
 pub const GROUND_SLIDE_COV: f32 = 0.10;
 /// Kinetic over static friction of a block on a ground (est: grounds without both numbers).
 pub const KINETIC_SHARE: f32 = 0.9;
+/// Kinetic over static friction of cardboard (CTU Code 2014 Annex 7: dynamic = 0.75 × static).
+pub const CARDBOARD_KINETIC_SHARE: f32 = 0.75;
 
 /// The object sliding on the ground (pushing): static and kinetic friction (research §1.2).
 pub fn item_on(item: ItemMaterial, ground: Surface) -> (Friction, Friction) {
     let wood = item == ItemMaterial::Wood;
+    if item == ItemMaterial::Cardboard {
+        // Cardboard on a rough face: on a wooden pallet 0.5, dynamic 0.75 × static
+        // [direct, CTU Code 2014 Annex 7 App. 2]; no measurement on soil, grass or
+        // gravel [substituted]. Wet sand lowers it as it does the others (−26%).
+        let s = match ground {
+            Surface::Water => 0.0,
+            Surface::WetSand => 0.5 * 0.74,
+            _ => 0.50,
+        };
+        return (Friction { mean: s, cov: GROUND_SLIDE_COV }, Friction { mean: CARDBOARD_KINETIC_SHARE * s, cov: GROUND_SLIDE_COV });
+    }
     let (s, k) = match ground {
         // Douglas fir on smooth concrete 0.58; stone on a hard face like hard rock on hard rock 0.55.
         Surface::Firm => (if wood { 0.58 } else { 0.55 }, None),
@@ -99,7 +119,13 @@ pub fn item_on(item: ItemMaterial, ground: Surface) -> (Friction, Friction) {
 
 /// Normal coefficient of restitution of a small block landing on the ground (research §1.3).
 pub fn restitution(item: ItemMaterial, ground: Surface) -> f32 {
-    let _ = item;
+    if item == ItemMaterial::Cardboard {
+        // Packages rebound 0.25–0.51, flat landings most, edges and corners least
+        // [direct, Kang Lin 2023 data set]: a cube landing on an edge takes the low
+        // end on a hard face; softer grounds take the share they take of a stone's [derived].
+        let stone = restitution(ItemMaterial::Stone, ground);
+        return 0.25 * stone / restitution(ItemMaterial::Stone, Surface::Rock);
+    }
     match ground {
         // An 8 cm rock block on a rock slab rebounds 0.21 [direct, laboratory drop].
         Surface::Firm | Surface::Rock => 0.21,

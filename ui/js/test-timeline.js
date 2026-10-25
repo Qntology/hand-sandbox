@@ -1,6 +1,7 @@
 // 하단 '통합 테스트' 탭: 게임 로직 → ML 로직 통합 테스트를 영상 편집기처럼 보여 준다.
 //   1줄 게임: 고정 간격 키프레임 (게임 로직이 퀘스트를 수행하며 촬영)
 //   행위: 행위의 물리 순간(접촉 · 들림 · 미끄러짐 · 충격 · 넘어짐 …)마다 찍은 키프레임 — 위 칸 게임, 아래 칸 ML 결정
+//   시각: 로봇이 본 때(패턴 · 행위 직전 · 기억이 흐려 응시)와 보지 않고 기억으로 한 행위, 믿음 위치 오차(보라 선)
 //   2줄 ML 인식: 같은 키프레임의 깊이 컬러맵 + 추적 마스크 + 의미 위치 점
 //   3줄 ML 결정: 결정(시계열·삼각 측량) → 이동 → 촬영한 키프레임
 //   4줄 SDS: 키프레임마다 트랙별(깊이·위치·추적·결정·혼합·밸런스·행위) z-점수
@@ -19,11 +20,13 @@ import { EVENT_KO, FOCUS_PARTS, PART_KO, drawFocus, focusPanel, resolvePart } fr
 const LANES = [
   { id: 'game', label: '1 게임', sub: '게임 로직 촬영', h: 'h-img' },
   { id: 'act', label: '행위', sub: '물리 순간 · 게임 / ML', h: 'h-act' },
+  { id: 'vision', label: '시각', sub: '봄 · 기억 · 게임 / ML', h: 'h-vis' },
   { id: 'perceive', label: '2 ML 인식', sub: '깊이 · 위치 · 추적', h: 'h-img' },
   { id: 'decide', label: '3 ML 결정', sub: '시계열 → 이동 → 촬영', h: 'h-img' },
   { id: 'sds', label: '4 SDS', sub: '트랙별 z · 게임 / ML', h: 'h-sds' },
 ];
-const LANE_PX = { 'h-img': 76, 'h-act': 96, 'h-sds': 46 };
+const LANE_PX = { 'h-img': 76, 'h-act': 96, 'h-sds': 46, 'h-vis': 48 };
+const VIS_KO = { pattern: '패턴 보기', pre_act: '행위 직전 보기', glance: '기억이 흐려 응시', blind: '보지 않고 기억으로', place: '목적지 보고 위치 보정', search: '탐색', locate: '찾기', approach: '접근 보기', retouch: '다시 보기' };
 const SDS_KEYS = ['depth', 'locate', 'tracker', 'decide', 'fusion', 'balance', 'act'];
 const SDS_KO = { depth: '깊이', locate: '위치', tracker: '추적', decide: '결정', fusion: '혼합', balance: '밸런스', act: '행위' };
 const ACT_W = 70;
@@ -151,6 +154,10 @@ function renderLanes() {
       lanes.act.append(actTile(pass, k, x, row));
     });
   }
+  // 시각 줄: 본 때와 기억으로 한 행위 (위 칸 게임, 아래 칸 ML), 믿음 위치 오차 선.
+  for (const [rowData, row] of [[status.game, 0], [status.decide, 1]]) {
+    visionRow(lanes.vision, rowData, row);
+  }
   // 3줄: 결정 키프레임. 겹치지 않게 오른쪽으로 민다.
   let prevX = -1e9;
   fixed(decide).forEach((k) => {
@@ -164,6 +171,36 @@ function renderLanes() {
     lanes.sds.append(sdsCell('ml', k, tickT(k) * pps, 1));
   });
   if (sel) highlight();
+}
+
+/** 시각 줄 한 칸: 보기 표시와 믿음 오차(cm) 선. 오차는 기록의 값이고 로봇은 모른다. */
+function visionRow(lane, rowData, row) {
+  const marks = rowData?.vision ?? [];
+  const top = 4 + row * 22;
+  for (const m of marks) {
+    const x = (m.tick / 10) * pps;
+    const sig = m.s0 != null ? ` · σ ${r(m.s0 * 100, 1)}${m.s1 != null ? `→${r(m.s1 * 100, 1)}` : ''} cm` : '';
+    const inn = m.innov != null ? ` · 기억 어긋남 ${r(m.innov * 100, 1)} cm` : '';
+    lane.append(el('i', { class: `tl-vis ${m.kind}`, style: `left:${x}px;top:${top}px`, title: `${r(m.tick / 10, 1)} s · ${VIS_KO[m.kind] ?? m.kind}${m.what ? ` · ${m.what}` : ''}${sig}${inn}` }));
+  }
+  const pts = rowData?.belief_err ?? [];
+  if (pts.length > 1) {
+    const maxE = Math.max(0.05, ...pts.map((p) => p[1]));
+    const h = 18;
+    const d = pts.map((p, i) => `${i ? 'L' : 'M'}${((p[0] / 10) * pps).toFixed(1)},${(h - (p[1] / maxE) * h).toFixed(1)}`).join(' ');
+    const w = Math.ceil((pts[pts.length - 1][0] / 10) * pps) + 4;
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('class', 'tl-vis-err');
+    svg.setAttribute('width', String(w));
+    svg.setAttribute('height', String(h));
+    svg.style.top = `${top}px`;
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    path.setAttribute('d', d);
+    const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+    title.textContent = `믿음 위치 오차 (최대 ${r(maxE * 100, 1)} cm) — 기록의 값, 로봇은 모름`;
+    svg.append(title, path);
+    lane.append(svg);
+  }
 }
 
 function stepColor(step) {

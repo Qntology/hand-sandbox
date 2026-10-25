@@ -39,7 +39,7 @@
 
 use serde::Serialize;
 
-use crate::balance::{step_knee_lever, Body, FeedForward, Posture, Source, CARGO_X_M, CARGO_Z_M, G, HIP_HALF_WIDTH_M, KNEE_LEVER_STAND_M, KNEE_LEVER_WALK_M, MAST_KG, REACTION_DELAY_S};
+use crate::balance::{step_knee_lever, Body, FeedForward, Posture, Source, CARGO_X_M, CARGO_Z_M, G, HIP_HALF_WIDTH_M, KNEE_LEVER_STAND_M, KNEE_LEVER_WALK_M, REACTION_DELAY_S};
 use crate::parts::*;
 
 type V = [f64; 3];
@@ -814,7 +814,7 @@ fn lower_masses(body: &Body, post: &Posture, single: bool, root: &RootState) -> 
         }
     } else {
         let r = rot(PITCH_AXIS, -(root.pitch as f64));
-        v.push((MAST_KG as f64, mv(&r, [0.0, 0.0, 0.35])));
+        v.push((body.mast_kg() as f64, mv(&r, [0.0, 0.0, 0.35])));
         v.push((body.chassis.mass_kg as f64, mv(&r, [0.0, 0.0, body.chassis.com_m as f64])));
     }
     v

@@ -167,18 +167,26 @@ pub struct Recording {
     pub started_tick: u64,
     pub ended_tick: Option<u64>,
     pub dropped_keyframes: usize,
+    /// When the robot looked, and the actions it took on memory (the vision lane).
+    pub vision: Vec<crate::vision::VisionMark>,
+    /// The belief's true error over time (tick, metres): the record's, never the robot's.
+    pub belief_err: Vec<(u64, f32)>,
 }
+
+/// Most vision marks kept per recording.
+pub const MAX_VISION_MARKS: usize = 4000;
 
 impl Recording {
     pub fn new(pass: &str, run_id: &str, tick: u64) -> Recording {
-        Recording { pass: pass.into(), run_id: run_id.into(), keyframes: Vec::new(), video: Vec::new(), started_tick: tick, ended_tick: None, dropped_keyframes: 0 }
+        Recording { pass: pass.into(), run_id: run_id.into(), keyframes: Vec::new(), video: Vec::new(), started_tick: tick, ended_tick: None, dropped_keyframes: 0, vision: Vec::new(), belief_err: Vec::new() }
     }
 }
 
-/// The robot's pose from its own odometry. The simulator's odometry is exact;
-/// a real robot's would drift, which the triangulation residuals would show.
+/// The robot's pose from its own odometry (`world_sim::odometry`): it drifts
+/// as a real robot's does, which the triangulation residuals show.
 pub fn odometry(world: &World) -> Pose {
-    Pose { x: world.agent.x, z: world.agent.z, yaw: world.agent.yaw, eye_m: EYE_HEIGHT_M }
+    let (x, z, yaw) = world.believed_pose();
+    Pose { x, z, yaw, eye_m: EYE_HEIGHT_M }
 }
 
 pub fn intrinsics(cam: &Camera) -> Intrinsics {
