@@ -59,7 +59,9 @@ pub struct EmbeddingCfg {
 
 impl Default for EmbeddingCfg {
     fn default() -> Self {
-        EmbeddingCfg { grids: vec![(2, 2), (4, 3)], overlap: 0.15, prejudice_weight: 0.5, report_floor: 0.10, nms_iou: 0.4, webp_quality: 80.0 }
+        // The 6×4 tiles (64 px on a 384×256 frame) pick a 0.30 m parcel out of
+        // the grass up to 3 m away, the 4×3 ones up to 2 m (tests/siglip_parcel.rs).
+        EmbeddingCfg { grids: vec![(2, 2), (4, 3), (6, 4)], overlap: 0.15, prejudice_weight: 0.5, report_floor: 0.10, nms_iou: 0.4, webp_quality: 80.0 }
     }
 }
 
@@ -418,7 +420,7 @@ mod tests {
         let mut p = perception();
         assert_eq!(p.mode(), "embedding");
         let out = p.scan(ScanInput { world: &w, frame: &f, camera: &cam }).unwrap();
-        assert_eq!(out.tiles, 1 + 4 + 12);
+        assert_eq!(out.tiles, 1 + 4 + 12 + 24);
         assert_eq!(out.device, "cpu (stand-in)");
         assert!(!out.scene.is_empty(), "the whole-frame scores are reported");
         assert!(out.candidates.iter().all(|c| c.truth.is_none()));

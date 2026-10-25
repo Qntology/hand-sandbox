@@ -407,3 +407,26 @@ fn a_manual_scan_gives_a_frame_with_boxes_a_body_status_and_a_forecast_series() 
     assert!(!ts.history.is_empty() && ts.forecast.is_some(), "{ts:?}");
     assert_eq!(ts.forecast.as_ref().unwrap().point.len(), 3);
 }
+
+#[test]
+fn a_parcel_seen_faintly_from_afar_is_walked_to_and_looked_down_at() {
+    // A strict score floor: a parcel a few pixels wide 5 m away does not pass it,
+    // the same parcel filling the view from 1.2 m with the head pitched down does.
+    let cfg = RuntimeConfig {
+        seed: 7,
+        noise: NoiseCfg::none(),
+        parcels: Some(0),
+        terrain: world_sim::TerrainKind::Open,
+        gates: GateCfg { min_score: 0.80, adaptive: false, ..GateCfg::default() },
+        ..RuntimeConfig::default()
+    };
+    let mut rt = runtime_with(cfg);
+    let (x, z, yaw) = (rt.world().agent.x, rt.world().agent.z, rt.world().agent.yaw);
+    let (px, pz) = (x + 5.0 * yaw.cos(), z + 5.0 * yaw.sin());
+    rt.world_mut().drops.push(world_sim::world::DropItem::whole(9001, ItemKind::Parcel, px, pz));
+    let q = run_command(&mut rt, "택배 1개를 창고로 가져와", 20_000);
+    let log = quest_log(&rt);
+    assert!(log.contains("가까이 가서 내려다보며 확인"), "no walk-up look:\n{log}");
+    assert!(log.contains("내려다보고 확인"), "the close look did not confirm it:\n{log}");
+    assert_done(&rt, &q);
+}
