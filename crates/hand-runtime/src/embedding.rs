@@ -33,9 +33,10 @@ use hand_search::vision::EntityScore;
 use hand_search::{Lexicon, VisionBank};
 use image::{DynamicImage, RgbImage};
 use serde::{Deserialize, Serialize};
+use world_sim::render::View;
 use world_sim::{decode_webp, encode_webp, Camera, Frame};
 
-use crate::perception::{centre_offset_m, Candidate, EntityTable, Recognizer, ScanInput, ScanOutput};
+use crate::perception::{centre_from_surface, centre_offset_m, Candidate, EntityTable, Recognizer, ScanInput, ScanOutput};
 
 /// Settings of the tile scan. Starting points, not tuned values.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -123,7 +124,7 @@ impl EmbeddingPerception {
     /// SigLIP2 for both sides. Phrase vectors are cached under `bank_dir` when given.
     pub fn siglip(model: Arc<Siglip2>, lex: &Lexicon, bank_dir: Option<&Path>, cfg: EmbeddingCfg) -> Result<EmbeddingPerception> {
         let phrases = BankedPhrases::new(Arc::clone(&model), bank_dir);
-        let device = format!("{:?}", model.device().location()).to_lowercase();
+        let device = hand_ml::device_label(model.device());
         let m = Arc::clone(&model);
         EmbeddingPerception::new(lex, &phrases, model, Arc::new(move |c| m.pair_probability(c)), &device, cfg)
     }
@@ -156,7 +157,8 @@ impl Recognizer for EmbeddingPerception {
         let scores: Vec<Vec<EntityScore>> = vecs.iter().map(|v| self.bank.score(v, &*self.calibrate, self.cfg.prejudice_weight)).collect();
 
         let scene = scores.first().map(|s| s.iter().map(|e| (e.id.clone(), e.score)).collect()).unwrap_or_default();
-        let candidates = candidates_from_tiles(&tiles, &scores, &self.table, f, input.camera, (input.world.agent.x, input.world.agent.z), input.world.agent.yaw, &self.cfg);
+        let view = input.world.head_view(input.camera).est;
+        let candidates = candidates_from_tiles(&tiles, &scores, &self.table, f, input.camera, &view, &self.cfg);
         Ok(ScanOutput { candidates, tiles: tiles.len(), embed_ms, device: self.device.clone(), scene })
     }
 }
@@ -202,8 +204,7 @@ pub fn candidates_from_tiles(
     table: &EntityTable,
     frame: &Frame,
     camera: &Camera,
-    agent_xz: (f32, f32),
-    yaw: f32,
+    view: &View,
     cfg: &EmbeddingCfg,
 ) -> Vec<Candidate> {
     let (fw, fh) = (frame.width as f32, frame.height as f32);
@@ -221,7 +222,7 @@ pub fn candidates_from_tiles(
         let bbox = [tile.x as f32 / fw, tile.y as f32 / fh, (tile.x + tile.w) as f32 / fw, (tile.y + tile.h) as f32 / fh];
         let depth = median_depth(frame, tile);
         let (cx, cy) = tile.center();
-        let world = depth.and_then(|d| camera.world_point(agent_xz, yaw, cx, cy, d + centre_offset_m(kind)));
+        let world = depth.and_then(|d| camera.world_point3_in(view, cx, cy, d)).map(|p| centre_from_surface(view, p, centre_offset_m(kind)));
         out.push(Candidate {
             label: best.id.clone(),
             kind,
@@ -298,7 +299,7 @@ mod tests {
         let hit = tile_with_most_tree(&tiles, &f, &w);
         let scores: Vec<Vec<EntityScore>> =
             (0..tiles.len()).map(|i| if i == hit { vec![score("tree", 0.82), score("boulder", 0.30)] } else { vec![score("boulder", 0.05)] }).collect();
-        let cands = candidates_from_tiles(&tiles, &scores, &table, &f, &cam, (w.agent.x, w.agent.z), w.agent.yaw, &EmbeddingCfg::default());
+        let cands = candidates_from_tiles(&tiles, &scores, &table, &f, &cam, &w.head_view(&cam).est, &EmbeddingCfg::default());
         assert_eq!(cands.len(), 1, "only the named tile reports: {cands:?}");
         let c = &cands[0];
         assert_eq!(c.label, "tree");
@@ -323,7 +324,7 @@ mod tests {
         let scores: Vec<Vec<EntityScore>> = (0..tiles.len())
             .map(|i| if i == 5 { vec![score("boulder", 0.7), score("tree", 0.1)] } else { vec![score("tree", 0.9 - 0.01 * i as f32), score("boulder", 0.1)] })
             .collect();
-        let cands = candidates_from_tiles(&tiles, &scores, &table, &f, &cam, (w.agent.x, w.agent.z), w.agent.yaw, &EmbeddingCfg::default());
+        let cands = candidates_from_tiles(&tiles, &scores, &table, &f, &cam, &w.head_view(&cam).est, &EmbeddingCfg::default());
         let trees: Vec<&Candidate> = cands.iter().filter(|c| c.label == "tree").collect();
         assert!(trees.len() < tiles.len() - 1, "NMS merged some of the {} tree tiles, left {}", tiles.len() - 2, trees.len());
         for (i, a) in trees.iter().enumerate() {
@@ -341,7 +342,7 @@ mod tests {
         let tiles = hand_ml::parallel::tile_layout(f.width as u32, f.height as u32, &[(2, 2)], 0.0);
         let table = EntityTable::from_lexicon(&lexicon());
         let scores: Vec<Vec<EntityScore>> = tiles.iter().map(|_| vec![score("tree", 0.09)]).collect();
-        let cands = candidates_from_tiles(&tiles, &scores, &table, &f, &cam, (w.agent.x, w.agent.z), w.agent.yaw, &EmbeddingCfg::default());
+        let cands = candidates_from_tiles(&tiles, &scores, &table, &f, &cam, &w.head_view(&cam).est, &EmbeddingCfg::default());
         assert!(cands.is_empty());
     }
 

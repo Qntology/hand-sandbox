@@ -738,7 +738,7 @@ impl DepthModel for TipsDepth {
     }
 
     fn device(&self) -> String {
-        format!("{:?}", self.device).to_lowercase()
+        hand_ml::device_label(&self.device)
     }
 
     fn max_depth_m(&self) -> Option<f32> {
@@ -872,7 +872,7 @@ mod tests {
         assert!(map.data.iter().all(|d| d.is_finite() && (cfg.min_depth..=cfg.max_depth).contains(d)), "depth outside the bins");
         assert_eq!(model.mode(), "tipsv2-b14-dpt");
         assert_eq!(model.max_depth_m(), Some(10.0));
-        assert_eq!(model.device(), "cpu");
+        assert_eq!(model.device(), "CPU");
     }
 
     #[test]

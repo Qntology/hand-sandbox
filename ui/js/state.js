@@ -48,7 +48,8 @@ export const state = {
   sds: null,
   forecast: null,
   device: null,
-  models: null, // models_status: {recognizer, embedding, ttm, parser_embedding, device, siglip_files, ttm_files}
+  models: null, // models_status: {recognizer, embedding, ttm, parser_embedding, device, siglip_files, ttm_files, stand_ins, ready}
+  modelCatalog: null, // models_catalog: 필수 모델 파일·받기 진행률·불러오기 상태
 
   // 화면
   centerTab: 'world',

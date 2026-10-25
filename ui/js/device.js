@@ -1,4 +1,5 @@
-// 연산 장치 선택·칩, 그리고 SigLIP2 / TTM / 임베더 / SDS 상태 줄(상태줄과 ④ 사전·모델 공용).
+// 연산 장치 선택·칩, 그리고 SigLIP2 / TTM / 깊이 / 마스크 / 임베더 / SDS 상태 줄(상태줄과 ④ 사전·모델 공용).
+// 모델 받기·삭제·불러오기는 models.js 가 맡는다(네 모델은 필수라 끄는 스위치가 없다).
 import { call } from './api.js';
 import { bus, state } from './state.js';
 import { $, clear, el } from './util.js';
@@ -31,11 +32,12 @@ async function onDeviceChanged() {
   const [backend, ordinal] = $('device-select').value.split(':');
   try {
     await call('select_device', { backend, ordinal: Number(ordinal) });
-    setStatus(`연산 장치를 ${backend.toUpperCase()}로 바꿨습니다. 다음 분류에서 모델을 다시 불러옵니다`);
+    setStatus(`연산 장치를 ${backend.toUpperCase()}로 바꿨습니다. 필수 모델을 이 장치에 다시 불러옵니다`);
   } catch {
     /* api-error 가 표시 */
   }
   await refreshDevices();
+  bus.emit('device-changed', state.device);
 }
 
 // ── 모델 상태 줄 ────────────────────────────────────────────────
@@ -75,97 +77,12 @@ export async function refreshModels({ quiet = true } = {}) {
   return state.models;
 }
 
-let switching = false;
-
-async function switchModel(cmd, args, doing, done) {
-  if (switching) return;
-  switching = true;
-  renderToggles();
-  setStatus(doing);
-  try {
-    state.models = await call(cmd, args);
-    bus.emit('models', state.models);
-    if (cmd === 'recognizer_use') {
-      state.perception = null; // 다른 인식기의 결과가 남지 않게
-      bus.emit('perception', null);
-    }
-    setStatus(done(state.models));
-  } catch {
-    /* api-error 가 이유를 표시한다 */
-  } finally {
-    switching = false;
-    renderToggles();
-    updateModelLines();
-  }
-}
-
-function onSiglipToggle() {
-  const on = state.models?.embedding === true;
-  return switchModel(
-    'recognizer_use',
-    { mode: on ? 'oracle' : 'embedding' },
-    on ? '오라클 인식기로 돌아가는 중…' : 'SigLIP2 를 불러오고 사전 문구를 임베딩하는 중… (처음에는 오래 걸립니다)',
-    (m) => (m.embedding ? 'SigLIP2 인식으로 바꿨습니다. 다음 인식부터 스크린샷 타일을 임베딩합니다' : '오라클 인식기로 바꿨습니다'),
-  );
-}
-
-function onTtmToggle() {
-  const on = state.models?.ttm === true;
-  return switchModel(
-    'ttm_use',
-    { enabled: !on },
-    on ? 'Granite TTM 을 해제하는 중…' : 'Granite TTM 을 불러오는 중…',
-    (m) => (m.ttm ? 'Granite TTM 을 연결했습니다. 다음 예측부터 융합에 참여합니다' : 'Granite TTM 을 해제했습니다'),
-  );
-}
-
-function onTipsToggle() {
-  const on = state.models?.ml?.depth === 'tipsv2-b14-dpt';
-  return switchModel(
-    'tips_use',
-    { enabled: !on },
-    on ? '깊이 대역 모델로 돌아가는 중…' : 'TIPSv2 DPT 를 불러오는 중…',
-    (m) => (m.ml?.depth === 'tipsv2-b14-dpt' ? `TIPSv2 깊이를 연결했습니다 (${m.devices?.depth ?? '장치 미확인'})` : '깊이 대역 모델로 바꿨습니다'),
-  );
-}
-
-function onSamToggle() {
-  const on = !!state.models?.ml?.track && state.models.ml.track !== 'region-grow';
-  return switchModel(
-    'sam_use',
-    { enabled: !on },
-    on ? '영역 확장 추적기로 돌아가는 중…' : 'SAM 마스크 모델을 불러오는 중…',
-    (m) => (m.ml?.track && m.ml.track !== 'region-grow' ? `${m.ml.track} 마스크 추적을 연결했습니다 (${m.devices?.track ?? '장치 미확인'})` : '영역 확장 추적기로 바꿨습니다'),
-  );
-}
-
 function renderToggles() {
-  const m = state.models;
-  const sg = $('model-siglip-toggle');
-  const tt = $('model-ttm-toggle');
-  const tp = $('model-tips-toggle');
-  const sm = $('model-sam-toggle');
-  const known = !!m;
-  sg.disabled = switching || !known;
-  tt.disabled = switching || !known;
-  tp.disabled = switching || !known;
-  sm.disabled = switching || !known;
-  const tipsOn = m?.ml?.depth === 'tipsv2-b14-dpt';
-  const samOn = !!m?.ml?.track && m.ml.track !== 'region-grow';
-  tp.textContent = tipsOn ? 'TIPS 끄기 (대역으로)' : 'TIPS 깊이 켜기';
-  sm.textContent = samOn ? 'SAM 끄기 (영역 확장으로)' : 'SAM 마스크 켜기';
-  tp.setAttribute('aria-pressed', String(tipsOn));
-  sm.setAttribute('aria-pressed', String(samOn));
-  sg.textContent = m?.embedding ? 'SigLIP2 끄기 (오라클로)' : 'SigLIP2 인식 켜기';
-  tt.textContent = m?.ttm ? 'TTM 끄기' : 'TTM 켜기';
-  sg.setAttribute('aria-pressed', String(m?.embedding === true));
-  tt.setAttribute('aria-pressed', String(m?.ttm === true));
-  const missing = [];
-  if (m?.siglip_files && !m.siglip_files.present) missing.push(`SigLIP2: ${m.siglip_files.dir} (SIGLIP2_DIR 로 바꿀 수 있음)`);
-  if (m?.ttm_files && !m.ttm_files.present) missing.push(`TTM: ${m.ttm_files.dir} (TTM_DIR 로 바꿀 수 있음)`);
-  if (m?.tips_files && !m.tips_files.present) missing.push(`TIPS: ${m.tips_files.dir} (TIPS_DIR 로 바꿀 수 있음)`);
-  if (m?.sam_files && !m.sam_files.present) missing.push(`SAM: ${m.sam_files.dir} (SAM_DIR 로 바꿀 수 있음)`);
-  $('model-files').textContent = missing.length ? `모델 파일을 찾지 못했습니다 — ${missing.join(' · ')}. 켜기를 누르면 이유를 알려 드립니다.` : '';
+  const live = state.models?.stand_ins;
+  const NAMES = { recognizer: '인식기', locate: '의미 위치', depth: '깊이', track: '마스크', ttm: 'TTM' };
+  $('model-files').textContent = Array.isArray(live) && live.length
+    ? `아직 대역 모델로 도는 부분: ${live.map((k) => NAMES[k] ?? k).join(', ')} — 불러오기를 누르세요.`
+    : '';
 }
 
 export function updateModelLines() {
@@ -175,7 +92,8 @@ export function updateModelLines() {
   const sds = state.sds;
   const rec = state.models?.recognizer;
   $('model-siglip').textContent = p ? `${SIGLIP[p.mode] ?? p.mode} · ${p.device}` : rec ? `${SIGLIP[rec] ?? rec} · 아직 인식 전` : '미확인 — 인식 실행 시 갱신';
-  $('model-ttm').textContent = ttmText(f?.method, state.models);
+  const ttmDev = state.models?.devices?.ttm;
+  $('model-ttm').textContent = `${ttmText(f?.method, state.models)}${ttmDev ? ` · ${ttmDev}` : ''}`;
   const ml = state.models?.ml;
   const dev = state.models?.devices;
   $('model-depth').textContent = ml ? `${ml.depth} · ${dev?.depth ?? '-'}` : '미확인';
@@ -194,10 +112,6 @@ export function initDevice() {
     openSection('secModel');
     $('device-select').focus();
   });
-  $('model-siglip-toggle').addEventListener('click', onSiglipToggle);
-  $('model-ttm-toggle').addEventListener('click', onTtmToggle);
-  $('model-tips-toggle').addEventListener('click', onTipsToggle);
-  $('model-sam-toggle').addEventListener('click', onSamToggle);
   $('model-refresh').addEventListener('click', async () => {
     await refreshModels({ quiet: false });
     renderToggles();

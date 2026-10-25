@@ -2,6 +2,7 @@
 //! `hand-data` and the simulated world (`hand-runtime`).
 
 pub mod commands;
+pub mod models;
 pub mod sim;
 pub mod state;
 pub mod views;
@@ -41,6 +42,11 @@ pub fn run() {
             sim::test_db_mirror,
             sim::tips_use,
             sim::sam_use,
+            models::models_catalog,
+            models::models_download,
+            models::models_cancel,
+            models::models_delete,
+            models::models_activate,
         ])
         .build(tauri::generate_context!())
         .expect("error while building the logistics hand simulator")

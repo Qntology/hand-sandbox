@@ -527,8 +527,12 @@ fn candidate3(body: &Body, goal: &ReachGoal, hands: Hands, out_m: f32, legs: [f3
             pose.shoulder_deg = [fd, 0.0];
             pose.elbow_deg = [ed, 10.0];
             pose.shoulder_abd_deg = [ad, 0.0];
-            // The head stays ahead: the camera does not see beside the foot.
-            pose.neck_deg = 0.0;
+            // The head turns to the hand beside the foot: the neck pans toward it and pitches down, each within its range.
+            let eye = [sh[0], sh[1] + kin::NECK_UP_M + 0.07];
+            let ground = (x - eye[0]).hypot(y);
+            pose.neck_pan_deg = y.atan2(x - eye[0]).to_degrees().clamp(-kin::NECK_PAN_MAX_DEG, kin::NECK_PAN_MAX_DEG);
+            let look = (eye[1] - goal.palm_z).atan2(ground).to_degrees();
+            pose.neck_deg = (look - trunk).clamp(-kin::NECK_PITCH_MAX_DEG, kin::NECK_PITCH_MAX_DEG);
             false
         }
         Hands::Between { x, y } => {

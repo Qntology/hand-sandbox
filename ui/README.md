@@ -48,7 +48,7 @@ cargo run --release -p hand-runtime --example serve [포트] [ui 폴더]   # 기
 ```
 
 127.0.0.1에서만 받고 인증이 없으니 자기 컴퓨터에서 보는 용도로만 쓰세요. 로그와 SDS 원장은 `RUNTIME_DIR`(기본 `data/runtime`)에 저장됩니다.
-`recognizer_use`·`ttm_use`는 Tauri 앱에서만 실제로 동작합니다(서버에서는 모의 백엔드가 이유를 알려 줍니다).
+`models_*` 명령과 `recognizer_use`·`ttm_use`는 Tauri 앱에서만 실제로 동작합니다(서버·모의 백엔드는 모델을 쓰지 않으므로 필수 모델 게이트도 뜨지 않습니다).
 
 ## 명령 계약
 
@@ -59,15 +59,20 @@ cargo run --release -p hand-runtime --example serve [포트] [ui 폴더]   # 기
 | --- | --- | --- |
 | `world_new` | `seed, size, config, base` | 월드 생성(손·발 구성 반영) |
 | `sim_step` | `ticks` | 시뮬레이션 전진 |
-| `world_frame` | `width, height, quality, view` | WebP 프레임과 탐지 상자 |
+| `world_frame` | `width, height, quality, view` | WebP 프레임과 탐지 상자, 1인칭이면 `camera`(눈 높이·피치·팬·흔들림·블러·추정 오차) |
 | `command_submit` | `text` | 자연어 명령 → 퀘스트 |
 | `quest_list` / `body_status` | 없음 | 퀘스트 · 신체 상태 |
 | `perception_scan` | `topK` | 비전 점수 |
 | `sds_status` / `ts_forecast` | `scope, axis` | SDS 원장 · 시계열 예측 (`axis`는 score · score_all · margin) |
 | `log_tail` | `afterSeq, limit, category` | 증분 로그 (시각은 UTC ISO 8601) |
 | `models_status` | 없음 | 인식기·TTM 연결 상태, 모델 폴더와 파일 유무 |
-| `recognizer_use` | `mode` (`embedding` \| `oracle`) | SigLIP2 인식 켜기·끄기 (Tauri 전용) |
-| `ttm_use` | `enabled` | Granite TTM 켜기·끄기 (Tauri 전용) |
+| `recognizer_use` | `mode` (`embedding` \| `oracle`) | SigLIP2 인식 켜기·끄기 (Tauri 전용, UI에는 스위치 없음) |
+| `ttm_use` | `enabled` | Granite TTM 켜기·끄기 (Tauri 전용, UI에는 스위치 없음) |
+| `models_catalog` | 없음 | 필수 모델 네 개의 파일·받은 바이트, 받기 진행률(`download`), 불러오기 상태(`ready`·`loading`·`load_error`) |
+| `models_download` | `ids` (없으면 모두) | 빠진 파일 받기 시작(바로 돌아옴, 진행은 `models_catalog` 폴링) |
+| `models_cancel` / `models_delete` | — / `id` | 받기 취소(`.part` 남김) · 모델 파일 삭제(월드가 멈춤) |
+| `models_activate` | 없음 | 네 모델을 선택한 장치에 올리고 월드에 연결. 이 전에는 `world_new`·`sim_step`·`command_submit`·`perception_scan`·`test_start`·`test_step`이 거부됨 |
+| `depth_view` | `quality` | 머리 카메라 화면에 깊이 모델을 돌린 결과와 정답 깊이(같은 색 척도), 지표, 카메라 상태 |
 
 기존 명령(`presets`, `hand_geometry`, `grasp_test`, `drive_courses`, `dictionary`, `devices`, `select_device`,
 `classify_image`, `default_paths`, `synthesize`, `load_dictionary`, `dataset_summary`)도 그대로 호출합니다.

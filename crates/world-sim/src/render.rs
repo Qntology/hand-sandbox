@@ -13,6 +13,15 @@
 //! along +x and 90 degrees looks along +z. The camera's right is
 //! `(-fz, 0, fx)`, so looking along +x the right-hand side is +z. The top view
 //! draws x to the right and z downward.
+//!
+//! The first-person camera is the head camera of `World::head_view`: a
+//! [`View`] (where it is and how it is turned, roll included) and an
+//! [`Exposure`] (how fast it turns while the sensor reads the frame). A
+//! rolling shutter reads the rows one after another, so each row is cast from
+//! the orientation of its own instant; the exposure then smears every pixel
+//! along the path the scene takes across the sensor while it is open (motion
+//! blur). The id and depth buffers follow the rows' rays and are not blurred:
+//! they stay the ground truth of what each pixel shows.
 
 use std::collections::HashMap;
 
@@ -23,7 +32,7 @@ use crate::kinds::{Ground, ItemKind, NodeKind};
 use crate::rng::hash2;
 use crate::snapshot::{drop_id, node_id, waypoint_id};
 use crate::terrain::{cell_center, CELL_M};
-use crate::world::{World, EYE_HEIGHT_M};
+use crate::world::World;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -101,21 +110,63 @@ pub struct Camera {
     pub height: usize,
     /// Horizontal field of view, degrees.
     pub fov_deg: f32,
-    /// Pitch, degrees; negative looks down.
+    /// Pitch, degrees; negative looks down. On the robot this is the
+    /// camera's mount tilt on the head, plus the neck's tilt for a look at the
+    /// ground (the body's own bend comes from `World::head_view`).
     pub pitch_deg: f32,
     pub max_dist_m: f32,
+    /// Neck pan the runtime commands for a look, degrees, to the robot's left
+    /// positive (on top of the pan of the pose the robot holds).
+    pub pan_deg: f32,
 }
 
 impl Default for Camera {
     fn default() -> Self {
-        Camera { width: 384, height: 256, fov_deg: 70.0, pitch_deg: -12.0, max_dist_m: 24.0 }
+        Camera { width: 384, height: 256, fov_deg: 70.0, pitch_deg: -12.0, max_dist_m: 24.0, pan_deg: 0.0 }
     }
 }
 
+/// Where a camera is and how it is turned at one instant: the optical centre
+/// (world, y up) and the heading, pitch (negative looks down) and roll (the
+/// right side down positive), radians.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct View {
+    pub origin: [f32; 3],
+    pub yaw: f32,
+    pub pitch: f32,
+    pub roll: f32,
+}
+
+/// How the sensor takes a frame while the camera turns.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct Exposure {
+    /// Angular rate (yaw, pitch, roll), rad/s, at the middle of the frame.
+    pub rate: [f32; 3],
+    /// Time the pixels collect light, s (motion blur).
+    pub exposure_s: f32,
+    /// Rolling-shutter readout from the first row to the last, s (0: a global shutter).
+    pub readout_s: f32,
+}
+
+impl Exposure {
+    /// Largest image motion during the exposure, pixels (at the frame centre).
+    pub fn blur_px(&self, cam: &Camera) -> f32 {
+        let f = focal_px(cam);
+        let w = self.rate[0].hypot(self.rate[1]);
+        let roll = self.rate[2].abs() * 0.5 * cam.width.max(cam.height) as f32;
+        (w * f + roll) * self.exposure_s
+    }
+}
+
+/// Focal length of a camera in pixels.
+pub fn focal_px(cam: &Camera) -> f32 {
+    0.5 * cam.width.max(1) as f32 / (cam.fov_deg.to_radians() * 0.5).tan()
+}
+
 impl Camera {
-    /// Where the camera sits: the robot's position at eye height.
+    /// Where the camera sits now: the head camera's optical centre.
     pub fn origin(world: &World) -> [f32; 3] {
-        [world.agent.x, world.agent_ground_m() + EYE_HEIGHT_M, world.agent.z]
+        world.head_view(&Camera::default()).view.origin
     }
 
     /// Vertical field of view, degrees (from the horizontal one and the aspect).
@@ -129,7 +180,7 @@ impl Camera {
         crate::explore::Eye {
             x: world.agent.x,
             z: world.agent.z,
-            height_m: world.agent_ground_m() + EYE_HEIGHT_M,
+            height_m: world.agent_ground_m() + world.standing_eye_m(),
             pitch_deg: self.pitch_deg,
             vfov_deg: self.vfov_deg(),
             range_m: crate::explore::SEARCH_RANGE_M.min(self.max_dist_m),
@@ -142,25 +193,45 @@ impl Camera {
     /// fraction `f` of the frame width is `f * width`. `None` for a depth that
     /// is not finite and positive.
     pub fn world_point(&self, agent_xz: (f32, f32), yaw_rad: f32, px: f32, py: f32, depth_m: f32) -> Option<(f32, f32)> {
+        let view = View { origin: [agent_xz.0, 0.0, agent_xz.1], yaw: yaw_rad, pitch: self.pitch_deg.to_radians(), roll: 0.0 };
+        self.world_point_in(&view, px, py, depth_m)
+    }
+
+    /// Ground-plane `(x, z)` of the surface point seen at pixel `(px, py)`
+    /// from `view`, `depth_m` away along its forward axis (the view's own
+    /// pitch and roll; this camera's `pitch_deg` is not used).
+    pub fn world_point_in(&self, view: &View, px: f32, py: f32, depth_m: f32) -> Option<(f32, f32)> {
+        self.world_point3_in(view, px, py, depth_m).map(|p| (p[0], p[2]))
+    }
+
+    /// The surface point (x, y, z) seen at pixel `(px, py)` from `view`,
+    /// `depth_m` away along its forward axis.
+    pub fn world_point3_in(&self, view: &View, px: f32, py: f32, depth_m: f32) -> Option<[f32; 3]> {
         if !depth_m.is_finite() || depth_m <= 0.0 {
             return None;
         }
         let (w, h) = (self.width.max(1) as f32, self.height.max(1) as f32);
-        let (fwd, right, up) = basis(yaw_rad, self.pitch_deg.to_radians());
+        let (fwd, right, up) = basis_rpy(view.yaw, view.pitch, view.roll);
         let half_w = (self.fov_deg.to_radians() * 0.5).tan();
         let half_h = half_w * h / w;
         let sx = (2.0 * px / w - 1.0) * half_w;
         let sy = (1.0 - 2.0 * py / h) * half_h;
-        let vx = fwd[0] + right[0] * sx + up[0] * sy;
-        let vz = fwd[2] + right[2] * sx + up[2] * sy;
-        Some((agent_xz.0 + depth_m * vx, agent_xz.1 + depth_m * vz))
+        let v = [fwd[0] + right[0] * sx + up[0] * sy, fwd[1] + right[1] * sx + up[1] * sy, fwd[2] + right[2] * sx + up[2] * sy];
+        Some([view.origin[0] + depth_m * v[0], view.origin[1] + depth_m * v[1], view.origin[2] + depth_m * v[2]])
     }
 
     /// Pixel and forward depth of a world point, the inverse of
     /// [`Camera::world_point`]. `None` for a point behind the camera.
     pub fn project(&self, origin: [f32; 3], yaw_rad: f32, point: [f32; 3]) -> Option<(f32, f32, f32)> {
+        self.project_in(&View { origin, yaw: yaw_rad, pitch: self.pitch_deg.to_radians(), roll: 0.0 }, point)
+    }
+
+    /// Pixel and forward depth of a world point seen from `view`, the inverse
+    /// of [`Camera::world_point_in`]. `None` for a point behind the camera.
+    pub fn project_in(&self, view: &View, point: [f32; 3]) -> Option<(f32, f32, f32)> {
         let (w, h) = (self.width.max(1) as f32, self.height.max(1) as f32);
-        let (fwd, right, up) = basis(yaw_rad, self.pitch_deg.to_radians());
+        let (fwd, right, up) = basis_rpy(view.yaw, view.pitch, view.roll);
+        let origin = view.origin;
         let rel = [point[0] - origin[0], point[1] - origin[1], point[2] - origin[2]];
         let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
         let depth = dot(rel, fwd);
@@ -516,10 +587,95 @@ fn basis(yaw: f32, pitch: f32) -> ([f32; 3], [f32; 3], [f32; 3]) {
     (fwd, right, up)
 }
 
-/// Renders the robot's first-person view.
+/// Camera basis with a roll about the forward axis (the right side down positive).
+fn basis_rpy(yaw: f32, pitch: f32, roll: f32) -> ([f32; 3], [f32; 3], [f32; 3]) {
+    let (fwd, right, up) = basis(yaw, pitch);
+    if roll == 0.0 {
+        return (fwd, right, up);
+    }
+    let (sr, cr) = roll.sin_cos();
+    let r = [right[0] * cr - up[0] * sr, right[1] * cr - up[1] * sr, right[2] * cr - up[2] * sr];
+    let u = [up[0] * cr + right[0] * sr, up[1] * cr + right[1] * sr, up[2] * cr + right[2] * sr];
+    (fwd, r, u)
+}
+
+/// Renders the robot's first-person view: the head camera as it is now
+/// (`World::head_view`), its rolling shutter and its motion blur.
 pub fn render(world: &World, cam: &Camera) -> Frame {
-    let origin = [world.agent.x, world.agent_ground_m() + EYE_HEIGHT_M, world.agent.z];
-    render_with(world, cam, origin, world.agent.yaw, cam.pitch_deg.to_radians(), &[])
+    let hv = world.head_view(cam);
+    render_view(world, cam, &hv.view, &hv.exposure)
+}
+
+/// Renders from a given view through a sensor with the given exposure.
+pub fn render_view(world: &World, cam: &Camera, view: &View, exp: &Exposure) -> Frame {
+    let mut f = render_rows(world, cam, view, exp, &[]);
+    motion_blur(&mut f, cam, view, exp);
+    f
+}
+
+/// The basis row `j` of `h` is read with: the view turned on by the rate for
+/// the row's offset from the middle of the readout.
+fn row_basis(view: &View, exp: &Exposure, j: usize, h: usize) -> ([f32; 3], [f32; 3], [f32; 3]) {
+    let tau = exp.readout_s * ((j as f32 + 0.5) / h.max(1) as f32 - 0.5);
+    basis_rpy(view.yaw + exp.rate[0] * tau, view.pitch + exp.rate[1] * tau, view.roll + exp.rate[2] * tau)
+}
+
+/// Smears each pixel along the path the scene takes across the sensor while
+/// it is open: the pixel's ray (at the middle of the exposure) projected
+/// through the camera turned back and on by half the exposure. Rotation only:
+/// the camera's travel during a few milliseconds moves the image by far less
+/// than a pixel at the ranges the robot looks at.
+fn motion_blur(f: &mut Frame, cam: &Camera, view: &View, exp: &Exposure) {
+    if exp.exposure_s <= 0.0 || exp.blur_px(cam) < 0.35 {
+        return;
+    }
+    let (w, h) = (f.width, f.height);
+    let half_w = (cam.fov_deg.to_radians() * 0.5).tan();
+    let half_h = half_w * h as f32 / w as f32;
+    let half = 0.5 * exp.exposure_s;
+    let src = f.rgb.clone();
+    let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let to_px = |d: [f32; 3], b: &([f32; 3], [f32; 3], [f32; 3])| -> Option<(f32, f32)> {
+        let z = dot(d, b.0);
+        if z <= 1e-4 {
+            return None;
+        }
+        Some(((dot(d, b.1) / z / half_w + 1.0) * 0.5 * w as f32, (1.0 - dot(d, b.2) / z / half_h) * 0.5 * h as f32))
+    };
+    f.rgb.par_chunks_mut(w * 3).enumerate().for_each(|(j, row)| {
+        let mid = row_basis(view, exp, j, h);
+        let turned = |s: f32| {
+            let tau = exp.readout_s * ((j as f32 + 0.5) / h as f32 - 0.5) + s;
+            basis_rpy(view.yaw + exp.rate[0] * tau, view.pitch + exp.rate[1] * tau, view.roll + exp.rate[2] * tau)
+        };
+        let (b0, b1) = (turned(-half), turned(half));
+        let sy = (1.0 - 2.0 * (j as f32 + 0.5) / h as f32) * half_h;
+        for i in 0..w {
+            let sx = (2.0 * (i as f32 + 0.5) / w as f32 - 1.0) * half_w;
+            let d = [mid.0[0] + mid.1[0] * sx + mid.2[0] * sy, mid.0[1] + mid.1[1] * sx + mid.2[1] * sy, mid.0[2] + mid.1[2] * sx + mid.2[2] * sy];
+            let (Some(p0), Some(p1)) = (to_px(d, &b0), to_px(d, &b1)) else { continue };
+            let len = (p1.0 - p0.0).hypot(p1.1 - p0.1);
+            if len < 0.5 {
+                continue;
+            }
+            let n = (len.ceil() as usize + 1).clamp(2, 32);
+            let mut acc = [0.0f32; 3];
+            for k in 0..n {
+                let u = k as f32 / (n - 1) as f32;
+                // The scene at this pixel during the exposure: the image as the
+                // sensor sees it at the middle, offset by the path's displacement.
+                let x = (i as f32 + 0.5 - (p0.0 + (p1.0 - p0.0) * u - (i as f32 + 0.5))).floor().clamp(0.0, (w - 1) as f32) as usize;
+                let y = (j as f32 + 0.5 - (p0.1 + (p1.1 - p0.1) * u - (j as f32 + 0.5))).floor().clamp(0.0, (h - 1) as f32) as usize;
+                let o = (y * w + x) * 3;
+                for c in 0..3 {
+                    acc[c] += src[o + c] as f32;
+                }
+            }
+            for c in 0..3 {
+                row[i * 3 + c] = (acc[c] / n as f32).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    });
 }
 
 /// An oriented box in world coordinates (the robot's links in the third-person view).
@@ -654,9 +810,13 @@ pub fn render_focus(world: &World, cam: &Camera, which: FocusCam) -> Frame {
 }
 
 fn render_with(world: &World, cam: &Camera, origin: [f32; 3], yaw: f32, pitch: f32, robot: &[Obb]) -> Frame {
+    render_rows(world, cam, &View { origin, yaw, pitch, roll: 0.0 }, &Exposure::default(), robot)
+}
+
+fn render_rows(world: &World, cam: &Camera, view: &View, exp: &Exposure, robot: &[Obb]) -> Frame {
     let scene = Scene::build(world);
     let (w, h) = (cam.width.max(1), cam.height.max(1));
-    let (fwd, right, up) = basis(yaw, pitch);
+    let origin = view.origin;
     let half_w = (cam.fov_deg.to_radians() * 0.5).tan();
     let half_h = half_w * h as f32 / w as f32;
     let seed = world.cfg.seed;
@@ -671,6 +831,7 @@ fn render_with(world: &World, cam: &Camera, origin: [f32; 3], yaw: f32, pitch: f
         .zip(depth.par_chunks_mut(w))
         .enumerate()
         .for_each(|(j, ((row_rgb, row_ids), row_depth))| {
+            let (fwd, right, up) = row_basis(view, exp, j, h);
             let sy = (1.0 - 2.0 * (j as f32 + 0.5) / h as f32) * half_h;
             for i in 0..w {
                 let sx = (2.0 * (i as f32 + 0.5) / w as f32 - 1.0) * half_w;
@@ -937,8 +1098,13 @@ mod tests {
             // a point in front of the robot, expressed along its heading
             let p = [origin[0] + dx * c - dz * s, origin[1] + dy, origin[2] + dx * s + dz * c];
             let (px, py, depth) = cam.project(origin, w.agent.yaw, p).expect("in front of the camera");
-            let (x, z) = cam.world_point((w.agent.x, w.agent.z), w.agent.yaw, px, py, depth).unwrap();
+            let (x, z) = cam.world_point((origin[0], origin[2]), w.agent.yaw, px, py, depth).unwrap();
             assert!((x - p[0]).abs() < 1e-3 && (z - p[2]).abs() < 1e-3, "({x},{z}) vs ({},{})", p[0], p[2]);
+            // The same with a rolled and pitched view.
+            let v = View { origin, yaw: w.agent.yaw, pitch: -0.3, roll: 0.12 };
+            let (px, py, depth) = cam.project_in(&v, p).expect("in front of the camera");
+            let (x, z) = cam.world_point_in(&v, px, py, depth).unwrap();
+            assert!((x - p[0]).abs() < 1e-3 && (z - p[2]).abs() < 1e-3, "rolled: ({x},{z}) vs ({},{})", p[0], p[2]);
         }
         assert!(cam.project(origin, w.agent.yaw, [origin[0] - 3.0 * w.agent.yaw.cos(), origin[1], origin[2] - 3.0 * w.agent.yaw.sin()]).is_none());
         assert!(cam.world_point((0.0, 0.0), 0.0, 10.0, 10.0, f32::INFINITY).is_none());
@@ -957,12 +1123,13 @@ mod tests {
         w.agent.yaw = 0.0;
         let cam = Camera { width: 192, height: 128, ..Camera::default() };
         let f = render(&w, &cam);
+        let view = w.head_view(&cam).view;
         let mut checked = 0;
         for j in 0..f.height {
             for i in 0..f.width {
                 let (class, id) = unpack_id(f.ids[j * f.width + i]);
                 if class == ObjectClass::Node && id == 5 {
-                    let (x, z) = cam.world_point((w.agent.x, w.agent.z), w.agent.yaw, i as f32 + 0.5, j as f32 + 0.5, f.depth[j * f.width + i]).unwrap();
+                    let (x, z) = cam.world_point_in(&view, i as f32 + 0.5, j as f32 + 0.5, f.depth[j * f.width + i]).unwrap();
                     // the surface point lies on the node's own cell
                     assert!((x - nx).abs() <= CELL_M * 0.5 + 0.02 && (z - nz).abs() <= CELL_M * 0.5 + 0.02, "({x},{z}) not on cell ({nx},{nz})");
                     checked += 1;
@@ -1070,8 +1237,9 @@ mod tests {
             let f = render(&w, &Camera { width: 192, height: 128, pitch_deg: -3.0, ..Camera::default() });
             visible_objects(&w, &f).iter().find(|o| o.entity == node_id(id)).map_or(0, |o| o.pixels)
         };
-        let near = area(1.5, 90);
-        let far = area(4.5, 91);
+        // From the head (1.14 m) the ground shows from about 2 m out at this pitch: both stand beyond that.
+        let near = area(2.5, 90);
+        let far = area(7.5, 91);
         assert!(near > far * 3 && far > 0, "near {near}, far {far}");
     }
 

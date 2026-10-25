@@ -23,12 +23,12 @@ use hand_ts::{Predictor, TtmPredictor};
 use hand_vision::{DecideCfg, Decider, Decision, TriStep};
 use serde_json::json;
 use world_sim::explore::{line_of_sight, Coverage, TARGET_H_M};
-use world_sim::world::{AMOUNT_EPS, DELIVER_REACH_M, EYE_HEIGHT_M, MINE_REACH_M, PICKUP_REACH_M};
+use world_sim::world::{AMOUNT_EPS, DELIVER_REACH_M, MINE_REACH_M, PICKUP_REACH_M};
 use world_sim::{amount_text, Action, ActionError, ItemKind, NodeKind, TimedEvent, WorldEvent};
 
 use crate::cargo::{self, CargoAction, CargoCtx};
 use crate::driver::{action_error_ko, MAX_FALLS, MAX_GRASP_TRIES, MAX_PUSH_TRIES, PLACE_REACH_M};
-use crate::vision::{in_view, memory_ok, tilt_to_see, Memory};
+use crate::vision::{gaze_to_see, memory_ok, Memory};
 
 /// A node counts as the one the ML logic meant when it is this close to the
 /// estimated target point (the estimate is the visible surface; the node's
@@ -683,7 +683,7 @@ impl Runtime {
             t.blind_run = 0;
             return None;
         }
-        let pose = crate::record::odometry(&self.world);
+        let pose = crate::record::odometry(&self.world, &self.cam);
         let ttm = self.gates.ttm();
         let tp = ttm.as_deref().map(TtmPredictor);
         let extra: Vec<&dyn Predictor> = tp.iter().map(|p| p as &dyn Predictor).collect();
@@ -825,7 +825,7 @@ impl Runtime {
     fn feasible_step(&self, s: &TriStep, from: (f32, f32)) -> (TriStep, &'static str) {
         let ok = |st: &TriStep| -> bool {
             let reach = self.world.terrain.cell_of(st.to.0, st.to.1).is_some_and(|c| self.world.plan_route(world_sim::nav::Goal::Cell(c)).is_some());
-            reach && line_of_sight(&self.world.terrain, st.to, EYE_HEIGHT_M, st.face, TARGET_H_M)
+            reach && line_of_sight(&self.world.terrain, st.to, self.world.standing_eye_m(), st.face, TARGET_H_M)
         };
         if ok(s) {
             return (s.clone(), "");
@@ -943,8 +943,8 @@ impl Runtime {
                 let size = d.kind.spec().piece_size_m(d.amount);
                 let mut m = m;
                 if !memory_ok(m.sigma_m(odo, rate), 0.5 * size[0].min(size[2]), &self.cfg.vision) {
-                    if let Some(tilt) = tilt_to_see(&self.cam, EYE_HEIGHT_M, self.me(), m.x, m.z) {
-                        if self.scan_tilted("glance", tilt).is_ok() {
+                    if let Some((pan, tilt)) = gaze_to_see(&self.cam, self.world.standing_eye_m(), self.me(), m.x, m.z) {
+                        if self.scan_gaze("glance", pan, tilt).is_ok() {
                             if let Some((fused, innov)) = self.refresh_memory(&m, d.kind, odo) {
                                 let before = m.sigma_m(odo, rate);
                                 m = fused;
@@ -955,7 +955,7 @@ impl Runtime {
                     }
                 }
                 let sigma = m.sigma_m(odo, rate);
-                if !in_view(&self.cam, EYE_HEIGHT_M, self.me(), m.x, m.z) {
+                if gaze_to_see(&self.cam, self.world.standing_eye_m(), self.me(), m.x, m.z).is_none() {
                     self.note_look("blind", format!("ML d{id}"), Some(sigma), None, None);
                 }
                 t.queue.push_back(Action::PickUp { drop: id, aim: Some((m.x, m.z)), side: false, memory_sigma_m: sigma });

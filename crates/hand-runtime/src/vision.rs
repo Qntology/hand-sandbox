@@ -150,6 +150,26 @@ pub fn tilt_to_see(cam: &Camera, eye_m: f32, pose: (f32, f32, f32), x: f32, z: f
     in_view(&down, eye_m, pose, x, z).then_some(tilt)
 }
 
+/// The head's turn that shows a point the camera does not see now: the neck
+/// pans toward it, as far as it goes (`hand_core::kin::NECK_PAN_MAX_DEG`),
+/// and pitches down when the point lies at the feet. `(pan, tilt)` in
+/// degrees, the pan to the robot's left positive; `None` when no turn of the
+/// head shows it (behind the robot, beyond the pan).
+pub fn gaze_to_see(cam: &Camera, eye_m: f32, pose: (f32, f32, f32), x: f32, z: f32) -> Option<(f32, f32)> {
+    if in_view(cam, eye_m, pose, x, z) {
+        return Some((0.0, 0.0));
+    }
+    let max = hand_core::kin::NECK_PAN_MAX_DEG;
+    // A heading to the right of the robot (toward +z of its heading) is a pan to the right: negative.
+    let bearing = wrap((z - pose.1).atan2(x - pose.0) - pose.2).to_degrees();
+    let pan = (-bearing).clamp(-max, max);
+    let turned = (pose.0, pose.1, pose.2 - pan.to_radians());
+    [0.0, hand_core::kin::NECK_PITCH_MAX_DEG].into_iter().find_map(|tilt| {
+        let c = Camera { pitch_deg: cam.pitch_deg - tilt, ..*cam };
+        in_view(&c, eye_m, turned, x, z).then_some((pan, tilt))
+    })
+}
+
 /// A record of when the robot looked and why, for the timeline's vision lane.
 #[derive(Clone, Debug, Serialize)]
 pub struct VisionMark {
@@ -208,6 +228,13 @@ mod tests {
         assert_eq!(tilt_to_see(&cam, 0.5, me, 0.4, 0.0), Some(hand_core::kin::NECK_PITCH_MAX_DEG));
         assert_eq!(tilt_to_see(&cam, 0.5, me, 3.0, 0.2), Some(0.0));
         assert_eq!(tilt_to_see(&cam, 0.5, me, 0.1, 0.3), None);
+        // Turning the head shows what lies beside the robot, not what is behind it.
+        let (pan, tilt) = gaze_to_see(&cam, 1.14, me, 1.0, 2.5).expect("to the right, ahead");
+        assert!(pan < -30.0 && tilt == 0.0, "pan {pan} tilt {tilt}");
+        let (pan, tilt) = gaze_to_see(&cam, 1.14, me, 0.15, -0.35).expect("beside the left foot");
+        assert!(pan > 30.0 && tilt > 0.0, "pan {pan} tilt {tilt}");
+        assert_eq!(gaze_to_see(&cam, 1.14, me, -2.0, 0.0), None);
+        assert_eq!(gaze_to_see(&cam, 1.14, me, 3.0, 0.2), Some((0.0, 0.0)));
         let cfg = VisionCfg::default();
         assert_eq!(cfg.look_every_ticks, 15);
         assert!(memory_ok(0.02, 0.06, &cfg) && !memory_ok(0.04, 0.06, &cfg));

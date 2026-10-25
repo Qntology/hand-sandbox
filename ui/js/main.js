@@ -9,6 +9,7 @@ import { initHandPanel } from './hand-panel.js';
 import { initVisionUpload } from './vision-upload.js';
 import { initDataPanel } from './data-panel.js';
 import { initDevice } from './device.js';
+import { initModels, modelsReady } from './models.js';
 import { initSim, newWorld } from './sim.js';
 import { initWorldPanel } from './world-panel.js';
 import { initWorldView } from './world-view.js';
@@ -18,6 +19,7 @@ import { initQuestPanel } from './quest-panel.js';
 import { initCommandBar } from './command-bar.js';
 import { initLogs } from './logs.js';
 import { initAnalysis } from './analysis.js';
+import { initDepthView } from './depth-view.js';
 import { initTimeseries } from './timeseries.js';
 import { initTestTimeline } from './test-timeline.js';
 import { initPresets } from './presets.js';
@@ -70,12 +72,16 @@ async function main() {
   initCommandBar();
   initVisionUpload();
   initAnalysis();
+  initDepthView();
   initTimeseries();
   initTestTimeline();
 
   // 손·발 프리셋이 있어야 월드 생성(HandConfig 전달)과 PiP 가 의미가 있으므로 먼저 기다린다.
   await initHandPanel().catch(() => {});
   await Promise.allSettled([initDevice(), initDataPanel(), initLogs(), initPresets()]);
+  // 필수 모델(SigLIP2 · TTM · TIPSv2 · SAM)이 장치에 올라가기 전에는 월드를 만들지 않는다.
+  await initModels().catch(() => {});
+  await modelsReady();
   await regenerate();
   setStatus(mock
     ? '모의 백엔드로 실행 중입니다. 입력줄에 "철광석 3개 캐서 베이스캠프로 가져와"를 입력해 보세요'

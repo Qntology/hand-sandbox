@@ -42,13 +42,13 @@ use hand_search::{DropTarget, Plan};
 use serde_json::json;
 use world_sim::explore::{Coverage, Viewpoint};
 use world_sim::nav::Goal;
-use world_sim::world::{AMOUNT_EPS, DELIVER_REACH_M, EYE_HEIGHT_M, MINE_REACH_M, PICKUP_REACH_M};
+use world_sim::world::{AMOUNT_EPS, DELIVER_REACH_M, MINE_REACH_M, PICKUP_REACH_M};
 use world_sim::{amount_text, Action, ActionError, ItemKind, NodeKind, TimedEvent, WorldEvent};
 
 use hand_search::text::eul_reul;
 
 use crate::cargo::{self, CargoAction, CargoCtx, CargoDecision};
-use crate::vision::{in_view, memory_ok, tilt_to_see, Memory, EYE_LEAD_S};
+use crate::vision::{gaze_to_see, memory_ok, Memory, EYE_LEAD_S};
 
 /// Grasps of one piece the driver tries before it leaves the piece (est: an operator's retry policy).
 pub(crate) const MAX_GRASP_TRIES: u32 = 3;
@@ -628,7 +628,7 @@ impl Runtime {
     pub(crate) fn search_viewpoint(&self, cov: &Coverage, avoid: &[(f32, f32)]) -> Option<Viewpoint> {
         let blocked = self.world.blocked_cells();
         let start = self.world.terrain.cell_of(self.world.agent.x, self.world.agent.z)?;
-        world_sim::explore::next_viewpoint(&self.world.terrain, &self.world.drive_spec(), &|x, z| blocked.contains(&(x, z)), start, cov, EYE_HEIGHT_M, self.cam.pitch_deg, self.cam.vfov_deg(), avoid)
+        world_sim::explore::next_viewpoint(&self.world.terrain, &self.world.drive_spec(), &|x, z| blocked.contains(&(x, z)), start, cov, self.world.standing_eye_m(), self.cam.pitch_deg, self.cam.vfov_deg(), avoid)
     }
 
     fn do_locate(&mut self, t: &mut Task) -> Flow {
@@ -1129,10 +1129,10 @@ impl Runtime {
         let side = t.side.is_some_and(|(sid, _)| sid == id);
         let intermittent = self.cfg.vision.intermittent;
         if !intermittent || !memory_ok(sigma, tolerance, &self.cfg.vision) {
-            if let Some(tilt) = tilt_to_see(&self.cam, EYE_HEIGHT_M, me, m.x, m.z) {
-                // A glance (the head pitched down for the ground at the feet): it refreshes the memory from what the gates saw there.
+            if let Some((pan, tilt)) = gaze_to_see(&self.cam, self.world.standing_eye_m(), me, m.x, m.z) {
+                // A glance (the head turned to the spot, pitched down for the ground at the feet): it refreshes the memory from what the gates saw there.
                 let before = sigma;
-                if self.scan_tilted(if intermittent { "glance" } else { "pre_act" }, tilt).is_ok() {
+                if self.scan_gaze(if intermittent { "glance" } else { "pre_act" }, pan, tilt).is_ok() {
                     t.looks += 1;
                     self.vstats.looks += 1;
                     if let Some((fused, innov)) = self.refresh_memory(&m, kind, odo) {
@@ -1191,11 +1191,13 @@ impl Runtime {
         let (rate, odo) = (self.drift_rate(), self.world.odom.travelled_m);
         let size = kind.spec().piece_size_m(amount);
         let sigma = m.sigma_m(odo, rate);
-        if (intermittent && memory_ok(sigma, 0.5 * size[0].min(size[2]), &self.cfg.vision)) || !in_view(&self.cam, EYE_HEIGHT_M, self.me(), m.x, m.z) {
+        if intermittent && memory_ok(sigma, 0.5 * size[0].min(size[2]), &self.cfg.vision) {
             return;
         }
+        // The head turns to the piece when the level camera does not reach it.
+        let Some((pan, tilt)) = gaze_to_see(&self.cam, self.world.standing_eye_m(), self.me(), m.x, m.z) else { return };
         t.look_cd = if intermittent { self.cfg.vision.look_every_ticks } else { self.cfg.approach_scan_every_ticks };
-        if self.scan_now("pattern").is_ok() {
+        if self.scan_gaze("pattern", pan, tilt).is_ok() {
             t.looks += 1;
             self.vstats.looks += 1;
             if intermittent {
@@ -1546,7 +1548,10 @@ impl Runtime {
                     self.vstats.approach_s += world_sim::TICK_S as f64;
                     // The pattern: a look per look-ahead horizon, and one about a second before the hand acts.
                     let lead_m = self.world.agent.speed_mps.max(0.1) * EYE_LEAD_S + PICKUP_REACH_M;
-                    let pre = !t.pre_looked && target.is_some_and(|(x, z, d)| d <= lead_m && in_view(&self.cam, EYE_HEIGHT_M, self.me(), x, z));
+                    // The look before the hand turns the head to the target when the level camera does not reach it (at the feet, to the side).
+                    let eye = self.world.standing_eye_m();
+                    let gaze = if t.pre_looked { None } else { target.filter(|&(_, _, d)| d <= lead_m).and_then(|(x, z, _)| gaze_to_see(&self.cam, eye, self.me(), x, z)) };
+                    let pre = gaze.is_some();
                     let due = t.look_cd == 0;
                     if pre || due {
                         let kind = if pre { "pre_act" } else { "pattern" };
@@ -1554,7 +1559,8 @@ impl Runtime {
                             t.pre_looked = true;
                         }
                         t.look_cd = self.cfg.vision.look_every_ticks;
-                        if self.scan_now(kind).is_ok() {
+                        let (pan, tilt) = gaze.unwrap_or((0.0, 0.0));
+                        if self.scan_gaze(kind, pan, tilt).is_ok() {
                             t.looks += 1;
                             self.vstats.looks += 1;
                             self.vstats.approach_looks += 1;

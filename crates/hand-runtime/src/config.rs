@@ -82,7 +82,7 @@ impl Default for CameraCfg {
 
 impl CameraCfg {
     pub fn camera(&self) -> Camera {
-        Camera { width: self.width, height: self.height, fov_deg: self.fov_deg, pitch_deg: self.pitch_deg, max_dist_m: self.max_dist_m }
+        Camera { width: self.width, height: self.height, fov_deg: self.fov_deg, pitch_deg: self.pitch_deg, max_dist_m: self.max_dist_m, pan_deg: 0.0 }
     }
 }
 

@@ -25,7 +25,7 @@ use crate::perception::{OraclePerception, Recognizer, ScanInput};
 use crate::perception::EntKind;
 use crate::precision::{Judged, MemCtx, PrecisionGates};
 use crate::vision::{in_view, memory_ok, DriftRate, VisionMark};
-use world_sim::world::{DELIVER_REACH_M, EYE_HEIGHT_M};
+use world_sim::world::DELIVER_REACH_M;
 use hand_sds::{Scope, Track};
 
 /// What one scan saw and decided.
@@ -163,6 +163,24 @@ pub struct Detection {
     /// `[x0, y0, x1, y1]` as fractions of the frame.
     pub bbox: [f32; 4],
     pub landmark: Option<u32>,
+}
+
+/// What the depth model makes of the head camera's view now (`Runtime::depth_view`).
+pub struct DepthView {
+    pub tick: u64,
+    pub width: u32,
+    pub height: u32,
+    pub mode: String,
+    pub device: String,
+    pub infer_ms: f32,
+    pub metrics: Option<hand_vision::DepthMetrics>,
+    /// Near and far ends of the colour scale of both maps, metres.
+    pub scale_m: (f32, f32),
+    /// The farthest depth the model can report (TIPS: its last bin), metres.
+    pub max_depth_m: Option<f32>,
+    pub rgb_webp: Vec<u8>,
+    pub pred_webp: Vec<u8>,
+    pub truth_webp: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -482,6 +500,29 @@ impl Runtime {
 
     pub fn recognizer_mode(&self) -> &str {
         self.recognizer.mode()
+    }
+
+    /// The parts that still run on a stand-in instead of their model
+    /// (`recognizer`, `locate`, `depth`, `track`, `ttm`); empty when every
+    /// model is attached.
+    pub fn stand_ins(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.recognizer.mode() == "oracle" {
+            out.push("recognizer");
+        }
+        if matches!(self.ml.locate, crate::ml::LocateEngine::StandIn(_)) {
+            out.push("locate");
+        }
+        if matches!(self.ml.depth, crate::ml::DepthEngine::StandIn(_)) {
+            out.push("depth");
+        }
+        if self.ml.tracker.mode() == "region-grow" {
+            out.push("track");
+        }
+        if !self.has_ttm() {
+            out.push("ttm");
+        }
+        out
     }
 
     pub fn busy(&self) -> bool {
@@ -972,8 +1013,15 @@ impl Runtime {
     /// A look with the head pitched down by `tilt_deg` (the neck), to see the
     /// ground in front of the feet; the camera goes back level after.
     pub fn scan_tilted(&mut self, trigger: &str, tilt_deg: f32) -> Result<()> {
+        self.scan_gaze(trigger, 0.0, tilt_deg)
+    }
+
+    /// A look with the head turned by the neck: panned `pan_deg` (to the
+    /// left positive) and pitched down `tilt_deg`; the head comes back after.
+    pub fn scan_gaze(&mut self, trigger: &str, pan_deg: f32, tilt_deg: f32) -> Result<()> {
         let level = self.cam;
         self.cam.pitch_deg -= tilt_deg;
+        self.cam.pan_deg += pan_deg;
         let r = self.scan_now(trigger).map(|_| ());
         self.cam = level;
         r
@@ -990,7 +1038,7 @@ impl Runtime {
             *cd -= 1;
             return false;
         }
-        if self.dist_me(x, z) > RELOCALIZE_RANGE_M || !in_view(&self.cam, EYE_HEIGHT_M, self.me(), x, z) {
+        if self.dist_me(x, z) > RELOCALIZE_RANGE_M || !in_view(&self.cam, self.world.standing_eye_m(), self.me(), x, z) {
             return false;
         }
         let intermittent = self.cfg.vision.intermittent;
@@ -1087,6 +1135,43 @@ impl Runtime {
 
     pub fn log_tail(&self, after_seq: u64, limit: usize, cat: Option<&str>) -> (Vec<LogLine>, u64) {
         self.audit.tail(after_seq, limit, cat)
+    }
+
+    /// The depth model on what the head camera sees now, next to the
+    /// renderer's depth of the same pixels: both maps on one colour scale
+    /// (the truth's), as WebP, with the metrics and the model's time.
+    pub fn depth_view(&mut self, quality: f32) -> Result<DepthView> {
+        let frame = self.world.render(&self.cam);
+        let truth = crate::ml::KeyTruth::capture(&self.world, &frame);
+        let rgb = hand_vision::Rgb::new(frame.width as u32, frame.height as u32, frame.rgb.clone());
+        let t0 = Instant::now();
+        let pred = match &mut self.ml.depth {
+            crate::ml::DepthEngine::Model(m) => m.infer(&rgb)?,
+            crate::ml::DepthEngine::StandIn(s) => s.run(&truth),
+        };
+        let infer_ms = t0.elapsed().as_secs_f32() * 1000.0;
+        let true_map = truth.depth_map();
+        let metrics = hand_vision::depth_metrics(&pred, &true_map, 24.0, false);
+        let (lo, hi) = true_map.range();
+        let enc = |img: &hand_vision::Rgb| encode_webp(&img.data, img.width, img.height, quality).map(|e| e.bytes).map_err(|e| anyhow!("WebP 인코딩 실패: {e}"));
+        let max_depth_m = match &self.ml.depth {
+            crate::ml::DepthEngine::Model(m) => m.max_depth_m(),
+            crate::ml::DepthEngine::StandIn(_) => None,
+        };
+        Ok(DepthView {
+            tick: self.world.tick,
+            width: frame.width as u32,
+            height: frame.height as u32,
+            mode: self.ml.depth_mode(),
+            device: self.ml.depth_device(),
+            infer_ms,
+            metrics,
+            scale_m: (lo, hi),
+            max_depth_m,
+            rgb_webp: enc(&rgb)?,
+            pred_webp: enc(&pred.colorize_in(lo, hi))?,
+            truth_webp: enc(&true_map.colorize_in(lo, hi))?,
+        })
     }
 
     /// A WebP screenshot of a view at the camera's own size.

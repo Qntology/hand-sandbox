@@ -81,14 +81,23 @@ impl DepthMap {
 
     /// 8-bit colour image of the map (near is warm, far is cool), for the UI.
     pub fn colorize(&self) -> Rgb {
+        let (lo, hi) = self.range();
+        self.colorize_in(lo, hi)
+    }
+
+    /// The 2nd and 98th percentiles of the finite depths, metres (`colorize`'s scale).
+    pub fn range(&self) -> (f32, f32) {
         let finite: Vec<f32> = self.data.iter().copied().filter(|d| d.is_finite() && *d > 0.0).collect();
-        let (lo, hi) = if finite.is_empty() {
-            (0.0, 1.0)
-        } else {
-            let mut s = finite.clone();
-            s.sort_by(f32::total_cmp);
-            (s[s.len() / 50], s[s.len() - 1 - s.len() / 50].max(s[s.len() / 50] + 1e-3))
-        };
+        if finite.is_empty() {
+            return (0.0, 1.0);
+        }
+        let mut s = finite;
+        s.sort_by(f32::total_cmp);
+        (s[s.len() / 50], s[s.len() - 1 - s.len() / 50].max(s[s.len() / 50] + 1e-3))
+    }
+
+    /// [`DepthMap::colorize`] on a given scale, so that two maps compare.
+    pub fn colorize_in(&self, lo: f32, hi: f32) -> Rgb {
         let mut out = Vec::with_capacity((self.width * self.height * 3) as usize);
         for &d in &self.data {
             if !d.is_finite() || d <= 0.0 {

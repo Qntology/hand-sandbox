@@ -346,3 +346,38 @@ output { font-family: var(--font-mono); font-size: 0.68rem; color: var(--text-di
 .side-controls .hint { margin: 2px 0; }
 .mini-canvas { width: 100%; background: var(--bg-plot); border: 1px solid var(--border-cell); border-radius: var(--radius); display: block; }
 .analysis-pane { overflow: auto; padding: 14px; }
+
+/* ── 필수 모델: 받기 진행률 · 삭제 · 시작 게이트 ─────────────────── */
+.model-list { display: flex; flex-direction: column; gap: 8px; }
+.model-row { padding: 7px 8px; background: var(--bg-card); border: 1px solid var(--border-cell); border-radius: var(--radius); display: flex; flex-direction: column; gap: 5px; }
+.model-head { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+.model-name { font-size: 0.72rem; font-weight: 600; color: var(--text-bright); }
+.model-size { font-family: var(--font-mono); font-size: 0.62rem; color: var(--text-muted); white-space: nowrap; }
+.model-role { font-size: 0.62rem; color: var(--text-dim); }
+.model-state { display: flex; justify-content: space-between; align-items: center; gap: 6px; flex-wrap: wrap; }
+.model-badge { font-size: 0.62rem; font-family: var(--font-mono); color: var(--text-dim); }
+.model-badge.ok { color: var(--success); }
+.model-badge.run { color: var(--signal); }
+.model-badge.miss { color: var(--alert); }
+.model-actions { display: inline-flex; gap: 4px; }
+.model-actions .btn { min-height: 22px; padding: 0 8px; font-size: 0.62rem; }
+.btn.btn-danger, .btn.btn-danger:hover { border-color: var(--danger); color: var(--danger); }
+.model-summary { font-family: var(--font-mono); font-size: 0.62rem; word-break: break-word; }
+.model-gate { position: fixed; inset: 0; z-index: 900; background: rgba(5, 5, 7, 0.82); display: flex; align-items: center; justify-content: center; padding: 16px; }
+.model-gate[hidden] { display: none; }
+.model-gate-card { width: min(560px, 100%); max-height: calc(100vh - 32px); overflow: auto; background: var(--bg-panel); border: 1px solid var(--border-strong); border-radius: var(--radius-card); padding: 18px 20px; box-shadow: 0 18px 60px rgba(0, 0, 0, 0.55); }
+.model-gate-card h2 { margin: 0 0 6px; font-size: 0.95rem; color: var(--text-bright); }
+.model-gate-lead { font-size: 0.7rem; color: var(--text-dim); line-height: 1.6; margin: 0 0 12px; }
+.model-gate-bar { height: 8px; margin-bottom: 6px; }
+.model-gate .btn-row { margin-top: 12px; }
+
+/* ── 깊이 · 카메라 탭 ─────────────────────────────────────────── */
+.depth-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.depth-grid figure { margin: 0; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.depth-img { width: 100%; height: auto; border-radius: var(--radius-sm); border: 1px solid var(--border-cell); image-rendering: auto; background: var(--bg-plot); }
+.depth-grid figcaption { font-size: 0.62rem; color: var(--text-dim); }
+.depth-legend { display: flex; align-items: center; gap: 8px; margin: 8px 0; font-family: var(--font-mono); font-size: 0.6rem; color: var(--text-muted); }
+.depth-ramp { flex: 1; height: 8px; border-radius: 999px; border: 1px solid var(--border-cell);
+  background: linear-gradient(90deg, #7a0403, #d23105, #fb8022, #edd03a, #a4fc3c, #2ee5ae, #28bceb, #4686fb, #4040a2, #30123b); }
+.depth-kv { margin-top: 6px; }
+@media (max-width: 760px) { .depth-grid { grid-template-columns: 1fr; } }
