@@ -16,13 +16,16 @@ use hand_search::{Lexicon, ParsedCommand, Parser, Plan};
 use hand_ts::Forecast;
 use serde::Serialize;
 use serde_json::{json, Value};
-use world_sim::{amount_text, encode_webp, Camera, ItemKind, NodeKind, TimedEvent, World, WorldConfig, WorldEvent, WorldSnapshot};
+use world_sim::{amount_text, encode_webp, Action, Camera, ItemKind, NodeKind, TimedEvent, World, WorldConfig, WorldEvent, WorldSnapshot};
 
 use hand_search::text::eul_reul;
 use crate::config::{GateCfg, NoiseCfg, RuntimeConfig};
 use crate::driver::Task;
 use crate::perception::{OraclePerception, Recognizer, ScanInput};
-use crate::precision::{Judged, PrecisionGates};
+use crate::perception::EntKind;
+use crate::precision::{Judged, MemCtx, PrecisionGates};
+use crate::vision::{in_view, memory_ok, DriftRate, VisionMark};
+use world_sim::world::{DELIVER_REACH_M, EYE_HEIGHT_M};
 use hand_sds::{Scope, Track};
 
 /// What one scan saw and decided.
@@ -109,6 +112,23 @@ impl EvalCounters {
     }
 }
 
+/// What the vision schedule did over the robot's quests (the benchmark reads it).
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct VisionStats {
+    /// Seconds spent approaching something remembered, and the looks taken meanwhile.
+    pub approach_s: f64,
+    pub approach_looks: u32,
+    /// Looks the schedule took in all (pattern, before acting, glances), and actions on memory alone.
+    pub looks: u32,
+    pub blind_acts: u32,
+    /// Picks tried from the side, and in all.
+    pub side_picks: u32,
+    pub picks: u32,
+    /// Aim error of the picks made on memory alone and of those just looked at, metres (the record's).
+    pub memory_aim_m: Vec<f32>,
+    pub seen_aim_m: Vec<f32>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Submission {
     pub ok: bool,
@@ -183,6 +203,9 @@ impl Labels for WorldLabels<'_> {
     fn place_ko(&self, id: &str) -> String {
         self.0.waypoint_by_key(id).map(|w| w.label_ko.clone()).unwrap_or_else(|| id.to_string())
     }
+    fn resource_mined(&self, id: &str) -> bool {
+        ItemKind::from_id(id).map_or(true, |k| k.from_node())
+    }
 }
 
 /// Korean name of a dictionary label.
@@ -199,8 +222,48 @@ pub fn label_ko(world: &World, label: &str) -> String {
     label.to_string()
 }
 
+/// Farthest a waypoint's flag is trusted to fix the robot's position, metres (est: the flag fills a few pixels there).
+pub(crate) const RELOCALIZE_RANGE_M: f32 = 8.0;
+/// Validation gate of a fix: a sighting whose squared innovation exceeds this
+/// many times its variance (the pose's and the sighting's) is not the flag the
+/// map has there (a misread one) and is left out: the 99% point of χ² with two
+/// degrees of freedom (the validation region of Bar-Shalom & Fortmann 1988,
+/// *Tracking and Data Association*).
+const FIX_GATE_CHI2: f32 = 9.21;
+
+/// A fix of the robot's pose a flag gave, and the stretch of odometry it
+/// corrects (from the fix before it to this one).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PoseFix {
+    pub dx: f32,
+    pub dz: f32,
+    /// The odometer at this fix and at the one before it.
+    pub odo_m: f32,
+    pub prev_odo_m: f32,
+}
+
+impl PoseFix {
+    /// The share of the fix a memory seen at odometer `odo` moves by: the
+    /// drift's variance it had taken in when it was seen over the variance at
+    /// the fix (all of it for what was seen just before the fix, none for
+    /// what was seen at or before the last one).
+    pub fn share(&self, odo: f32, rate: DriftRate) -> f32 {
+        if odo <= self.prev_odo_m {
+            return 0.0;
+        }
+        let var = |d: f32| (rate.per_m * d).powi(2) + rate.walk_m * rate.walk_m * d;
+        (var(odo.min(self.odo_m) - self.prev_odo_m) / var(self.odo_m - self.prev_odo_m).max(1e-12)).clamp(0.0, 1.0)
+    }
+
+    /// Where a memory seen at odometer `odo` lies after the fix.
+    pub fn shift(&self, x: f32, z: f32, odo: f32, rate: DriftRate) -> (f32, f32) {
+        let k = self.share(odo, rate);
+        (x + k * self.dx, z + k * self.dz)
+    }
+}
+
 fn new_world(cfg: &RuntimeConfig) -> Result<World> {
-    World::new(WorldConfig { seed: cfg.seed, cells: cfg.cells, hand: cfg.hand, body: cfg.body, terrain: cfg.terrain }).map_err(|e| anyhow!("월드를 만들 수 없습니다: {e}"))
+    World::new(WorldConfig { seed: cfg.seed, cells: cfg.cells, hand: cfg.hand, body: cfg.body, terrain: cfg.terrain, odometry: cfg.odometry, parcels: cfg.parcels }).map_err(|e| anyhow!("월드를 만들 수 없습니다: {e}"))
 }
 
 pub struct Runtime {
@@ -218,6 +281,8 @@ pub struct Runtime {
     pub(crate) quests: QuestBook,
     pub(crate) task: Option<Task>,
     pub(crate) last_scan: Option<ScanReport>,
+    /// A fix of the pose a flag gave, for the next driver step (`apply_fix`).
+    pub(crate) pending_fix: Option<PoseFix>,
     scan_seq: u64,
     last_device: String,
     pub(crate) eval: EvalCounters,
@@ -238,6 +303,8 @@ pub struct Runtime {
     pub test_cfg: crate::testrun::TestCfg,
     /// Commands typed while a live recording runs, started one after another.
     pub(crate) live_queue: std::collections::VecDeque<String>,
+    /// What the vision schedule did (`vision`).
+    pub(crate) vstats: VisionStats,
 }
 
 impl Runtime {
@@ -269,6 +336,7 @@ impl Runtime {
             quests: QuestBook::new(),
             task: None,
             last_scan: None,
+            pending_fix: None,
             scan_seq: 0,
             last_device: String::new(),
             nn_live: crate::nnlive::NnLive::default(),
@@ -286,6 +354,7 @@ impl Runtime {
             test: None,
             test_cfg: crate::testrun::TestCfg::default(),
             live_queue: std::collections::VecDeque::new(),
+            vstats: VisionStats::default(),
         };
         let msg = format!(
             "월드 시작: seed {} · {}×{}칸 · 베이스 {:?} · 손가락 {} · 인식기 {}",
@@ -392,6 +461,11 @@ impl Runtime {
 
     pub fn eval(&self) -> &EvalCounters {
         &self.eval
+    }
+
+    /// What the vision schedule did so far.
+    pub fn vision_stats(&self) -> &VisionStats {
+        &self.vstats
     }
 
     pub fn last_scan(&self) -> Option<&ScanReport> {
@@ -746,11 +820,19 @@ impl Runtime {
         } else {
             Vec::new()
         };
-        let cands = std::mem::take(&mut out.candidates);
-        let judged = self.gates.judge(cands, tick, &mut self.sds);
+        let mut cands = std::mem::take(&mut out.candidates);
+        // The camera measures where things are from the robot; the robot puts
+        // them in its own (believed) frame, which its odometry drifts.
+        for c in cands.iter_mut() {
+            c.world = c.world.map(|(x, z)| self.world.belief_of(x, z));
+        }
+        let mem = self.mem_ctx();
+        let judged = self.gates.judge_with(cands, tick, &mut self.sds, &mem);
+        self.relocalize_from(&judged);
         if oracle {
             self.eval.add(&truths, &judged);
         }
+        self.note_look(trigger, String::new(), None, None, None);
         self.scan_seq += 1;
         let report = ScanReport {
             seq: self.scan_seq,
@@ -767,6 +849,160 @@ impl Runtime {
         self.note_scan(&report);
         self.last_scan = Some(report);
         Ok(self.last_scan.as_ref().expect("just stored"))
+    }
+
+    /// The robot's believed pose (its odometry): x, z, yaw.
+    pub(crate) fn me(&self) -> (f32, f32, f32) {
+        self.world.believed_pose()
+    }
+
+    /// Distance from the robot's believed position to a believed point.
+    pub(crate) fn dist_me(&self, x: f32, z: f32) -> f32 {
+        let (mx, mz, _) = self.me();
+        (x - mx).hypot(z - mz)
+    }
+
+    pub(crate) fn base_id(&self) -> String {
+        format!("{:?}", self.world.hand.base.kind).to_lowercase()
+    }
+
+    /// How fast the robot's memories spread per metre: what the SDS learned, else its odometry's specification.
+    pub(crate) fn drift_rate(&self) -> DriftRate {
+        DriftRate::learned(&self.sds, &self.base_id(), self.world.body.legged)
+    }
+
+    /// 1σ of the robot's own position against the map: its odometry's drift
+    /// since the last fix, at the same rate as a memory's (Smith, Self &
+    /// Cheeseman 1986, §3.2).
+    pub(crate) fn pose_sigma_m(&self) -> f32 {
+        let r = self.drift_rate();
+        let d = self.world.odom.since_fix_m;
+        ((r.per_m * d).powi(2) + r.walk_m * r.walk_m * d).sqrt()
+    }
+
+    /// What the gates need to keep landmarks as memories.
+    pub(crate) fn mem_ctx(&self) -> MemCtx {
+        let base = self.base_id();
+        let floor = self.sds.adaptive_baseline(&Scope::new(Track::Memory, &base, "obs"), "scatter_var_m2").map_or(0.0, |b| (b.0 as f32).max(0.0).sqrt());
+        MemCtx { odo_m: self.world.odom.travelled_m, rate: self.drift_rate(), base, camera: world_sim::world::camera_of(self.world.body.head.sensor), obs_floor_m: floor }
+    }
+
+    /// A waypoint seen where the map does not have it shows how far the
+    /// robot's belief has drifted. The surest such sighting (the nearest flag)
+    /// that passes the validation gate moves the believed pose by the Kalman
+    /// share of the difference, the drift since the last fix against the
+    /// sighting's own error (Matthies & Shafer 1987, Eqs. 9-10). The fix waits
+    /// for the start of the next driver step and moves the memories with the
+    /// pose there (`apply_fix`): what one step decides stays in one frame.
+    fn relocalize_from(&mut self, judged: &[Judged]) {
+        if self.pending_fix.is_some() {
+            return;
+        }
+        let mem = self.mem_ctx();
+        let p_pose = self.pose_sigma_m().powi(2);
+        let mut best: Option<(f32, f32, f32, String, f32)> = None;
+        for j in judged.iter().filter(|j| j.accepted && j.cand.kind == EntKind::Waypoint && j.cand.depth_m <= RELOCALIZE_RANGE_M) {
+            let (Some((sx, sz)), Some(w)) = (j.cand.world, self.world.waypoint_by_key(&j.cand.link)) else { continue };
+            let (ex, ez) = (w.x - sx, w.z - sz);
+            let p_obs = mem.sigma_obs(j.cand.depth_m).powi(2);
+            if ex * ex + ez * ez > FIX_GATE_CHI2 * (p_pose + p_obs) {
+                let msg = format!("위치 보정 안 함: 지점 깃발 {}이 지도와 {:.2} m 달라 보임 — 예상 오차 밖 (잘못 본 깃발)", j.cand.label, ex.hypot(ez));
+                self.log("vision", Level::Debug, msg, None);
+                continue;
+            }
+            if best.as_ref().map_or(true, |b| p_obs < b.0) {
+                best = Some((p_obs, ex, ez, j.cand.label.clone(), 0.0));
+            }
+        }
+        let Some((p_obs, ex, ez, label, _)) = best else { return };
+        let k = p_pose / (p_pose + p_obs).max(1e-9);
+        if k * ex.hypot(ez) > 1e-3 {
+            let odo = self.world.odom.travelled_m;
+            self.pending_fix = Some(PoseFix { dx: k * ex, dz: k * ez, odo_m: odo, prev_odo_m: odo - self.world.odom.since_fix_m });
+            let msg = format!("위치 보정: 지점 깃발 {label}이 지도와 {:.2} m 달라 보여 {:.0}%만큼 고침", ex.hypot(ez), k * 100.0);
+            self.log("vision", Level::Debug, msg, None);
+        }
+    }
+
+    /// The pending fix of the pose, applied: the believed pose moves, and so
+    /// does every landmark, by the share of the drift it had taken in when it
+    /// was last seen (`PoseFix::share`): the first-order update of a landmark
+    /// whose error is correlated with the pose's (the stochastic map of Smith,
+    /// Self & Cheeseman 1986). Returns the fix, for the task's own memories.
+    pub(crate) fn apply_fix(&mut self) -> Option<PoseFix> {
+        let f = self.pending_fix.take()?;
+        self.world.relocalize(f.dx, f.dz);
+        let rate = self.drift_rate();
+        self.gates.shift_landmarks(|x, z, odo| f.shift(x, z, odo, rate));
+        Some(f)
+    }
+
+    /// An action in the robot's believed frame as the world's: where its body
+    /// goes when it goes where it believes that is (its odometry's drift is
+    /// in the difference). Ids (a node, a piece, a waypoint) need nothing.
+    pub fn to_world(&self, a: Action) -> Action {
+        match a {
+            Action::MoveTo { x, z, reach_m } => {
+                let (x, z) = self.world.true_of(x, z);
+                Action::MoveTo { x, z, reach_m }
+            }
+            Action::Face { x, z } => {
+                let (x, z) = self.world.true_of(x, z);
+                Action::Face { x, z }
+            }
+            Action::Turn { yaw_deg } => Action::Turn { yaw_deg: self.world.true_yaw_of(yaw_deg.to_radians()).to_degrees() },
+            Action::Push { drop, x, z } => {
+                let (x, z) = self.world.true_of(x, z);
+                Action::Push { drop, x, z }
+            }
+            other => other,
+        }
+    }
+
+    /// Notes a look (or an action taken on memory without one) for the timeline's vision lane.
+    pub(crate) fn note_look(&mut self, kind: &str, what: String, sigma_before_m: Option<f32>, sigma_after_m: Option<f32>, innovation_m: Option<f32>) {
+        let mark = VisionMark { tick: self.world.tick, kind: kind.to_string(), what, sigma_before_m, sigma_after_m, innovation_m };
+        if let Some(rec) = self.recording.as_mut() {
+            if rec.vision.len() < crate::record::MAX_VISION_MARKS {
+                rec.vision.push(mark);
+            }
+        }
+    }
+
+    /// A look with the head pitched down by `tilt_deg` (the neck), to see the
+    /// ground in front of the feet; the camera goes back level after.
+    pub fn scan_tilted(&mut self, trigger: &str, tilt_deg: f32) -> Result<()> {
+        let level = self.cam;
+        self.cam.pitch_deg -= tilt_deg;
+        let r = self.scan_now(trigger).map(|_| ());
+        self.cam = level;
+        r
+    }
+
+    /// On the way to a place of the map. Once the place is near enough for a
+    /// sighting of its flag to fix the pose (`RELOCALIZE_RANGE_M`) and in
+    /// view, the robot looks on the pattern while its pose is too unsure for
+    /// the hand to find the pile there: 2σ of the drift since the last fix
+    /// against the slack between where the move stops and the hand's reach.
+    /// With the pattern off it looks as often as on an approach. Whether it looked.
+    pub(crate) fn place_look(&mut self, cd: &mut u32, x: f32, z: f32) -> bool {
+        if *cd > 0 {
+            *cd -= 1;
+            return false;
+        }
+        if self.dist_me(x, z) > RELOCALIZE_RANGE_M || !in_view(&self.cam, EYE_HEIGHT_M, self.me(), x, z) {
+            return false;
+        }
+        let intermittent = self.cfg.vision.intermittent;
+        if intermittent && memory_ok(self.pose_sigma_m(), DELIVER_REACH_M - crate::driver::PLACE_REACH_M, &self.cfg.vision) {
+            return false;
+        }
+        *cd = if intermittent { self.cfg.vision.look_every_ticks } else { self.cfg.approach_scan_every_ticks };
+        let looked = self.scan_now("place").is_ok();
+        if looked {
+            self.vstats.looks += 1;
+        }
+        looked
     }
 
     fn note_scan(&mut self, r: &ScanReport) {

@@ -16,6 +16,9 @@ pub enum ItemKind {
     Stone,
     Coal,
     IronOre,
+    /// A small corrugated parcel: no node yields it, it lies where the world
+    /// placed it (`World::new`), so the robot finds it by looking.
+    Parcel,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -46,7 +49,7 @@ impl ItemSpec {
 }
 
 impl ItemKind {
-    pub const ALL: [ItemKind; 4] = [ItemKind::Log, ItemKind::Stone, ItemKind::Coal, ItemKind::IronOre];
+    pub const ALL: [ItemKind; 5] = [ItemKind::Log, ItemKind::Stone, ItemKind::Coal, ItemKind::IronOre, ItemKind::Parcel];
 
     pub fn spec(self) -> ItemSpec {
         match self {
@@ -94,7 +97,26 @@ impl ItemKind {
                 color: [186, 140, 112],
                 divisible: true,
             },
+            // A small corrugated parcel: the median delivery weighs 0.7 kg (Amaral,
+            // de Oliveira & Beckers 2026: half below 0.7 kg); 16 × 12 × 10 cm is
+            // inside the small class of a locker study (cells about 5 in high,
+            // Ranjbari et al. 2023) and the hand's span.
+            ItemKind::Parcel => ItemSpec {
+                kind: self,
+                id: "parcel",
+                label_ko: "택배 상자",
+                label_en: "parcel box",
+                size_m: [0.16, 0.10, 0.12],
+                mass_kg: 0.7,
+                color: [196, 158, 108],
+                divisible: false,
+            },
         }
+    }
+
+    /// Whether a node yields it (mined) or the world placed it (found by looking).
+    pub fn from_node(self) -> bool {
+        NodeKind::ALL.into_iter().any(|n| n.spec().drop == self)
     }
 
     pub fn id(self) -> &'static str {

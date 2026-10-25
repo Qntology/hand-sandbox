@@ -99,6 +99,12 @@ pub struct Quest {
 pub trait Labels {
     fn resource_ko(&self, id: &str) -> String;
     fn place_ko(&self, id: &str) -> String;
+    /// Whether the resource is mined out of a node (a tree's logs) or lies where
+    /// it was placed (a parcel: the third step touches it instead of mining).
+    fn resource_mined(&self, id: &str) -> bool {
+        let _ = id;
+        true
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -124,6 +130,15 @@ impl std::fmt::Display for QuestError {
 
 impl std::error::Error for QuestError {}
 
+/// The third step of a target: mining its node, or touching what lies there.
+fn mine_label(labels: &dyn Labels, resource: &str, name: &str) -> String {
+    if labels.resource_mined(resource) {
+        format!("{name} 채취")
+    } else {
+        format!("{name} 손으로 확인")
+    }
+}
+
 fn step(kind: StepKind, label: String, resource: Option<&str>) -> Step {
     Step { kind, label_ko: label, state: State::Pending, progress: 0.0, note: None, resource: resource.map(String::from), retries: 0 }
 }
@@ -139,7 +154,7 @@ impl Quest {
                     let name = labels.resource_ko(&t.resource);
                     steps.push(step(StepKind::Locate, format!("{name} 탐색"), Some(&t.resource)));
                     steps.push(step(StepKind::Approach, format!("{name} 가까이 접근"), Some(&t.resource)));
-                    steps.push(step(StepKind::Mine, format!("{name} 채취"), Some(&t.resource)));
+                    steps.push(step(StepKind::Mine, mine_label(labels, &t.resource, &name), Some(&t.resource)));
                     steps.push(step(StepKind::Collect, format!("{name} 줍기 {}개", t.quantity), Some(&t.resource)));
                 }
                 let place = labels.place_ko(&destination.place);
@@ -152,7 +167,7 @@ impl Quest {
                     let name = labels.resource_ko(&t.resource);
                     steps.push(step(StepKind::Locate, format!("{name} 탐색"), Some(&t.resource)));
                     steps.push(step(StepKind::Approach, format!("{name} 가까이 접근"), Some(&t.resource)));
-                    steps.push(step(StepKind::Mine, format!("{name} 채취"), Some(&t.resource)));
+                    steps.push(step(StepKind::Mine, mine_label(labels, &t.resource, &name), Some(&t.resource)));
                     steps.push(step(StepKind::Collect, format!("{name} 줍기 {}개", t.quantity), Some(&t.resource)));
                 }
                 title = format!("{} 채취", item_list(targets, labels));

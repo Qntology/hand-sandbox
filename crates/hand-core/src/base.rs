@@ -43,6 +43,7 @@ impl BaseKind {
                 drive_accel_mps2: None,
                 mass_kg: None,
                 walk_com_z_m: None,
+                walk_foot_m: None,
             },
             BaseKind::Mecanum => BaseSpec {
                 kind: self,
@@ -55,6 +56,7 @@ impl BaseKind {
                 drive_accel_mps2: None,
                 mass_kg: None,
                 walk_com_z_m: None,
+                walk_foot_m: None,
             },
             BaseKind::Track => BaseSpec {
                 kind: self,
@@ -67,6 +69,7 @@ impl BaseKind {
                 drive_accel_mps2: None,
                 mass_kg: None,
                 walk_com_z_m: None,
+                walk_foot_m: None,
             },
             BaseKind::HumanFoot => BaseSpec {
                 kind: self,
@@ -79,6 +82,7 @@ impl BaseKind {
                 drive_accel_mps2: None,
                 mass_kg: None,
                 walk_com_z_m: None,
+                walk_foot_m: None,
             },
         }
     }
@@ -111,6 +115,10 @@ pub struct BaseSpec {
     /// the gait is not known and the ground does not change the speed).
     #[serde(default)]
     pub walk_com_z_m: Option<f32>,
+    /// Sole length of a walking base, metres (set from the body for legs:
+    /// where the centre of pressure rolls; `None`: the gait's nominal foot).
+    #[serde(default)]
+    pub walk_foot_m: Option<f32>,
 }
 
 /// One piece of a route for the drive model.

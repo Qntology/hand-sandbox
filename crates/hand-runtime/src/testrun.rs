@@ -242,6 +242,15 @@ impl Runtime {
                 }
             }
         }
+        // How far the robot's belief is off the truth (the record's, never the robot's).
+        if since % BELIEF_EVERY_TICKS == 0 {
+            let e = self.world.belief_error_m();
+            if let Some(r) = self.recording.as_mut() {
+                if r.belief_err.len() < MAX_BELIEF_POINTS {
+                    r.belief_err.push((self.world.tick, e));
+                }
+            }
+        }
         if key {
             let index = n_kf as u32;
             if n_kf >= cfg.max_keyframes {
@@ -335,14 +344,21 @@ impl Runtime {
         Ok(())
     }
 
-    /// Wanted vision labels of a quest: the source nodes of every target.
+    /// Wanted vision labels of a quest: the source nodes of every target (a
+    /// placed item, a parcel, is seen as itself).
     fn quest_labels(&self, q: Option<&Quest>) -> Vec<String> {
         let Some(q) = q else { return vec![] };
         let resources: Vec<String> = match &q.plan {
             hand_search::Plan::Fetch { targets, .. } | hand_search::Plan::Collect { targets } => targets.iter().map(|t| t.resource.clone()).collect(),
             _ => vec![],
         };
-        resources.iter().flat_map(|r| self.ml.source_labels_for(r)).collect()
+        resources
+            .iter()
+            .flat_map(|r| match world_sim::ItemKind::from_id(r) {
+                Some(k) if !k.from_node() => vec![r.clone()],
+                _ => self.ml.source_labels_for(r),
+            })
+            .collect()
     }
 
     fn perceive_some(&mut self) -> Result<()> {
@@ -495,6 +511,9 @@ impl Runtime {
                     "run_id": r.run_id, "start_tick": r.started_tick, "end_tick": r.ended_tick,
                     "video": r.video.len(), "dropped": r.dropped_keyframes,
                     "keyframes": r.keyframes.iter().map(Self::kf_brief).collect::<Vec<_>>(),
+                    // When the robot looked and what it did on memory alone (the vision lane).
+                    "vision": r.vision.iter().map(|m| json!({"tick": m.tick, "kind": m.kind, "what": m.what, "s0": m.sigma_before_m.map(r3), "s1": m.sigma_after_m.map(r3), "innov": m.innovation_m.map(r3)})).collect::<Vec<_>>(),
+                    "belief_err": r.belief_err.iter().map(|(t, e)| json!([t, r3(*e)])).collect::<Vec<_>>(),
                 }),
             }
         };
@@ -597,6 +616,10 @@ impl Runtime {
         Ok(json!({"stats": stats, "nn": nn, "ff_gains": gains, "runs": runs, "db_dir": self.db.dir().map(|d| d.display().to_string())}))
     }
 }
+
+/// The belief's error is recorded every this many ticks, up to this many points.
+const BELIEF_EVERY_TICKS: u64 = 5;
+const MAX_BELIEF_POINTS: usize = 6000;
 
 /// A cheap stand-in left in a slot while its keyframe is being analysed.
 fn placeholder(k: &Keyframe) -> Keyframe {

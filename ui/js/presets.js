@@ -13,13 +13,13 @@ const SEGS = [
   ['arm', '팔 (어깨 · 팔꿈치)'],
   ['leg', '다리 / 섀시'],
 ];
-const NAMED_KO = { budget: '보급형 전체', mid: '중급형 전체', pro: '고급형 전체', budget_arms_mid_base: '보급 팔·머리 + 중급 몸', pro_arms: '고급 팔 + 중급 몸', battery_low: '중급 + 배터리 골반' };
+const NAMED_KO = { budget: '보급형 전체', mid: '중급형 전체', pro: '고급형 전체', budget_arms_mid_base: '보급 팔·머리 + 중급 몸', pro_arms: '고급 팔 + 중급 몸', battery_low: '중급 + 배터리 골반', wheel_lift: '중급 + 몸통 리프트·고급 허리 (바퀴형 바닥 집기)' };
 
 let presets = null;
 let evalSeq = 0;
 
 function plan() {
-  const p = { battery_low: $('pp-battery').checked };
+  const p = { battery_low: $('pp-battery').checked, lift: $('pp-lift').checked };
   for (const [id] of SEGS) p[id] = $(`pp-${id}`).value;
   return p;
 }
@@ -27,6 +27,7 @@ function plan() {
 function setPlan(p) {
   for (const [id] of SEGS) $(`pp-${id}`).value = p[id];
   $('pp-battery').checked = !!p.battery_low;
+  $('pp-lift').checked = !!p.lift;
 }
 
 function r(x, d = 2) {
@@ -72,9 +73,10 @@ async function evaluate() {
 const later = debounce(evaluate, 150);
 
 export async function initPresets() {
-  state.bodyPlan = { head: 'mid', chest: 'mid', belly: 'mid', arm: 'mid', leg: 'mid', battery_low: false };
+  state.bodyPlan = { head: 'mid', chest: 'mid', belly: 'mid', arm: 'mid', leg: 'mid', battery_low: false, lift: false };
   for (const [id] of SEGS) $(`pp-${id}`).addEventListener('change', () => { $('pp-named').value = ''; later(); });
   $('pp-battery').addEventListener('change', later);
+  $('pp-lift').addEventListener('change', () => { $('pp-named').value = ''; later(); });
   $('pp-named').addEventListener('change', (e) => {
     const n = e.target.value;
     if (!n || !presets) return;
@@ -85,6 +87,7 @@ export async function initPresets() {
       budget_arms_mid_base: { head: 'budget', chest: 'mid', belly: 'mid', arm: 'budget', leg: 'mid', battery_low: false },
       pro_arms: { head: 'mid', chest: 'mid', belly: 'mid', arm: 'pro', leg: 'mid', battery_low: false },
       battery_low: { head: 'mid', chest: 'mid', belly: 'mid', arm: 'mid', leg: 'mid', battery_low: true },
+      wheel_lift: { head: 'mid', chest: 'mid', belly: 'pro', arm: 'mid', leg: 'mid', battery_low: false, lift: true },
     };
     if (map[n]) setPlan(map[n]);
     later();

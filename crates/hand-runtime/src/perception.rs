@@ -140,6 +140,8 @@ pub fn look_alike(label: &str) -> Option<&'static str> {
         "stone" => "coal",
         "coal" => "iron_ore",
         "iron_ore" => "stone",
+        // A brown box on the ground reads like a brown log.
+        "parcel" => "log",
         "base_camp" => "warehouse",
         "warehouse" => "base_camp",
         _ => return None,

@@ -353,6 +353,8 @@ pub struct Body {
     pub arm: ArmPreset,
     pub leg: LegPreset,
     pub chassis: ChassisPreset,
+    /// The torso lift on the mast (wheeled and tracked bases with one).
+    pub lift: Option<LiftPreset>,
     pub hand_kg: f32,
     /// Support length along travel and width, metres.
     pub support_len_m: f32,
@@ -395,15 +397,21 @@ impl Body {
             arm: plan.arm_preset(),
             leg,
             chassis: plan.chassis_preset(),
+            lift: plan.lift_preset(base),
             hand_kg: hand_mass_kg(fingers),
             support_len_m,
             support_width_m,
         }
     }
 
+    /// The mast and its lift (if any), kg: fixed to the chassis.
+    pub fn mast_kg(&self) -> f32 {
+        MAST_KG + self.lift.as_ref().map_or(0.0, |l| l.mass_kg)
+    }
+
     /// Robot mass without cargo.
     pub fn mass_kg(&self) -> f32 {
-        let lower = if self.legged { 2.0 * (self.leg.mass_kg + self.leg.foot_mass_kg) } else { self.chassis.mass_kg + MAST_KG };
+        let lower = if self.legged { 2.0 * (self.leg.mass_kg + self.leg.foot_mass_kg) } else { self.chassis.mass_kg + self.mast_kg() };
         self.head.mass_kg + self.chest.mass_kg + self.chest.battery_kg + self.belly.mass_kg + 2.0 * (self.arm.mass_kg + self.hand_kg) + lower
     }
 
@@ -504,7 +512,7 @@ impl Body {
                 v.push(Pt { seg: Segment::Foot, group: g, m: self.leg.foot_mass_kg, p: [0.25 * self.leg.foot_len_m + if swing { 0.15 } else { 0.0 }, y, 0.04 + lift] });
             }
         } else {
-            v.push(Pt { seg: Segment::Leg, group: Group::Lower, m: MAST_KG, p: [0.0, 0.0, 0.35] });
+            v.push(Pt { seg: Segment::Leg, group: Group::Lower, m: self.mast_kg(), p: [0.0, 0.0, 0.35] });
             v.push(Pt { seg: Segment::Foot, group: Group::Lower, m: self.chassis.mass_kg, p: [0.0, 0.0, self.chassis.com_m] });
         }
         v

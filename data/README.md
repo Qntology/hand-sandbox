@@ -68,6 +68,12 @@
 | 제자리 회전 속도 | `TURN_RATE_RAD_S` | 2.5 rad/s | 가정 |
 | 손 패드 · 지면과 아이템의 마찰 (v0.6) | `hand_core::act::material::{pad_on, item_on}` | 패드–나무 0.60, 돌·철광석 0.83, 석탄 0.45 (산포 10%); 아이템–지면 0.41–0.62 (정지·운동, 산포 10%) | CTU Code 2014, Nikolić 2024, Teffo & Naudé 2013, NAVFAC DM-7.02, Linthorne & Cooper 2013, Fall 2014 (`docs/research/actions.md` §1.2–1.3). v0.5의 `ITEM_FRICTION` 0.6(재질 구분 없음)을 대체. 석탄 패드 마찰과 산포는 추정 |
 | 행위 시계열 (v0.6) | `hand_core::act` | 굽힘(관절 범위·토크), 잡기(조준·쥠 안전계수 2·연질 접촉·충돌·들기 관성), 놓기(낙하·반발), 밀기(한계면·안정 반경), 걷기(LIPM·미끄럼·넘어짐), 주행(견인–미끄럼) | `docs/research/actions.md` §1. 관절 범위, 착지 속도, 범퍼 강성, 일어나는 시간 6 s 등은 추정 |
+| 오도메트리 드리프트 (v0.7) | `world_sim::odometry` | 바퀴 축척 0.58%, 다리 1.67% (이동마다 1σ), 무작위 보행 6.25 mm/√m, 자이로 각 무작위 보행 0.0069 °/√s · 바이어스 3.5 °/h, 미끄럼 s/(1−s) | Wheel-INS 표 III, Camurri 2020 §7.2, Borenstein & Feng 1996 p. 21, MILUV 표 3–4 (`docs/research/perception.md` §1.1) |
+| 기억과 시각 일정 (v0.7) | `hand_runtime::vision`, `precision` | σ(d) = √(σ₀² + (r·d)² + w²·d), 칼만 혼합, 패턴 1.5 s · 행위 전 1 s, 2σ ≤ 허용 오차, 위치 보정 8 m 안 · 검증 게이트 χ²(2) 99% | Smith, Self & Cheeseman 1986, Matthies & Shafer 1987, Matthis 2018, Johansson 2001, Bar-Shalom & Fortmann 1988 (§1.2–1.3). 2σ 기준, 8 m 범위는 추정 |
+| 택배 상자 (v0.7) | `ItemKind::Parcel`, `material::Cardboard` | 0.7 kg, 16 × 12 × 10 cm, 패드 마찰 0.60, 지면 0.50 (운동 0.75×), 반발 0.25 | Amaral 2026(초록), CTU Code 2014, Kang Lin 2023 (§1.4). 크기는 대입 |
+| 어깨 외전 · 넓은 발 (v0.7) | `hand_core::kin` | 외전 129°, 내전 19.5°, 고관절 외전 30° | 휴머노이드 일곱 URDF/MJCF 중앙값 (§1.5). 고관절 외전은 추정 |
+| 걸음의 CoM 진폭 · 압력 중심 (v0.7) | `hand_core::act::gait` | 0.015 m(1 km/h) → 0.034 m(6 km/h), 동역학적 상사; 압력 중심 −7.45 … 70.55% 발 길이 | Massaad 2007 그림 1A, Jeon & Cho 2020 표 1–2 (§1.6). 발꿈치 중심 15% 발 길이는 추정 |
+| 몸통 리프트 (v0.7) | `hand_core::parts::TORSO_LIFT` | 0.40 m, 0.10 m/s, 450 N, 2.5 kg, $600 | Fetch 사양·URDF (§1.7). 질량·가격은 추정 |
 | 채취 속도 | `World::mining_rate` | 손가락 수 / 5 (5지 = 1.0) | 가정 |
 | 노드 경도 | `NodeSpec::hardness` | 나무 2.0, 바위 1.5, 석탄·철 3.0 | Minecraft 관례를 따른 값. "도구 필요" 규칙은 두지 않음 |
 | 노드 드롭 수 | `NodeSpec::drop_count` | 나무 3, 바위 2, 석탄 광석 2, 철 광석 1 | 가정 |

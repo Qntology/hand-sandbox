@@ -118,6 +118,15 @@ pub struct RuntimeConfig {
     pub approach_reach_m: f32,
     /// Objects covering fewer pixels than this are not reported.
     pub min_pixels: u32,
+    /// When the robot looks (`vision`): on a pattern and before acting, or as often as before v0.7.
+    #[serde(default)]
+    pub vision: crate::vision::VisionCfg,
+    /// The robot's dead reckoning (`world_sim::odometry`).
+    #[serde(default)]
+    pub odometry: world_sim::OdomCfg,
+    /// Parcels lying in new worlds (`None`: the default number).
+    #[serde(default)]
+    pub parcels: Option<usize>,
 }
 
 fn default_hand() -> HandConfig {
@@ -148,6 +157,9 @@ impl Default for RuntimeConfig {
             max_trips: default_max_trips(),
             approach_reach_m: 0.65,
             min_pixels: 6,
+            vision: crate::vision::VisionCfg::default(),
+            odometry: world_sim::OdomCfg::default(),
+            parcels: None,
         }
     }
 }

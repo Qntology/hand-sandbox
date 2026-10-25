@@ -25,6 +25,12 @@
       "bias": "철광석, 철광, 철, 원철, 생철광석, 철덩이, iron ore, raw iron, iron, iron lump, 鉄鉱石, 铁矿石, 铁矿",
       "prejudice": "돌, 석탄, 원목, 구리, 금, stone, coal, log, copper, gold",
       "exact_match": ["철광석", "철광", "원철", "철", "생철광석", "iron ore", "iron", "raw iron", "鉄鉱石", "铁矿石", "铁矿"]
+    },
+    "parcel": {
+      "semantic": "a small corrugated cardboard parcel box lying on the ground, waiting to be picked up and delivered",
+      "bias": "택배, 택배 상자, 택배상자, 상자, 소포, 박스, 택배박스, 골판지 상자, 종이 상자, parcel, parcel box, package, box, carton, cardboard box, 小包, 段ボール箱, 包裹, 箱子",
+      "prejudice": "원목, 돌, 석탄, 철광석, log, stone, coal, iron ore",
+      "exact_match": ["택배", "택배 상자", "택배상자", "택배박스", "상자", "소포", "박스", "골판지 상자", "종이 상자", "parcel", "parcels", "package", "packages", "box", "boxes", "carton", "cartons", "小包", "段ボール箱", "包裹", "箱子"]
     }
   },
   "place": {
@@ -165,6 +171,13 @@
       "semantic": "a small lump of raw iron ore lying on the ground",
       "bias": "a small piece of raw iron ore on the ground, an orange brown iron lump, a raw iron item",
       "prejudice": "a grey stone piece, a lump of coal, a wooden log"
+    },
+    "parcel": {
+      "kind": "drop",
+      "link": "parcel",
+      "semantic": "a small brown cardboard parcel box lying on the ground",
+      "bias": "a small cardboard box on the ground, a brown parcel box, a small package, a taped carton",
+      "prejudice": "a wooden log, a grey stone piece, a tree"
     },
     "base_camp": {
       "kind": "waypoint",

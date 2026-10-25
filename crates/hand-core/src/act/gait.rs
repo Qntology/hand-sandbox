@@ -1,18 +1,33 @@
 //! Walking step by step on two legs.
 //!
-//! The walking controller is the linear inverted pendulum (LIPM) most ZMP
-//! walkers use: the CoM moves at a constant height `z_c` (the standing CoM
-//! lowered by the knee bend the walking knee lever implies), the ZMP sits
-//! under the stance ankle in single support and moves to the new foot during
-//! double support, and the horizontal ground force is `m·g·(x − p)/z_c`.
+//! The walking controller is an inverted pendulum whose CoM rises and falls
+//! as a person's does and whose centre of pressure rolls from heel to toe
+//! (v0.7; before it the linear inverted pendulum, LIPM, at a constant height):
+//!
+//! * the CoM height follows a cosine at the step frequency about the walking
+//!   height `z_c` (the standing CoM lowered by the walking knee bend), lowest
+//!   in the middle of double support and highest over the stance foot, with
+//!   the peak-to-peak excursion people walk with at the same dimensionless
+//!   speed (Massaad et al. 2007): the vertical ground force is `m·(g + z̈)`,
+//!   above the weight while both feet are down and below it in single
+//!   support, which is the two humps and the valley of a walking stance;
+//! * the centre of pressure runs under the stance foot from behind the heel
+//!   centre to the forefoot as a person's does over the stance (Jeon & Cho
+//!   2020), and from the trailing foot to the leading one in double support;
+//! * the horizontal motion is the pendulum's `ẍ = (g + z̈)·(x − p)/z`, solved
+//!   for the path that repeats from step to step (the map from the step's
+//!   start to its end is affine, so two unit runs and a 2×2 solve give it);
+//!   the friction a step needs is the largest lean of the ground force,
+//!   `|x − p| / z`, plus the slope.
+//!
 //! Each step:
 //!
 //! * the step length and the double support follow the speed's Froude number
 //!   as people's walking does (dynamic similarity: the stride and the duty
 //!   factor of Donelan & Kram 1997), then the controller shortens the step
-//!   until the friction it needs (`λ/(2·z_c)` plus the slope) stays a margin
-//!   below what it believes the ground gives (`KEEP_MARGIN`); the cadence
-//!   stays and the speed falls with the step;
+//!   until the friction it needs (the path's largest lean plus the slope)
+//!   stays a margin below what it believes the ground gives (`KEEP_MARGIN`);
+//!   the cadence stays and the speed falls with the step;
 //! * the swing foot lands at the controller's touchdown speed; the foot and
 //!   the shank hit the ground through the sole and the ground in series: the
 //!   heel-strike impact;
@@ -29,6 +44,9 @@
 //! kinematics, the CoM's acceleration as inertia), so the foot and joint
 //! focus views get the ground reaction, the centre of pressure and every
 //! leg joint per sample.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 use serde::Serialize;
 
@@ -65,6 +83,30 @@ pub const WALK_RUN_FROUDE: f32 = 0.5;
 /// Duty factor (stance share of a stride) over the Froude number on a 0.88 m
 /// leg: Donelan & Kram 1997 Table 2 (0.25–0.75 m/s) and Table 1 (Fr 0.1–0.4).
 const DUTY_FACTOR: [(f32, f32); 7] = [(0.0072, 0.77), (0.029, 0.71), (0.065, 0.68), (0.10, 0.66), (0.20, 0.64), (0.30, 0.63), (0.40, 0.62)];
+/// Leg length of the people the human gait numbers come from, metres (as [`FALL_SLIDE_LEG`]).
+const PERSON_LEG_M: f32 = 0.88;
+/// Peak-to-peak vertical excursion of a person's CoM over the walking speed
+/// (m/s, m): 0.015 ± 0.003 m at 1 km/h to 0.034 ± 0.004 m at 6 km/h, linear
+/// between, lowest in double support (Massaad et al. 2007, J Physiol 582,
+/// Fig. 1A, n = 6); carried to the robot by dynamic similarity (over the leg
+/// length against the speed over √(g·ℓ)) and held at the ends.
+pub const COM_EXCURSION: [(f32, f32); 2] = [(1.0 / 3.6, 0.015), (6.0 / 3.6, 0.034)];
+/// Where a person's centre of pressure runs under the foot over a stance:
+/// the mean of each of five phases, at the phase's middle (share of the
+/// stance, share of the foot length in front of the heel centre; Jeon & Cho
+/// 2020, IJERPH 17:7845, Tables 1–2, n = 90 at 1.29 m/s, the phases ending at
+/// 8.83, 40.85, 59.32, 87.02 and 100% of the stance), held at the ends.
+pub const COP_PATH: [(f32, f32); 5] = [(0.0442, -0.0745), (0.2484, 0.1619), (0.5009, 0.4034), (0.7317, 0.5921), (0.9351, 0.7055)];
+/// The heel centre (the origin of [`COP_PATH`]) lies this share of the foot
+/// length in front of the heel's back edge (est: the middle of the heel, the
+/// rear 30% of the foot): `docs/research/perception.md` §1.6.
+pub const HEEL_CENTRE_FL: f32 = 0.15;
+/// The ankle lies this share of the sole's length in front of its back edge (as `kin`'s sole).
+pub const ANKLE_FL: f32 = 0.25;
+/// The sole the route planner assumes when the base does not say (the mid legs'), metres.
+pub const NOMINAL_FOOT_M: f32 = 0.20;
+/// Integration steps per walking step of the CoM path.
+const PATH_STEPS: usize = 160;
 
 /// The gait the controller walks at a speed.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -84,6 +126,13 @@ pub struct GaitPlan {
     pub mu_est: f32,
     /// The step was shortened for friction.
     pub shortened: bool,
+    /// Peak-to-peak vertical excursion of the CoM over a step, metres.
+    pub com_amp_m: f32,
+    /// Sole length the centre of pressure rolls along, metres.
+    pub foot_m: f32,
+    /// Where the CoM starts each step, relative to the new stance ankle, and its speed then (the path that repeats).
+    pub x0: f32,
+    pub v0: f32,
 }
 
 /// Relative step length λ/ℓ at a Froude number: half the stride, whose
@@ -125,26 +174,226 @@ pub fn walking_com_z(body: &Body) -> f32 {
     body.com_height_m() - (THIGH_M + SHANK_M) * (1.0 - bend.cos())
 }
 
-/// The gait at `speed` on a ground with friction `mu_est` and a slope.
-pub fn plan(body: &Body, speed: f32, mu_est: f32, slope_deg: f32) -> GaitPlan {
-    plan_z(walking_com_z(body), speed, mu_est, slope_deg)
+/// Peak-to-peak CoM excursion at `speed` on a leg of `leg_m`: a person's
+/// ([`COM_EXCURSION`]) at the same dimensionless speed, over their leg length.
+pub fn com_excursion_m(speed: f32, leg_m: f32) -> f32 {
+    let hat = |v: f32, l: f32| v / (G * l).sqrt();
+    let (a, b) = (COM_EXCURSION[0], COM_EXCURSION[1]);
+    let u = ((hat(speed, leg_m) - hat(a.0, PERSON_LEG_M)) / (hat(b.0, PERSON_LEG_M) - hat(a.0, PERSON_LEG_M))).clamp(0.0, 1.0);
+    (a.1 + (b.1 - a.1) * u) / PERSON_LEG_M * leg_m
 }
 
-/// [`plan`] from the walking CoM height alone (the route planner has no body).
-pub fn plan_z(z_c: f32, speed: f32, mu_est: f32, slope_deg: f32) -> GaitPlan {
+/// How far the walking CoM can rise above `walking_com_z` before the stance leg is straight, metres.
+pub fn com_rise_room_m() -> f32 {
+    let bend = (KNEE_LEVER_WALK_M / SHANK_M).clamp(0.0, 0.9).asin();
+    (THIGH_M + SHANK_M) * (1.0 - bend.cos())
+}
+
+fn interp(table: &[(f32, f32)], x: f32) -> f32 {
+    if x <= table[0].0 {
+        return table[0].1;
+    }
+    for w in table.windows(2) {
+        if x <= w[1].0 {
+            return w[0].1 + (w[1].1 - w[0].1) * (x - w[0].0) / (w[1].0 - w[0].0);
+        }
+    }
+    table[table.len() - 1].1
+}
+
+/// One step of the walk: the stance ankle at x = 0, the trailing one at −λ.
+#[derive(Clone, Copy, Debug)]
+struct StepModel {
+    lam: f32,
+    step_s: f32,
+    t_ds: f32,
+    z_c: f32,
+    amp: f32,
+    foot_m: f32,
+}
+
+impl StepModel {
+    fn of(g: &GaitPlan) -> StepModel {
+        StepModel { lam: g.step_m, step_s: g.step_s, t_ds: g.ds_frac * g.step_s, z_c: g.com_z, amp: g.com_amp_m, foot_m: g.foot_m }
+    }
+
+    /// CoM height and vertical acceleration `t` into the step: lowest in the middle of double support.
+    fn z(&self, t: f32) -> (f32, f32) {
+        let w = std::f32::consts::TAU / self.step_s.max(1e-3);
+        let c = (w * (t - 0.5 * self.t_ds)).cos();
+        (self.z_c - 0.5 * self.amp * c, 0.5 * self.amp * w * w * c)
+    }
+
+    /// A stance foot's centre of pressure `f` (share of its stance) into the
+    /// stance, from its ankle. The pressure advances one step per step, so a
+    /// step shorter than the sole's roll (a shuffle) rolls only that much of
+    /// it, about the same point (est: the model's limit; people's steps are
+    /// longer than their feet).
+    fn sole(&self, f: f32) -> f32 {
+        let span = COP_PATH[COP_PATH.len() - 1].1 - COP_PATH[0].1;
+        let roll = self.foot_m.min(self.lam / span);
+        roll * (interp(&COP_PATH, f) + HEEL_CENTRE_FL - ANKLE_FL)
+    }
+
+    /// The centre of pressure `t` into the step: from the trailing foot's to the
+    /// leading foot's while both are down, then along the stance foot.
+    fn cop(&self, t: f32) -> f32 {
+        let stance = self.step_s + self.t_ds;
+        if t < self.t_ds {
+            let u = t / self.t_ds.max(1e-6);
+            let trail = -self.lam + self.sole((self.step_s + t) / stance);
+            let lead = self.sole(t / stance);
+            trail + (lead - trail) * u
+        } else {
+            self.sole(t / stance)
+        }
+    }
+
+    fn accel(&self, t: f32, x: f32) -> f32 {
+        let (z, zdd) = self.z(t);
+        (G + zdd) * (x - self.cop(t)) / z.max(0.05)
+    }
+
+    /// Runs the step from (x0, v0), calling `each(t, x, v)` at every point; returns the end.
+    fn run(&self, x0: f32, v0: f32, mut each: impl FnMut(f32, f32, f32)) -> (f32, f32) {
+        let h = self.step_s / PATH_STEPS as f32;
+        let (mut x, mut v) = (x0, v0);
+        each(0.0, x, v);
+        for i in 0..PATH_STEPS {
+            let t = i as f32 * h;
+            let (k1x, k1v) = (v, self.accel(t, x));
+            let (k2x, k2v) = (v + 0.5 * h * k1v, self.accel(t + 0.5 * h, x + 0.5 * h * k1x));
+            let (k3x, k3v) = (v + 0.5 * h * k2v, self.accel(t + 0.5 * h, x + 0.5 * h * k2x));
+            let (k4x, k4v) = (v + h * k3v, self.accel(t + h, x + h * k3x));
+            x += h / 6.0 * (k1x + 2.0 * k2x + 2.0 * k3x + k4x);
+            v += h / 6.0 * (k1v + 2.0 * k2v + 2.0 * k3v + k4v);
+            each(t + h, x, v);
+        }
+        (x, v)
+    }
+
+    /// The start that repeats: the step ends λ further on (over the next
+    /// stance ankle) at the speed it began with. The map from the start to the
+    /// end is affine, so the base run and two unit runs give it.
+    fn periodic(&self) -> (f32, f32) {
+        let base = self.run(0.0, 0.0, |_, _, _| {});
+        let ex = self.run(1.0, 0.0, |_, _, _| {});
+        let ev = self.run(0.0, 1.0, |_, _, _| {});
+        let (a, b, c, d) = (ex.0 - base.0, ev.0 - base.0, ex.1 - base.1, ev.1 - base.1);
+        let (r1, r2) = (self.lam - base.0, -base.1);
+        let det = (a - 1.0) * (d - 1.0) - b * c;
+        if det.abs() < 1e-9 {
+            return (-0.5 * self.lam, self.lam / self.step_s.max(1e-3));
+        }
+        ((r1 * (d - 1.0) - b * r2) / det, ((a - 1.0) * r2 - c * r1) / det)
+    }
+
+    /// The largest lean of the ground force over the step, `|x − p| / z`.
+    fn lean(&self, x0: f32, v0: f32) -> f32 {
+        let mut worst = 0.0f32;
+        self.run(x0, v0, |t, x, _| worst = worst.max((x - self.cop(t)).abs() / self.z(t).0));
+        worst
+    }
+}
+
+/// A step's model, its repeating start and its lean, for a step of `step_m` at the cadence of `step_s`.
+fn step_lean(z_c: f32, foot_m: f32, step_m: f32, step_s: f32, ds_frac: f32) -> (f32, f32, f32, f32) {
+    let speed = step_m / step_s.max(1e-3);
+    let amp = com_excursion_m(speed, HIP_M).min(2.0 * com_rise_room_m());
+    let m = StepModel { lam: step_m, step_s, t_ds: ds_frac * step_s, z_c, amp, foot_m };
+    let (x0, v0) = m.periodic();
+    (m.lean(x0, v0), amp, x0, v0)
+}
+
+/// Plans already made, by their inputs (the route planner asks for the same few again and again).
+static PLANS: Mutex<Option<HashMap<[u32; 5], GaitPlan>>> = Mutex::new(None);
+
+/// The gait at `speed` on a ground with friction `mu_est` and a slope.
+pub fn plan(body: &Body, speed: f32, mu_est: f32, slope_deg: f32) -> GaitPlan {
+    plan_z(walking_com_z(body), body.leg.foot_len_m, speed, mu_est, slope_deg)
+}
+
+/// [`plan`] from the walking CoM height and the sole alone (the route planner has no body).
+pub fn plan_z(z_c: f32, foot_m: f32, speed: f32, mu_est: f32, slope_deg: f32) -> GaitPlan {
+    let key = [z_c.to_bits(), foot_m.to_bits(), speed.to_bits(), mu_est.to_bits(), slope_deg.to_bits()];
+    if let Some(g) = PLANS.lock().ok().and_then(|p| p.as_ref().and_then(|m| m.get(&key).copied())) {
+        return g;
+    }
+    let g = plan_uncached(z_c, foot_m, speed, mu_est, slope_deg);
+    if let Ok(mut p) = PLANS.lock() {
+        let m = p.get_or_insert_with(HashMap::new);
+        if m.len() > 4096 {
+            m.clear();
+        }
+        m.insert(key, g);
+    }
+    g
+}
+
+fn plan_uncached(z_c: f32, foot_m: f32, speed: f32, mu_est: f32, slope_deg: f32) -> GaitPlan {
     let l = HIP_M;
     let fr = speed * speed / (G * l);
-    let mut step = relative_step(fr) * l;
-    let step_s = step / speed.max(0.01);
+    let ds_frac = ds_fraction(fr);
+    let full = relative_step(fr) * l;
+    let step_s = full / speed.max(0.01);
     let tan = slope_deg.to_radians().tan().abs();
-    let need = |s: f32| s / (2.0 * z_c) + tan;
-    let mut shortened = false;
     let room = mu_est - KEEP_MARGIN - tan;
-    if need(step) > mu_est - KEEP_MARGIN {
-        step = (2.0 * z_c * room).clamp(0.05 * l, step);
+    let mut step = full;
+    let mut at = step_lean(z_c, foot_m, step, step_s, ds_frac);
+    let mut shortened = false;
+    if at.0 > room {
+        // The longest step whose lean stays inside the room (the lean grows with the step at a fixed cadence).
         shortened = true;
+        let (mut lo, mut hi) = (0.05 * l, full);
+        let low = step_lean(z_c, foot_m, lo, step_s, ds_frac);
+        if low.0 > room {
+            step = lo;
+            at = low;
+        } else {
+            for _ in 0..14 {
+                let mid = 0.5 * (lo + hi);
+                if step_lean(z_c, foot_m, mid, step_s, ds_frac).0 > room {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+            step = lo;
+            at = step_lean(z_c, foot_m, step, step_s, ds_frac);
+        }
     }
-    GaitPlan { speed_cmd: speed, speed: step / step_s, step_m: step, step_s, ds_frac: ds_fraction(fr), com_z: z_c, rcof: need(step), mu_est, shortened }
+    let (lean, amp, x0, v0) = at;
+    GaitPlan { speed_cmd: speed, speed: step / step_s, step_m: step, step_s, ds_frac, com_z: z_c, rcof: lean + tan, mu_est, shortened, com_amp_m: amp, foot_m, x0, v0 }
+}
+
+/// The CoM `t` into a step of the plan: its position from the stance ankle,
+/// its height, its acceleration (forward, up) and the centre of pressure.
+pub fn com_at(g: &GaitPlan, t: f32) -> ComState {
+    let m = StepModel::of(g);
+    let t = t.clamp(0.0, g.step_s);
+    let mut best = (0.0f32, g.x0, g.v0);
+    m.run(g.x0, g.v0, |tt, x, v| {
+        if tt <= t + 1e-6 {
+            best = (tt, x, v);
+        }
+    });
+    // From the last point before `t` on to it, by the point's own speed and acceleration.
+    let dt = t - best.0;
+    let a = m.accel(best.0, best.1);
+    let x = best.1 + best.2 * dt + 0.5 * a * dt * dt;
+    let (z, zdd) = m.z(t);
+    ComState { x, v: best.2 + a * dt, z, ax: m.accel(t, x), az: zdd, cop: m.cop(t) }
+}
+
+/// The CoM at an instant of a step (`com_at`).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct ComState {
+    pub x: f32,
+    pub v: f32,
+    pub z: f32,
+    pub ax: f32,
+    pub az: f32,
+    pub cop: f32,
 }
 
 /// One walked step's numbers.
@@ -171,20 +420,14 @@ pub fn walk(body: &Body, ground: &SurfaceProps, mu_belief: Option<f32>, slope_de
     let mu_mean = surface::available_mu(body.base, ground);
     let g = plan(body, speed, mu_belief.unwrap_or(mu_mean), slope_deg);
     let m = body.mass_kg() + cargo_kg;
-    let tc = (g.com_z / G).sqrt();
     let t_ds = g.ds_frac * g.step_s;
     let t_ss = g.step_s - t_ds;
     let lam = g.step_m;
-    // Periodic LIPM: single support carries the CoM from −(λ/2 − δ) to +(λ/2 − δ)
-    // over the stance ankle, double support the remaining 2δ while the ZMP moves
-    // to the new foot; δ makes the CoM speed continuous across the transfer.
-    let ss_end_speed = |d: f32| (0.5 * lam - d) / tc / (0.5 * t_ss / tc).tanh();
-    let mut delta = 0.5 * g.speed * t_ds;
-    for _ in 0..20 {
-        delta = (0.5 * ss_end_speed(delta) * t_ds).min(0.45 * lam);
-    }
-    let half_ss = 0.5 * lam - delta;
-    let x_ss = |t: f32| half_ss * ((t - 0.5 * t_ss) / tc).sinh() / (0.5 * t_ss / tc).sinh();
+    // The CoM path repeats from step to step: sample it once.
+    let n_ds = (t_ds / SAMPLE_S).ceil().max(1.0) as usize;
+    let n_ss = (t_ss / SAMPLE_S).ceil().max(1.0) as usize;
+    let path_ds: Vec<ComState> = (0..n_ds).map(|i| com_at(&g, i as f32 / n_ds as f32 * t_ds)).collect();
+    let path_ss: Vec<ComState> = (0..n_ss).map(|i| com_at(&g, t_ds + i as f32 / n_ss as f32 * t_ss)).collect();
     let half_w = 0.5 * STANCE_WIDTH_M;
     let m_imp = impact_mass_kg(body);
     let k_ground = super::material::ground_stiffness(crate::surface::Surface::from_id(ground.id).unwrap_or_default());
@@ -208,27 +451,23 @@ pub fn walk(body: &Body, ground: &SurfaceProps, mu_belief: Option<f32>, slope_de
         let slipped = d.uniform() < p;
         let mut peak = 0.0f32;
         let mut low = f32::INFINITY;
-        // Double support: the ZMP moves from the trailing foot to the new stance foot.
-        let n_ds = (t_ds / SAMPLE_S).ceil().max(1.0) as usize;
-        for i in 0..n_ds {
+        // Double support: the centre of pressure moves from the trailing foot to the new stance foot, the CoM at its lowest.
+        for (i, c) in path_ds.iter().enumerate() {
             let u = i as f32 / n_ds as f32;
             let t = u * t_ds;
-            let x = -0.5 * lam - delta + 2.0 * delta * u;
-            let p_zmp = -lam + lam * u;
-            let ax = G * (x - p_zmp) / g.com_z;
             // The heel-strike transient on the landing foot over its contact time.
             let fz_extra = if t < dt_imp { f_imp * (std::f32::consts::PI * t / dt_imp).sin() } else { 0.0 };
-            let bw = (m * G + fz_extra) / (m * G);
+            let bw = (m * (G + c.az) + fz_extra) / (m * G);
             peak = peak.max(bw);
             low = low.min(bw);
             let mut pose = KinPose::stand(cargo_kg);
-            pose.hip = [x, g.com_z + (HIP_M - body.com_height_m())];
+            pose.hip = [c.x, c.z + (HIP_M - body.com_height_m())];
             pose.feet[stance] = [0.0, 0.0];
             pose.feet[swing] = [-lam, 0.0];
             // The pelvis moves from over the old stance foot to over the new one.
             pose.pelvis_y = ys * (2.0 * u - 1.0);
             pose.shoulder_deg = [8.0, -8.0];
-            let loads = KinLoads { accel: [ax, 0.0, 0.0], ..KinLoads::default() };
+            let loads = KinLoads { accel: [c.ax, 0.0, c.az], ..KinLoads::default() };
             let r = kin::solve_fast(body, &pose, &loads);
             samples.push(ActSample { t: t0 + t, phase: "double_support", pose: shift(pose, x_base), loads, margin: r.margin, zmp: [r.zmp[0] + x_base, r.zmp[1]], com: [r.com[0] + x_base, r.com[1], r.com[2]], peak_ratio: r.worst().map_or(0.0, |j| j.ratio), grip: None, object: None });
         }
@@ -246,24 +485,23 @@ pub fn walk(body: &Body, ground: &SurfaceProps, mu_belief: Option<f32>, slope_de
             }
             events.push(ActEvent::new(t0 + t_ds * 0.5, "foot_slip", format!("발 미끄러짐 {:.0} mm · 마찰 {mu:.2} < 필요 {:.2} → 회복", slide * 1000.0, g.rcof), &[Part::Foot, Part::FootJoints], Some(slide), true));
         }
-        // Single support: the CoM vaults over the stance ankle, the swing foot travels 2λ.
-        let n_ss = (t_ss / SAMPLE_S).ceil().max(1.0) as usize;
-        for i in 0..n_ss {
+        // Single support: the CoM vaults over the stance foot, rising over it, the swing foot travels 2λ.
+        for (i, c) in path_ss.iter().enumerate() {
             let u = i as f32 / n_ss as f32;
             let t = u * t_ss;
-            let x = x_ss(t);
-            let ax = G * x / g.com_z;
             let mut pose = KinPose::stand(cargo_kg);
-            pose.hip = [x, g.com_z + (HIP_M - body.com_height_m())];
+            pose.hip = [c.x, c.z + (HIP_M - body.com_height_m())];
             pose.feet[stance] = [0.0, 0.0];
             let sw = super::min_jerk(u);
             // The swing foot is off the ground from the first instant of single support.
             pose.feet[swing] = [-lam + 2.0 * lam * sw, (SWING_LIFT_M * (std::f32::consts::PI * u).sin()).max(SWING_OFF_M)];
             pose.pelvis_y = ys;
             pose.shoulder_deg = if stance == 0 { [-8.0, 8.0] } else { [8.0, -8.0] };
-            let loads = KinLoads { accel: [ax, 0.0, 0.0], ..KinLoads::default() };
+            let loads = KinLoads { accel: [c.ax, 0.0, c.az], ..KinLoads::default() };
             let r = kin::solve_fast(body, &pose, &loads);
-            low = low.min(1.0);
+            let bw = (G + c.az) / G;
+            peak = peak.max(bw);
+            low = low.min(bw);
             samples.push(ActSample { t: t0 + t_ds + t, phase: "single_support", pose: shift(pose, x_base), loads, margin: r.margin, zmp: [r.zmp[0] + x_base, r.zmp[1]], com: [r.com[0] + x_base, r.com[1], r.com[2]], peak_ratio: r.worst().map_or(0.0, |j| j.ratio), grip: None, object: None });
         }
         events.push(ActEvent::new(t0 + t_ds, "toe_off", format!("{}발 들림", if swing == 0 { "오른" } else { "왼" }), &[Part::Foot], None, true));
@@ -293,6 +531,7 @@ pub fn walk(body: &Body, ground: &SurfaceProps, mu_belief: Option<f32>, slope_de
         ("slip_p_mean", stats.iter().map(|s| s.slip_p).sum::<f32>() / walked.max(1.0)),
         ("relative_step", g.step_m / HIP_M),
         ("froude", g.speed * g.speed / (G * HIP_M)),
+        ("com_amp_m", g.com_amp_m),
         ("duration_s", t0),
     ];
     let notes = if g.shortened { vec![format!("마찰 {:.2}에 맞춰 보폭을 {:.2} m로 줄임 (속도 {:.2} → {:.2} m/s)", g.mu_est, g.step_m, g.speed_cmd, g.speed)] } else { vec![] };
@@ -304,38 +543,28 @@ pub fn walk(body: &Body, ground: &SurfaceProps, mu_belief: Option<f32>, slope_de
 /// same LIPM as [`walk`], for drawing a robot as it walks a route. Returns the
 /// pose, its loads (the CoM's acceleration) and the phase.
 pub fn pose_at(body: &Body, g: &GaitPlan, stance: usize, u: f32, cargo_kg: f32) -> (KinPose, KinLoads, &'static str) {
-    let tc = (g.com_z / G).sqrt();
     let t_ds = g.ds_frac * g.step_s;
     let t_ss = g.step_s - t_ds;
     let lam = g.step_m;
-    let ss_end_speed = |d: f32| (0.5 * lam - d) / tc / (0.5 * t_ss / tc).tanh();
-    let mut delta = 0.5 * g.speed * t_ds;
-    for _ in 0..20 {
-        delta = (0.5 * ss_end_speed(delta) * t_ds).min(0.45 * lam);
-    }
-    let half_ss = 0.5 * lam - delta;
     let swing = 1 - stance;
     let ys = if stance == 0 { -0.5 * STANCE_WIDTH_M } else { 0.5 * STANCE_WIDTH_M };
     let t = u.clamp(0.0, 1.0) * g.step_s;
+    let c = com_at(g, t);
     let mut pose = KinPose::stand(cargo_kg);
     pose.feet[stance] = [0.0, 0.0];
+    pose.hip = [c.x, c.z + (HIP_M - body.com_height_m())];
+    let loads = KinLoads { accel: [c.ax, 0.0, c.az], ..KinLoads::default() };
     if t < t_ds {
         let v = t / t_ds.max(1e-4);
-        let x = -0.5 * lam - delta + 2.0 * delta * v;
-        let p_zmp = -lam + lam * v;
-        pose.hip = [x, g.com_z + (HIP_M - body.com_height_m())];
         pose.feet[swing] = [-lam, 0.0];
         pose.pelvis_y = ys * (2.0 * v - 1.0);
-        (pose, KinLoads { accel: [G * (x - p_zmp) / g.com_z, 0.0, 0.0], ..KinLoads::default() }, "double_support")
+        (pose, loads, "double_support")
     } else {
-        let ts = t - t_ds;
-        let v = ts / t_ss.max(1e-4);
-        let x = half_ss * ((ts - 0.5 * t_ss) / tc).sinh() / (0.5 * t_ss / tc).sinh();
-        pose.hip = [x, g.com_z + (HIP_M - body.com_height_m())];
+        let v = (t - t_ds) / t_ss.max(1e-4);
         pose.feet[swing] = [-lam + 2.0 * lam * super::min_jerk(v), (SWING_LIFT_M * (std::f32::consts::PI * v).sin()).max(SWING_OFF_M)];
         pose.pelvis_y = ys;
         pose.shoulder_deg = if stance == 0 { [-8.0, 8.0] } else { [8.0, -8.0] };
-        (pose, KinLoads { accel: [G * x / g.com_z, 0.0, 0.0], ..KinLoads::default() }, "single_support")
+        (pose, loads, "single_support")
     }
 }
 
@@ -384,7 +613,8 @@ mod tests {
         let b = legs(Tier::Mid);
         let firm = plan(&b, 0.9, Surface::Firm.props().mu_foot, 0.0);
         assert!(!firm.shortened && firm.step_m > 0.2 && firm.step_m < 0.5, "{firm:?}");
-        assert!((firm.rcof - firm.step_m / (2.0 * firm.com_z)).abs() < 1e-5);
+        // The heel-to-toe roll keeps the ground force leaning less than the flat pendulum's λ/(2·z).
+        assert!(firm.rcof > 0.0 && firm.rcof < firm.step_m / (2.0 * firm.com_z), "{firm:?}");
         let wet = plan(&b, 0.9, 0.35, 8.0);
         assert!(wet.shortened && wet.step_m < firm.step_m && wet.speed < firm.speed, "{wet:?}");
         assert!(wet.rcof <= 0.35 - KEEP_MARGIN + 1e-4);
@@ -406,6 +636,29 @@ mod tests {
         // Told the truth, the controller shortens its steps and does not slip.
         let (r, st) = walk(&b, &ice, None, 0.0, 0.0, 0.9, 20, 3);
         assert!(r.metric("step_m").unwrap() < 0.2 && st.iter().filter(|x| x.slipped).count() <= 1, "{:?}", r.notes);
+    }
+
+    #[test]
+    fn the_com_bobs_and_the_stance_force_has_two_humps_and_a_valley() {
+        let b = legs(Tier::Mid);
+        let g = plan(&b, 0.9, Surface::Firm.props().mu_foot, 0.0);
+        // A person's excursion at the same dimensionless speed (Massaad 2007), inside the stance leg's room.
+        assert!(g.com_amp_m > 0.008 && g.com_amp_m < 2.0 * com_rise_room_m(), "{g:?}");
+        // The path repeats: the step ends λ on at the speed it began with.
+        let end = com_at(&g, g.step_s);
+        assert!((end.x - g.step_m - g.x0).abs() < 0.01 && (end.v - g.v0).abs() < 0.02, "{end:?} vs {g:?}");
+        assert!(g.v0 > 0.0 && (0..20).all(|i| com_at(&g, i as f32 * g.step_s / 20.0).v > 0.0), "always moving on");
+        // Lowest with both feet down, highest over the stance foot; the force follows z̈.
+        let t_ds = g.ds_frac * g.step_s;
+        let (ds, ss) = (com_at(&g, 0.5 * t_ds), com_at(&g, t_ds + 0.5 * (g.step_s - t_ds)));
+        assert!(ds.z < ss.z && ds.az > 0.0 && ss.az < 0.0);
+        // The centre of pressure rolls forward under the stance foot.
+        assert!(com_at(&g, t_ds).cop < com_at(&g, g.step_s - 1e-3).cop);
+        let (r, _) = walk(&b, Surface::Firm.props(), None, 0.0, 0.0, 0.9, 6, 1);
+        let fz: Vec<(f32, f32)> = r.samples.iter().filter(|s| s.pose.feet[0][1] <= 1e-4).map(|s| (s.t, kin::solve_fast(&b, &s.pose, &s.loads).contact("foot_r").map_or(0.0, |c| c.normal_n))).collect();
+        let w = b.mass_kg() * G;
+        let (hi, lo) = fz.iter().fold((0.0f32, f32::INFINITY), |(h, l), p| (h.max(p.1 / w), if p.1 > 0.5 * w { l.min(p.1 / w) } else { l }));
+        assert!(hi > 1.05 && lo < 0.95, "humps {hi} valley {lo}");
     }
 
     #[test]

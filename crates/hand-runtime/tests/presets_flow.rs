@@ -5,6 +5,7 @@
 //! actuators, so a preset that silently does not reach the physics fails here.
 
 use hand_core::parts::{BodyPlan, Tier};
+use hand_sds::{Scope, Track};
 use hand_runtime::{Runtime, RuntimeConfig};
 use serde_json::json;
 use world_sim::Camera;
@@ -46,8 +47,10 @@ fn a_quest_records_the_joint_dynamics_in_the_sds() {
     for _ in 0..60 {
         rt.api_sim_step(40).unwrap();
     }
-    let sds = rt.api_sds_status().unwrap().to_string();
-    assert!(sds.contains("effort|dynamics"), "dynamics scopes in the SDS");
+    // Asked of the store itself: the status lists only the 80 most observed
+    // axes, and a posture change is one sample (v0.7's tracks outnumber it).
+    let n = rt.sds().exact_baseline(&Scope::new(Track::Effort, "dynamics", ""), "min_margin").map_or(0, |b| b.2);
+    assert!(n > 0, "dynamics scopes in the SDS");
     let m = rt.world().motion.as_ref().expect("the world simulated a posture change");
     assert!(!m.rollout.samples.is_empty());
 }

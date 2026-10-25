@@ -270,6 +270,32 @@ pub struct ChassisPreset {
     pub src: &'static str,
 }
 
+/// A torso lift on the wheeled base's mast: a carriage that slides the
+/// pelvis, and everything the pelvis carries, down the mast so the hands get
+/// to the floor (the mobile manipulators that pick from the floor all have
+/// one: Fetch, TIAGo, HSR, Stretch; research `docs/research/perception.md` §1).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct LiftPreset {
+    pub name: &'static str,
+    /// Travel down the mast, metres.
+    pub stroke_m: f32,
+    /// Top speed, m/s, and the force it holds and drives, N.
+    pub speed_mps: f32,
+    pub force_n: f32,
+    pub mass_kg: f32,
+    pub power_w: f32,
+    pub cost_usd: f32,
+    pub src: &'static str,
+}
+
+/// Fetch's torso lift: 0–400 mm at 0.1 m/s and 450 N (Fetch mechanical
+/// specification; the URDF's torso_lift_joint 0–0.386 m, 0.1 m/s, 450 N). The
+/// stroke also fits this robot: the pelvis stops 1 cm above the chassis. Its
+/// mass on a robot this size: a belt axis with a stepper and a brake (est:
+/// igus drylin ZLW-1040 1.0 kg + 0.14 kg per 100 mm, about 1.6 kg for the
+/// stroke, and 0.9 kg of motor and brake), and its cost (est).
+pub const TORSO_LIFT: LiftPreset = LiftPreset { name: "몸통 리프트 (Fetch 급 0.40 m · 450 N)", stroke_m: 0.40, speed_mps: 0.10, force_n: 450.0, mass_kg: 2.5, power_w: 30.0, cost_usd: 600.0, src: "Fetch 사양 · 질량·가격 추정" };
+
 impl HeadPreset {
     pub fn of(tier: Tier) -> HeadPreset {
         match tier.no_plus() {
@@ -359,6 +385,9 @@ pub struct BodyPlan {
     /// takes inertia off the waist; research §6).
     #[serde(default)]
     pub battery_low: bool,
+    /// A torso lift on the mast of a wheeled or tracked base ([`TORSO_LIFT`]; nothing on legs).
+    #[serde(default)]
+    pub lift: bool,
 }
 
 impl Default for BodyPlan {
@@ -369,23 +398,24 @@ impl Default for BodyPlan {
 
 impl BodyPlan {
     pub fn uniform(tier: Tier) -> BodyPlan {
-        BodyPlan { head: tier, chest: tier, belly: tier, arm: tier, leg: tier, battery_low: false }
+        BodyPlan { head: tier, chest: tier, belly: tier, arm: tier, leg: tier, battery_low: false, lift: false }
     }
 
     /// Short id such as `mid` or `h:mid c:pro b:mid a:budget l:mid bat:low`.
     pub fn id(&self) -> String {
         let u = [self.head, self.chest, self.belly, self.arm].iter().all(|t| *t == self.head) && self.leg == self.head;
-        if u && !self.battery_low {
+        if u && !self.battery_low && !self.lift {
             return self.head.id().to_string();
         }
         format!(
-            "h:{} c:{} b:{} a:{} l:{}{}",
+            "h:{} c:{} b:{} a:{} l:{}{}{}",
             self.head.id(),
             self.chest.id(),
             self.belly.id(),
             self.arm.id(),
             self.leg.id(),
-            if self.battery_low { " bat:low" } else { "" }
+            if self.battery_low { " bat:low" } else { "" },
+            if self.lift { " lift" } else { "" }
         )
     }
 
@@ -400,11 +430,15 @@ impl BodyPlan {
             // Strong shoulders on mid legs: more payload, but the ankles must follow.
             "pro_arms" => BodyPlan { arm: Tier::Pro, ..BodyPlan::uniform(Tier::Mid) },
             "battery_low" => BodyPlan { battery_low: true, ..BodyPlan::uniform(Tier::Mid) },
+            // A wheeled base that reaches the floor: the torso lift lowers the
+            // shoulders 0.40 m and the pro belly's waist pitch leans them over
+            // the bumper (neither does it alone).
+            "wheel_lift" => BodyPlan { lift: true, belly: Tier::Pro, ..BodyPlan::uniform(Tier::Mid) },
             _ => return None,
         })
     }
 
-    pub const NAMED: [&'static str; 6] = ["budget", "mid", "pro", "budget_arms_mid_base", "pro_arms", "battery_low"];
+    pub const NAMED: [&'static str; 7] = ["budget", "mid", "pro", "budget_arms_mid_base", "pro_arms", "battery_low", "wheel_lift"];
 
     pub fn head_preset(&self) -> HeadPreset {
         HeadPreset::of(self.head)
@@ -424,10 +458,14 @@ impl BodyPlan {
     pub fn chassis_preset(&self) -> ChassisPreset {
         ChassisPreset::of(self.leg)
     }
+    /// The torso lift on a wheeled or tracked base, when the plan has one.
+    pub fn lift_preset(&self, base: BaseKind) -> Option<LiftPreset> {
+        (self.lift && base != BaseKind::HumanFoot).then_some(TORSO_LIFT)
+    }
 
     /// Approximate parts cost, US dollars, for two arms and two legs (or one chassis).
     pub fn cost_usd(&self, base: BaseKind) -> f32 {
-        let lower = if base == BaseKind::HumanFoot { 2.0 * self.leg_preset().cost_usd } else { self.chassis_preset().cost_usd };
+        let lower = if base == BaseKind::HumanFoot { 2.0 * self.leg_preset().cost_usd } else { self.chassis_preset().cost_usd + self.lift_preset(base).map_or(0.0, |l| l.cost_usd) };
         self.head_preset().cost_usd + self.chest_preset().cost_usd + self.belly_preset().cost_usd + 2.0 * self.arm_preset().cost_usd + lower
     }
 }

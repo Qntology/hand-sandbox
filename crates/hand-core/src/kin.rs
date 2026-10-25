@@ -30,7 +30,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::balance::{Body, JointLoad, CARGO_X_M, CARGO_Z_M, G, HIP_HALF_WIDTH_M, MAST_KG};
+use crate::balance::{Body, JointLoad, CARGO_X_M, CARGO_Z_M, G, HIP_HALF_WIDTH_M};
 use crate::base::BaseKind;
 use crate::dynamics::{BodyPose, JointPoint, LinkBox};
 use crate::parts::*;
@@ -71,6 +71,18 @@ pub const HIP_FLEX_MAX_DEG: f32 = 106.0;
 pub const WAIST_PITCH_MAX_DEG: f32 = 70.0;
 /// Neck pitch range, degrees (as `dynamics`).
 pub const NECK_PITCH_MAX_DEG: f32 = 45.0;
+/// Shoulder abduction (the arm turned out to the side), degrees: the median
+/// of seven humanoids' shoulder-roll limits outward (Unitree G1 129°, H1 178°,
+/// Fourier GR-1 187°, N1 160°, Apptronik Apollo 92°, Booster T1 90°, Berkeley
+/// Humanoid Lite 75°; research perception.md §3).
+pub const SHOULDER_ABD_MAX_DEG: f32 = 129.0;
+/// Shoulder adduction (the arm turned in, across the front of the body),
+/// degrees: the median of the same seven limits inward (91°, 19.5°, 32.7°,
+/// 10°, 7°, 99.7°, 15°).
+pub const SHOULDER_ADD_MAX_DEG: f32 = 19.5;
+/// Hip abduction a wide stance may use, degrees (est: a few degrees are all
+/// the stances here need; every humanoid's hip roll allows that much).
+pub const HIP_ABD_MAX_DEG: f32 = 30.0;
 /// Largest fold between the trunk and a thigh (hip flexion plus waist pitch),
 /// degrees: beyond it the trunk box (0.20 m deep) meets the thigh (est, collision).
 pub const TRUNK_THIGH_FOLD_MAX_DEG: f32 = 150.0;
@@ -137,11 +149,24 @@ pub struct KinPose {
     /// Shoulder flexion relative to the trunk (0 hanging along it, forward positive) and elbow flexion, per arm (right, left).
     pub shoulder_deg: [f32; 2],
     pub elbow_deg: [f32; 2],
+    /// Shoulder abduction per arm (right, left), degrees, outward positive:
+    /// the arm's flexion plane turned out about the trunk's fore-aft axis (a
+    /// reach to the side). 0 keeps the arm in the sagittal plane.
+    #[serde(default)]
+    pub shoulder_abd_deg: [f32; 2],
+    /// Each foot this much further out than the standing stance, metres (a
+    /// wide stance, the feet either side of a load on the ground).
+    #[serde(default)]
+    pub stance_out_m: f32,
     /// Wheeled base pitch on a slope or a step, nose up positive.
     pub base_pitch_deg: f32,
     pub cargo_kg: f32,
     /// Finger closure 0 (open) … 1 (closed), for drawing.
     pub closure: f32,
+    /// The torso lift's travel down the mast, metres (a wheeled or tracked
+    /// base with a lift; 0 otherwise).
+    #[serde(default)]
+    pub lift_m: f32,
 }
 
 impl KinPose {
@@ -156,9 +181,12 @@ impl KinPose {
             neck_deg: 0.0,
             shoulder_deg: [0.0, 0.0],
             elbow_deg: [10.0, 10.0],
+            shoulder_abd_deg: [0.0, 0.0],
+            stance_out_m: 0.0,
             base_pitch_deg: 0.0,
             cargo_kg,
             closure: 0.0,
+            lift_m: 0.0,
         }
     }
 
@@ -180,9 +208,12 @@ impl KinPose {
             neck_deg: l(a.neck_deg, b.neck_deg),
             shoulder_deg: l2(a.shoulder_deg, b.shoulder_deg),
             elbow_deg: l2(a.elbow_deg, b.elbow_deg),
+            shoulder_abd_deg: l2(a.shoulder_abd_deg, b.shoulder_abd_deg),
+            stance_out_m: l(a.stance_out_m, b.stance_out_m),
             base_pitch_deg: l(a.base_pitch_deg, b.base_pitch_deg),
             cargo_kg: l(a.cargo_kg, b.cargo_kg),
             closure: l(a.closure, b.closure),
+            lift_m: l(a.lift_m, b.lift_m),
         }
     }
 }
@@ -298,6 +329,12 @@ pub struct Rom {
     pub neck_max: f32,
     pub shoulder: [f32; 2],
     pub elbow_max: f32,
+    /// Shoulder abduction, adduction negative.
+    pub shoulder_abd: [f32; 2],
+    /// How far each foot may go out beyond the standing stance, metres (legs).
+    pub stance_out_max_m: f32,
+    /// How far the torso lift lowers the pelvis down the mast, metres (0 without one).
+    pub lift_max_m: f32,
 }
 
 impl Rom {
@@ -311,6 +348,11 @@ impl Rom {
             neck_max: NECK_PITCH_MAX_DEG,
             shoulder: [-60.0, 180.0],
             elbow_max: 150.0,
+            shoulder_abd: [-SHOULDER_ADD_MAX_DEG, SHOULDER_ABD_MAX_DEG],
+            // The straight leg swung out to the hip abduction limit, less the
+            // standing stance (the feet stand under the hips).
+            stance_out_max_m: if body.legged { ((HIP_M - ANKLE_H_M) * HIP_ABD_MAX_DEG.to_radians().sin() + HIP_HALF_WIDTH_M - 0.5 * STANCE_WIDTH_M).max(0.0) } else { 0.0 },
+            lift_max_m: if body.legged { 0.0 } else { body.lift.as_ref().map_or(0.0, |l| l.stroke_m) },
         }
     }
 }
@@ -339,6 +381,19 @@ fn down_dir(deg: f32) -> V3 {
     let a = deg.to_radians();
     [a.sin(), 0.0, -a.cos()]
 }
+fn dot(a: V3, b: V3) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+/// The trunk's fore-aft axis when it is pitched `deg` forward (+x upright).
+fn fore_aft(deg: f32) -> V3 {
+    let a = deg.to_radians();
+    [a.cos(), 0.0, -a.sin()]
+}
+/// `v` turned by `theta` radians about the unit axis `k` (Rodrigues).
+pub fn rotate(v: V3, k: V3, theta: f32) -> V3 {
+    let (s, c) = theta.sin_cos();
+    add(add(scale(v, c), scale(cross(k, v), s)), scale(k, dot(k, v) * (1.0 - c)))
+}
 /// Rotates a point or a direction about the y axis through the origin by a base pitch (nose up positive).
 fn pitch_about_origin(p: V3, deg: f32) -> V3 {
     let (s, c) = (-deg.to_radians()).sin_cos();
@@ -366,6 +421,34 @@ pub fn knee_ik(hip: [f32; 2], ankle: [f32; 2]) -> Option<([f32; 2], f32)> {
     }
     let knee = [mx + h * px, mz + h * pz];
     let interior = (1.0 - 0.5 * d * d / (THIGH_M * THIGH_M)).clamp(-1.0, 1.0).acos();
+    Some((knee, (std::f32::consts::PI - interior).to_degrees()))
+}
+
+/// `balance`'s margin of a ZMP in a support rectangle `[x0, x1, y0, y1]`: 1
+/// with the ZMP at the centre, 0 at the edge, negative outside.
+pub fn support_margin(support: [f32; 4], zmp: [f32; 2]) -> f32 {
+    let (hx, hy) = (0.5 * (support[1] - support[0]), 0.5 * (support[3] - support[2]));
+    let (cx, cy) = (0.5 * (support[0] + support[1]), 0.5 * (support[2] + support[3]));
+    (1.0 - (zmp[0] - cx).abs() / hx.max(1e-3)).min(1.0 - (zmp[1] - cy).abs() / hy.max(1e-3))
+}
+
+/// [`knee_ik`] in three dimensions, for a foot that stands out to the side of
+/// its hip (a wide stance): the knee bends forward in the plane of the leg.
+/// The knee and its flexion, degrees; `None` beyond the leg's length.
+pub fn knee_ik3(hip: [f32; 3], ankle: [f32; 3]) -> Option<([f32; 3], f32)> {
+    let d = sub(ankle, hip);
+    let len = dot(d, d).sqrt();
+    if len > THIGH_M + SHANK_M + 1e-4 || len < 1e-3 {
+        return None;
+    }
+    let len = len.min(THIGH_M + SHANK_M);
+    let u = scale(d, 1.0 / len);
+    // Forward, square to the hip–ankle line.
+    let fwd = sub([1.0, 0.0, 0.0], scale(u, u[0]));
+    let f = scale(fwd, 1.0 / dot(fwd, fwd).sqrt().max(1e-6));
+    let h = (THIGH_M * THIGH_M - 0.25 * len * len).max(0.0).sqrt();
+    let knee = add(add(hip, scale(d, 0.5)), scale(f, h));
+    let interior = (1.0 - 0.5 * len * len / (THIGH_M * THIGH_M)).clamp(-1.0, 1.0).acos();
     Some((knee, (std::f32::consts::PI - interior).to_degrees()))
 }
 
@@ -416,7 +499,8 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
     let tag = |s: usize| if s == 0 { "r" } else { "l" };
 
     // ----- lower body -----
-    let half = STANCE_WIDTH_M * 0.5;
+    let wide = pose.stance_out_m > 1e-6;
+    let half = STANCE_WIDTH_M * 0.5 + pose.stance_out_m.max(0.0);
     let foot_y = [-half, half];
     let mut knees = [[0.0f32; 3]; 2];
     let mut ankles = [[0.0f32; 3]; 2];
@@ -424,7 +508,10 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
     let mut stance = [false; 2];
     // Per leg: ankle dorsiflexion (shank from vertical), knee flexion, hip flexion.
     let mut leg_angles = [(0.0f32, 0.0f32, 0.0f32); 2];
-    let hip_c: V3 = if legged { [pose.hip[0], pose.pelvis_y, pose.hip[1]] } else { [0.0, pose.pelvis_y, HIP_M] };
+    // Hip abduction of a wide stance (the leg's tilt out to its foot), degrees.
+    let mut hip_abd_deg = [0.0f32; 2];
+    // A wheeled base carries the pelvis on its mast, as far down it as the torso lift has slid.
+    let hip_c: V3 = if legged { [pose.hip[0], pose.pelvis_y, pose.hip[1]] } else { [0.0, pose.pelvis_y, HIP_M - pose.lift_m] };
     if legged {
         let share = thigh_share(body);
         for s in 0..2 {
@@ -432,17 +519,36 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
             stance[s] = lift <= 1e-4;
             let hip2 = [hip_c[0], hip_c[2]];
             let ankle2 = [pose.feet[s][0], ANKLE_H_M + lift];
-            let (knee, knee_flex) = knee_ik(hip2, ankle2).unwrap_or_else(|| {
-                out_of_range.push(format!("leg_{} 다리 길이를 넘는 자세", tag(s)));
-                let (dx, dz) = (ankle2[0] - hip2[0], ankle2[1] - hip2[1]);
-                let d = (dx * dx + dz * dz).sqrt().max(1e-3);
-                ([hip2[0] + dx / d * THIGH_M, hip2[1] + dz / d * THIGH_M], 0.0)
-            });
             // A swing foot moves with the pelvis; a stance foot stays where it stands.
             let y = foot_y[s] + if stance[s] { 0.0 } else { pose.pelvis_y };
             hips[s] = [hip_c[0], hip_c[1] + if s == 0 { -HIP_HALF_WIDTH_M } else { HIP_HALF_WIDTH_M }, hip_c[2]];
-            knees[s] = [knee[0], y, knee[1]];
+            let too_long = |out: &mut Vec<String>| out.push(format!("leg_{} 다리 길이를 넘는 자세", tag(s)));
+            let (knee, ky, knee_flex) = if wide {
+                // A wide stance splays the leg out to the foot: solved in the leg's own tilted plane.
+                match knee_ik3(hips[s], [ankle2[0], y, ankle2[1]]) {
+                    Some((k, flex)) => ([k[0], k[2]], k[1], flex),
+                    None => {
+                        too_long(&mut out_of_range);
+                        ([0.5 * (hip2[0] + ankle2[0]), 0.5 * (hip2[1] + ankle2[1])], 0.5 * (y + hips[s][1]), 0.0)
+                    }
+                }
+            } else {
+                let (k, flex) = knee_ik(hip2, ankle2).unwrap_or_else(|| {
+                    too_long(&mut out_of_range);
+                    let (dx, dz) = (ankle2[0] - hip2[0], ankle2[1] - hip2[1]);
+                    let d = (dx * dx + dz * dz).sqrt().max(1e-3);
+                    ([hip2[0] + dx / d * THIGH_M, hip2[1] + dz / d * THIGH_M], 0.0)
+                });
+                (k, y, flex)
+            };
+            knees[s] = [knee[0], ky, knee[1]];
             ankles[s] = [ankle2[0], y, ankle2[1]];
+            if wide {
+                hip_abd_deg[s] = (y - hips[s][1]).abs().atan2((hips[s][2] - ankle2[1]).max(1e-3)).to_degrees();
+                if hip_abd_deg[s] > HIP_ABD_MAX_DEG + 0.5 {
+                    out_of_range.push(format!("hip_roll_{} 외전 {:.0}° > {:.0}°", tag(s), hip_abd_deg[s], HIP_ABD_MAX_DEG));
+                }
+            }
             let shank = (knee[0] - ankle2[0]).atan2(knee[1] - ankle2[1]).to_degrees();
             let thigh = (knee[0] - hip2[0]).atan2(hip2[1] - knee[1]).to_degrees();
             // Hip flexion: the trunk's pitch plus the thigh's forward swing.
@@ -467,7 +573,7 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
             }
         }
     } else {
-        masses.push(Mass { group: Grp::Base, m: MAST_KG, p: [0.0, 0.0, 0.35] });
+        masses.push(Mass { group: Grp::Base, m: body.mast_kg(), p: [0.0, 0.0, 0.35] });
         masses.push(Mass { group: Grp::Base, m: body.chassis.mass_kg, p: [0.0, 0.0, body.chassis.com_m] });
     }
 
@@ -504,13 +610,24 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
     let mut hands = [[0.0f32; 3]; 2];
     let mut shoulders = [[0.0f32; 3]; 2];
     let mut elbows = [[0.0f32; 3]; 2];
+    // The axis each arm's shoulder and elbow flex about (+y until the arm is abducted).
+    let mut flex_axes = [[0.0f32, 1.0, 0.0]; 2];
+    let trunk_fwd = fore_aft(trunk_deg);
     for s in 0..2 {
         let y = if s == 0 { -SHOULDER_HALF_WIDTH_M } else { SHOULDER_HALF_WIDTH_M };
         let sh = [shoulder_c[0], shoulder_c[1] + y, shoulder_c[2]];
         // Shoulder flexion is measured from hanging along the trunk.
         let up_ang = pose.shoulder_deg[s] - trunk_deg;
-        let du = down_dir(up_ang);
-        let df = down_dir(up_ang + pose.elbow_deg[s]);
+        let mut du = down_dir(up_ang);
+        let mut df = down_dir(up_ang + pose.elbow_deg[s]);
+        let abd = pose.shoulder_abd_deg[s];
+        if abd.abs() > 1e-6 {
+            // Abduction turns the arm's plane out about the trunk's fore-aft axis: the right arm toward −y.
+            let theta = if s == 0 { -abd } else { abd }.to_radians();
+            du = rotate(du, trunk_fwd, theta);
+            df = rotate(df, trunk_fwd, theta);
+            flex_axes[s] = rotate([0.0, 1.0, 0.0], trunk_fwd, theta);
+        }
         let el = add(sh, scale(du, UPPER_ARM_M));
         let wrist = add(el, scale(df, FOREARM_M));
         let hand = add(wrist, scale(df, PALM_OFFSET_M));
@@ -522,13 +639,19 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
         masses.push(Mass { group: Grp::Hand(s), m: body.hand_kg, p: hand });
         boxes.push(limb_box(if s == 0 { "upper_arm_r" } else { "upper_arm_l" }, Segment::Arm, sh, el, 0.035));
         boxes.push(limb_box(if s == 0 { "forearm_r" } else { "forearm_l" }, Segment::Arm, el, wrist, 0.03));
-        boxes.extend(hand_boxes(s, wrist, df, pose.closure, body));
+        boxes.extend(hand_boxes(s, wrist, df, flex_axes[s], pose.closure, body));
         if !(rom.shoulder[0] - 0.5..=rom.shoulder[1] + 0.5).contains(&pose.shoulder_deg[s]) {
             out_of_range.push(format!("shoulder_{} {:.0}°", tag(s), pose.shoulder_deg[s]));
         }
         if !(-0.5..=rom.elbow_max + 0.5).contains(&pose.elbow_deg[s]) {
             out_of_range.push(format!("elbow_{} {:.0}°", tag(s), pose.elbow_deg[s]));
         }
+        if !(rom.shoulder_abd[0] - 0.5..=rom.shoulder_abd[1] + 0.5).contains(&abd) {
+            out_of_range.push(format!("shoulder_abd_{} {:.0}° (범위 {:.0}…{:.0}°)", tag(s), abd, rom.shoulder_abd[0], rom.shoulder_abd[1]));
+        }
+    }
+    if legged && wide && pose.stance_out_m > rom.stance_out_max_m + 1e-3 {
+        out_of_range.push(format!("발 벌림 {:.2} m > {:.2} m (고관절 외전 범위)", pose.stance_out_m, rom.stance_out_max_m));
     }
     if pose.waist_deg.abs() > rom.waist_max + 0.5 {
         out_of_range.push(if rom.waist_max == 0.0 { format!("허리 피치 관절 없음 (요청 {:.0}°)", pose.waist_deg) } else { format!("waist_pitch {:.0}° > {:.0}°", pose.waist_deg, rom.waist_max) });
@@ -628,9 +751,30 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
     let mut joints: Vec<KinJoint> = Vec::new();
     joints.push(jnt("waist_pitch", Segment::Belly, waist, Some(pose.waist_deg), body.belly.pitch.as_ref(), moment(waist, &above_waist, &[0, 1])[1], pose.waist_deg.abs() <= rom.waist_max + 0.5));
     joints.push(jnt("neck", Segment::Head, neck, Some(pose.neck_deg), Some(&body.head.neck), moment(neck, &[Grp::Head], &[])[1], pose.neck_deg.abs() <= rom.neck_max + 0.5));
+    // The torso lift holds up the carriage and everything on it (the pelvis
+    // and the bay, the trunk, the head, the arms) and what the hands carry;
+    // a linear actuator, its "torque" is that force in newtons.
+    if let (false, Some(lift)) = (legged, body.lift.as_ref()) {
+        let carried = [Grp::Head, Grp::Trunk, Grp::Pelvis, Grp::Upper(0), Grp::Fore(0), Grp::Hand(0), Grp::Upper(1), Grp::Fore(1), Grp::Hand(1)];
+        let f: f32 = -(masses.iter().filter(|m| carried.contains(&m.group)).map(|m| m.m * g_eff[2]).sum::<f32>() + hand_f[0][2] + hand_f[1][2]);
+        let in_range = (-1e-3..=rom.lift_max_m + 1e-3).contains(&pose.lift_m);
+        if !in_range {
+            out_of_range.push(format!("torso_lift {:.2} m > {:.2} m", pose.lift_m, rom.lift_max_m));
+        }
+        joints.push(KinJoint { name: "torso_lift".into(), segment: Segment::Leg, pos: hip_c, angle_deg: None, actuator: lift.name.into(), torque: f, peak: lift.force_n, cont: lift.force_n, ratio: f.abs() / lift.force_n.max(1e-3), effort: f.abs() / lift.force_n.max(1e-3), in_range, structural: false });
+    }
     for s in 0..2 {
-        joints.push(jnt(&format!("shoulder_{}", tag(s)), Segment::Arm, shoulders[s], Some(pose.shoulder_deg[s]), Some(&body.arm.shoulder), moment(shoulders[s], &arm_groups(s), &[s])[1], true));
-        joints.push(jnt(&format!("elbow_{}", tag(s)), Segment::Arm, elbows[s], Some(pose.elbow_deg[s]), Some(&body.arm.elbow), moment(elbows[s], &[Grp::Fore(s), Grp::Hand(s)], &[s])[1], true));
+        let abducted = pose.shoulder_abd_deg[s].abs() > 1e-6;
+        // About the arm's own flexion axis once it is turned out (+y otherwise).
+        let about = |m: V3| if abducted { dot(m, flex_axes[s]) } else { m[1] };
+        let m_sh = moment(shoulders[s], &arm_groups(s), &[s]);
+        joints.push(jnt(&format!("shoulder_{}", tag(s)), Segment::Arm, shoulders[s], Some(pose.shoulder_deg[s]), Some(&body.arm.shoulder), about(m_sh), true));
+        joints.push(jnt(&format!("elbow_{}", tag(s)), Segment::Arm, elbows[s], Some(pose.elbow_deg[s]), Some(&body.arm.elbow), about(moment(elbows[s], &[Grp::Fore(s), Grp::Hand(s)], &[s])), true));
+        // The abduction joint holds the turned-out arm about the trunk's fore-aft axis
+        // (listed only while an arm is turned out, so sagittal poses keep their joints).
+        if pose.shoulder_abd_deg[s].abs() > 0.5 {
+            joints.push(jnt(&format!("shoulder_abd_{}", tag(s)), Segment::Arm, shoulders[s], Some(pose.shoulder_abd_deg[s]), Some(&body.arm.shoulder), dot(m_sh, trunk_fwd), (rom.shoulder_abd[0] - 0.5..=rom.shoulder_abd[1] + 0.5).contains(&pose.shoulder_abd_deg[s])));
+        }
     }
 
     // ----- contacts and the lower joints -----
@@ -664,14 +808,24 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
                 let knee_m = add(cross(sub(cop3, knees[s]), f), moment(knees[s], &[Grp::Foot(s), Grp::Shank(s)], &[]));
                 // Top down at the hip: this leg's share of everything above the hips.
                 let hm = moment(hips[s], &above_hip, &[0, 1]);
-                (ankle_m[1], knee_m[1], hm[1] * share, if on.len() == 1 { hm[0] } else { 0.0 })
+                // Hip roll: in single support the leg carries the whole body's
+                // moment; in a wide double stance each foot pushes up outside its
+                // hip (bottom up: the ground reaction and the leg below the hip).
+                let roll = if on.len() == 1 {
+                    hm[0]
+                } else if wide {
+                    add(cross(sub(cop3, hips[s]), f), moment(hips[s], &[Grp::Thigh(s), Grp::Shank(s), Grp::Foot(s)], &[]))[0]
+                } else {
+                    0.0
+                };
+                (ankle_m[1], knee_m[1], hm[1] * share, roll)
             } else {
                 // A swing leg: the hip and the knee hold the leg itself.
                 (0.0, moment(knees[s], &[Grp::Shank(s), Grp::Foot(s)], &[])[1], moment(hips[s], &[Grp::Thigh(s), Grp::Shank(s), Grp::Foot(s)], &[])[1], 0.0)
             };
             let (dorsi, kflex, hflex) = leg_angles[s];
             joints.push(jnt(&format!("hip_pitch_{}", tag(s)), Segment::Leg, hips[s], Some(hflex), Some(&body.leg.knee), hip_t, hflex <= rom.hip_flex_max + 0.5));
-            joints.push(jnt(&format!("hip_roll_{}", tag(s)), Segment::Leg, hips[s], Some(0.0), Some(&body.leg.knee), roll_t, true));
+            joints.push(jnt(&format!("hip_roll_{}", tag(s)), Segment::Leg, hips[s], Some(hip_abd_deg[s]), Some(&body.leg.knee), roll_t, hip_abd_deg[s] <= HIP_ABD_MAX_DEG + 0.5));
             joints.push(jnt(&format!("knee_{}", tag(s)), Segment::Leg, knees[s], Some(kflex), Some(&body.leg.knee), knee_t, kflex <= rom.knee_max + 0.5));
             joints.push(jnt(&format!("ankle_{}", tag(s)), Segment::Foot, ankles[s], Some(dorsi), Some(&body.leg.ankle), ank_t, !stance[s] || dorsi <= rom.ankle_dorsi_max + 0.5));
         }
@@ -711,9 +865,7 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
     }
 
     // ----- margin and feasibility -----
-    let (hx, hy) = (0.5 * (support[1] - support[0]), 0.5 * (support[3] - support[2]));
-    let (cx, cy) = (0.5 * (support[0] + support[1]), 0.5 * (support[2] + support[3]));
-    let margin = (1.0 - (zmp[0] - cx).abs() / hx.max(1e-3)).min(1.0 - (zmp[1] - cy).abs() / hy.max(1e-3));
+    let margin = support_margin(support, zmp);
     let mut feasible = out_of_range.is_empty();
     let mut limiting = out_of_range.first().map(|r| format!("관절 범위: {r}"));
     if let Some(w) = joints.iter().filter(|j| !j.structural).max_by(|a, b| a.ratio.total_cmp(&b.ratio)) {
@@ -758,19 +910,20 @@ fn limb_box(name: &'static str, segment: Segment, a: V3, b: V3, w: f32) -> LinkB
 /// The palm and the fingers of one hand as boxes: the palm continues the
 /// forearm, the fingers spread across it and curl toward the palm side by the
 /// closure (each joint at `closure` of its flexion range, as `sim::closure_angles`
-/// for direct drive; segment lengths as `hand`).
-fn hand_boxes(side: usize, wrist: V3, dir: V3, closure: f32, body: &Body) -> Vec<LinkBox> {
+/// for direct drive; segment lengths as `hand`). `axis` is the arm's flexion
+/// axis (+y in the sagittal plane): the fingers spread along it.
+fn hand_boxes(side: usize, wrist: V3, dir: V3, axis: V3, closure: f32, body: &Body) -> Vec<LinkBox> {
     let n = u8::from(body.fingers) as usize;
     let mut v = vec![limb_box(if side == 0 { "palm_r" } else { "palm_l" }, Segment::Hand, wrist, add(wrist, scale(dir, 0.10)), 0.035)];
-    // The palm side faces forward of the forearm in the sagittal plane.
-    let palm_n = [-dir[2], 0.0, dir[0]];
+    // The palm side faces forward of the forearm in the arm's plane.
+    let palm_n = cross(dir, axis);
     let palm_n = if palm_n[0] < 0.0 { scale(palm_n, -1.0) } else { palm_n };
     let segs: &[f32] = if n == 2 { &[0.050, 0.035] } else { &[0.040, 0.025, 0.018] };
     let flex_max = [90.0f32, 100.0, 80.0];
     let base = add(wrist, scale(dir, 0.10));
     for k in 0..n {
         let off = -0.035 + 0.07 * k as f32 / (n.max(2) - 1) as f32;
-        let mut p = add(base, [0.0, off, 0.0]);
+        let mut p = add(base, scale(axis, off));
         let mut ang = 0.0f32;
         for (i, len) in segs.iter().enumerate() {
             ang += closure.clamp(0.0, 1.0) * flex_max[i.min(2)];

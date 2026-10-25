@@ -38,7 +38,7 @@ use crate::sim::{grasp as close_hand, ContactSource, GraspSetup, Payload};
 use crate::surface::Surface;
 
 use super::material::{self, ItemMaterial};
-use super::reach::{self, ReachGoal};
+use super::reach::{self, ReachGoal, ReachMode};
 use super::{min_jerk, ActEvent, ActKind, ActRollout, ActSample, Draw, Grip, Outcome, Part, SAMPLE_S};
 
 /// Closed-loop rise time of a joint position loop (0.35 / bandwidth, the 4 Hz
@@ -72,6 +72,23 @@ pub struct GraspInput<'a> {
     /// 1σ of the hand's aim error along each horizontal axis, metres.
     pub aim_sigma_m: f32,
     pub seed: u64,
+    /// Where the hand meets the object: in front, or beside the right foot
+    /// without facing it (`reach::ReachMode`).
+    pub mode: ReachMode,
+    /// Where the robot believes the object is minus where it is, in the base
+    /// frame (x forward, y left), metres: what its memory got wrong since it
+    /// last saw the object (odometry drift). Zero when it sees it as it reaches.
+    pub aim_offset_m: [f32; 2],
+    /// 1σ the robot itself gives that memory, metres (0 when it sees the object):
+    /// it expects its aim to be off by this as well.
+    pub memory_sigma_m: f32,
+}
+
+impl<'a> GraspInput<'a> {
+    /// A grasp of an object the robot sees in front of it (the pick before v0.7).
+    pub fn front(body: &'a Body, hand: &'a Hand, material: ItemMaterial, mass_kg: f32, size_m: [f32; 3], ground: Surface, two_arms: bool, cargo_kg: f32, aim_sigma_m: f32, seed: u64) -> GraspInput<'a> {
+        GraspInput { body, hand, material, mass_kg, size_m, ground, two_arms, cargo_kg, aim_sigma_m, seed, mode: ReachMode::Front, aim_offset_m: [0.0; 2], memory_sigma_m: 0.0 }
+    }
 }
 
 /// What the fingers can do on this object: total finger squeeze (no palm), contacts, finger joints.
@@ -139,30 +156,58 @@ pub fn arms_to(body: &Body, p: &KinPose, at: [f32; 2], two_arms: bool) -> KinPos
     out
 }
 
+/// `p` with the holding arms reaching the palm point `at` (x forward, y left,
+/// z up) by [`reach::arm_ik3`]: the right palm at `at`, the left (with both
+/// arms) at its mirror across the middle. A point past an arm's length is
+/// reached as far as the straight arm goes along the line to it, as in
+/// [`arms_to`].
+pub fn arms_to3(body: &Body, p: &KinPose, at: [f32; 3], two_arms: bool) -> KinPose {
+    let mut out = *p;
+    let sh = reach::shoulder_point(body, p);
+    let len = UPPER_ARM_M + FOREARM_M + kin::PALM_OFFSET_M - 0.002;
+    for &k in holding_arms(two_arms) {
+        let (sy, ty) = if k == 0 { (-SHOULDER_HALF_WIDTH_M, at[1]) } else { (SHOULDER_HALF_WIDTH_M, -at[1]) };
+        let s3 = [sh[0], sy, sh[1]];
+        let d = [at[0] - s3[0], ty - s3[1], at[2] - s3[2]];
+        let n = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-6);
+        let f = (len / n).min(1.0);
+        if let Some((sd, ed, ad)) = reach::arm_ik3(s3, [s3[0] + d[0] * f, s3[1] + d[1] * f, s3[2] + d[2] * f], p.trunk_deg(), k) {
+            out.shoulder_deg[k] = sd;
+            out.elbow_deg[k] = ed;
+            out.shoulder_abd_deg[k] = ad;
+        }
+    }
+    out
+}
+
 /// The path of a lift: the body straightens from `bottom` to `hold`'s over
 /// `rise_s` while the hand carries the load straight up from where it took it
 /// to the hold's height (the load stays over its spot, close to the body,
 /// instead of swinging out with the arms), then the arms bring it to `hold`
-/// over `curl_s`. Played backwards it sets a load down.
+/// over `curl_s`. Played backwards it sets a load down. An arm turned out at
+/// the bottom (a reach to the side, hands between the feet) is solved in
+/// three dimensions; a sagittal one as before.
 struct LiftPath {
     bottom: KinPose,
     top: KinPose,
     hold: KinPose,
-    from: [f32; 2],
+    from: [f32; 3],
     up_z: f32,
     two_arms: bool,
     rise_s: f32,
     curl_s: f32,
+    spatial: bool,
 }
 
 impl LiftPath {
     fn new(body: &Body, bottom: &KinPose, hold: &KinPose, two_arms: bool, rise_s: f32) -> LiftPath {
         let start = kin::solve_fast(body, bottom, &KinLoads::default()).hands[0];
         let end = kin::solve_fast(body, hold, &KinLoads::default()).hands[0];
-        let from = [start[0], start[2]];
-        let top = arms_to(body, &KinPose { closure: hold.closure, ..*hold }, [from[0], end[2]], two_arms);
+        let spatial = bottom.shoulder_abd_deg.iter().any(|a| a.abs() > 1e-6);
+        let held = KinPose { closure: hold.closure, ..*hold };
+        let top = if spatial { arms_to3(body, &held, [start[0], start[1], end[2]], two_arms) } else { arms_to(body, &held, [start[0], end[2]], two_arms) };
         let curl_s = reach::move_time(&kin::solve_fast(body, &top, &KinLoads::default()), &kin::solve_fast(body, hold, &KinLoads::default()));
-        LiftPath { bottom: *bottom, top, hold: *hold, from, up_z: end[2], two_arms, rise_s, curl_s }
+        LiftPath { bottom: *bottom, top, hold: *hold, from: start, up_z: end[2], two_arms, rise_s, curl_s, spatial }
     }
 
     fn duration(&self) -> f32 {
@@ -174,7 +219,12 @@ impl LiftPath {
         if t <= self.rise_s {
             let u = min_jerk((t / self.rise_s.max(1e-3)).clamp(0.0, 1.0));
             let p = reach::blend(body, &self.bottom, &self.top, u);
-            arms_to(body, &p, [self.from[0], self.from[1] + (self.up_z - self.from[1]) * u], self.two_arms)
+            let z = self.from[2] + (self.up_z - self.from[2]) * u;
+            if self.spatial {
+                arms_to3(body, &p, [self.from[0], self.from[1], z], self.two_arms)
+            } else {
+                arms_to(body, &p, [self.from[0], z], self.two_arms)
+            }
         } else {
             KinPose::lerp(&self.top, &self.hold, min_jerk(((t - self.rise_s) / self.curl_s.max(1e-3)).clamp(0.0, 1.0)))
         }
@@ -235,25 +285,48 @@ pub fn grasp(inp: &GraspInput) -> ActRollout {
     let mut notes = Vec::new();
     let mut metrics: Vec<(&'static str, f32)> = Vec::new();
     let half = [0.5 * inp.size_m[0], 0.5 * inp.size_m[2]];
-    let plan = reach::plan(body, &ReachGoal::ground_object(inp.size_m[1], inp.mass_kg, inp.two_arms, inp.cargo_kg));
+    let goal = ReachGoal::ground_object(inp.size_m[1], inp.mass_kg, inp.two_arms, inp.cargo_kg);
+    // In front: the bend, or a wide squat over a load the bend cannot hold. Beside the foot: the arm turned out.
+    let plan = match inp.mode {
+        ReachMode::Front => reach::plan_or_straddle(body, &goal, half[1]),
+        ReachMode::Side => reach::plan_side(body, &goal, half[1]),
+    };
     let stand = KinPose::stand(inp.cargo_kg);
     if !plan.ok {
-        s.push(body, 0.0, "reach", stand, KinLoads::default(), None, Some([reach::min_object_x(body, half[0]), 0.0, 0.5 * inp.size_m[1]]));
+        let at = if inp.mode == ReachMode::Side { [plan.object_x, plan.object_y, 0.5 * inp.size_m[1]] } else { [reach::min_object_x(body, half[0]), 0.0, 0.5 * inp.size_m[1]] };
+        s.push(body, 0.0, "reach", stand, KinLoads::default(), None, Some(at));
         let why = plan.reason_ko.clone().unwrap_or_default();
         s.events.push(ActEvent::new(0.0, "reach_fail", why.clone(), &[Part::Waist, Part::Hand, Part::FootJoints], Some(plan.lowest_palm_z), false));
         metrics.push(("lowest_palm_z", plan.lowest_palm_z));
-        return ActRollout { kind: ActKind::Grasp, samples: s.samples, events: s.events, outcome: Outcome::fail("reach_ground", why), duration_s: 0.0, metrics, notes };
+        let code = if inp.mode == ReachMode::Side { "reach_side" } else { "reach_ground" };
+        return ActRollout { kind: ActKind::Grasp, samples: s.samples, events: s.events, outcome: Outcome::fail(code, why), duration_s: 0.0, metrics, notes };
     }
     metrics.push(("lowest_palm_z", plan.lowest_palm_z));
+    // A load held between the feet takes both hands; a reach to the side, the right one.
+    let two_arms = match plan.approach {
+        "straddle" => true,
+        "side" => false,
+        _ => inp.two_arms,
+    };
+    if plan.approach != "front" {
+        metrics.push(("stance_out_m", plan.pose.stance_out_m));
+        metrics.push(("reach_y_m", plan.object_y));
+        metrics.push(("abduction_deg", plan.pose.shoulder_abd_deg[0]));
+    }
     let ox = plan.object_x;
-    let obj_ground = [ox, 0.0, 0.5 * inp.size_m[1]];
+    let obj_ground = [ox, plan.object_y, 0.5 * inp.size_m[1]];
     let mu = material::pad_on(inp.material);
     let mu_act = d.lognormal(mu.mean, mu.cov);
-    let aim = [inp.aim_sigma_m * d.normal(), inp.aim_sigma_m * d.normal()];
-    let per_hand_kg = if inp.two_arms { 0.5 * inp.mass_kg } else { inp.mass_kg };
+    // The hand goes where the robot believes the object is: its memory's error plus the camera's and the arm's.
+    let aim = [inp.aim_offset_m[0] + inp.aim_sigma_m * d.normal(), inp.aim_offset_m[1] + inp.aim_sigma_m * d.normal()];
+    if inp.memory_sigma_m > 0.0 || inp.aim_offset_m != [0.0; 2] {
+        metrics.push(("memory_offset_m", inp.aim_offset_m[0].hypot(inp.aim_offset_m[1])));
+        metrics.push(("memory_sigma_m", inp.memory_sigma_m));
+    }
+    let per_hand_kg = if two_arms { 0.5 * inp.mass_kg } else { inp.mass_kg };
     let cap = capacity(inp.hand, inp.size_m, per_hand_kg, mu.mean);
     // The controller expects the minimum-jerk lift's peak acceleration, 10/√3 · Δz / T².
-    let rise_dz = (kin::solve_fast(body, &hold_pose(inp.two_arms, inp.cargo_kg), &KinLoads::default()).hands[0][2] - plan.empty.hands[0][2]).max(0.05);
+    let rise_dz = (kin::solve_fast(body, &hold_pose(two_arms, inp.cargo_kg), &KinLoads::default()).hands[0][2] - plan.empty.hands[0][2]).max(0.05);
     let a_plan = MIN_JERK_ACC * rise_dz / (plan.rise_s * plan.rise_s);
     let grip_target = GRIP_SAFETY * per_hand_kg * (G + a_plan) / mu.mean.max(0.05);
     let grip = grip_target.min(cap.squeeze_n);
@@ -262,15 +335,18 @@ pub fn grasp(inp: &GraspInput) -> ActRollout {
     let rise_s = if a_room >= a_plan {
         plan.rise_s
     } else {
-        let t = if a_room > 1e-3 { (MIN_JERK_ACC * rise_dz / a_room).sqrt() } else { LIFT_SLOWEST_S };
-        notes.push(format!("목표 쥠 {:.0} N > 손가락 한계 {:.0} N: 한계로 쥐고 {:.1} s에 걸쳐 천천히 듦", grip_target, cap.squeeze_n, t.min(LIFT_SLOWEST_S)));
-        t.clamp(plan.rise_s, LIFT_SLOWEST_S)
+        // A plan already slower than that (a torso lift's travel) keeps its own pace.
+        let slowest = LIFT_SLOWEST_S.max(plan.rise_s);
+        let t = if a_room > 1e-3 { (MIN_JERK_ACC * rise_dz / a_room).sqrt() } else { slowest };
+        notes.push(format!("목표 쥠 {:.0} N > 손가락 한계 {:.0} N: 한계로 쥐고 {:.1} s에 걸쳐 천천히 듦", grip_target, cap.squeeze_n, t.clamp(plan.rise_s, slowest)));
+        t.clamp(plan.rise_s, slowest)
     };
     metrics.push(("lift_s", rise_s));
     // What the robot expects before it tries, from its own model: the palm lands
     // on the top face (the aim error against the half widths) and the pads'
     // friction holds the planned lift's peak load (their scatter).
-    let hit = |half: f32| if inp.aim_sigma_m > 1e-6 { super::erf(half / (inp.aim_sigma_m * std::f32::consts::SQRT_2)) } else { 1.0 };
+    let sigma_expect = inp.aim_sigma_m.hypot(inp.memory_sigma_m);
+    let hit = |half: f32| if sigma_expect > 1e-6 { super::erf(half / (sigma_expect * std::f32::consts::SQRT_2)) } else { 1.0 };
     let need_mu = per_hand_kg * (G + MIN_JERK_ACC * rise_dz / (rise_s * rise_s)) / grip.max(1e-3);
     let p_success = if cap.contacts >= 2 { hit(half[0]) * hit(half[1]) * super::lognormal_above(mu.mean, mu.cov, need_mu) } else { 0.0 };
     metrics.push(("p_success", p_success));
@@ -283,7 +359,12 @@ pub fn grasp(inp: &GraspInput) -> ActRollout {
         s.push(body, i as f32 * SAMPLE_S, "reach", reach::blend(body, &stand, &bottom, u), KinLoads::default(), None, Some(obj_ground));
     }
     let t_bottom = s.end();
-    s.events.push(ActEvent::new(t_bottom, "bend_bottom", format!("{} · 손바닥 {:.2} m", plan.strategy_ko, plan.empty.hands[0][2]), &[Part::Waist, Part::FootJoints, Part::Neck], Some(plan.loaded.margin), true));
+    let how = match plan.approach {
+        "side" => format!("오른팔 옆으로 {:.0}° 뻗음 (보지 않고) · ", plan.pose.shoulder_abd_deg[0]),
+        "straddle" => format!("발 {:.0} cm 벌려 물건을 사이에 · ", plan.pose.stance_out_m * 100.0),
+        _ => String::new(),
+    };
+    s.events.push(ActEvent::new(t_bottom, "bend_bottom", format!("{how}{} · 손바닥 {:.2} m", plan.strategy_ko, plan.empty.hands[0][2]), &[Part::Waist, Part::FootJoints, Part::Neck], Some(plan.loaded.margin), true));
 
     // 2. Close the fingers: on the object, or on air when the palm missed its top face.
     let w_close = inp.hand.fingers.first().map_or(std::f32::consts::TAU, |f| f.joints[0].max_speed);
@@ -345,7 +426,7 @@ pub fn grasp(inp: &GraspInput) -> ActRollout {
         if gr.slip_ratio < 1.0 && failed.is_none() {
             failed = Some(("grasp_slip", format!("들기 전에 미끄러짐: 마찰 {:.2} × 쥠 {:.0} N < 하중 {:.0} N", mu_act, grip, load), t));
         }
-        s.push(body, t, "load", KinPose { closure: 0.7, ..bottom }, KinLoads { hand_force: hand_force(inp.two_arms, [0.0, 0.0, -inp.mass_kg * G * u]), ..KinLoads::default() }, Some(gr), Some(obj_ground));
+        s.push(body, t, "load", KinPose { closure: 0.7, ..bottom }, KinLoads { hand_force: hand_force(two_arms, [0.0, 0.0, -inp.mass_kg * G * u]), ..KinLoads::default() }, Some(gr), Some(obj_ground));
     }
     let t_lift = s.end();
     metrics.push(("lift_off_s", t_lift - t_contact));
@@ -360,8 +441,8 @@ pub fn grasp(inp: &GraspInput) -> ActRollout {
     // 4. Rise with the object, then bring it up to the hold pose; the load is
     //    weight plus inertia. The controller keeps the load hanging under the
     //    shoulder while the body straightens, then curls it to the chest.
-    let hold = hold_pose(inp.two_arms, inp.cargo_kg);
-    let path = LiftPath::new(body, &bottom, &hold, inp.two_arms, rise_s);
+    let hold = hold_pose(two_arms, inp.cargo_kg);
+    let path = LiftPath::new(body, &bottom, &hold, two_arms, rise_s);
     let lift_s = path.duration();
     metrics.push(("curl_s", path.curl_s));
     let at = |t: f32| path.at(body, t);
@@ -381,17 +462,19 @@ pub fn grasp(inp: &GraspInput) -> ActRollout {
         let p_next = palm(((i + 1) as f32 / n as f32).min(1.0));
         let p_prev = prev.map(|x| x.0).unwrap_or(palm((i - 1) as f32 / n as f32));
         let dt = lift_s / n as f32;
-        let acc = [(p_next[0] - 2.0 * p[0] + p_prev[0]) / (dt * dt), 0.0, (p_next[2] - 2.0 * p[2] + p_prev[2]) / (dt * dt)];
+        // Across, only one hand's swing in from the side moves the object (two hands mirror each other).
+        let ay = if two_arms { 0.0 } else { (p_next[1] - 2.0 * p[1] + p_prev[1]) / (dt * dt) };
+        let acc = [(p_next[0] - 2.0 * p[0] + p_prev[0]) / (dt * dt), ay, (p_next[2] - 2.0 * p[2] + p_prev[2]) / (dt * dt)];
         prev = Some((p, acc));
-        let f_obj = [-inp.mass_kg * acc[0], 0.0, -inp.mass_kg * (G + acc[2])];
-        let load = per_hand_kg * ((G + acc[2]).powi(2) + acc[0] * acc[0]).sqrt();
+        let f_obj = [-inp.mass_kg * acc[0], -inp.mass_kg * acc[1], -inp.mass_kg * (G + acc[2])];
+        let load = per_hand_kg * ((G + acc[2]).powi(2) + acc[0] * acc[0] + acc[1] * acc[1]).sqrt();
         let gr = mk_grip(grip, load, 0.7 + 0.3 * u);
         slip_min = slip_min.min(gr.slip_ratio);
         let tw = if torsion(grip) > 1e-6 { load * lever / torsion(grip) } else { 99.0 };
         twist_max = twist_max.max(tw);
         let t = t_lift + i as f32 * dt;
         let pose = KinPose { closure: 0.7 + 0.3 * u, ..at(u * lift_s) };
-        let ok = s.push(body, t, "lift", pose, KinLoads { hand_force: hand_force(inp.two_arms, f_obj), ..KinLoads::default() }, Some(gr), Some([p[0], p[1], p[2] - 0.5 * inp.size_m[1] - reach::PALM_CLEARANCE_M]));
+        let ok = s.push(body, t, "lift", pose, KinLoads { hand_force: hand_force(two_arms, f_obj), ..KinLoads::default() }, Some(gr), Some([p[0], p[1], p[2] - 0.5 * inp.size_m[1] - reach::PALM_CLEARANCE_M]));
         if gr.slip_ratio < 1.0 {
             failed = Some(("grasp_slip", format!("들어 올리다 미끄러짐: 마찰 {:.2} × 쥠 {:.0} N < 하중 {:.0} N (가속 {:+.1} m/s²)", mu_act, grip, load, acc[2]), t));
             dropped_at = Some(p);
@@ -451,16 +534,16 @@ pub fn grasp(inp: &GraspInput) -> ActRollout {
     s.events.push(ActEvent::new(t_hold, "hold", format!("들어 올림 · 최소 미끄럼 여유 {:.2}", slip_min), &[Part::Hand, Part::Waist, Part::Neck], Some(slip_min), true));
 
     // 5. Stow it in the bay.
-    let bay = bay_pose(inp.two_arms, inp.cargo_kg);
-    let r_hold = kin::solve_fast(body, &hold, &KinLoads::holding(inp.mass_kg, inp.two_arms, 0.0));
-    let r_bay = kin::solve_fast(body, &bay, &KinLoads::holding(inp.mass_kg, inp.two_arms, 0.0));
+    let bay = bay_pose(two_arms, inp.cargo_kg);
+    let r_hold = kin::solve_fast(body, &hold, &KinLoads::holding(inp.mass_kg, two_arms, 0.0));
+    let r_bay = kin::solve_fast(body, &bay, &KinLoads::holding(inp.mass_kg, two_arms, 0.0));
     let t_stow = reach::move_time(&r_hold, &r_bay);
     let n = (t_stow / SAMPLE_S).ceil().max(1.0) as usize;
     for i in 1..=n {
         let u = min_jerk(i as f32 / n as f32);
         let pose = KinPose::lerp(&hold, &bay, u);
         let p = kin::solve_fast(body, &pose, &KinLoads::default()).hands[0];
-        s.push(body, t_hold + i as f32 * SAMPLE_S, "stow", pose, KinLoads::holding(inp.mass_kg, inp.two_arms, 0.0), Some(mk_grip(grip, per_hand_kg * G, 1.0)), Some([p[0], p[1], p[2] - 0.5 * inp.size_m[1]]));
+        s.push(body, t_hold + i as f32 * SAMPLE_S, "stow", pose, KinLoads::holding(inp.mass_kg, two_arms, 0.0), Some(mk_grip(grip, per_hand_kg * G, 1.0)), Some([p[0], p[1], p[2] - 0.5 * inp.size_m[1]]));
     }
     let t_open = s.end();
     let (f_bay, _) = material::impact((2.0 * G * BAY_DROP_M).sqrt(), inp.mass_kg, material::ground_stiffness(Surface::Firm));
@@ -597,7 +680,7 @@ mod tests {
     }
 
     fn input<'a>(b: &'a Body, h: &'a Hand, seed: u64, sigma: f32) -> GraspInput<'a> {
-        GraspInput { body: b, hand: h, material: ItemMaterial::Wood, mass_kg: 2.4, size_m: [0.15, 0.15, 0.15], ground: Surface::Gravel, two_arms: false, cargo_kg: 0.0, aim_sigma_m: sigma, seed }
+        GraspInput::front(b, h, ItemMaterial::Wood, 2.4, [0.15, 0.15, 0.15], Surface::Gravel, false, 0.0, sigma, seed)
     }
 
     #[test]
@@ -656,7 +739,7 @@ mod tests {
                     let mut ok = 0;
                     let mut codes = std::collections::BTreeMap::new();
                     for seed in 0..100u64 {
-                        let r = grasp(&GraspInput { body: &b, hand: &h, material: mat, mass_kg: kg, size_m: [size; 3], ground: Surface::Gravel, two_arms: false, cargo_kg: 0.0, aim_sigma_m: sigma, seed });
+                        let r = grasp(&GraspInput::front(&b, &h, mat, kg, [size; 3], Surface::Gravel, false, 0.0, sigma, seed));
                         if r.outcome.ok { ok += 1 } else { *codes.entry(r.outcome.code.unwrap_or("?")).or_insert(0) += 1 }
                         if seed == 0 {
                             println!("[GRASP1] {fingers:?} {mat:?} σ{sigma}: {:?} dur {:.2} gf/lf {:?} slip {:?} twist {:?} grip {:?} cap {:?} mu {:?} notes {:?}", r.outcome.code, r.duration_s, r.metric("gf_lf_hold"), r.metric("slip_ratio_min"), r.metric("twist_ratio_max"), r.metric("grip_n"), r.metric("squeeze_cap_n"), r.metric("mu"), r.notes);

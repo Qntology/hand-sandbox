@@ -14,7 +14,7 @@
 //! they do there, and are handled the same way (`crate::driver`): a grasp is
 //! tried again, a body that cannot reach the ground pushes, a fall is waited out.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use hand_quest::{QuestResult, State};
 use hand_sds::{Level, Scope, Track};
@@ -27,7 +27,8 @@ use world_sim::world::{AMOUNT_EPS, DELIVER_REACH_M, EYE_HEIGHT_M, MINE_REACH_M, 
 use world_sim::{amount_text, Action, ActionError, ItemKind, NodeKind, TimedEvent, WorldEvent};
 
 use crate::cargo::{self, CargoAction, CargoCtx};
-use crate::driver::{action_error_ko, MAX_FALLS, MAX_GRASP_TRIES, MAX_PUSH_TRIES};
+use crate::driver::{action_error_ko, MAX_FALLS, MAX_GRASP_TRIES, MAX_PUSH_TRIES, PLACE_REACH_M};
+use crate::vision::{in_view, memory_ok, tilt_to_see, Memory};
 
 /// A node counts as the one the ML logic meant when it is this close to the
 /// estimated target point (the estimate is the visible surface; the node's
@@ -105,6 +106,15 @@ pub(crate) struct MlTask {
     /// The piece being pushed and the pushes that lost it.
     push: Option<(u32, u32)>,
     last_pick: Option<u32>,
+    /// Where the robot believes each piece it knows of lies (its believed frame).
+    mem: HashMap<u32, Memory>,
+    /// Decisions made without a keyframe in a row (the ML tracks off), and in all.
+    blind_run: u32,
+    pub blind: u32,
+    /// Ticks to the next look at the place on the way there.
+    look_cd: u32,
+    /// The hand did not find the pile once on this delivery: it looked and walked up close.
+    deliver_retry: bool,
 }
 
 enum Flow {
@@ -153,7 +163,9 @@ impl Runtime {
         };
         for t in &list {
             let item = ItemKind::from_id(&t.resource).ok_or_else(|| ("unknown_target".to_string(), format!("'{}'은(는) 이 월드에 없는 자원입니다", t.resource)))?;
-            targets.push(MlTarget { resource: t.resource.clone(), item, wanted: t.quantity.max(1), picked: 0.0, label_ko: item.spec().label_ko.into(), labels: self.ml.source_labels_for(&t.resource) });
+            // A mined item is found by the node that yields it; a placed one by itself.
+            let labels = if item.from_node() { self.ml.source_labels_for(&t.resource) } else { vec![t.resource.clone()] };
+            targets.push(MlTarget { resource: t.resource.clone(), item, wanted: t.quantity.max(1), picked: 0.0, label_ko: item.spec().label_ko.into(), labels });
         }
         let n_steps = self.quests.get(quest).map_or(0, |q| q.steps.len());
         let phase = match kind {
@@ -208,6 +220,11 @@ impl Runtime {
             falls: 0,
             push: None,
             last_pick: None,
+            mem: HashMap::new(),
+            blind_run: 0,
+            blind: 0,
+            look_cd: 0,
+            deliver_retry: false,
         })
     }
 
@@ -233,7 +250,17 @@ impl Runtime {
                 }
             }
         }
-        let Some(mut t) = self.ml_task.take() else { return };
+        let Some(mut t) = self.ml_task.take() else {
+            self.apply_fix();
+            return;
+        };
+        // A fix of the pose from the last step's looks: the memories move with it.
+        if let Some(f) = self.apply_fix() {
+            let rate = self.drift_rate();
+            for m in t.mem.values_mut() {
+                (m.x, m.z) = f.shift(m.x, m.z, m.odo_m, rate);
+            }
+        }
         match self.ml_step(&mut t, events) {
             Flow::Continue => self.ml_task = Some(t),
             Flow::Done => self.ml_end(t, None),
@@ -262,7 +289,7 @@ impl Runtime {
     }
 
     fn ml_issue(&mut self, t: &mut MlTask, a: Action) -> Result<(), ActionError> {
-        match self.world.command(a.clone()) {
+        match self.world.command(self.to_world(a.clone())) {
             Ok(ev) => {
                 self.log_world_events(&ev);
                 t.running = true;
@@ -300,6 +327,7 @@ impl Runtime {
                     }
                 }
                 WorldEvent::Delivered { item, amount, .. } => {
+                    t.deliver_retry = false;
                     let id = item.id().to_string();
                     match t.delivered.iter_mut().find(|(k, _)| *k == id) {
                         Some(e) => e.1 += *amount,
@@ -320,7 +348,14 @@ impl Runtime {
         }
         if t.running {
             match t.done.take() {
-                None => return Flow::Continue,
+                None => {
+                    // On the way to the place (carrying there, or a trip out before a hand-over): near it a look at its flag fixes the pose.
+                    let to_place = matches!(t.phase, MlPhase::Carry | MlPhase::Goto) || matches!(t.queue.front(), Some(Action::Deliver { .. }));
+                    if let Some((x, z)) = t.destination.as_deref().and_then(|k| self.world.waypoint_by_key(k)).map(|w| (w.x, w.z)).filter(|_| to_place) {
+                        self.place_look(&mut t.look_cd, x, z);
+                    }
+                    return Flow::Continue;
+                }
                 Some((ok, reason)) => {
                     t.running = false;
                     if !ok {
@@ -343,6 +378,15 @@ impl Runtime {
                         }
                         // A grasp that slipped or missed: the same piece again, then leave it.
                         if t.phase == MlPhase::Collect && (why.starts_with("grasp") || why == "lift_overload") {
+                            // The hand closed on air: the memory was off by more than half the top face, so the next try looks first.
+                            if why == "grasp_missed" {
+                                if let Some(id) = t.last_pick {
+                                    if let (Some(m), Some(d)) = (t.mem.get_mut(&id), self.world.drop_item(id)) {
+                                        let size = d.kind.spec().piece_size_m(d.amount);
+                                        m.sigma0_m = m.sigma0_m.max(0.5 * size[0].min(size[2]));
+                                    }
+                                }
+                            }
                             t.grasp_tries += 1;
                             t.queue.clear();
                             if t.grasp_tries < MAX_GRASP_TRIES {
@@ -410,6 +454,27 @@ impl Runtime {
                 Err(ActionError::CapacityExceeded { carried_kg, item_kg, capacity_kg }) => {
                     fail("capacity_exceeded", format!("적재 한도를 넘습니다 ({carried_kg:.1} + {item_kg:.1} > {capacity_kg:.1} kg)"))
                 }
+                // The hand did not find the pile where the robot believed it stood in reach: it looks at the place, walks up close and hands over again.
+                Err(ActionError::OutOfReach { .. }) if matches!(a, Action::Deliver { .. }) && !t.deliver_retry => {
+                    t.deliver_retry = true;
+                    let _ = self.scan_now("place");
+                    match t.destination.as_deref().and_then(|k| self.world.waypoint_by_key(k)).map(|w| (w.x, w.z)) {
+                        Some((x, z)) => {
+                            self.log("quest", Level::Warn, "[ML] 목적지에 손이 닿지 않음 — 보고 더 다가감", None);
+                            t.queue.push_front(a);
+                            t.queue.push_front(Action::MoveTo { x, z, reach_m: PLACE_REACH_M - 0.5 });
+                            Flow::Continue
+                        }
+                        None => fail("unknown_target", "목적지를 찾을 수 없습니다"),
+                    }
+                }
+                // A spot it cannot stand on (its belief drifted onto a slope): from the nearest one in reach of it.
+                Err(ActionError::NoPath) if matches!(a, Action::MoveTo { reach_m, .. } if reach_m < PICKUP_REACH_M - 0.1) => {
+                    if let Action::MoveTo { x, z, .. } = a {
+                        t.queue.push_front(Action::MoveTo { x, z, reach_m: PICKUP_REACH_M - 0.1 });
+                    }
+                    Flow::Continue
+                }
                 Err(e) => fail(e.code(), action_error_ko(&e)),
             };
         }
@@ -427,6 +492,9 @@ impl Runtime {
         if self.world.time_s - t.look_since_s > self.cfg.locate_timeout_s {
             let name = t.target().label_ko.clone();
             return fail("locate_timeout", format!("[ML] {name}을(를) {:.0}초 안에 찾지 못했습니다", self.cfg.locate_timeout_s));
+        }
+        if let Some(flow) = self.ml_blind(t) {
+            return flow;
         }
         t.decisions += 1;
         if t.decisions > self.test_cfg.max_ml_decisions {
@@ -597,24 +665,101 @@ impl Runtime {
         Flow::Continue
     }
 
+    /// Between keyframes the ML tracks may stay off: with a good fix the
+    /// decision moves on the forecast alone (`Decider::predict`), while what
+    /// the robot's drift adds since the last keyframe keeps the target's 2σ
+    /// inside the arrival reach, and never twice in a row (the next hop looks
+    /// again). `None`: capture a keyframe.
+    fn ml_blind(&mut self, t: &mut MlTask) -> Option<Flow> {
+        if !self.cfg.vision.intermittent || t.blind_run >= 1 || !t.fixed {
+            t.blind_run = 0;
+            return None;
+        }
+        let rate = self.drift_rate();
+        let since = t.decider.fix_sigma_m()?;
+        let hop = t.decider.cfg.hop_max_m;
+        let drift = Memory::seen(0.0, 0.0, 0.0, 0.0, 0).sigma_m(hop, rate);
+        if self.cfg.vision.sigmas * since.hypot(drift) > t.decider.cfg.reach_m {
+            t.blind_run = 0;
+            return None;
+        }
+        let pose = crate::record::odometry(&self.world);
+        let ttm = self.gates.ttm();
+        let tp = ttm.as_deref().map(TtmPredictor);
+        let extra: Vec<&dyn Predictor> = tp.iter().map(|p| p as &dyn Predictor).collect();
+        let rep = t.decider.predict(&pose, &extra, drift)?;
+        t.blind_run += 1;
+        t.blind += 1;
+        t.decisions += 1;
+        let what = rep.estimate.as_ref().map(|e| format!("{:.1},{:.1}", e.x, e.z)).unwrap_or_default();
+        self.note_look("blind", format!("ML {what}"), rep.estimate.as_ref().map(|e| e.sigma_m), None, None);
+        self.log("quest", Level::Info, format!("[ML] {}", rep.note), None);
+        match rep.decision {
+            Decision::Approach { to, face, .. } => {
+                t.queue.push_back(Action::MoveTo { x: to.0, z: to.1, reach_m: 0.3 });
+                t.queue.push_back(Action::Face { x: face.0, z: face.1 });
+                Some(Flow::Continue)
+            }
+            Decision::Arrive { at } => Some(self.ml_arrive(t, at)),
+            _ => None,
+        }
+    }
+
     fn ml_arrive(&mut self, t: &mut MlTask, at: (f32, f32)) -> Flow {
+        // A placed item: the hand feels for it where the decision put it.
+        if !t.target().item.from_node() {
+            let item = t.target().item;
+            return match self.touch_piece(at, item) {
+                Some(piece) => {
+                    t.arrive_tries = 0;
+                    t.touch_ok += 1;
+                    t.mem.insert(piece, Memory::seen(at.0, at.1, t.decider.fix_sigma_m().unwrap_or(0.1), self.world.odom.travelled_m, self.world.tick));
+                    t.decider.reset();
+                    self.ml.reset();
+                    t.fixed = false;
+                    t.drops = vec![piece];
+                    t.drop_idx = 0;
+                    self.ml_goto(t, MlPhase::Collect, "");
+                    self.mark_executed(t, format!("접촉 d{piece} → 줍기"), true);
+                    Flow::Continue
+                }
+                None if t.arrive_tries < 2 => {
+                    t.arrive_tries += 1;
+                    t.queue.push_back(Action::MoveTo { x: at.0, z: at.1, reach_m: 0.4 });
+                    Flow::Continue
+                }
+                None => {
+                    t.arrive_tries = 0;
+                    t.decider.reset();
+                    self.ml.reset();
+                    t.fixed = false;
+                    t.wasted += 1;
+                    self.log("vision", Level::Warn, "[ML] 추정 위치에 손에 닿는 물건이 없음: 다시 탐색", None);
+                    Flow::Continue
+                }
+            };
+        }
         // Touch: of the nodes within reach of the hand, the one nearest to
         // where the ML logic placed the target (the hand reaches toward what
-        // was seen, not toward whatever happens to be closest).
+        // was seen, not toward whatever happens to be closest; it goes where
+        // the robot believes that is).
         let (ax, az) = (self.world.agent.x, self.world.agent.z);
+        let at_w = self.world.true_of(at.0, at.1);
         let near = self
             .world
             .nodes
             .iter()
             .filter(|n| (n.x - ax).hypot(n.z - az) <= MINE_REACH_M)
-            .map(|n| (n.id, n.x, n.z, (n.x - at.0).hypot(n.z - at.1)))
+            .map(|n| (n.id, n.x, n.z, (n.x - at_w.0).hypot(n.z - at_w.1)))
             .filter(|n| n.3 <= TOUCH_FROM_ESTIMATE_M)
             .min_by(|a, b| a.3.total_cmp(&b.3));
         match near {
             Some((id, x, z, _)) => {
                 t.arrive_tries = 0;
                 self.ml_goto(t, MlPhase::Mine, "");
-                t.queue.push_back(Action::Face { x, z });
+                // Face what the hand found (felt there, so its place relative to the robot is known).
+                let (fx, fz) = self.world.belief_of(x, z);
+                t.queue.push_back(Action::Face { x: fx, z: fz });
                 t.queue.push_back(Action::Mine { node: id });
                 self.mark_executed(t, format!("접촉 n{id} → 채취"), true);
                 Flow::Continue
@@ -656,6 +801,14 @@ impl Runtime {
             t.touch_ok += 1;
             t.drops = drops.iter().filter_map(|d| d.get(1..)?.parse().ok()).filter(|id| self.world.drop_item(*id).map_or(false, |d| d.kind == want)).collect();
             t.drop_idx = 0;
+            // It sees them fall: their places go into memory, in its believed frame.
+            let sigma = self.world.aim_sigma_m();
+            for &id in &t.drops {
+                if let Some(d) = self.world.drop_item(id) {
+                    let (x, z) = self.world.belief_of(d.x, d.z);
+                    t.mem.insert(id, Memory::seen(x, z, sigma, self.world.odom.travelled_m, self.world.tick));
+                }
+            }
             self.ml_goto(t, MlPhase::Collect, "");
         } else {
             t.touch_miss += 1;
@@ -757,9 +910,13 @@ impl Runtime {
             t.drop_idx += 1;
             return Flow::Continue;
         };
-        let dist = (d.x - self.world.agent.x).hypot(d.z - self.world.agent.z);
+        let m = *t.mem.entry(id).or_insert_with(|| {
+            let (x, z) = self.world.belief_of(d.x, d.z);
+            Memory::seen(x, z, self.world.aim_sigma_m(), self.world.odom.travelled_m, self.world.tick)
+        });
+        let dist = self.dist_me(m.x, m.z);
         if dist > PICKUP_REACH_M - 0.1 {
-            t.queue.push_back(Action::MoveTo { x: d.x, z: d.z, reach_m: 0.4 });
+            t.queue.push_back(Action::MoveTo { x: m.x, z: m.z, reach_m: 0.4 });
             return Flow::Continue;
         }
         let dest = t.destination.as_deref().and_then(|k| self.world.waypoint_by_key(k)).map(|w| (w.id, w.x, w.z));
@@ -780,7 +937,28 @@ impl Runtime {
             CargoAction::Take => {
                 t.drop_idx += 1;
                 t.last_pick = Some(id);
-                t.queue.push_back(Action::PickUp { drop: id });
+                // The hand goes where memory says, seen or not from here; a memory too unsure for it
+                // (2σ wider than half the top face) is refreshed by a glance at the spot when the robot can see it.
+                let (rate, odo) = (self.drift_rate(), self.world.odom.travelled_m);
+                let size = d.kind.spec().piece_size_m(d.amount);
+                let mut m = m;
+                if !memory_ok(m.sigma_m(odo, rate), 0.5 * size[0].min(size[2]), &self.cfg.vision) {
+                    if let Some(tilt) = tilt_to_see(&self.cam, EYE_HEIGHT_M, self.me(), m.x, m.z) {
+                        if self.scan_tilted("glance", tilt).is_ok() {
+                            if let Some((fused, innov)) = self.refresh_memory(&m, d.kind, odo) {
+                                let before = m.sigma_m(odo, rate);
+                                m = fused;
+                                t.mem.insert(id, m);
+                                self.note_look("glance", format!("ML d{id}"), Some(before), Some(m.sigma_m(odo, rate)), Some(innov));
+                            }
+                        }
+                    }
+                }
+                let sigma = m.sigma_m(odo, rate);
+                if !in_view(&self.cam, EYE_HEIGHT_M, self.me(), m.x, m.z) {
+                    self.note_look("blind", format!("ML d{id}"), Some(sigma), None, None);
+                }
+                t.queue.push_back(Action::PickUp { drop: id, aim: Some((m.x, m.z)), side: false, memory_sigma_m: sigma });
             }
             CargoAction::Split { portion } => t.queue.push_back(Action::Split { drop: id, portion }),
             CargoAction::Shuttle => {
@@ -795,7 +973,9 @@ impl Runtime {
                         t.queue.push_back(Action::Deliver { waypoint: wid, item: Some(x.item) });
                     }
                 }
-                t.queue.push_back(Action::MoveTo { x: d.x, z: d.z, reach_m: 0.4 });
+                // Back to where it stands now, within the hand's reach of the rest.
+                let (sx, sz, _) = self.me();
+                t.queue.push_back(Action::MoveTo { x: sx, z: sz, reach_m: 0.4 });
             }
             CargoAction::Refuse => return fail(dec.code.unwrap_or("lift_overload"), format!("[ML] {}", dec.summary_ko)),
         }
@@ -812,7 +992,9 @@ impl Runtime {
             t.drop_idx += 1;
             return Flow::Continue;
         };
-        if (d.x - wx).hypot(d.z - wz) <= DELIVER_REACH_M {
+        // The piece against the bumper: its place relative to the robot is known by touch.
+        let (px, pz) = self.world.belief_of(d.x, d.z);
+        if (px - wx).hypot(pz - wz) <= DELIVER_REACH_M {
             let mut ev = Vec::new();
             if let Some(a) = self.world.stock_pushed(id, wid, &mut ev) {
                 self.log_world_events(&ev);
@@ -824,16 +1006,19 @@ impl Runtime {
                     Some(e) => e.1 += a,
                     None => t.delivered.push((k, a)),
                 }
+                t.push = None;
+                t.drop_idx += 1;
+                return Flow::Continue;
             }
-            t.push = None;
-            t.drop_idx += 1;
-            return Flow::Continue;
         }
-        let (_, (lx, lz, yaw)) = match self.world.push_route(id, wx, wz) {
+        let (tx, tz) = self.world.true_of(wx, wz);
+        let (_, (lx, lz, yaw)) = match self.world.push_route(id, tx, tz) {
             Ok(r) => r,
             Err(e) => return fail(e.code(), format!("[ML] 밀 수 없습니다: {}", action_error_ko(&e))),
         };
-        if (lx - self.world.agent.x).hypot(lz - self.world.agent.z) > world_sim::world::PUSH_START_SLACK_M {
+        let (lx, lz) = self.world.belief_of(lx, lz);
+        let yaw = yaw + (self.me().2 - self.world.agent.yaw);
+        if self.dist_me(lx, lz) > world_sim::world::PUSH_START_SLACK_M {
             t.queue.push_back(Action::MoveTo { x: lx, z: lz, reach_m: 0.36 });
         }
         t.queue.push_back(Action::Turn { yaw_deg: yaw.to_degrees() });
@@ -845,7 +1030,7 @@ impl Runtime {
         let Some(dest) = t.destination.clone() else { return Flow::Done };
         let Some((x, z)) = self.world.waypoint_by_key(&dest).map(|w| (w.x, w.z)) else { return fail("unknown_target", "목적지를 찾을 수 없습니다") };
         let reach = DELIVER_REACH_M - 0.5;
-        if (x - self.world.agent.x).hypot(z - self.world.agent.z) <= reach + 0.2 {
+        if self.dist_me(x, z) <= reach + 0.2 {
             if t.phase == MlPhase::Goto && t.kind == "drop" {
                 self.ml_goto(t, MlPhase::Unload, "");
                 return Flow::Continue;

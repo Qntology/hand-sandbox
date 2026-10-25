@@ -139,6 +139,24 @@ fn a_wheeled_body_pushes_what_it_cannot_reach() {
 }
 
 #[test]
+fn a_wheeled_body_with_a_torso_lift_picks_the_log_up_from_the_floor() {
+    // The same quest on the wheeled preset with a torso lift and the pro waist
+    // pitch: the carriage slides down the mast and the trunk leans over the
+    // bumper, so the hands take the log instead of the bumper pushing it.
+    let cfg = RuntimeConfig { seed: 7, noise: NoiseCfg::none(), body: hand_core::BodyPlan::named("wheel_lift").unwrap(), ..RuntimeConfig::default() };
+    let mut rt = Runtime::new(cfg, LEXICON, None).expect("runtime");
+    assert_eq!(rt.world().hand.base.kind, BaseKind::Wheel);
+    let q = run_command(&mut rt, "원목 1개 캐줘", 40_000);
+    assert_done(&rt, &q);
+    assert_eq!(rt.world().carried_count(ItemKind::Log), 1, "the log is in the bay");
+    let log = quest_log(&rt);
+    assert!(!log.contains("범퍼로 밀어"), "{log}");
+    // The pick lowered the torso: the grasp's bend says so.
+    let world_log = rt.log_tail(0, 5000, None).0.iter().filter(|l| l.cat == "world").map(|l| l.msg.clone()).collect::<Vec<_>>().join("\n");
+    assert!(world_log.contains("몸통을 내리"), "{world_log}");
+}
+
+#[test]
 fn going_to_a_place_ends_within_reach_of_it() {
     let mut rt = runtime(7, NoiseCfg::none());
     let q = run_command(&mut rt, "창고로 가", 30_000);
@@ -310,7 +328,11 @@ fn under_injected_errors_the_gates_cut_wasted_work() {
         off.done, off.runs, off.wasted, off.ticks, off.raw_precision, off.gated_precision, off.raw_recall, off.gated_recall
     );
     assert_eq!(on.done, on.runs, "every run finishes with the gates on");
-    assert!(off.wasted >= 4, "the injected errors must cost something without gates, got {}", off.wasted);
+    // The look pattern (v0.7) takes about half the scans the camera used to,
+    // so fewer phantoms and look-alikes reach the gates: 3–4 wasted actions here
+    // with the gates off. With the camera always on, exact odometry and no
+    // parcels (v0.6's setting) the same batch still wastes 7 off and 0 on.
+    assert!(off.wasted >= 2, "the injected errors must cost something without gates, got {}", off.wasted);
     assert!(on.wasted * 2 <= off.wasted, "gates on wasted {} vs off {}", on.wasted, off.wasted);
     assert!(on.gated_precision > on.raw_precision + 0.05, "gated {:.2} vs raw {:.2}", on.gated_precision, on.raw_precision);
     assert!(on.gated_recall <= on.raw_recall + 1e-9, "gating can only lose detections, never add them");

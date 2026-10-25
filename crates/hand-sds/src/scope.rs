@@ -40,10 +40,14 @@ pub enum Track {
     /// each body part, against research references where they exist, and the
     /// calibration of the success the action predicted.
     Act,
+    /// Spatial memory while the camera is off: how far a remembered position
+    /// had drifted when it was seen again (per metre travelled), and how the
+    /// predicted spread of a memory compared with what the next look showed.
+    Memory,
 }
 
 impl Track {
-    pub const ALL: [Track; 13] = [
+    pub const ALL: [Track; 14] = [
         Track::Vision,
         Track::Search,
         Track::Motion,
@@ -57,6 +61,7 @@ impl Track {
         Track::Effort,
         Track::Quest,
         Track::Act,
+        Track::Memory,
     ];
 
     /// The four ML keyframe tracks, in pipeline order.
@@ -77,6 +82,7 @@ impl Track {
             Track::Effort => "effort",
             Track::Quest => "quest",
             Track::Act => "act",
+            Track::Memory => "memory",
         }
     }
 
@@ -100,6 +106,8 @@ impl Track {
             Track::Quest => (4, 3, 6),
             // One observation per action (a pick, a push, a walked edge).
             Track::Act => (6, 4, 8),
+            // One observation per look that found a remembered target again.
+            Track::Memory => (6, 4, 8),
         }
     }
 
@@ -116,6 +124,7 @@ impl Track {
             Track::Depth | Track::Locate | Track::Tracker | Track::Decide | Track::Fusion => Ledger::Ml,
             Track::Balance | Track::Effort => Ledger::Body,
             Track::Act => Ledger::Act,
+            Track::Memory => Ledger::Perception,
         }
     }
 }
