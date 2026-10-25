@@ -26,6 +26,9 @@ serde_json = { workspace = true }
 image = { workspace = true, features = ["jpeg", "png"] }
 base64 = "0.22"
 tokio = { workspace = true }
+# Model downloads from Hugging Face (rustls, as object_store already builds it) and their check.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
+sha2 = "0.10"
 
 [features]
 default = []

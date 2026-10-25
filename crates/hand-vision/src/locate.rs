@@ -197,7 +197,7 @@ impl SemanticLocator for SiglipLocator {
     }
 
     fn device(&self) -> String {
-        format!("{:?}", self.model.device()).to_lowercase()
+        hand_ml::device_label(self.model.device())
     }
 
     fn locate(&mut self, rgb: &Rgb, labels: &[LabelPrompt]) -> Result<Vec<SemanticPoint>> {

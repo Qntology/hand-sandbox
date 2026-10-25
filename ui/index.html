@@ -94,7 +94,7 @@
 
         <!-- ④ 사전·모델 -->
         <div class="panel-section-header collapsed" data-section="secModel" role="button" tabindex="0" aria-expanded="false" aria-controls="secModel">
-          <span class="sec-title"><span class="step-no">4</span><span class="sec-name">사전 · 모델</span><span class="help" tabindex="0" data-tip="연산 장치를 고르고 SigLIP2·TTM·명령 임베더가 어떤 모드로 도는지 봅니다. 모드는 인식 실행·시계열 조회·명령 실행 때 갱신됩니다.">?</span></span>
+          <span class="sec-title"><span class="step-no">4</span><span class="sec-name">사전 · 모델</span><span class="help" tabindex="0" data-tip="연산 장치를 고르고 필수 모델 네 개(SigLIP2 · TTM · TIPSv2 · SAM)를 받고·지우고·불러옵니다. 네 모델이 모두 장치에 올라가기 전에는 시뮬레이터가 실행되지 않습니다(대역 모델 없음).">?</span></span>
           <span class="step-sum" id="sum-model"></span><span class="chevron" aria-hidden="true">▼</span>
         </div>
         <div class="panel-section-body collapsed" id="secModel">
@@ -105,13 +105,13 @@
           <div class="status-line"><span class="k">마스크 (SAM)</span><span class="v" id="model-mask">미확인</span></div>
           <div class="status-line"><span class="k">명령 임베더</span><span class="v" id="model-embed">미확인</span></div>
           <div class="status-line"><span class="k">SDS 레시피</span><span class="v" id="model-sds">미확인</span></div>
+          <div class="ct-sec model-sec">필수 모델 (받기 · 삭제)</div>
+          <div class="model-list" id="model-list"></div>
+          <p class="hint model-summary" id="model-dl-summary" role="status" aria-live="polite"></p>
           <div class="btn-row">
-            <button type="button" class="btn btn-sm btn-outline" id="model-siglip-toggle" aria-pressed="false" title="월드 스크린샷 타일을 SigLIP2 로 임베딩해 인식합니다. 처음에는 모델을 불러오고 사전 문구를 임베딩하느라 시간이 걸립니다.">SigLIP2 인식 켜기</button>
-            <button type="button" class="btn btn-sm btn-outline" id="model-ttm-toggle" aria-pressed="false" title="시계열 예측 융합에 Granite TTM 을 더합니다. 가중치 폴더가 필요합니다.">TTM 켜기</button>
-          </div>
-          <div class="btn-row">
-            <button type="button" class="btn btn-sm btn-outline" id="model-tips-toggle" aria-pressed="false" title="통합 테스트의 ML 깊이를 TIPSv2-B/14 DPT 로 계산합니다(선택한 연산 장치, 키프레임 일괄 처리). models/tipsv2-b14-dpt 가 필요합니다.">TIPS 깊이 켜기</button>
-            <button type="button" class="btn btn-sm btn-outline" id="model-sam-toggle" aria-pressed="false" title="마스크 추적을 SAM(MobileSAM 또는 ViT-B)으로 합니다. 키프레임마다 이미지 인코더를 한 번만 돌리고 프롬프트는 한 번에 디코딩합니다. models/sam 이 필요합니다.">SAM 마스크 켜기</button>
+            <button type="button" class="btn btn-sm" id="model-get-all" title="빠진 파일을 Hugging Face 의 고정 커밋에서 받습니다. 크기와 SHA-256 을 확인한 뒤에만 모델 파일이 됩니다.">모두 받기</button>
+            <button type="button" class="btn btn-sm btn-outline" id="model-cancel" disabled title="받던 파일은 .part 로 남아 다음에 이어 받습니다.">취소</button>
+            <button type="button" class="btn btn-sm btn-outline" id="model-load" title="네 모델을 선택한 연산 장치에 올리고 월드에 연결합니다.">불러오기</button>
           </div>
           <div class="btn-row">
             <button type="button" class="btn btn-sm btn-outline" id="model-refresh">상태 확인</button>
@@ -362,13 +362,14 @@
       <button type="button" class="panel-toggle-btn" data-toggle="panelBottom" title="하단 패널 접기" aria-label="하단 패널 접기" aria-expanded="true">▼</button>
       <div class="panel-section-header" data-section="secOutput" role="button" tabindex="0" aria-expanded="true" aria-controls="secOutput">
         <span class="sec-title"><span class="step-no sec-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 6h14M5 12h14M5 18h9"/></svg></span><span class="sec-name">기록</span><span class="help" tabindex="0" data-tip="로그 — 월드·퀘스트·검색·비전·SDS·시계열·임베딩·장치 로그(증분 조회)&#10;비전 점수 — 월드 인식과 이미지 분류&#10;명령 해석 — 명령이 어떻게 구조화됐는지&#10;시계열 — 예측 띠(P10~P90)&#10;합성 데이터 — Lance 기록">?</span></span>
-        <span class="step-sum">통합 테스트 · 로그 · 비전 · 명령 해석 · 시계열 · 합성 데이터</span><span class="chevron" aria-hidden="true">▼</span>
+        <span class="step-sum">통합 테스트 · 로그 · 비전 · 깊이 · 명령 해석 · 시계열 · 합성 데이터</span><span class="chevron" aria-hidden="true">▼</span>
       </div>
       <div class="panel-section-body" id="secOutput">
         <div class="bottom-tabs" role="tablist" aria-label="기록 탭" id="bottom-tabs">
           <button type="button" class="bottom-tab" role="tab" id="btab-test" data-tab="test" aria-selected="false" aria-controls="bpane-test" tabindex="-1">통합 테스트</button>
           <button type="button" class="bottom-tab active" role="tab" id="btab-log" data-tab="log" aria-selected="true" aria-controls="bpane-log">로그</button>
           <button type="button" class="bottom-tab" role="tab" id="btab-vision" data-tab="vision" aria-selected="false" aria-controls="bpane-vision" tabindex="-1">비전 점수</button>
+          <button type="button" class="bottom-tab" role="tab" id="btab-depth" data-tab="depth" aria-selected="false" aria-controls="bpane-depth" tabindex="-1">깊이 · 카메라</button>
           <button type="button" class="bottom-tab" role="tab" id="btab-trace" data-tab="trace" aria-selected="false" aria-controls="bpane-trace" tabindex="-1">명령 해석</button>
           <button type="button" class="bottom-tab" role="tab" id="btab-ts" data-tab="ts" aria-selected="false" aria-controls="bpane-ts" tabindex="-1">시계열</button>
           <button type="button" class="bottom-tab" role="tab" id="btab-synth" data-tab="synth" aria-selected="false" aria-controls="bpane-synth" tabindex="-1">합성 데이터</button>
@@ -412,6 +413,15 @@
           </div>
         </div>
 
+        <div class="bottom-pane" id="bpane-depth" role="tabpanel" aria-labelledby="btab-depth" hidden>
+          <div class="pane-toolbar">
+            <button type="button" class="vt-btn" id="depth-run" title="지금 머리 카메라 화면에 깊이 모델(TIPSv2-B/14 DPT)을 돌려 렌더러의 정답 깊이와 같은 색 척도로 비교합니다.">깊이 추정 실행</button>
+            <label class="ct-check" for="depth-auto"><input type="checkbox" id="depth-auto" /> 재생 중 자동 (2초)</label>
+            <span class="vt-info" id="depth-meta" style="margin-left:auto;font-family:var(--font-mono);font-size:.62rem;color:var(--text-muted)"></span>
+          </div>
+          <div class="pane-scroll" id="depth-view"></div>
+        </div>
+
         <div class="bottom-pane" id="bpane-trace" role="tabpanel" aria-labelledby="btab-trace" hidden>
           <div class="pane-scroll" id="trace-view"></div>
         </div>
@@ -447,6 +457,22 @@
         </div>
       </div>
     </section>
+  </div>
+
+  <!-- 필수 모델 게이트: 네 모델이 장치에 올라가기 전에는 시뮬레이터를 쓸 수 없다 -->
+  <div class="model-gate" id="model-gate" hidden role="dialog" aria-modal="true" aria-labelledby="model-gate-title">
+    <div class="model-gate-card">
+      <h2 id="model-gate-title">필수 모델 준비</h2>
+      <p class="model-gate-lead">이 시뮬레이터는 실제 모델로만 돕니다. 인식(SigLIP2), 시계열 예측(Granite TTM), 깊이(TIPSv2), 마스크(MobileSAM)를 받아 연산 장치에 올린 뒤에 시작합니다. 파일은 Hugging Face 의 고정 커밋에서 받고 크기와 SHA-256 을 확인합니다.</p>
+      <div class="bar-pill model-gate-bar" id="model-gate-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="전체 진행률"><span></span></div>
+      <p class="hint model-summary" id="model-gate-summary" role="status" aria-live="polite"></p>
+      <div class="model-list" id="model-gate-list"></div>
+      <div class="btn-row">
+        <button type="button" class="btn" id="model-gate-get">모두 받기</button>
+        <button type="button" class="btn btn-outline" id="model-gate-cancel" disabled>취소</button>
+        <button type="button" class="btn btn-outline" id="model-gate-load">불러오기</button>
+      </div>
+    </div>
   </div>
 
   <footer class="status-bar" role="contentinfo">

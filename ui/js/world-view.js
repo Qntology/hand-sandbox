@@ -79,7 +79,14 @@ async function drawFrame(f) {
     drewOnce = true;
     $('world-empty').hidden = true;
   }
-  $('frame-info').textContent = `틱 ${f.tick} · ${f.width}×${f.height} · ${fmt.bytes(f.bytes)} · 인코딩 ${fmt.n(f.encode_ms, 1)} ms`;
+  // 1인칭이면 머리 카메라의 높이·피치·팬·흔들림·블러를 함께 적는다.
+  const c = f.camera;
+  if (c) {
+    state.camera = c;
+    bus.emit('camera', c);
+  }
+  const cam = c ? ` · 눈 ${fmt.n(c.eye_m, 2)} m · 피치 ${fmt.n(c.pitch_deg, 1)}°${Math.abs(c.pan_deg) > 0.5 ? ` · 팬 ${fmt.n(c.pan_deg, 0)}°` : ''} · 흔들림 ${c.shake?.source === 'still' ? '없음' : `${fmt.n(c.shake?.pitch_deg, 2)}°`} · 블러 ${fmt.n(c.blur_px, 1)} px` : '';
+  $('frame-info').textContent = `틱 ${f.tick} · ${f.width}×${f.height} · ${fmt.bytes(f.bytes)} · 인코딩 ${fmt.n(f.encode_ms, 1)} ms${cam}`;
   $('sb-frame').textContent = `${fmt.bytes(f.bytes)} · ${fmt.n(f.encode_ms, 1)} ms`;
   renderDetections();
   bus.emit('frame', state.frame);

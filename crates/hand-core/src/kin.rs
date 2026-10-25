@@ -71,6 +71,8 @@ pub const HIP_FLEX_MAX_DEG: f32 = 106.0;
 pub const WAIST_PITCH_MAX_DEG: f32 = 70.0;
 /// Neck pitch range, degrees (as `dynamics`).
 pub const NECK_PITCH_MAX_DEG: f32 = 45.0;
+/// Neck pan range either side, degrees (research camera.md §5).
+pub const NECK_PAN_MAX_DEG: f32 = 90.0;
 /// Shoulder abduction (the arm turned out to the side), degrees: the median
 /// of seven humanoids' shoulder-roll limits outward (Unitree G1 129°, H1 178°,
 /// Fourier GR-1 187°, N1 160°, Apptronik Apollo 92°, Booster T1 90°, Berkeley
@@ -146,6 +148,10 @@ pub struct KinPose {
     pub waist_deg: f32,
     /// Head pitch at the neck, forward (down) positive.
     pub neck_deg: f32,
+    /// Head pan at the neck, to the robot's left positive (the camera turned
+    /// toward something off its axis; the statics are sagittal and ignore it).
+    #[serde(default)]
+    pub neck_pan_deg: f32,
     /// Shoulder flexion relative to the trunk (0 hanging along it, forward positive) and elbow flexion, per arm (right, left).
     pub shoulder_deg: [f32; 2],
     pub elbow_deg: [f32; 2],
@@ -179,6 +185,7 @@ impl KinPose {
             pelvis_deg: 0.0,
             waist_deg: 0.0,
             neck_deg: 0.0,
+            neck_pan_deg: 0.0,
             shoulder_deg: [0.0, 0.0],
             elbow_deg: [10.0, 10.0],
             shoulder_abd_deg: [0.0, 0.0],
@@ -206,6 +213,7 @@ impl KinPose {
             pelvis_deg: l(a.pelvis_deg, b.pelvis_deg),
             waist_deg: l(a.waist_deg, b.waist_deg),
             neck_deg: l(a.neck_deg, b.neck_deg),
+            neck_pan_deg: l(a.neck_pan_deg, b.neck_pan_deg),
             shoulder_deg: l2(a.shoulder_deg, b.shoulder_deg),
             elbow_deg: l2(a.elbow_deg, b.elbow_deg),
             shoulder_abd_deg: l2(a.shoulder_abd_deg, b.shoulder_abd_deg),
@@ -394,6 +402,45 @@ pub fn rotate(v: V3, k: V3, theta: f32) -> V3 {
     let (s, c) = theta.sin_cos();
     add(add(scale(v, c), scale(cross(k, v), s)), scale(k, dot(k, v) * (1.0 - c)))
 }
+/// Where the head camera is on a pose, base frame (x forward, y left, z up
+/// from the ground), how far its axis is pitched below the head-level line
+/// (forward/down positive, degrees; the camera's own mount tilt comes on top)
+/// and how far it is panned to the left (degrees). The camera sits on the
+/// front of the head, [`CAMERA_UP_M`] above the neck joint and
+/// [`CAMERA_FWD_M`] ahead of it along the head; the chain is the one
+/// [`solve`] draws (hip, pelvis, waist, trunk, neck), and a wheeled base's
+/// pitch tilts all of it.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct HeadCamera {
+    pub pos: [f32; 3],
+    pub pitch_down_deg: f32,
+    pub pan_deg: f32,
+}
+
+/// The camera's optical centre above the neck joint along the head, metres
+/// (est: the middle of the drawn 0.14 m head, where a D435-class camera's
+/// lenses sit).
+pub const CAMERA_UP_M: f32 = 0.07;
+/// The camera's optical centre ahead of the neck joint, metres (est: the
+/// face of the drawn head, half its 0.14 m depth).
+pub const CAMERA_FWD_M: f32 = 0.07;
+
+pub fn head_camera(body: &Body, pose: &KinPose) -> HeadCamera {
+    let hip_c: V3 = if body.legged { [pose.hip[0], pose.pelvis_y, pose.hip[1]] } else { [0.0, pose.pelvis_y, HIP_M - pose.lift_m] };
+    let waist = add(hip_c, scale(up_dir(pose.pelvis_deg), PELVIS_M));
+    let trunk = pose.trunk_deg();
+    let v = up_dir(trunk);
+    let neck = add(waist, scale(v, TRUNK_M + NECK_UP_M));
+    let head = trunk + pose.neck_deg;
+    // The pan turns the head about the neck's long axis; the lens is ahead of it.
+    let pan = pose.neck_pan_deg.to_radians();
+    let fwd = fore_aft(head);
+    let ahead = [fwd[0] * pan.cos(), pan.sin(), fwd[2] * pan.cos()];
+    let eye = add(add(neck, scale(up_dir(head), CAMERA_UP_M)), scale(ahead, CAMERA_FWD_M));
+    let pitch = if body.legged { 0.0 } else { pose.base_pitch_deg };
+    HeadCamera { pos: if pitch != 0.0 { pitch_about_origin(eye, pitch) } else { eye }, pitch_down_deg: head - pitch, pan_deg: pose.neck_pan_deg }
+}
+
 /// Rotates a point or a direction about the y axis through the origin by a base pitch (nose up positive).
 fn pitch_about_origin(p: V3, deg: f32) -> V3 {
     let (s, c) = (-deg.to_radians()).sin_cos();
@@ -658,6 +705,9 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
     }
     if pose.neck_deg.abs() > rom.neck_max + 0.5 {
         out_of_range.push(format!("neck {:.0}° > {:.0}°", pose.neck_deg, rom.neck_max));
+    }
+    if pose.neck_pan_deg.abs() > NECK_PAN_MAX_DEG + 0.5 {
+        out_of_range.push(format!("neck_pan {:.0}° > {:.0}°", pose.neck_pan_deg, NECK_PAN_MAX_DEG));
     }
     if legged {
         for s in 0..2 {
@@ -983,6 +1033,24 @@ mod tests {
             assert!((r.grf[2] - r.mass_kg * G).abs() < 1e-2);
             assert!(r.feasible && r.margin > 0.3, "{base:?}: {:?} margin {}", r.limiting, r.margin);
         }
+    }
+
+    #[test]
+    fn the_head_camera_follows_the_bend_the_neck_and_the_slope() {
+        let b = body(Tier::Pro, BaseKind::HumanFoot);
+        let stand = head_camera(&b, &KinPose::stand(0.0));
+        assert!((stand.pos[2] - 1.14).abs() < 0.01 && stand.pitch_down_deg.abs() < 1e-4, "{stand:?}");
+        // Bent 60° at the waist with the head down another 30°: lower, ahead, looking down 90°.
+        let bent = head_camera(&b, &KinPose { waist_deg: 60.0, neck_deg: 30.0, ..KinPose::stand(0.0) });
+        assert!(bent.pos[2] < stand.pos[2] - 0.15 && bent.pos[0] > stand.pos[0] + 0.25, "{bent:?}");
+        assert!((bent.pitch_down_deg - 90.0).abs() < 1e-3);
+        // Panned to the left, the lens moves left of the neck.
+        let left = head_camera(&b, &KinPose { neck_pan_deg: 60.0, ..KinPose::stand(0.0) });
+        assert!(left.pos[1] > 0.05 && left.pan_deg == 60.0, "{left:?}");
+        // A wheeled base nose up on a slope tilts the camera up with it.
+        let w = body(Tier::Mid, BaseKind::Wheel);
+        let up = head_camera(&w, &KinPose { base_pitch_deg: 10.0, ..KinPose::stand(0.0) });
+        assert!((up.pitch_down_deg + 10.0).abs() < 1e-3);
     }
 
     #[test]

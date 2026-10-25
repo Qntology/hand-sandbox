@@ -559,6 +559,7 @@ impl Runtime {
     /// `focus:<hand|side|low>`; a focus view also returns the focus views of
     /// the instant (`focus`, as a keyframe's).
     pub fn api_world_frame(&mut self, width: u32, height: u32, quality: f32, view: &str) -> Result<Value, String> {
+        let view_id = if view.starts_with("chase") || view.starts_with("focus") || view == "top" { "other" } else { "agent" };
         let view = match view {
             "top" => FrameView::Top,
             v if v.starts_with("chase") => FrameView::Chase { orbit_deg: v.split_once(':').and_then(|(_, o)| o.parse::<f32>().ok()).unwrap_or(0.0).clamp(-180.0, 180.0) as i16 },
@@ -578,6 +579,7 @@ impl Runtime {
                 })
             })
             .collect();
+        let camera = matches!(view_id, "agent").then(|| self.head_view_json());
         Ok(json!({
             "webp_base64": STANDARD.encode(&f.webp),
             "width": f.width, "height": f.height, "bytes": f.bytes,
@@ -585,6 +587,40 @@ impl Runtime {
             "detections": dets,
             "overlay": f.overlay,
             "focus": focus,
+            "camera": camera,
+        }))
+    }
+
+    /// The head camera now, for the UI: where it is, how it is turned by the
+    /// body and the neck, how it shakes and blurs, and how far the robot's
+    /// own estimate of it is off (the gyro's random walk over the shake).
+    pub fn head_view_json(&self) -> Value {
+        let w = self.world();
+        let hv = w.head_view(&self.cam);
+        let t = world_sim::world::sensor_timing(w.body.head.sensor);
+        let deg = |r: f32| r3(r.to_degrees());
+        json!({
+            "eye_m": r3(hv.eye_m), "standing_eye_m": r3(w.standing_eye_m()),
+            "pitch_deg": deg(hv.view.pitch), "roll_deg": deg(hv.view.roll), "yaw_deg": deg(hv.view.yaw),
+            "head_pitch_deg": r3(hv.head_pitch_deg), "pan_deg": r3(hv.pan_deg), "mount_deg": r3(self.cam.pitch_deg),
+            "shake": {"source": hv.shake.source, "dz_mm": r3(hv.shake.dz_m * 1000.0), "pitch_deg": deg(hv.shake.pitch), "roll_deg": deg(hv.shake.roll),
+                      "rate_dps": [deg(hv.exposure.rate[0]), deg(hv.exposure.rate[1]), deg(hv.exposure.rate[2])]},
+            "est_err_deg": {"pitch": deg(hv.view.pitch - hv.est.pitch), "roll": deg(hv.view.roll - hv.est.roll)},
+            "blur_px": r3(hv.blur_px),
+            "sensor": {"name": w.body.head.sensor, "rgb": t.rgb, "exposure_ms": r3(t.exposure_s * 1000.0), "readout_ms": r3(t.readout_s * 1000.0), "gyro_arw_deg": r3(t.gyro_arw_deg), "scene_lux": world_sim::world::SCENE_LUX},
+            "ground": w.ground_here().surface().props().id,
+        })
+    }
+
+    /// `depth_view({quality})`: the depth model on the head camera's view now, beside the renderer's depth.
+    pub fn api_depth_view(&mut self, quality: f32) -> Result<Value, String> {
+        let d = self.depth_view(quality).map_err(|e| format!("{e:#}"))?;
+        Ok(json!({
+            "tick": d.tick, "width": d.width, "height": d.height, "mode": d.mode, "device": d.device, "infer_ms": r3(d.infer_ms),
+            "metrics": d.metrics.map(|m| json!({"absrel": r3(m.absrel), "delta1": r3(m.delta1), "rmse_m": r3(m.rmse_m), "median_scale": r3(m.median_scale), "pixels": m.pixels})),
+            "scale_m": [r3(d.scale_m.0), r3(d.scale_m.1)], "max_depth_m": d.max_depth_m.map(r3),
+            "rgb_webp_base64": STANDARD.encode(&d.rgb_webp), "pred_webp_base64": STANDARD.encode(&d.pred_webp), "truth_webp_base64": STANDARD.encode(&d.truth_webp),
+            "camera": self.head_view_json(),
         }))
     }
 
@@ -764,8 +800,9 @@ impl Runtime {
             "embedding": mode != "oracle",
             "ttm": self.has_ttm(),
             "parser_embedding": self.has_embedder(),
-            "devices": {"depth": self.ml.depth_device(), "locate": self.ml.locate_device(), "track": self.ml.tracker.device()},
+            "devices": {"depth": self.ml.depth_device(), "locate": self.ml.locate_device(), "track": self.ml.tracker.device(), "ttm": self.gates.ttm().map(|t| hand_ml::device_label(t.device()))},
             "ml": {"depth": self.ml.depth_mode(), "locate": self.ml.locate_mode(), "track": self.ml.track_mode()},
+            "stand_ins": self.stand_ins(),
         }))
     }
 
@@ -809,6 +846,7 @@ impl Runtime {
             "sds_status" => self.api_sds_status(),
             "ts_forecast" => self.api_ts_forecast(text(args, "scope").unwrap_or(""), text(args, "axis").unwrap_or("")),
             "models_status" => self.api_models_status(),
+            "depth_view" => self.api_depth_view(num(args, "quality").unwrap_or(80.0) as f32),
             "tips_use" => self.api_model_use("tips", args),
             "sam_use" => self.api_model_use("sam", args),
             "devices" => Ok(device_json(&hand_ml::preferred())),

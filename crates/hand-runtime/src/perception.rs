@@ -16,6 +16,8 @@ use anyhow::Result;
 use hand_search::{EntityKind, Lexicon};
 use serde::{Deserialize, Serialize};
 use world_sim::rng::Rng;
+use world_sim::render::{unpack_id, View};
+use world_sim::snapshot::{drop_id, node_id, waypoint_id};
 use world_sim::{Camera, Frame, ObjectClass, World};
 
 use crate::config::NoiseCfg;
@@ -120,7 +122,53 @@ impl EntityTable {
     }
 }
 
-/// Distance of the object's centre behind the surface the camera sees, metres.
+/// Ground position of an object's centre from a point on its visible
+/// surface seen from `view`. From above, the camera sees the object's front
+/// face (whose centre lies `r` in front of the object's) and its top face
+/// (right above the centre) in proportion to their projected areas, `cos θ`
+/// and `sin θ` for a cube at the depression θ of the ray to the point; the
+/// centre is the point moved away from the camera by `r` times the front
+/// face's share. Seen level (θ ≤ 0) that is the whole `r`.
+pub fn centre_from_surface(view: &View, p: [f32; 3], r: f32) -> (f32, f32) {
+    let (dx, dz) = (p[0] - view.origin[0], p[2] - view.origin[2]);
+    let ground = dx.hypot(dz).max(1e-4);
+    let theta = (view.origin[1] - p[1]).atan2(ground).max(0.0);
+    let front = theta.cos() / (theta.cos() + theta.sin());
+    (p[0] + dx / ground * r * front, p[2] + dz / ground * r * front)
+}
+
+/// The centroid (x, y, z) of each object's visible pixels in a frame, by
+/// entity (`n12`, `d3`, `w1`): what an RGB-D camera's points of a mask give.
+pub fn visible_centroids(frame: &Frame, camera: &Camera, view: &View) -> HashMap<String, [f32; 3]> {
+    let mut acc: HashMap<u32, ([f64; 3], u32)> = HashMap::new();
+    for (idx, &raw) in frame.ids.iter().enumerate() {
+        let (class, _) = unpack_id(raw);
+        if !matches!(class, ObjectClass::Node | ObjectClass::Drop | ObjectClass::Waypoint) {
+            continue;
+        }
+        let (i, j) = (idx % frame.width, idx / frame.width);
+        let Some(p) = camera.world_point3_in(view, i as f32 + 0.5, j as f32 + 0.5, frame.depth[idx]) else { continue };
+        let a = acc.entry(raw).or_insert(([0.0; 3], 0));
+        for k in 0..3 {
+            a.0[k] += p[k] as f64;
+        }
+        a.1 += 1;
+    }
+    acc.into_iter()
+        .map(|(raw, (s, n))| {
+            let (class, id) = unpack_id(raw);
+            let key = match class {
+                ObjectClass::Node => node_id(id),
+                ObjectClass::Drop => drop_id(id),
+                _ => waypoint_id(id),
+            };
+            (key, [(s[0] / n as f64) as f32, (s[1] / n as f64) as f32, (s[2] / n as f64) as f32])
+        })
+        .collect()
+}
+
+/// Distance of the object's centre behind the surface the camera sees, metres
+/// (seen level; `centre_from_surface` scales it for a view from above).
 pub fn centre_offset_m(kind: EntKind) -> f32 {
     match kind {
         EntKind::Source => 0.20,
@@ -193,8 +241,9 @@ impl Recognizer for OraclePerception {
 
     fn scan(&mut self, input: ScanInput<'_>) -> Result<ScanOutput> {
         let (w, h) = (input.frame.width as f32, input.frame.height as f32);
-        let agent = (input.world.agent.x, input.world.agent.z);
-        let yaw = input.world.agent.yaw;
+        // The head camera as the robot believes it is (joints and the head IMU).
+        let view = input.world.head_view(input.camera).est;
+        let centroids = visible_centroids(input.frame, input.camera, &view);
         let mut out = ScanOutput { device: "cpu (oracle)".into(), ..ScanOutput::default() };
         let sd = self.noise.score_sd;
 
@@ -225,7 +274,7 @@ impl Recognizer for OraclePerception {
             let Some((ckind, link)) = self.table.get(&label).cloned() else { continue };
             let bbox = [v.bbox[0] as f32 / w, v.bbox[1] as f32 / h, (v.bbox[2] + 1) as f32 / w, (v.bbox[3] + 1) as f32 / h];
             let (px, py) = ((bbox[0] + bbox[2]) * 0.5 * w, (bbox[1] + bbox[3]) * 0.5 * h);
-            let world = input.camera.world_point(agent, yaw, px, py, v.depth_m + centre_offset_m(ckind));
+            let world = centroids.get(&v.entity).copied().or_else(|| input.camera.world_point3_in(&view, px, py, v.depth_m)).map(|p| centre_from_surface(&view, p, centre_offset_m(ckind)));
             out.candidates.push(Candidate {
                 label,
                 kind: ckind,
@@ -254,7 +303,7 @@ impl Recognizer for OraclePerception {
                 let bbox = [x0, y0, x0 + bw, y0 + bh];
                 let (cx, cy) = (((bbox[0] + bbox[2]) * 0.5 * w) as usize, ((bbox[1] + bbox[3]) * 0.5 * h) as usize);
                 let depth = input.frame.depth.get(cy.min(input.frame.height - 1) * input.frame.width + cx.min(input.frame.width - 1)).copied().unwrap_or(f32::INFINITY);
-                let world = input.camera.world_point(agent, yaw, (bbox[0] + bbox[2]) * 0.5 * w, (bbox[1] + bbox[3]) * 0.5 * h, depth);
+                let world = input.camera.world_point3_in(&view, (bbox[0] + bbox[2]) * 0.5 * w, (bbox[1] + bbox[3]) * 0.5 * h, depth).map(|p| centre_from_surface(&view, p, centre_offset_m(kind)));
                 out.candidates.push(Candidate {
                     label,
                     kind,

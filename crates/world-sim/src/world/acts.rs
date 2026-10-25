@@ -191,6 +191,13 @@ impl World {
             ((at.0 - self.agent.x) * k, (at.1 - self.agent.z) * k, (dist - planned[0]).abs())
         };
         let shuffle = step / SHUFFLE_MPS;
+        // The shuffle walks on ground the robot can stand on: within its cell, or
+        // onto a neighbour it could drive onto. Otherwise (a rock column, a ledge)
+        // the item is out of the hand's reach from here and the robot must go round.
+        if shuffle > 0.05 && !self.can_step_to(self.agent.x + step_x, self.agent.z + step_z) {
+            let dist = (at.0 - self.agent.x).hypot(at.1 - self.agent.z);
+            return Err(ActionError::OutOfReach { distance_m: dist, reach_m: (dist - step).max(0.0) });
+        }
         if shuffle > 0.05 {
             for s in rollout.samples.iter_mut() {
                 s.t += shuffle;
@@ -206,6 +213,19 @@ impl World {
         let dur = rollout.duration_s;
         self.act = Some(ActPlay::new(rollout, self.time_s, Some((d.kind, d.amount)), (self.agent.x, self.agent.z, heading)));
         Ok((dur, (!side).then_some(at)))
+    }
+
+    /// Whether a short step of the body to `(x, z)` stays on ground it can
+    /// stand on: its own cell, or a free neighbour it could drive onto now
+    /// (the route there is that one edge).
+    pub(super) fn can_step_to(&self, x: f32, z: f32) -> bool {
+        let Some(to) = self.terrain.cell_of(x, z) else { return false };
+        let from = self.agent_cell();
+        if to == from {
+            return true;
+        }
+        let near = (to.0 as i32 - from.0 as i32).abs() <= 1 && (to.1 as i32 - from.1 as i32).abs() <= 1;
+        near && !self.blocked_cells().contains(&to) && self.plan_route(Goal::Cell(to)).is_some_and(|p| p.edges.len() == 1)
     }
 
     /// Plays a release out for every piece being set down, one after another; returns the total time.

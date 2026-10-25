@@ -87,7 +87,26 @@ export CUDA_COMPUTE_CAP=86
 
 ROCm과 Vulkan은 [Qntology/candle-rocm-vulkan](https://github.com/Qntology/candle-rocm-vulkan)의 candle 포크를 씁니다. 커밋 `2191c7ad`로 고정되어 있습니다(루트 `Cargo.toml`). ROCm 스크립트는 logis-center commerce와 같은 규칙으로 HIP SDK 7.x(legacy)와 ROCm Core SDK 10.x(core) 가운데 이 PC의 GPU를 지원하는 쪽을 고릅니다(`ROCM_VER`, `ROCM_PATH`, `CANDLE_ROCM_TRACK`, `ROCM_SEARCH_PATHS`).
 
-SAM 마스크 모델은 `lmz/candle-sam`의 `mobile_sam-tiny-vitt.safetensors`(MobileSAM, 4 GB GPU 권장) 또는 `sam_vit_b_01ec64.safetensors`를 `models/sam`(또는 `SAM_DIR`)에 두고 ④의 **SAM 마스크 켜기**로 연결합니다. 없으면 영역 확장 추적기가 그대로 돕니다.
+### 필수 모델 (v0.8)
+
+Tauri 앱은 네 모델이 모두 연산 장치에 올라가기 전에는 월드를 돌리지 않습니다(대역 모델 없음). GPU가 있으면 네 모델 모두 GPU에서 돕니다(GPU 백엔드로 빌드한 앱: `dev_cuda.bat` 등; `HAND_DEVICE=cpu`일 때만 CPU). CPU 전용 빌드를 NVIDIA GPU가 있는 PC에서 띄우면 모델 창이 그렇게 알려 줍니다. 처음 실행하면 "필수 모델 준비" 창이 뜨고, **모두 받기**로 Hugging Face의 고정 커밋에서 받습니다. 받는 동안 모델별 진행 막대와 전체 진행률·속도·남은 시간이 보이고, **취소**하면 받던 파일이 `.part`로 남아 다음에 이어 받습니다. 받은 파일은 크기와 SHA-256을 확인한 뒤에만 모델 파일이 되고, 다 받으면 자동으로 장치에 불러옵니다. ④ "사전 · 모델"에서 모델마다 받기·삭제(두 번 눌러 확인)와 불러오기를 할 수 있고, 연산 장치를 바꾸면 새 장치에 다시 불러옵니다.
+
+| 모델 | 쓰임 | 저장소 @ 커밋 | 폴더 (환경 변수) | 크기 |
+|---|---|---|---|---|
+| SigLIP2 base patch16 NaFlex | 인식 · 의미 위치 · 명령 임베딩 | `google/siglip2-base-patch16-naflex` @ `b53b807d` | `models/siglip2-base-patch16-naflex` (`SIGLIP2_DIR`) | 1.54 GB |
+| Granite TTM-R3 52-16 | 시계열 예측 | `ibm-granite/granite-timeseries-ttm-r3` @ `7d99b7e3` (가지 `52-16-dec-52-r3`) | `models/granite-timeseries-ttm-r3/52-16-dec-52-r3` (`TTM_DIR`) | 5.9 MB |
+| TIPSv2-B/14 DPT | 깊이 | `google/tipsv2-b14-dpt` @ `da81b552` | `models/tipsv2-b14-dpt` (`TIPS_DIR`) | 632 MB |
+| MobileSAM (TinyViT) | 마스크 추적 | `lmz/candle-sam` @ `8b4cb7c7` | `models/sam` (`SAM_DIR`) | 41 MB |
+
+`models/sam`에 `sam_vit_b_01ec64.safetensors`만 있어도 SAM은 그것을 씁니다(4 GB GPU에는 MobileSAM 권장). 받기·검증·불러오기를 한 번에 확인하려면(네트워크 필요):
+
+```bash
+cargo test -p hand-sim-app --lib -- --ignored --nocapture all_models
+```
+
+### 머리 카메라 (v0.8)
+
+1인칭 화면은 머리에 달린 카메라입니다(눈 높이 약 1.14 m). 허리를 굽히거나 목을 숙이면 카메라가 따라 내려가 바닥을 보고, 옆에 있는 물건은 목을 돌려(팬) 봅니다. 걸을 때는 몸통 흔들림과 발뒤꿈치 착지 충격(지면 재질마다 다름), 울퉁불퉁한 발 디딤이, 바퀴·트랙은 지면 거칠기(ISO 8608 등급)에 따른 진동이 카메라를 흔들고, RGB 센서의 롤링 셔터와 노출이 그 움직임을 기울임과 흐림으로 남깁니다. 로봇은 관절 각과 머리 IMU로 카메라 자세를 추정해 거리를 계산합니다. 수치와 출처는 `docs/research/camera.md`, 설계는 `docs/PLAN-v0.8.md`. 하단 **깊이 · 카메라** 탭에서 지금 화면의 TIPSv2 깊이 추정을 렌더러의 정답 깊이와 같은 색 척도로 비교하고, 카메라 높이·피치·팬·흔들림·흐림을 볼 수 있습니다.
 
 ### 월드 시뮬레이터
 
@@ -97,7 +116,7 @@ SAM 마스크 모델은 `lmz/candle-sam`의 `mobile_sam-tiny-vitt.safetensors`(M
 cargo run --release -p hand-runtime --example serve   # http://127.0.0.1:8787/
 ```
 
-로그와 SDS 원장은 `data/runtime`(또는 `RUNTIME_DIR`)에 쌓입니다. 기본 인식기는 정답 ID 버퍼를 쓰는 대역(오라클)이며, 왼쪽 ④ "사전 · 모델"에서 **SigLIP2 인식 켜기**와 **TTM 켜기**로 바꿉니다(Tauri 앱에서만 동작, 가중치 필요). 시뮬레이터의 숫자는 대부분 가정값이니 `data/README.md` §7을 먼저 보세요.
+로그와 SDS 원장은 `data/runtime`(또는 `RUNTIME_DIR`)에 쌓입니다. Tauri 앱은 필수 모델 네 개를 불러온 뒤에만 월드를 돌립니다. 개발용 서버와 `cargo test`의 런타임은 모델 없이 대역(오라클 인식기, 깊이·의미 위치 대역, 영역 확장 추적기)으로 돕니다. 시뮬레이터의 숫자는 대부분 가정값이니 `data/README.md` §7을 먼저 보세요.
 
 ### 통합 테스트 (v0.3)
 
@@ -109,27 +128,20 @@ cargo run --release -p hand-runtime --example serve   # http://127.0.0.1:8787/
 
 키프레임을 누르면 원본, 깊이·마스크, 삼각 측량, 결정, 밸런스(관절 토크와 N:N 셀)가 나옵니다. "성공률 · N:N" 보기에는 퀘스트·단계별 성공률(DB)과 사람 기준 대비 N:N 행렬이 있습니다. 결과는 `data/runtime/db/*.jsonl`과 `quest_stats.json`에 쌓이고, "DB(Lance) 기록"(또는 테스트 종료 시 자동)으로 LanceDB 테이블 `quest_runs`, `quest_steps`, `quest_stats`, `ml_keyframes`, `balance_effort`에 복사됩니다. 왼쪽 ⑤ **부품 프리셋**에서 부위별 등급을 바꾸면 들 수 있는 물건과 한계가 바로 계산됩니다.
 
-깊이와 의미 위치는 가중치가 없으면 대역 모델로 돌고, 모드 칩에 `stand-in`으로 표시됩니다. TIPSv2 가중치는 아래처럼 받아 두면 Tauri 앱의 `tips_use` 명령으로 연결됩니다(`TIPS_DIR`로 위치 변경).
-
-```bash
-huggingface-cli download google/tipsv2-b14-dpt --local-dir models/tipsv2-b14-dpt
-```
+Tauri 앱에서는 깊이(TIPSv2)와 의미 위치(SigLIP2)가 실제 모델로 돕니다. 개발용 서버와 테스트에서는 대역 모델이고, 모드 칩에 `stand-in`으로 표시됩니다.
 
 SAM 3.1(`avencera/sam3.1-mlx-bf16`)은 Apple MLX용 가중치라 이 Windows/CUDA 빌드에서 돌릴 수 없습니다. 추적은 SAM과 같은 인터페이스(포인트 프롬프트 → ID가 유지되는 마스크)에 이미지·깊이만 쓰는 영역 확장 추적기를 붙였습니다. 실제 SAM 계열을 붙이는 경로는 `docs/PLAN-v0.3.md` 4장에 있습니다.
 
-### SigLIP2 가중치
+### 가중치를 손으로 받기
 
-가중치는 저장소에 넣지 않습니다. 아래 위치에 받아 두면 앱이 자동으로 읽습니다. 다른 위치는 `SIGLIP2_DIR`로 지정합니다.
+앱의 받기 대신 직접 받아도 됩니다(위 표의 폴더에, 같은 커밋으로). 크기가 맞으면 앱이 받은 것으로 봅니다.
 
 ```bash
-huggingface-cli download google/siglip2-base-patch16-naflex --local-dir models/siglip2-base-patch16-naflex
+huggingface-cli download google/siglip2-base-patch16-naflex config.json tokenizer.json model.safetensors --revision b53b807d3a2d5e2b3911292f2d69e5341cdc064c --local-dir models/siglip2-base-patch16-naflex
+huggingface-cli download ibm-granite/granite-timeseries-ttm-r3 config.json model.safetensors --revision 52-16-dec-52-r3 --local-dir models/granite-timeseries-ttm-r3/52-16-dec-52-r3
+huggingface-cli download google/tipsv2-b14-dpt config.json model.safetensors --revision da81b552538c453432e7a1efea39737c89580424 --local-dir models/tipsv2-b14-dpt
+huggingface-cli download lmz/candle-sam mobile_sam-tiny-vitt.safetensors --local-dir models/sam
 ```
-
-필요한 파일은 `config.json`, `tokenizer.json`, `model.safetensors`입니다.
-
-### Granite TTM 가중치
-
-시계열 예측에 쓰는 Granite TTM-R3는 `models/granite-timeseries-ttm-r3`(또는 그 아래 `52-16-dec-52-r3`)에서 읽으며, 다른 위치는 `TTM_DIR`로 지정합니다. `config.json`과 safetensors가 필요합니다. 파일이 없으면 last/ewma/holt 융합만 쓰고, ④ "사전 · 모델"에서 이유를 보여 줍니다.
 
 ### 합성 데이터 (LanceDB)
 

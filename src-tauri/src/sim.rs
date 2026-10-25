@@ -18,6 +18,7 @@ type App<'a> = State<'a, Arc<AppState>>;
 
 #[tauri::command]
 pub async fn world_new(state: App<'_>, seed: u64, size: usize, config: Option<HandConfig>, base: Option<String>, body: Option<BodyPlan>, terrain: Option<String>) -> Result<Value, String> {
+    state.require_models()?;
     state.with_world(|rt| {
         if let Some(b) = body {
             rt.cfg.body = b;
@@ -29,11 +30,17 @@ pub async fn world_new(state: App<'_>, seed: u64, size: usize, config: Option<Ha
     })
 }
 
+/// Runtime calls that run the world (and its models), refused until the models are loaded.
+const RUNS_WORLD: [&str; 2] = ["test_start", "test_step"];
+
 /// The runtime's other JSON calls (integrated test, part presets) by name, with
 /// the arguments the UI sends. Runs off the window's thread: a test step can
 /// render and analyse several keyframes.
 #[tauri::command]
 pub async fn rt_call(state: App<'_>, cmd: String, args: Option<Value>) -> Result<Value, String> {
+    if RUNS_WORLD.contains(&cmd.as_str()) {
+        state.require_models()?;
+    }
     let shared: Arc<AppState> = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || shared.with_world(|rt| rt.api_call(&cmd, &args.unwrap_or(Value::Null))))
         .await
@@ -109,6 +116,7 @@ fn selected_device(state: &AppState) -> Result<candle_core::Device, String> {
 
 #[tauri::command]
 pub async fn sim_step(state: App<'_>, ticks: u32) -> Result<Value, String> {
+    state.require_models()?;
     state.with_world(|rt| rt.api_sim_step(ticks))
 }
 
@@ -121,6 +129,7 @@ pub async fn world_frame(state: App<'_>, width: u32, height: u32, quality: f32, 
 /// behind the recording that runs).
 #[tauri::command]
 pub async fn command_submit(state: App<'_>, text: String, record: Option<bool>) -> Result<Value, String> {
+    state.require_models()?;
     state.with_world(|rt| rt.api_command_submit_rec(&text, record.unwrap_or(false)))
 }
 
@@ -131,6 +140,7 @@ pub async fn quest_list(state: App<'_>) -> Result<Value, String> {
 
 #[tauri::command]
 pub async fn perception_scan(state: App<'_>, top_k: usize) -> Result<Value, String> {
+    state.require_models()?;
     state.with_world(|rt| rt.api_perception_scan(top_k))
 }
 
@@ -154,10 +164,19 @@ pub async fn log_tail(state: App<'_>, after_seq: u64, limit: usize, category: Op
     state.with_world(|rt| rt.api_log_tail(after_seq, limit, category.as_deref()))
 }
 
-/// What `models_status` and the two model switches answer: the runtime's own
+/// Whether every model is attached to the world (none of the stand-ins runs).
+pub(crate) fn all_live(rt: &Runtime) -> bool {
+    rt.stand_ins().is_empty()
+}
+
+/// What `models_status` and the model switches answer: the runtime's own
 /// view plus what only the host knows (which device, which folders, whether the
-/// files are there).
-fn models_json(state: &AppState, rt: &Runtime) -> Result<Value, String> {
+/// files are there). The switches also keep the ready flag honest: switching
+/// one model back to its stand-in stops the world until it is loaded again.
+pub(crate) fn models_json(state: &AppState, rt: &Runtime) -> Result<Value, String> {
+    if state.models_ready() && !all_live(rt) {
+        state.set_models_ready(false);
+    }
     let mut v = rt.api_models_status()?;
     let (backend, ordinal) = state.selected();
     let siglip = model_dir().map_err(|e| format!("{e:#}"))?;
@@ -171,6 +190,7 @@ fn models_json(state: &AppState, rt: &Runtime) -> Result<Value, String> {
     v["sam_files"] = json!({"dir": sam.display().to_string(), "present": hand_vision::SamModel::find_weights(&sam).is_some()});
     let s = state.startup();
     v["startup"] = json!({"backend": s.backend.name(), "ordinal": s.ordinal, "reason": s.reason});
+    v["ready"] = json!(state.models_ready());
     Ok(v)
 }
 

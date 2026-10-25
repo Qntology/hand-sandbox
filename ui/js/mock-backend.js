@@ -115,6 +115,23 @@ const handlers = {
     siglip_files: { dir: '(브라우저 모의)', present: false }, ttm_files: { dir: '(브라우저 모의)', present: false },
   }),
   recognizer_use: async () => { throw '브라우저 모의 백엔드에서는 SigLIP2 를 불러올 수 없습니다. Tauri 앱에서 사용하세요'; },
+  // 모의 백엔드는 모델을 쓰지 않으므로 필수 모델 게이트를 걸지 않는다(required: false).
+  models_catalog: async () => ({
+    required: false, mock: true, ready: false, all_present: false, loading: null, load_error: null,
+    device: { backend: 'cpu', ordinal: 0 },
+    download: { running: false, phase: '', done: 0, total: 0, rate_bps: 0, queue: [] },
+    models: [
+      ['siglip2', 'SigLIP2 base (patch16, NaFlex)', '비전 인식 · 의미 위치 · 명령 임베딩', 'google/siglip2-base-patch16-naflex', 1535341857],
+      ['ttm', 'Granite TTM-R3 (52-16)', '시계열 예측 (정밀도 게이트)', 'ibm-granite/granite-timeseries-ttm-r3', 5888229],
+      ['tips', 'TIPSv2-B/14 DPT', '깊이 추정 (키프레임)', 'google/tipsv2-b14-dpt', 632074338],
+      ['sam', 'MobileSAM (TinyViT)', '마스크 추적', 'lmz/candle-sam', 40613024],
+    ].map(([id, label, role_ko, repo, bytes]) => ({ id, label, role_ko, repo, revision: '(모의)', license: 'Apache-2.0', dir: '(브라우저 모의)', files: [], bytes, have: 0, present: false })),
+  }),
+  models_download: async () => { throw '모델 받기는 Tauri 앱에서만 됩니다'; },
+  depth_view: async () => { throw '깊이 · 카메라 탭은 실제 Rust 런타임(개발 서버 또는 Tauri)에서만 동작합니다'; },
+  models_cancel: async () => { throw '모델 받기는 Tauri 앱에서만 됩니다'; },
+  models_delete: async () => { throw '모델 삭제는 Tauri 앱에서만 됩니다'; },
+  models_activate: async () => { throw '모델 불러오기는 Tauri 앱에서만 됩니다'; },
   test_status: async () => ({ active: false }),
   test_start: async () => { throw '통합 테스트는 실제 Rust 런타임(개발 서버 또는 Tauri)에서만 동작합니다'; },
   body_presets: async () => { throw '부품 프리셋 물리는 실제 Rust 런타임에서 계산합니다'; },

@@ -2,6 +2,7 @@
 //! the lazily loaded SigLIP2 engine.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
@@ -33,6 +34,14 @@ pub struct AppState {
     vision: Mutex<Option<Arc<VisionEngine>>>,
     /// The simulated world and robot. Built on the first world command.
     world: Mutex<Option<Runtime>>,
+    /// Model downloads (`models`).
+    pub downloads: Arc<crate::models::Downloads>,
+    /// All four models are loaded on the selected device and attached to the world.
+    models_ready: AtomicBool,
+    /// The model being loaded now, and why the last load failed.
+    loading: Mutex<Option<String>>,
+    load_error: Mutex<Option<String>>,
+    live_devices: Mutex<std::collections::BTreeMap<String, String>>,
 }
 
 impl AppState {
@@ -46,7 +55,82 @@ impl AppState {
             probed: OnceLock::new(),
             vision: Mutex::new(None),
             world: Mutex::new(None),
+            downloads: Arc::default(),
+            models_ready: AtomicBool::new(false),
+            loading: Mutex::new(None),
+            load_error: Mutex::new(None),
+            live_devices: Mutex::new(Default::default()),
         }
+    }
+
+    /// Whether the world may run: every model downloaded and loaded. The world
+    /// commands call this first, so nothing runs on a stand-in.
+    pub fn require_models(&self) -> Result<(), String> {
+        if self.models_ready() {
+            Ok(())
+        } else {
+            Err(crate::models::not_ready_message())
+        }
+    }
+
+    pub fn models_ready(&self) -> bool {
+        self.models_ready.load(Ordering::Acquire)
+    }
+
+    pub fn set_models_ready(&self, ready: bool) {
+        self.models_ready.store(ready, Ordering::Release);
+    }
+
+    pub fn loading(&self) -> Option<String> {
+        self.loading.lock().ok().and_then(|l| l.clone())
+    }
+
+    pub fn set_loading(&self, id: Option<&str>) {
+        if let Ok(mut l) = self.loading.lock() {
+            *l = id.map(String::from);
+        }
+    }
+
+    pub fn load_error(&self) -> Option<String> {
+        self.load_error.lock().ok().and_then(|l| l.clone())
+    }
+
+    pub fn set_load_error(&self, e: Option<String>) {
+        if let Ok(mut l) = self.load_error.lock() {
+            *l = e;
+        }
+    }
+
+    /// The device the models go on: the selected one, unless that is the CPU
+    /// while this build has a GPU that opens — then the first such GPU (the
+    /// start-up order), which becomes the selection. `HAND_DEVICE=cpu` keeps
+    /// the CPU. Returns whether the selection moved.
+    pub fn prefer_gpu(&self) -> bool {
+        let (backend, _) = self.selected();
+        if backend != Backend::Cpu || std::env::var(hand_ml::device::DEVICE_ENV).is_ok_and(|v| v.trim().eq_ignore_ascii_case("cpu")) {
+            return false;
+        }
+        let picked = hand_ml::device::select(None);
+        if picked.backend == Backend::Cpu {
+            return false;
+        }
+        self.select(picked.backend, picked.ordinal).is_ok()
+    }
+
+    /// Where each loaded model runs, by model id (set when they are loaded).
+    pub fn live_devices(&self) -> std::collections::BTreeMap<String, String> {
+        self.live_devices.lock().map(|d| d.clone()).unwrap_or_default()
+    }
+
+    pub fn set_live_devices(&self, d: std::collections::BTreeMap<String, String>) {
+        if let Ok(mut l) = self.live_devices.lock() {
+            *l = d;
+        }
+    }
+
+    /// Forgets the loaded SigLIP2 (its files are about to go).
+    pub fn drop_vision(&self) {
+        *self.vision.lock().expect("vision lock") = None;
     }
 
     /// Runs `f` on the world runtime, building it first if needed. The lock is
@@ -78,14 +162,20 @@ impl AppState {
         backend.device(ordinal)
     }
 
-    /// Selects a device. The vision engine reloads on the next classification.
+    /// Selects a device. The vision engine reloads on the next classification,
+    /// and the world waits until the models are loaded again on this device.
     pub fn select(&self, backend: Backend, ordinal: usize) -> Result<()> {
         if !backend.compiled() {
             anyhow::bail!("{} is not compiled into this build", backend.name());
         }
         backend.device(ordinal)?;
+        let changed = *self.device.lock().expect("device lock") != (backend, ordinal);
         *self.device.lock().expect("device lock") = (backend, ordinal);
-        *self.vision.lock().expect("vision lock") = None;
+        if changed {
+            *self.vision.lock().expect("vision lock") = None;
+            self.set_models_ready(false);
+            self.set_live_devices(Default::default());
+        }
         Ok(())
     }
 
@@ -164,6 +254,21 @@ pub fn ttm_dir() -> PathBuf {
         return nested;
     }
     base
+}
+
+/// Where downloaded TTM files go: `TTM_DIR`, else the folder that already has
+/// a `config.json`, else the `52-16-dec-52-r3` subfolder (the branch the files
+/// come from).
+pub fn ttm_download_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("TTM_DIR") {
+        return PathBuf::from(p);
+    }
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("models").join(TTM_FOLDER);
+    if base.join("config.json").is_file() {
+        base
+    } else {
+        base.join(TTM_SUBFOLDER)
+    }
 }
 
 /// Folder with the TIPSv2-B/14 DPT files (`model.safetensors`, `config.json`).

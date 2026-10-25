@@ -1212,6 +1212,14 @@ impl TtmForecaster {
         self.config.context_length
     }
 
+    /// The device the weights live on (where the forecasts run).
+    pub fn device(&self) -> &Device {
+        match &self.kind {
+            Kind::Plain(p) => &p.device,
+            Kind::Decomposed { trend, .. } => &trend.device,
+        }
+    }
+
     pub fn prediction_length(&self) -> usize {
         self.config.prediction_length
     }

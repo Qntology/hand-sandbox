@@ -27,12 +27,12 @@ use crate::snapshot::*;
 use crate::terrain::{cell_center, FlatZone, RuggedLayout, Terrain, TerrainKind, CELL_M};
 
 mod acts;
+mod eye;
 pub use acts::{camera_of, material_of, ActPlay, PushState, WalkState, GET_UP_S, PUSH_START_SLACK_M, SIDE_SHUFFLE_MAX_M};
+pub use eye::{chassis_accel_rms, exposure_s, profile, roughness_gd, sensor_timing, strike_peak_mps2, strike_scale, EyeState, HeadView, SensorTiming, Shake, SCENE_LUX};
 
 /// Length of one simulation tick, seconds.
 pub const TICK_S: f32 = 0.1;
-/// Camera height above the ground the robot stands on, metres.
-pub const EYE_HEIGHT_M: f32 = 0.5;
 /// How close the robot must be to mine a node, metres.
 pub const MINE_REACH_M: f32 = 0.9;
 /// How close the robot must be to pick up a dropped item, metres.
@@ -425,6 +425,8 @@ pub struct World {
     pub odom: Odometry,
     /// Share of this tick's distance the wheels counted without travelling it (their slip).
     odom_over: f32,
+    /// What the head camera tracks between ticks (`eye`).
+    pub eye: EyeState,
     /// Side reaches planned so far, by item, piece (thousandths) and cargo (tenths of a kg).
     side_cache: Mutex<std::collections::HashMap<(ItemKind, i32, i32), Option<(f32, f32)>>>,
 }
@@ -466,6 +468,7 @@ impl Clone for World {
             walk: self.walk.clone(),
             odom: self.odom.clone(),
             odom_over: self.odom_over,
+            eye: self.eye.clone(),
             side_cache: Mutex::new(self.side_cache.lock().unwrap_or_else(|e| e.into_inner()).clone()),
         }
     }
@@ -730,6 +733,7 @@ impl World {
             walk: WalkState::default(),
             odom,
             odom_over: 0.0,
+            eye: EyeState::default(),
             side_cache: Mutex::new(std::collections::HashMap::new()),
         })
     }
@@ -1223,6 +1227,7 @@ impl World {
         let after = (self.agent.x, self.agent.z, self.agent.yaw);
         self.odom.update(before, after, dt, self.odom_over);
         self.odom_over = 0.0;
+        self.eye.advance(before, after, dt);
         self.time_s += dt as f64;
         events
     }
@@ -1933,6 +1938,20 @@ mod tests {
         let mut hand = HandConfig::preset(fingers);
         hand.base = base;
         World::new(WorldConfig { seed: 7, cells: 64, hand, body: BodyPlan::default(), terrain: TerrainKind::Open, parcels: Some(0), ..WorldConfig::default() }).unwrap()
+    }
+
+    #[test]
+    fn a_pick_never_shuffles_the_body_onto_ground_it_cannot_drive_onto() {
+        let mut w = world(FingerCount::Five, BaseKind::HumanFoot);
+        let (cx, cz) = w.agent_cell();
+        let (ax, az) = (w.agent.x, w.agent.z);
+        assert!(w.can_step_to(ax + 0.1, az), "within its own cell");
+        assert!(w.can_step_to(ax + CELL_M, az), "onto a level neighbour");
+        // A rock column 0.9 m above the cell ahead: no step onto it, and not two cells away either.
+        let h = (w.terrain.height_m(cx, cz) * 100.0).round() as i32;
+        w.terrain.set_height_cm(cx + 1, cz, h + 90);
+        assert!(!w.can_step_to(ax + CELL_M, az));
+        assert!(!w.can_step_to(ax + 2.0 * CELL_M, az));
     }
 
     #[test]

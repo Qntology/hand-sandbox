@@ -17,7 +17,6 @@ use hand_core::act::focus::FocusFrame;
 use hand_core::BalanceSummary;
 use hand_vision::{DepthMetrics, Features, Intrinsics, Pose, Rgb};
 use serde::{Deserialize, Serialize};
-use world_sim::world::EYE_HEIGHT_M;
 use world_sim::render::{render_focus, FocusCam};
 use world_sim::{decode_webp, encode_webp, Camera, World};
 
@@ -183,14 +182,23 @@ impl Recording {
 }
 
 /// The robot's pose from its own odometry (`world_sim::odometry`): it drifts
-/// as a real robot's does, which the triangulation residuals show.
-pub fn odometry(world: &World) -> Pose {
+/// as a real robot's does, which the triangulation residuals show. The camera
+/// is where the robot believes its head camera is on that pose: the head's
+/// offset from the body (its joints) turned into the believed heading, the
+/// neck's pan on top, and the eye's height above the ground.
+pub fn odometry(world: &World, cam: &Camera) -> Pose {
     let (x, z, yaw) = world.believed_pose();
-    Pose { x, z, yaw, eye_m: EYE_HEIGHT_M }
+    let est = world.head_view(cam).est;
+    let (ox, oz) = (est.origin[0] - world.agent.x, est.origin[2] - world.agent.z);
+    let (s, c) = (yaw - world.agent.yaw).sin_cos();
+    Pose { x: x + c * ox - s * oz, z: z + s * ox + c * oz, yaw: yaw + (est.yaw - world.agent.yaw), eye_m: est.origin[1] - world.agent_ground_m() }
 }
 
-pub fn intrinsics(cam: &Camera) -> Intrinsics {
-    Intrinsics { width: cam.width as u32, height: cam.height as u32, fov_deg: cam.fov_deg, pitch_deg: cam.pitch_deg }
+/// The camera's intrinsics with the pitch the robot believes its head camera
+/// has now (the mount, the bend and the neck, the shake its IMU reads).
+pub fn intrinsics(world: &World, cam: &Camera) -> Intrinsics {
+    let est = world.head_view(cam).est;
+    Intrinsics { width: cam.width as u32, height: cam.height as u32, fov_deg: cam.fov_deg, pitch_deg: est.pitch.to_degrees() }
 }
 
 /// Width and height of the focus close-ups, pixels.
@@ -217,8 +225,8 @@ pub fn capture_keyframe(world: &World, cam: &Camera, quality: f32, index: u32) -
         index,
         tick: world.tick,
         time_s: world.time_s,
-        pose: odometry(world),
-        intr: intrinsics(cam),
+        pose: odometry(world, cam),
+        intr: intrinsics(world, cam),
         webp: enc.bytes,
         truth: KeyTruth::capture(world, &frame),
         step: None,
