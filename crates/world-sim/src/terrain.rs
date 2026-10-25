@@ -458,6 +458,30 @@ impl Terrain {
         }
     }
 
+    /// Surface height (curbs included) at a point, bilinear between cell
+    /// centres: the ground a wheel or a track rolls over as it climbs from one
+    /// cell's height to the next. Cells more than `step_m` above or below
+    /// `base_m` (a wall, a drop the base cannot climb) count at `base_m`: the
+    /// wheel stands against them, not on them.
+    pub fn surface_smooth_m(&self, x: f32, z: f32, base_m: f32, step_m: f32) -> f32 {
+        let fx = (x / CELL_M - 0.5).clamp(0.0, (self.w - 1) as f32);
+        let fz = (z / CELL_M - 0.5).clamp(0.0, (self.d - 1) as f32);
+        let (x0, z0) = (fx.floor() as usize, fz.floor() as usize);
+        let (x1, z1) = ((x0 + 1).min(self.w - 1), (z0 + 1).min(self.d - 1));
+        let (u, v) = (fx - x0 as f32, fz - z0 as f32);
+        let h = |a: usize, b: usize| {
+            let s = self.height_m(a, b) + self.curb_m(a, b);
+            if (s - base_m).abs() > step_m {
+                base_m
+            } else {
+                s
+            }
+        };
+        let near = h(x0, z0) * (1.0 - u) + h(x1, z0) * u;
+        let far = h(x0, z1) * (1.0 - u) + h(x1, z1) * u;
+        near * (1.0 - v) + far * v
+    }
+
     /// Slope in degrees between the centres of two cells.
     pub fn slope_deg(&self, a: (usize, usize), b: (usize, usize)) -> f32 {
         let (ax, az) = cell_center(a.0, a.1);

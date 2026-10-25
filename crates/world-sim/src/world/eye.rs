@@ -119,6 +119,10 @@ pub struct HeadView {
     pub pan_deg: f32,
     /// Largest motion blur in this frame, pixels.
     pub blur_px: f32,
+    /// Pitch (nose up) and roll (right side down) of a wheeled or tracked
+    /// chassis on the ground under it, degrees (0 for legs: the gait keeps
+    /// the torso level).
+    pub tilt_deg: [f32; 2],
 }
 
 // ----- the sensor of each head preset (research camera.md §4) -----
@@ -294,7 +298,19 @@ impl World {
 
     /// The head camera now: the body's pose, the shake, the sensor.
     pub fn head_view(&self, cam: &Camera) -> HeadView {
-        let (pose, walking) = self.camera_pose();
+        let (mut pose, walking) = self.camera_pose();
+        // A rigid chassis lies on the ground under its contacts; legs keep the torso level.
+        let (tilt, tilt_rate) = if self.body.legged {
+            ((0.0, 0.0), [0.0, 0.0])
+        } else {
+            let (x, z, yaw) = (self.agent.x, self.agent.z, self.agent.yaw);
+            let now = self.chassis_attitude(x, z, yaw);
+            let v = self.agent.speed_mps;
+            let dt = 0.05;
+            let next = if v > 1e-3 { self.chassis_attitude(x + v * dt * yaw.cos(), z + v * dt * yaw.sin(), yaw) } else { now };
+            pose.base_pitch_deg = now.0.to_degrees();
+            (now, [(next.0 - now.0) / dt, (next.1 - now.1) / dt])
+        };
         let hc = hkin::head_camera(&self.body, &pose);
         let mut pos = hc.pos;
         if walking {
@@ -312,10 +328,35 @@ impl World {
         let pan_deg = hc.pan_deg + cam.pan_deg;
         let yaw = self.agent.yaw - pan_deg.to_radians();
         let pitch = cam.pitch_deg.to_radians() - head_pitch_deg.to_radians();
-        let view = View { origin: [at[0], at[1] + shake.dz_m, at[2]], yaw, pitch: pitch + shake.pitch, roll: shake.roll };
+        // The neck has no roll joint: the chassis's roll reaches the camera whole.
+        let view = View { origin: [at[0], at[1] + shake.dz_m, at[2]], yaw, pitch: pitch + shake.pitch, roll: shake.roll + tilt.1 };
         let est = View { pitch: view.pitch + ep, roll: view.roll + er, ..view };
-        let exposure = Exposure { rate: [self.eye.yaw_rate, shake.rate[1], shake.rate[2]], exposure_s: timing.exposure_s, readout_s: timing.readout_s };
-        HeadView { view, exposure, est, shake, eye_m: pos[2] + shake.dz_m, head_pitch_deg, pan_deg, blur_px: exposure.blur_px(cam) }
+        let keep = 1.0 - self.body.head.gaze_stabilization;
+        let rate = [self.eye.yaw_rate, shake.rate[1] + tilt_rate[0] * keep, shake.rate[2] + tilt_rate[1]];
+        let exposure = Exposure { rate, exposure_s: timing.exposure_s, readout_s: timing.readout_s };
+        let tilt_deg = [tilt.0.to_degrees(), tilt.1.to_degrees()];
+        HeadView { view, exposure, est, shake, eye_m: pos[2] + shake.dz_m, head_pitch_deg, pan_deg, blur_px: exposure.blur_px(cam), tilt_deg }
+    }
+
+    /// Pitch (nose up) and roll (right side down), radians, of a rigid
+    /// wheeled or tracked chassis at `(x, z)` heading `yaw`: the plane of the
+    /// ground (`Terrain::surface_smooth_m`) under its four contacts, the
+    /// wheelbase (a track's contact length) apart along the heading and the
+    /// track width across it. A cell taller than the base climbs (by step or
+    /// by slope) is a wall beside it, not ground under it.
+    pub fn chassis_attitude(&self, x: f32, z: f32, yaw: f32) -> (f32, f32) {
+        let spec = self.drive_spec();
+        let reach = spec.max_step_m.max(spec.max_slope_deg.to_radians().tan() * crate::terrain::CELL_M) + 0.01;
+        let base = self.surface_m(x, z);
+        let (len, wid) = (self.body.support_len_m.max(0.2), self.body.support_width_m.max(0.2));
+        let (s, c) = yaw.sin_cos();
+        // Forward (c, s); the robot's right is (-s, c) as the camera's.
+        let h = |f: f32, r: f32| self.terrain.surface_smooth_m(x + c * f - s * r, z + s * f + c * r, base, reach);
+        let (fr, fl) = (h(0.5 * len, 0.5 * wid), h(0.5 * len, -0.5 * wid));
+        let (rr, rl) = (h(-0.5 * len, 0.5 * wid), h(-0.5 * len, -0.5 * wid));
+        let pitch = (0.5 * (fr + fl) - 0.5 * (rr + rl)).atan2(len);
+        let roll = (0.5 * (fl + rl) - 0.5 * (fr + rr)).atan2(wid);
+        (pitch, roll)
     }
 
     /// The shake now and how long the IMU has been integrating it, s.
@@ -521,6 +562,44 @@ mod tests {
         assert!(tilt(Surface::Rock) > 4.0 * tilt(Surface::Firm), "rock {} firm {}", tilt(Surface::Rock), tilt(Surface::Firm));
         let roll = |s: Surface| ((0..400).map(|i| rolling(5, roughness_gd(s), i as f32 * 0.07, 1.0, 0.4, 0.35, 0.12).pitch.powi(2)).sum::<f32>() / 400.0).sqrt();
         assert!(roll(Surface::Gravel) > 1.5 * roll(Surface::Firm), "gravel {} firm {}", roll(Surface::Gravel), roll(Surface::Firm));
+    }
+
+    #[test]
+    fn a_chassis_tilts_with_the_ground_and_legs_keep_the_torso_level() {
+        for base in [BaseKind::Wheel, BaseKind::Track, BaseKind::HumanFoot] {
+            let mut w = world(base);
+            w.agent.yaw = 0.0;
+            let (cx, cz) = w.agent_cell();
+            (w.agent.x, w.agent.z) = crate::terrain::cell_center(cx, cz);
+            let h0 = 50;
+            // A side slope: the ground falls 5 cm per cell toward the robot's right (+z at yaw 0).
+            for dz in -2i32..=2 {
+                for dx in -2i32..=2 {
+                    let (x, z) = ((cx as i32 + dx) as usize, (cz as i32 + dz) as usize);
+                    w.terrain.set_height_cm(x, z, h0 - 5 * dz);
+                }
+            }
+            let hv = w.head_view(&Camera::default());
+            if base == BaseKind::HumanFoot {
+                assert_eq!(hv.tilt_deg, [0.0, 0.0], "legs keep the torso level");
+                assert!(hv.view.roll.abs() < 1e-6);
+            } else {
+                // 5 cm per 0.5 m is a 5.7° slope: the chassis rolls right side down by about that.
+                assert!(hv.tilt_deg[1] > 3.0 && hv.tilt_deg[1] < 7.0, "{base:?} roll {:?}", hv.tilt_deg);
+                assert!(hv.tilt_deg[0].abs() < 0.5, "{base:?} pitch {:?}", hv.tilt_deg);
+                assert!((hv.view.roll.to_degrees() - hv.tilt_deg[1]).abs() < 1e-3, "the neck has no roll joint");
+            }
+        }
+        // A wall beside the robot is not ground under its wheels.
+        let mut w = world(BaseKind::Wheel);
+        w.agent.yaw = 0.0;
+        let (cx, cz) = w.agent_cell();
+        (w.agent.x, w.agent.z) = crate::terrain::cell_center(cx, cz);
+        let h0 = (w.terrain.height_m(cx, cz) * 100.0).round() as i32;
+        for dx in -2i32..=2 {
+            w.terrain.set_height_cm((cx as i32 + dx) as usize, cz + 1, h0 + 120);
+        }
+        assert!(w.head_view(&Camera::default()).tilt_deg[1].abs() < 0.5);
     }
 
     #[test]

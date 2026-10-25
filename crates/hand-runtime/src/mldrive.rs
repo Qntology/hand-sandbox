@@ -608,7 +608,7 @@ impl Runtime {
                 t.queue.push_back(Action::MoveTo { x: step.to.0, z: step.to.1, reach_m: 0.0 });
                 t.queue.push_back(Action::Face { x: step.face.0, z: step.face.1 });
             }
-            Decision::Explore { .. } => match self.search_viewpoint(&t.coverage, &t.visited) {
+            Decision::Explore { .. } => match self.search_viewpoint_for(&t.coverage, &t.visited) {
                 Some(v) => {
                     t.visited.push((self.world.agent.x, self.world.agent.z));
                     t.visited.push((v.x, v.z));

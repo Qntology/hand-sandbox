@@ -607,6 +607,7 @@ impl Runtime {
                       "rate_dps": [deg(hv.exposure.rate[0]), deg(hv.exposure.rate[1]), deg(hv.exposure.rate[2])]},
             "est_err_deg": {"pitch": deg(hv.view.pitch - hv.est.pitch), "roll": deg(hv.view.roll - hv.est.roll)},
             "blur_px": r3(hv.blur_px),
+            "terrain_tilt_deg": [r3(hv.tilt_deg[0]), r3(hv.tilt_deg[1])],
             "sensor": {"name": w.body.head.sensor, "rgb": t.rgb, "exposure_ms": r3(t.exposure_s * 1000.0), "readout_ms": r3(t.readout_s * 1000.0), "gyro_arw_deg": r3(t.gyro_arw_deg), "scene_lux": world_sim::world::SCENE_LUX},
             "ground": w.ground_here().surface().props().id,
         })

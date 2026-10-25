@@ -143,7 +143,8 @@ pub struct Viewpoint {
 }
 
 /// The reachable cell that would show the most unseen ground per second.
-/// `eye_above_m`, `pitch_deg` and `vfov_deg` describe the camera; `avoid` are
+/// `eye_above_m`, `pitch_deg` and `vfov_deg` describe the camera and
+/// `range_m` how far it recognises what is searched for; `avoid` are
 /// points already tried (a viewpoint within 2 m of one is skipped). `None`
 /// when nothing reachable would show [`MIN_GAIN`] new cells.
 #[allow(clippy::too_many_arguments)]
@@ -156,6 +157,7 @@ pub fn next_viewpoint(
     eye_above_m: f32,
     pitch_deg: f32,
     vfov_deg: f32,
+    range_m: f32,
     avoid: &[(f32, f32)],
 ) -> Option<Viewpoint> {
     let times = nav::travel_times(spec, t, blocked, start, 900.0);
@@ -178,7 +180,7 @@ pub fn next_viewpoint(
     let mut stamp = vec![u32::MAX; t.w * t.d];
     let mut best: Option<Viewpoint> = None;
     for (k, &(cx, cz, tt)) in cands.iter().enumerate() {
-        let eye = Eye::at(t, (cx, cz), eye_above_m, pitch_deg, vfov_deg);
+        let eye = Eye { range_m: range_m.min(SEARCH_RANGE_M), ..Eye::at(t, (cx, cz), eye_above_m, pitch_deg, vfov_deg) };
         let mut gain = 0usize;
         let mut sectors = [0usize; 8];
         let tag = k as u32;
@@ -292,11 +294,11 @@ mod tests {
         }
         let spec = BaseKind::Track.spec();
         let none = |_: usize, _: usize| false;
-        let v = next_viewpoint(&t, &spec, &none, start, &cov, 0.5, -12.0, 50.0, &[]).expect("unseen ground is left");
+        let v = next_viewpoint(&t, &spec, &none, start, &cov, 0.5, -12.0, 50.0, SEARCH_RANGE_M, &[]).expect("unseen ground is left");
         assert!(v.gain >= MIN_GAIN && v.time_s > 0.0);
         // Everything seen: nowhere to go.
         let mut all = Coverage::new(&t);
         all.seen.iter_mut().for_each(|s| *s = true);
-        assert!(next_viewpoint(&t, &spec, &none, start, &all, 0.5, -12.0, 50.0, &[]).is_none());
+        assert!(next_viewpoint(&t, &spec, &none, start, &all, 0.5, -12.0, 50.0, SEARCH_RANGE_M, &[]).is_none());
     }
 }

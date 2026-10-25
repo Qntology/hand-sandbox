@@ -26,6 +26,7 @@ export function cameraRows(c) {
   return [
     ['눈 높이', `${fmt.n(c.eye_m, 2)} m (서 있을 때 ${fmt.n(c.standing_eye_m, 2)} m)`],
     ['카메라 피치', `${fmt.n(c.pitch_deg, 1)}° = 장착 ${fmt.n(c.mount_deg, 0)}° − 몸·목 ${fmt.n(c.head_pitch_deg, 1)}° + 흔들림 ${fmt.n(s.pitch_deg, 2)}°`],
+    ['차체 기울기 (지면)', c.terrain_tilt_deg ? `피치 ${fmt.n(c.terrain_tilt_deg[0], 1)}° · 롤 ${fmt.n(c.terrain_tilt_deg[1], 1)}° (바퀴·트랙만, 다리형은 몸통을 수평으로 유지)` : '—'],
     ['목 팬 · 롤', `팬 ${fmt.n(c.pan_deg, 1)}° (왼쪽 +) · 롤 ${fmt.n(c.roll_deg, 2)}°`],
     ['흔들림', `${SHAKE_KO[s.source] ?? s.source ?? '—'} · 상하 ${fmt.n(s.dz_mm, 1)} mm · 각속도 ${(s.rate_dps ?? []).map((r) => fmt.n(r, 0)).join(' / ')} °/s (요·피치·롤)`],
     ['모션 블러', `${fmt.n(c.blur_px, 2)} px (노출 ${fmt.n(c.sensor?.exposure_ms, 2)} ms @ ${c.sensor?.scene_lux ?? '—'} lx · 롤링 셔터 ${fmt.n(c.sensor?.readout_ms, 1)} ms)`],

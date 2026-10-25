@@ -66,6 +66,17 @@ pub(crate) const SIDE_SPOT_REACH_M: f32 = 0.36;
 /// A move to a place of the map stops this far from it, metres: the hand's
 /// reach of the pile less half a metre of slack.
 pub(crate) const PLACE_REACH_M: f32 = DELIVER_REACH_M - 0.5;
+/// How far from a faintly seen item the robot stands to look down at it,
+/// metres: the head camera (1.14 m) then sees it about 44° below level,
+/// inside the 12° mount plus the neck's 45° tilt (est).
+pub(crate) const INSPECT_STAND_M: f32 = 1.2;
+/// How far a parcel is recognised from the head camera, metres: SigLIP2 base
+/// with the 6×4 tiles picks a 0.30 m parcel out of the grass up to 3 m away
+/// with the head pitched down 30°, never at 4 m (tests/siglip_parcel.rs).
+pub(crate) const SMALL_ITEM_SEE_M: f32 = 3.0;
+/// Head tilt of the look down that sweeps the ground near the feet while
+/// searching for a small item, degrees (the probe's best view at 2–3 m).
+pub(crate) const GROUND_SWEEP_TILT_DEG: f32 = 30.0;
 /// Moves the driver adds toward a place when the planned one ended short of
 /// it in the robot's belief (est).
 pub(crate) const MAX_PLACE_FIXES: u32 = 2;
@@ -187,6 +198,8 @@ pub(crate) struct Task {
     pub coverage: Coverage,
     /// Heading to turn to after reaching a viewpoint.
     pub face_after: Option<f32>,
+    /// Faint sightings of the target already walked to and looked down at.
+    pub inspected: Vec<u32>,
     // collecting
     pub drops: Vec<u32>,
     pub drop_idx: usize,
@@ -322,6 +335,7 @@ impl Task {
             approach_scan_cd: 0,
             coverage: Coverage::new(&world.terrain),
             face_after: None,
+            inspected: Vec::new(),
             drops: Vec::new(),
             drop_idx: 0,
             rounds: 0,
@@ -620,15 +634,47 @@ impl Runtime {
 
     /// Marks what the camera sees from here into the quest's coverage.
     pub(crate) fn mark_coverage(&self, cov: &mut Coverage) {
-        let eye = self.cam.eye(&self.world);
+        self.mark_coverage_as(cov, 0.0, world_sim::explore::SEARCH_RANGE_M);
+    }
+
+    /// Marks the ground the camera saw with the head pitched down `tilt_deg`,
+    /// as far as `range_m`: past that the target would not have been
+    /// recognised even in view, so that ground is still unsearched.
+    pub(crate) fn mark_coverage_as(&self, cov: &mut Coverage, tilt_deg: f32, range_m: f32) {
+        let mut eye = self.cam.eye(&self.world);
+        eye.pitch_deg -= tilt_deg;
+        eye.range_m = eye.range_m.min(range_m);
         cov.look(&self.world.terrain, &eye, self.world.agent.yaw, self.cam.fov_deg);
     }
 
-    /// The next viewpoint for a search (see `world_sim::explore`).
-    pub(crate) fn search_viewpoint(&self, cov: &Coverage, avoid: &[(f32, f32)]) -> Option<Viewpoint> {
+    /// How far the target can be recognised, and the head tilt of the sweep
+    /// that searches the ground near the feet: a small item lying on the
+    /// ground (a parcel) only within [`SMALL_ITEM_SEE_M`], with a look down.
+    fn search_reach(&self, t: &Task) -> (f32, f32) {
+        if t.placed() {
+            (SMALL_ITEM_SEE_M, GROUND_SWEEP_TILT_DEG)
+        } else {
+            (world_sim::explore::SEARCH_RANGE_M, 0.0)
+        }
+    }
+
+    /// The next viewpoint for a search (see `world_sim::explore`): the
+    /// camera's level view and its look down together, as far as the target
+    /// can be recognised.
+    pub(crate) fn search_viewpoint(&self, t: &Task) -> Option<Viewpoint> {
+        let (range, tilt) = self.search_reach(t);
+        self.viewpoint_with(&t.coverage, &t.visited, tilt, range)
+    }
+
+    /// The next viewpoint with the level camera at its full range (the ML pass's search).
+    pub(crate) fn search_viewpoint_for(&self, cov: &Coverage, avoid: &[(f32, f32)]) -> Option<Viewpoint> {
+        self.viewpoint_with(cov, avoid, 0.0, world_sim::explore::SEARCH_RANGE_M)
+    }
+
+    fn viewpoint_with(&self, cov: &Coverage, avoid: &[(f32, f32)], tilt: f32, range: f32) -> Option<Viewpoint> {
         let blocked = self.world.blocked_cells();
         let start = self.world.terrain.cell_of(self.world.agent.x, self.world.agent.z)?;
-        world_sim::explore::next_viewpoint(&self.world.terrain, &self.world.drive_spec(), &|x, z| blocked.contains(&(x, z)), start, cov, self.world.standing_eye_m(), self.cam.pitch_deg, self.cam.vfov_deg(), avoid)
+        world_sim::explore::next_viewpoint(&self.world.terrain, &self.world.drive_spec(), &|x, z| blocked.contains(&(x, z)), start, cov, self.world.standing_eye_m(), self.cam.pitch_deg - 0.5 * tilt, self.cam.vfov_deg() + tilt, range, avoid)
     }
 
     fn do_locate(&mut self, t: &mut Task) -> Flow {
@@ -650,6 +696,11 @@ impl Runtime {
             self.goto_phase(t, Phase::Approach, "");
             return Flow::Continue;
         }
+        if t.placed() {
+            if let Some(flow) = self.inspect_faint(t) {
+                return flow;
+            }
+        }
         if t.scan_cooldown > 0 {
             t.scan_cooldown -= 1;
             return Flow::Continue;
@@ -660,7 +711,12 @@ impl Runtime {
                 self.log("vision", Level::Error, format!("인식 실패: {e}"), None);
                 return fail("perception_failed", format!("인식기가 실패했습니다: {e}"));
             }
-            self.mark_coverage(&mut t.coverage);
+            let (range, tilt) = self.search_reach(t);
+            self.mark_coverage_as(&mut t.coverage, 0.0, range);
+            // A small item: the same heading again with the head pitched down over the ground near the feet.
+            if tilt > 0.0 && self.scan_gaze("locate_down", 0.0, tilt).is_ok() {
+                self.mark_coverage_as(&mut t.coverage, tilt, range);
+            }
             t.scans_here += 1;
             t.scan_cooldown = self.cfg.scan_every_ticks;
             return Flow::Continue;
@@ -688,7 +744,7 @@ impl Runtime {
         t.rotations = 0;
         t.scans_here = 0;
         loop {
-            let Some(v) = self.search_viewpoint(&t.coverage, &t.visited) else {
+            let Some(v) = self.search_viewpoint(t) else {
                 let name = t.target().label_ko.clone();
                 let seen = t.coverage.land_frac(&self.world.terrain) * 100.0;
                 return fail("locate_timeout", format!("{name}{} 찾지 못했습니다 (갈 수 있는 곳에서 볼 수 있는 땅을 다 봄 · {seen:.0}%)", eul_reul(&name)));
@@ -707,6 +763,60 @@ impl Runtime {
                 Err(e) => return fail(e.code(), action_error_ko(&e)),
             }
         }
+    }
+
+    /// Something that looked like the wanted item from afar but did not pass
+    /// the gates (a parcel a few pixels wide in a tile of grass) is checked as
+    /// a person would: walk to about [`INSPECT_STAND_M`] from it, pitch and
+    /// turn the head down at it so it fills the view, and look again. The
+    /// close look confirms it (the next step approaches it) or leaves it
+    /// unconfirmed, and the search goes on. `None` when there is nothing faint
+    /// left to check.
+    fn inspect_faint(&mut self, t: &mut Task) -> Option<Flow> {
+        let want = t.target().resource.clone();
+        let (mx, mz, myaw) = self.me();
+        let (id, label, x, z, score) = self
+            .gates
+            .landmarks()
+            .iter()
+            .filter(|l| !l.confirmed && l.state == LmState::Active && l.kind == EntKind::Drop && l.link == want && l.seen >= 1 && !t.inspected.contains(&l.id))
+            .min_by(|a, b| a.distance_to(mx, mz).total_cmp(&b.distance_to(mx, mz)))
+            .map(|l| (l.id, l.label.clone(), l.x, l.z, l.score))?;
+        let name = t.target().label_ko.clone();
+        let d = (x - mx).hypot(z - mz);
+        if d > INSPECT_STAND_M + 0.4 {
+            self.log("quest", Level::Info, format!("멀리서 {name}처럼 보이는 것을 봄 (L{id} {label}, 점수 {score:.2}, {d:.1} m) — 가까이 가서 내려다보며 확인"), Some(json!({"landmark": id, "x": x, "z": z, "score": score})));
+            t.face_after = Some((z - mz).atan2(x - mx));
+            return match self.issue(t, Action::MoveTo { x, z, reach_m: INSPECT_STAND_M }, Act::Move(MoveFor::Search)) {
+                Ok(()) => Some(Flow::Continue),
+                Err(_) => {
+                    t.inspected.push(id);
+                    None
+                }
+            };
+        }
+        // Here: the head pitched down (and turned) until the spot is in the middle of the view.
+        let b = (z - mz).atan2(x - mx) - myaw;
+        let bearing = b.sin().atan2(b.cos()).to_degrees();
+        let pan = (-bearing).clamp(-hand_core::kin::NECK_PAN_MAX_DEG, hand_core::kin::NECK_PAN_MAX_DEG);
+        let depression = self.world.standing_eye_m().atan2(d.max(0.1)).to_degrees();
+        let tilt = (depression + self.cam.pitch_deg).clamp(0.0, hand_core::kin::NECK_PITCH_MAX_DEG);
+        t.inspected.push(id);
+        for _ in 0..self.cfg.gates.confirm_sightings.max(1) {
+            if self.scan_gaze("inspect", pan, tilt).is_err() {
+                break;
+            }
+        }
+        t.looks += 1;
+        let ok = self.gates.landmark(id).is_some_and(|l| l.confirmed);
+        let msg = if ok {
+            format!("내려다보고 확인: L{id}는 {name} (목 숙임 {tilt:.0}°, 돌림 {pan:.0}°)")
+        } else {
+            format!("내려다봤지만 L{id}는 {name}로 확인되지 않음 (목 숙임 {tilt:.0}°) — 다른 곳을 찾음")
+        };
+        self.log("quest", Level::Info, msg, Some(json!({"landmark": id, "confirmed": ok, "tilt_deg": tilt, "pan_deg": pan})));
+        self.note_look("inspect", format!("L{id}"), None, None, None);
+        Some(Flow::Continue)
     }
 
     fn do_approach(&mut self, t: &mut Task) -> Flow {
