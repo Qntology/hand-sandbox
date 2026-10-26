@@ -1,6 +1,6 @@
 # 간헐 시각과 공간 기억, 가벼운 물건 · 옆으로 잡기 · 무거운 물건 자세: 리서치, 벤치마크, 개선 기록
 
-조사일 2026-10-25. 이 문서에서 온 코드: `crates/world-sim/src/odometry.rs`(오도메트리 드리프트), `crates/hand-runtime/src/vision.rs`(시각 일정과 기억), `precision.rs`(랜드마크 = 기억, 칼만 융합), `driver.rs`·`mldrive.rs`(믿음 좌표로 결정, 손으로 확인, 지나가며 옆으로 집기, 눈 감은 ML 홉), `crates/hand-vision/src/decide.rs`(`Decider::predict`), `crates/hand-core/src/kin.rs`(어깨 외전, 넓은 발), `act/reach.rs`(옆 뻗기 · 걸터서기 · 일어서기 동적 ZMP), `act/grasp.rs`(기억 조준), `crates/world-sim/src/kinds.rs`(택배 상자), `crates/hand-runtime/tests/vision_bench.rs`(벤치마크), `crates/hand-core/src/act/gait.rs`(LIPM 너머 걸음), `crates/hand-core/src/parts.rs`의 `TORSO_LIFT`와 `wheel_lift` 프리셋(바퀴형 바닥 집기). 앞선 행위 물리는 [`actions.md`](actions.md).
+조사일 2026-10-25. 이 문서에서 온 코드: `crates/world-sim/src/odometry.rs`(오도메트리 드리프트), `crates/noto-runtime/src/vision.rs`(시각 일정과 기억), `precision.rs`(랜드마크 = 기억, 칼만 융합), `driver.rs`·`mldrive.rs`(믿음 좌표로 결정, 손으로 확인, 지나가며 옆으로 집기, 눈 감은 ML 홉), `crates/noto-vision/src/decide.rs`(`Decider::predict`), `crates/noto-core/src/kin.rs`(어깨 외전, 넓은 발), `act/reach.rs`(옆 뻗기 · 걸터서기 · 일어서기 동적 ZMP), `act/grasp.rs`(기억 조준), `crates/world-sim/src/kinds.rs`(택배 상자), `crates/noto-runtime/tests/vision_bench.rs`(벤치마크), `crates/noto-core/src/act/gait.rs`(LIPM 너머 걸음), `crates/noto-core/src/parts.rs`의 `TORSO_LIFT`와 `wheel_lift` 프리셋(바퀴형 바닥 집기). 앞선 행위 물리는 [`actions.md`](actions.md).
 
 표기는 [`actions.md`](actions.md)와 같다: **[직접]** 출처에 인쇄된 값, **[유도: 식]** 이 문서에서 계산, **[추정]** 출처를 찾지 못해 정한 값, **[대입]** 다른 대상의 값, **[2차: X]** X가 인용한 값, **[초록]** 초록만 확인. **벤치마크는 시간 측정이 아니라 기준 점수 시험**이다.
 
@@ -135,7 +135,7 @@
 
 ## 4. 결과
 
-명령: `cargo test -p hand-runtime --test vision_bench -- --nocapture` (V1–V3), `cargo test -p hand-core --test action_bench --test effects_bench --test nn_scenarios -- --nocapture` (기존 점수), `cargo test -p hand-runtime -- --nocapture` (퀘스트).
+명령: `cargo test -p noto-runtime --test vision_bench -- --nocapture` (V1–V3), `cargo test -p noto-core --test action_bench --test effects_bench --test nn_scenarios -- --nocapture` (기존 점수), `cargo test -p noto-runtime -- --nocapture` (퀘스트).
 
 ### 4.1 시각 벤치마크 (V1–V3)
 
@@ -180,7 +180,7 @@ v0.6 기준선과 비교해 바뀐 것은 다리형 걷기 12개뿐이고 나머
 | 통합 시험 S1 · S6 | 88.1 · 87.4 | 87.9 · 86.5 |
 | 바퀴형 리프트 프리셋이 원목을 손으로 (새 시험) | — | 통과 (범퍼로 밀지 않음, "몸통을 내리고 허리 굽힘") |
 
-런타임 시험 78개(단위 43, 지형 9, 통합 3, 프리셋 2, 시나리오 19, 시각 벤치 2), hand-core 단위 94 · 벤치 3종 · 프리셋 물리, world-sim 82, hand-sds 34, hand-search 63, hand-vision 27, hand-ts 24, hand-quest 10 모두 통과. 바꾼 시험 두 곳: 게이트 끔 헛수고 하한 4 → 2(위 행), 동역학 SDS 확인을 상태 요약(관측 수 상위 80축) 대신 저장소에 직접 물음(요약에서 밀려났을 뿐 기록은 됨).
+런타임 시험 78개(단위 43, 지형 9, 통합 3, 프리셋 2, 시나리오 19, 시각 벤치 2), noto-core 단위 94 · 벤치 3종 · 프리셋 물리, world-sim 82, noto-sds 34, noto-search 63, noto-vision 27, noto-ts 24, noto-quest 10 모두 통과. 바꾼 시험 두 곳: 게이트 끔 헛수고 하한 4 → 2(위 행), 동역학 SDS 확인을 상태 요약(관측 수 상위 80축) 대신 저장소에 직접 물음(요약에서 밀려났을 뿐 기록은 됨).
 
 ## 5. 개선 기록 (0 = v0.6)
 

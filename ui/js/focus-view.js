@@ -1,4 +1,4 @@
-// 행위 키프레임의 부위 포커스: 키프레임 하나의 FocusFrame(hand_core::act::focus)으로
+// 행위 키프레임의 부위 포커스: 키프레임 하나의 FocusFrame(noto_core::act::focus)으로
 // 손 모양 · 손 관절 · 발 모양 · 발 관절 · 허리 · 목 관절 · 바퀴 · 트랙을 그린다.
 // 타임라인 타일(작게)과 검사기(크게)가 같은 그리기를 쓴다. 숫자는 모두 Rust 가 계산한 값이고 여기서는 그리기만 한다.
 import { cssVar, el, fitCanvas } from './util.js';

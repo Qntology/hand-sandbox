@@ -1,5 +1,5 @@
 //! Tauri commands of the simulated world. Each one hands its arguments to
-//! `hand_runtime::Runtime::api_*`, which builds the JSON the UI reads. Nothing
+//! `noto_runtime::Runtime::api_*`, which builds the JSON the UI reads. Nothing
 //! is decided here.
 //!
 //! The commands are `async` so that a long call (a few hundred ticks, a frame
@@ -7,8 +7,8 @@
 
 use std::sync::Arc;
 
-use hand_core::{BodyPlan, HandConfig};
-use hand_runtime::Runtime;
+use noto_core::{BodyPlan, NotoConfig};
+use noto_runtime::Runtime;
 use serde_json::{json, Value};
 use tauri::State;
 
@@ -17,14 +17,14 @@ use crate::state::{bank_dir, default_store_dir, model_dir, sam_dir, tips_dir, tt
 type App<'a> = State<'a, Arc<AppState>>;
 
 #[tauri::command]
-pub async fn world_new(state: App<'_>, seed: u64, size: usize, config: Option<HandConfig>, base: Option<String>, body: Option<BodyPlan>, terrain: Option<String>) -> Result<Value, String> {
+pub async fn world_new(state: App<'_>, seed: u64, size: usize, config: Option<NotoConfig>, base: Option<String>, body: Option<BodyPlan>, terrain: Option<String>) -> Result<Value, String> {
     state.require_models()?;
     state.with_world(|rt| {
         if let Some(b) = body {
             rt.cfg.body = b;
         }
         if let Some(t) = terrain.as_deref().filter(|t| !t.is_empty()) {
-            rt.cfg.terrain = hand_runtime::world_terrain_kind(t)?;
+            rt.cfg.terrain = noto_runtime::world_terrain_kind(t)?;
         }
         rt.api_world_new(seed, size, config, base.as_deref())
     })
@@ -56,8 +56,8 @@ pub async fn test_db_mirror(state: App<'_>, store_dir: Option<String>) -> Result
         Ok((db.take_mirror(), db.stats()))
     })?;
     let dir = store_dir.filter(|s| !s.trim().is_empty()).map(std::path::PathBuf::from).unwrap_or_else(default_store_dir);
-    let store = hand_data::LanceStore::open(dir.to_str().ok_or("저장 경로가 UTF-8 이 아닙니다")?).await.map_err(|e| format!("{e:#}"))?;
-    let counts = hand_data::test_tables::write_mirror(&store, &batch, &stats).await.map_err(|e| format!("{e:#}"))?;
+    let store = noto_data::LanceStore::open(dir.to_str().ok_or("저장 경로가 UTF-8 이 아닙니다")?).await.map_err(|e| format!("{e:#}"))?;
+    let counts = noto_data::test_tables::write_mirror(&store, &batch, &stats).await.map_err(|e| format!("{e:#}"))?;
     Ok(json!({"store_dir": dir.display().to_string(), "written": counts}))
 }
 
@@ -187,7 +187,7 @@ pub(crate) fn models_json(state: &AppState, rt: &Runtime) -> Result<Value, Strin
     let tips = tips_dir();
     v["tips_files"] = json!({"dir": tips.display().to_string(), "present": tips.join("model.safetensors").is_file()});
     let sam = sam_dir();
-    v["sam_files"] = json!({"dir": sam.display().to_string(), "present": hand_vision::SamModel::find_weights(&sam).is_some()});
+    v["sam_files"] = json!({"dir": sam.display().to_string(), "present": noto_vision::SamModel::find_weights(&sam).is_some()});
     let s = state.startup();
     v["startup"] = json!({"backend": s.backend.name(), "ordinal": s.ordinal, "reason": s.reason});
     v["ready"] = json!(state.models_ready());

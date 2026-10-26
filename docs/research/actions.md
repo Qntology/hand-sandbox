@@ -1,6 +1,6 @@
 # 행위 (잡기·놓기 · 밀기 · 걷기 · 굽히기): 마찰 · 무게 · 탄성 · 충돌 리서치, N:N 벤치마크, 개선 기록
 
-조사일 2026-10-24. 이 문서에서 온 코드: `crates/hand-core/src/kin.rs`(전신 기구학·정역학), `act/`(행위 시계열: `reach` 굽히기, `grasp` 잡기·놓기, `push` 밀기, `gait` 걷기, `drive` 주행, `material` 접촉 재료, `focus` 부위 포커스), `actbench.rs`(벤치마크), `crates/world-sim/src/world/acts.rs`(월드가 행위를 재생), `crates/hand-runtime/src/actsds.rs`(키프레임·SDS), `ui/js/focus-view.js`(부위 화면). 앞선 물리는 [`effects.md`](effects.md)(지면·마모), [`balance.md`](balance.md)(단일 원인 균형), [`nn-scenarios.md`](nn-scenarios.md)(복합 N:N), [`parts.md`](parts.md)(부품 프리셋).
+조사일 2026-10-24. 이 문서에서 온 코드: `crates/noto-core/src/kin.rs`(전신 기구학·정역학), `act/`(행위 시계열: `reach` 굽히기, `grasp` 잡기·놓기, `push` 밀기, `gait` 걷기, `drive` 주행, `material` 접촉 재료, `focus` 부위 포커스), `actbench.rs`(벤치마크), `crates/world-sim/src/world/acts.rs`(월드가 행위를 재생), `crates/noto-runtime/src/actsds.rs`(키프레임·SDS), `ui/js/focus-view.js`(부위 화면). 앞선 물리는 [`effects.md`](effects.md)(지면·마모), [`balance.md`](balance.md)(단일 원인 균형), [`nn-scenarios.md`](nn-scenarios.md)(복합 N:N), [`parts.md`](parts.md)(부품 프리셋).
 
 표기: **[직접]** 출처에 인쇄된 값, **[유도: 식]** 이 문서에서 계산한 값, **[추정]** 출처를 찾지 못해 정한 값, **[대입]** 다른 대상의 값을 빌려 씀, **[2차: X]** X가 인용한 값(원문 미확인), **[미확인]** 출처 위치를 끝내 찾지 못한 값. **벤치마크는 시간 측정이 아니라 기준 점수 시험**이다.
 
@@ -156,7 +156,7 @@
 | W1–W6 | 이동 (다리는 걷기, 바퀴·트랙은 주행) | 단단한 바닥 · 젖은 모래 8° · 예고 없는 오염 바닥(μ 0.164, 단단한 바닥으로 믿음) · 짐 10% 풀밭 · 마른 모래 평지 · 마른 모래 12°, 걷기는 40걸음 × 시드 30개 |
 | B1–B2 | 굽히기 | 바닥의 원목 · 짐 10%를 실은 채 바닥의 돌 |
 
-## 4. 결과 (`cargo test -p hand-core --test action_bench -- --nocapture`)
+## 4. 결과 (`cargo test -p noto-core --test action_bench -- --nocapture`)
 
 `[AX]`(셀), `[AX-SUM]`(시나리오), `[AX-WHY]`(실패 이유), `[AX-HELD]`(홀드아웃) 줄이 기록이다. 5손가락, 프리셋 × 베이스:
 

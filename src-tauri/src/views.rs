@@ -2,10 +2,10 @@
 //! The Tauri commands are thin wrappers around these, so the logic can be
 //! unit-tested without a window.
 
-use hand_core::sim::{closure_angles, fk_all};
-use hand_core::{
+use noto_core::sim::{closure_angles, fk_all};
+use noto_core::{
     grasp, simulate_drive, BaseKind, BaseSpec, DriveReport, FingerCount, GraspResult, GraspSetup,
-    HandConfig, JointAngles, JointKind, Payload, Terrain,
+    NotoConfig, JointAngles, JointKind, Payload, Terrain,
 };
 use serde::Serialize;
 
@@ -69,11 +69,11 @@ pub struct PresetsView {
     pub bases: Vec<DriveView>,
 }
 
-fn to_point(v: hand_core::Vec3) -> Point {
+fn to_point(v: noto_core::Vec3) -> Point {
     [v.x, v.y, v.z]
 }
 
-fn finger_views(hand: &hand_core::Hand, angles: &[Vec<JointAngles>]) -> Vec<FingerView> {
+fn finger_views(hand: &noto_core::Hand, angles: &[Vec<JointAngles>]) -> Vec<FingerView> {
     hand.fingers
         .iter()
         .zip(fk_all(hand, angles))
@@ -86,7 +86,7 @@ fn finger_views(hand: &hand_core::Hand, angles: &[Vec<JointAngles>]) -> Vec<Fing
 }
 
 /// Hand geometry with every finger closed to `closure` in `[0, 1]`.
-pub fn hand_view(config: &HandConfig, closure: f32) -> Result<HandView, String> {
+pub fn hand_view(config: &NotoConfig, closure: f32) -> Result<HandView, String> {
     let hand = config.build().map_err(|e| e.to_string())?;
     let actuation = hand.config.joints.actuation;
     let angles: Vec<Vec<JointAngles>> = hand
@@ -104,7 +104,7 @@ pub fn hand_view(config: &HandConfig, closure: f32) -> Result<HandView, String> 
 
 /// Closes the hand on `payload` and reports the grasp.
 pub fn grasp_view(
-    config: &HandConfig,
+    config: &NotoConfig,
     payload: &Payload,
     setup: &GraspSetup,
 ) -> Result<GraspView, String> {
@@ -217,7 +217,7 @@ pub fn presets_view() -> PresetsView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hand_core::{Actuation, GraspType, HandConfig};
+    use noto_core::{Actuation, GraspType, NotoConfig};
 
     fn carton() -> Payload {
         Payload {
@@ -231,7 +231,7 @@ mod tests {
     #[test]
     fn hand_view_has_one_finger_view_per_finger() {
         for c in FingerCount::ALL {
-            let cfg = HandConfig::preset(c);
+            let cfg = NotoConfig::preset(c);
             let v = hand_view(&cfg, 0.5).unwrap();
             assert_eq!(v.fingers.len(), c.count() as usize);
             // Each finger has one point per joint plus the tip.
@@ -243,7 +243,7 @@ mod tests {
 
     #[test]
     fn invalid_joint_options_surface_as_errors() {
-        let mut cfg = HandConfig::preset(FingerCount::Five);
+        let mut cfg = NotoConfig::preset(FingerCount::Five);
         cfg.joints.segments = 9;
         assert!(hand_view(&cfg, 0.0).is_err());
         assert!(grasp_view(&cfg, &carton(), &GraspSetup::default()).is_err());
@@ -252,7 +252,7 @@ mod tests {
     #[test]
     fn grasp_view_reports_palm_supported_grasp() {
         let v = grasp_view(
-            &HandConfig::preset(FingerCount::Five),
+            &NotoConfig::preset(FingerCount::Five),
             &carton(),
             &GraspSetup::default(),
         )
@@ -264,7 +264,7 @@ mod tests {
 
     #[test]
     fn tendon_coupling_is_reflected_in_closed_pose() {
-        let mut cfg = HandConfig::preset(FingerCount::Five);
+        let mut cfg = NotoConfig::preset(FingerCount::Five);
         cfg.joints.actuation = Actuation::Coupled { ratio: 0.5 };
         let open = hand_view(&cfg, 0.0).unwrap();
         let closed = hand_view(&cfg, 1.0).unwrap();
@@ -301,7 +301,7 @@ mod tests {
     /// so the JSON shape is checked as well as the values.
     #[test]
     fn json_shapes_match_what_the_ui_reads() {
-        let cfg = HandConfig::preset(FingerCount::Five);
+        let cfg = NotoConfig::preset(FingerCount::Five);
         let geom = serde_json::to_value(hand_view(&cfg, 0.5).unwrap()).unwrap();
         assert!(geom["reach_m"].is_number());
         assert!(geom["palm"].is_array());

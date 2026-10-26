@@ -74,7 +74,7 @@ exit /b 0
 :unique_tmp
 rem Creates a fresh folder under %TEMP% and stores its path in the variable named by %1.
 rem mkdir is atomic, so consoles that start in the same second (same %RANDOM% seed) cannot share it.
-set "UT_DIR=%TEMP%\hand_env_%RANDOM%%RANDOM%"
+set "UT_DIR=%TEMP%\noto_env_%RANDOM%%RANDOM%"
 mkdir "%UT_DIR%" > nul 2>&1 || goto :unique_tmp
 set "%~1=%UT_DIR%"
 set "UT_DIR="

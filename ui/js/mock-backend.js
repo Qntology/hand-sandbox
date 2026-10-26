@@ -29,7 +29,7 @@ function sdsStatus() {
   });
   const sum = (f) => axes.filter(f).reduce((a, x) => a + x.n, 0);
   return {
-    dir: '(모의) ~/.local/share/hand-sandbox/sds',
+    dir: '(모의) ~/.local/share/noto-sandbox/sds',
     recipe: 'vision-v1|margin-z|mock',
     ledgers: [
       { ledger: 'vision', scopes: 3, observations: sum((x) => x.scope.startsWith('vision')), run_observations: tick },
@@ -78,7 +78,7 @@ function tsForecast({ scope, axis }) {
 function worldNew(a) {
   if (!Number.isFinite(a.seed) || a.seed < 0) throw 'seed 는 0 이상의 숫자여야 합니다';
   if (!(a.size >= 16 && a.size <= 256)) throw 'size 는 16~256 셀이어야 합니다';
-  if (!a.config?.fingers) throw 'config(HandConfig)가 필요합니다';
+  if (!a.config?.fingers) throw 'config(NotoConfig)가 필요합니다';
   return mw.worldNew(a);
 }
 

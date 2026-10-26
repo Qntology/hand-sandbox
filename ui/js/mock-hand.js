@@ -116,9 +116,9 @@ export function classifyImage({ imageBase64, topK }) {
 // ── 합성 데이터 / 사전 / 장치 ────────────────────────────────────
 const tables = { samples: 0, contacts: 0, joint_states: 0, dictionary: 0 };
 const device = { selected: 'cpu', ordinal: 0 };
-const STORE = '(모의) ~/.local/share/hand-sandbox/lance';
+const STORE = '(모의) ~/.local/share/noto-sandbox/lance';
 
-export const paths = () => ({ models_dir: '(모의) ~/.local/share/hand-sandbox/models', store_dir: STORE });
+export const paths = () => ({ models_dir: '(모의) ~/.local/share/noto-sandbox/models', store_dir: STORE });
 
 export function synthesize({ count }) {
   const n = Math.max(1, Math.min(5000, count));

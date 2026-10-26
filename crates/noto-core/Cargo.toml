@@ -1,0 +1,12 @@
+[package]
+name = "noto-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Noto robot model for logistics robots: hands (2-5 fingers, joint options), locomotion bases, body parts, balance, contact physics and grasp simulation"
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

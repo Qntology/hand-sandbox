@@ -1,0 +1,13 @@
+[package]
+name = "noto-quest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Game-style quests: a command plan becomes steps that move through pending, active, done or failed"
+
+[dependencies]
+noto-search = { path = "../noto-search" }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

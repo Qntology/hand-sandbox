@@ -13,7 +13,7 @@ export const bus = {
 };
 
 export const state = {
-  // 손·발 구성 (hand_geometry / grasp_test / world_new 에 그대로 전달되는 HandConfig)
+  // 손·발 구성 (hand_geometry / grasp_test / world_new 에 그대로 전달되는 NotoConfig)
   presets: null,
   dict: [],
   dictById: new Map(),

@@ -779,7 +779,7 @@ impl FocusCam {
     }
 
     /// Where the camera looks (base frame) and where it sits relative to that, metres.
-    fn aim(self, pose: Option<&hand_core::dynamics::BodyPose>) -> ([f32; 3], [f32; 3]) {
+    fn aim(self, pose: Option<&noto_core::dynamics::BodyPose>) -> ([f32; 3], [f32; 3]) {
         match self {
             FocusCam::Hand => {
                 let palm = pose.and_then(|p| p.boxes.iter().find(|b| b.name == "palm_r")).map_or([0.3, -0.18, 0.7], |b| b.center);
@@ -946,8 +946,8 @@ impl World {
     }
 
     /// The links of a body pose as world boxes, coloured by segment.
-    pub fn robot_boxes(&self, pose: &hand_core::dynamics::BodyPose) -> Vec<Obb> {
-        use hand_core::Segment;
+    pub fn robot_boxes(&self, pose: &noto_core::dynamics::BodyPose) -> Vec<Obb> {
+        use noto_core::Segment;
         pose.boxes
             .iter()
             .map(|b| Obb {
@@ -1075,12 +1075,12 @@ mod tests {
     use super::*;
     use crate::nav::Goal;
     use crate::world::{DropItem, WorldConfig};
-    use hand_core::{BaseKind, FingerCount, HandConfig};
+    use noto_core::{BaseKind, FingerCount, NotoConfig};
 
     fn world() -> World {
-        let mut hand = HandConfig::preset(FingerCount::Five);
+        let mut hand = NotoConfig::preset(FingerCount::Five);
         hand.base = BaseKind::Track;
-        World::new(WorldConfig { seed: 7, cells: 64, hand, ..WorldConfig::default() }).unwrap()
+        World::new(WorldConfig { seed: 7, cells: 64, noto: hand, ..WorldConfig::default() }).unwrap()
     }
 
     fn small() -> Camera {
@@ -1353,9 +1353,9 @@ mod tests {
 
     #[test]
     fn the_sea_renders_as_water_and_hides_nothing_behind_it() {
-        let mut hand = HandConfig::preset(FingerCount::Five);
+        let mut hand = NotoConfig::preset(FingerCount::Five);
         hand.base = BaseKind::Track;
-        let w = World::new(WorldConfig { seed: 4, cells: 64, hand, terrain: crate::terrain::TerrainKind::Rugged, ..WorldConfig::default() }).unwrap();
+        let w = World::new(WorldConfig { seed: 4, cells: 64, noto: hand, terrain: crate::terrain::TerrainKind::Rugged, ..WorldConfig::default() }).unwrap();
         let t = &w.terrain;
         let water = (0..t.d).flat_map(|z| (0..t.w).map(move |x| (x, z))).filter(|&(x, z)| t.is_water(x, z)).count();
         assert!(water > 0);

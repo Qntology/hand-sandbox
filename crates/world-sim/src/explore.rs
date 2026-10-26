@@ -15,7 +15,7 @@
 //! Objects (trees, boulders) do not occlude here: the planner does not know
 //! where they are, only the terrain.
 
-use hand_core::BaseSpec;
+use noto_core::BaseSpec;
 
 use crate::nav::{self, Cell};
 use crate::terrain::{cell_center, Terrain, CELL_M};
@@ -239,7 +239,7 @@ pub fn line_of_sight(t: &Terrain, a: (f32, f32), eye_above_m: f32, b: (f32, f32)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hand_core::BaseKind;
+    use noto_core::BaseKind;
 
     fn flat(n: usize) -> Terrain {
         Terrain::generate(1, n, n, &[(n as f32 * 0.25, n as f32 * 0.25, n as f32)])

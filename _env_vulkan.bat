@@ -11,5 +11,5 @@ if errorlevel 1 exit /b 1
 if not exist "%SystemRoot%\System32\vulkan-1.dll" (
     echo [Vulkan] vulkan-1.dll not found. It ships with the GPU driver; without it the models run on the CPU.
 )
-if not defined HAND_DEVICE set "HAND_DEVICE=vulkan"
+if not defined NOTO_DEVICE set "NOTO_DEVICE=vulkan"
 exit /b 0

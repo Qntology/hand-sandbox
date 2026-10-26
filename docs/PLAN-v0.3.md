@@ -1,4 +1,4 @@
-# hand-sandbox v0.3 기획서 — 게임 로직 / ML 로직 분리 통합 테스트 (SDS 중심)
+# noto-sandbox v0.3 기획서 — 게임 로직 / ML 로직 분리 통합 테스트 (SDS 중심)
 
 작성일 2026-10-23. v0.2 기획([`PLAN.md`](PLAN.md))의 월드·퀘스트·SDS를 그대로 두고, 테스트를 **게임 로직**과 **ML 로직** 두 갈래로 나눈다. 모든 판단과 개선은 SDS(Score Dynamics Store, 점수 동역학 원장)에 기록되고 SDS에서 다시 읽힌다. 리서치 근거는 [`research/parts.md`](research/parts.md)(부품 프리셋)와 [`research/balance.md`](research/balance.md)(자세 밸런스 기준값)에 있다.
 
@@ -6,14 +6,14 @@
 
 | 요청 | 반영 |
 | --- | --- |
-| 테스트를 게임 로직과 ML 로직으로 나눔 | 게임: `world-sim`·`hand-quest`·`hand-runtime` 퀘스트 실행기. ML: 새 크레이트 `hand-vision`. ML 쪽은 키프레임 이미지·카메라 내부값·주행 거리계(odometry) 자세만 받는다. 정답(ID·깊이 버퍼)은 평가 열에만 쓴다 |
+| 테스트를 게임 로직과 ML 로직으로 나눔 | 게임: `world-sim`·`noto-quest`·`noto-runtime` 퀘스트 실행기. ML: 새 크레이트 `noto-vision`. ML 쪽은 키프레임 이미지·카메라 내부값·주행 거리계(odometry) 자세만 받는다. 정답(ID·깊이 버퍼)은 평가 열에만 쓴다 |
 | 게임 로직으로 영상 촬영 → 고정 키프레임 분할 | 퀘스트를 게임 로직으로 끝까지 실행하며 영상(5 fps, 저해상도)과 고정 간격 키프레임(기본 1초, 전 해상도 WebP)을 기록 |
-| 각 이미지에 ML 로직: ① 깊이(TIPSv2-B/14 DPT) ② SigLIP2 의미 기반 위치 ③ 그 위치로 추적(SAM 3.1) | `hand-vision::{tips, locate, track}`. 4장 참고 |
-| 위치와 캐릭터 간 거리 측정을 위한 의무 삼각 측량 이동 | ML 결정 단계의 첫 행동은 언제나 기선(baseline) 이동 후 두 방위 교차(`hand-vision::triangulate`). 5장 |
+| 각 이미지에 ML 로직: ① 깊이(TIPSv2-B/14 DPT) ② SigLIP2 의미 기반 위치 ③ 그 위치로 추적(SAM 3.1) | `noto-vision::{tips, locate, track}`. 4장 참고 |
+| 위치와 캐릭터 간 거리 측정을 위한 의무 삼각 측량 이동 | ML 결정 단계의 첫 행동은 언제나 기선(baseline) 이동 후 두 방위 교차(`noto-vision::triangulate`). 5장 |
 | 하단 UI: 1줄 게임 키프레임, 2줄 ML 추적+깊이, 3줄 시계열 결정→움직임 해석→이동→촬영 키프레임 | 하단 "통합 테스트" 타임라인. SDS 레인을 4번째 줄로 따로 둔다. 8장 |
-| 몸·가슴·배·손·머리 밸런스를 지형 높낮이에 맞춰 조정, 현실 의미가 있는 물리 | `hand-core::{parts, balance}`. 6장 |
+| 몸·가슴·배·손·머리 밸런스를 지형 높낮이에 맞춰 조정, 현실 의미가 있는 물리 | `noto-core::{parts, balance}`. 6장 |
 | 가성비 부품 프리셋(다층 리서치), 들 수 있는 물건과 속도에 영향 | 보급/보급+/중급/고급 프리셋. 들기 판정, 속도·경사·턱·적재 한계, 배터리 용량, 에너지 |
-| 퀘스트별 성공률·횟수 DB 기록 | `hand-sds::records::TestDb`(JSONL + 성공 표) → LanceDB 미러(`hand-data::test_tables`). 7장 |
+| 퀘스트별 성공률·횟수 DB 기록 | `noto-sds::records::TestDb`(JSONL + 성공 표) → LanceDB 미러(`noto-data::test_tables`). 7장 |
 | ML 트랙별 SDS + 혼합 특징 SDS 트랙 | SDS 트랙 `depth`·`locate`·`tracker`·`decide`·`fusion`. 1장 |
 | 팔 들기→몸·다리, 발 들기→몸·머리, N:N 밸런스 SDS와 기준값 | SDS 트랙 `balance`. 리서치 기준값을 차원 없는 값으로 바꿔 N:N 셀마다 편차를 기록. 1.3장 |
 | N:N 상태별 힘(노력) 측정과 개선 DB 기록 | SDS 트랙 `effort` + DB `balance_effort`(피드포워드 있음/없음의 노력·여유를 나란히) |
@@ -44,13 +44,13 @@ SDS는 v0.2에서 인식 점수의 원장이었다. v0.3에서는 테스트 전�
 
 ### 1.2 시계열 모델
 
-`hand-ts`의 융합 예측(last·EWMA·Holt, 가중치가 있으면 Granite TTM-R3)을 결정 단계에 쓴다. 대상 위치(삼각 측량 점)의 시계열을 예측해 그 예측값으로 움직이고, 새 측량점이 P10–P90 띠를 벗어나면 따르지 않고 다시 측량한다(`hold(band)`). 이동 뒤에는 "다음 키프레임에서 대상이 정면에 보여야 한다"는 예측을 남기고, 다음 키프레임의 잔차가 `decide` 트랙에 쌓인다.
+`noto-ts`의 융합 예측(last·EWMA·Holt, 가중치가 있으면 Granite TTM-R3)을 결정 단계에 쓴다. 대상 위치(삼각 측량 점)의 시계열을 예측해 그 예측값으로 움직이고, 새 측량점이 P10–P90 띠를 벗어나면 따르지 않고 다시 측량한다(`hold(band)`). 이동 뒤에는 "다음 키프레임에서 대상이 정면에 보여야 한다"는 예측을 남기고, 다음 키프레임의 잔차가 `decide` 트랙에 쌓인다.
 
 ### 1.3 N:N 밸런스
 
 원인 동작 7가지 × 대상 부위 7가지. 원인: `arm_raise`(채취 타격), `arm_lift`(들어올리기), `foot_lift`(보행 중 한 발), `step_up`(턱), `slope`(경사), `carry_front`(앞쪽 적재), `accel`(가감속). 대상: 머리·가슴·배·팔·손·다리·발.
 
-셀 값은 모두 차원 없는 값이다: CoM 이동 / 발 길이, 관절 토크 / 피크 토크, 회복 비율, 좌우 이동 / 반 보폭, 머리 잔여 기울기(°), 안정 여유(지지면 반길이 비율). 사람 기준값(유도 포함)은 `hand_core::balance::reference`에 있고, 짐이 있는 동작은 하중/체중 비율로 선형 보정한다. 예:
+셀 값은 모두 차원 없는 값이다: CoM 이동 / 발 길이, 관절 토크 / 피크 토크, 회복 비율, 좌우 이동 / 반 보폭, 머리 잔여 기울기(°), 안정 여유(지지면 반길이 비율). 사람 기준값(유도 포함)은 `noto_core::balance::reference`에 있고, 짐이 있는 동작은 하중/체중 비율로 선형 보정한다. 예:
 
 - `arm_raise > arm.peak_ratio` 기준 0.15 ± 0.05 (어깨 최대의 ~15%)
 - `arm_lift > belly.restore_frac` 기준 0.2 → 0.9 (5 kg에서 골반·몸통이 CoM을 거의 다 되돌림)
@@ -65,11 +65,11 @@ SDS는 v0.2에서 인식 점수의 원장이었다. v0.3에서는 테스트 전�
 ## 2. 게임 로직과 ML 로직의 경계
 
 ```
-게임 로직 (world-sim, hand-quest, hand-runtime driver)
+게임 로직 (world-sim, noto-quest, noto-runtime driver)
   월드 · 물리(프리셋, 밸런스) · 퀘스트 실행 · 렌더(RGB + 정답 ID/깊이)
         │ 키프레임: WebP, 카메라 내부값, 주행 거리계 자세, 시각
         ▼
-ML 로직 (hand-vision)
+ML 로직 (noto-vision)
   깊이(TIPSv2 DPT) → 의미 위치(SigLIP2) → 마스크 추적(SAM 3.1 인터페이스) → 삼각 측량 → 시계열 결정
         │ 결정: 회전 / 삼각 측량 이동 / 접근 / 도달
         ▼
@@ -90,7 +90,7 @@ ML 로직 (hand-vision)
 
 | 모델 | 사실 | 결정 |
 | --- | --- | --- |
-| `google/tipsv2-b14-dpt` | TIPSv2(arXiv 2604.12012, CVPR 2026). DINOv2식 ViT-B/14(등록 토큰 1, LN eps 1e-6, LayerScale), 블록 2·5·8·11 탭, DPT 헤드, 256개 구간 기대값으로 **미터 깊이 0.001–10 m**(NYUv2 학습). 입력 [0,1] 정규화 없음. 632 MB F32, Apache-2.0 | candle로 직접 이식(`hand-vision::tips`). 실제 체크포인트 헤더의 텐서 이름·형상 227개를 시험에서 전부 확인. 가중치로 PyTorch와 수치 비교는 아직(가중치 없음). 384×256 → 504×336(36×24 패치) |
+| `google/tipsv2-b14-dpt` | TIPSv2(arXiv 2604.12012, CVPR 2026). DINOv2식 ViT-B/14(등록 토큰 1, LN eps 1e-6, LayerScale), 블록 2·5·8·11 탭, DPT 헤드, 256개 구간 기대값으로 **미터 깊이 0.001–10 m**(NYUv2 학습). 입력 [0,1] 정규화 없음. 632 MB F32, Apache-2.0 | candle로 직접 이식(`noto-vision::tips`). 실제 체크포인트 헤더의 텐서 이름·형상 227개를 시험에서 전부 확인. 가중치로 PyTorch와 수치 비교는 아직(가중치 없음). 384×256 → 504×336(36×24 패치) |
 | SigLIP2 (`siglip2-base-patch16-naflex`) | 공간 정보는 MAP 헤드의 value 경로에 생긴다(SILC). 마지막 층 수술(ClearCLIP식)은 SigLIP을 망친다. NaFlex 체크포인트에는 위치 손실이 적용되지 않아 밀집 특징이 약할 수 있음(미확인) | MaskCLIP식 MAP-value 트릭: 패치 토큰마다 value→out→MLP를 통과시켜 텍스트 공간의 패치 임베딩을 얻고 코사인 히트맵. 한 번의 순전파. 전역 임베딩으로 존재 확률(presence)도 함께 |
 | `avencera/sam3.1-mlx-bf16` | `mlx-community/sam3.1-bf16`의 미러, 이름과 달리 F32 3.49 GB, 873M 파라미터, MLX 레이아웃(OHWI). 탐지기 + 추적기. SAM License | **이 Windows/CUDA(4 GB) 환경에서 MLX 실행 불가, candle 이식은 텐서 1,961개라 현실적이지 않음.** SAM 인터페이스(포인트 프롬프트 → 객체 ID가 유지되는 마스크)를 고정하고, 대역 `region-grow`(이미지+깊이 영역 확장, 정답 미사용)로 동작. 후속 경로: ORT 사이드카로 SAM3 이미지 모델(usls ONNX q4f16/fp16) |
 
@@ -124,7 +124,7 @@ ML 로직 (hand-vision)
 ## 7. DB
 
 - 파일(항상 동작): `data/runtime/db/quest_runs.jsonl`, `keyframes.jsonl`, `balance_effort.jsonl`, `quest_stats.json`(pass|kind|target|preset|step별 시도·성공·성공률).
-- LanceDB(Tauri 앱·개발 서버): 같은 행을 `quest_runs`, `quest_steps`, `quest_stats`, `ml_keyframes`, `balance_effort` 테이블로 미러(`hand-data::test_tables`).
+- LanceDB(Tauri 앱·개발 서버): 같은 행을 `quest_runs`, `quest_steps`, `quest_stats`, `ml_keyframes`, `balance_effort` 테이블로 미러(`noto-data::test_tables`).
 
 ## 8. UI
 

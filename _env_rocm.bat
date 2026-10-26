@@ -88,5 +88,5 @@ if exist "%ROCM_PATH%\bin\hipcc.exe" set "HIPCC=%ROCM_PATH%\bin\hipcc.exe"
 set "PATH=%ROCM_PATH%\bin;%PATH%"
 if exist "%ROCM_PATH%\lib\llvm\bin" set "PATH=%PATH%;%ROCM_PATH%\lib\llvm\bin"
 echo [ROCm] %ROCM_TRACK% track: %ROCM_PATH% %ROCM_HIP_VER%
-if not defined HAND_DEVICE set "HAND_DEVICE=rocm"
+if not defined NOTO_DEVICE set "NOTO_DEVICE=rocm"
 exit /b 0

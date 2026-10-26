@@ -1,21 +1,21 @@
 //! The simulated open world and the robot living in it.
 //!
 //! The robot is the project's own hand and foot model: the base spec decides
-//! where it can drive and how fast (through `hand_core::simulate_drive`), the
-//! finger count decides how fast it mines, and `hand_core::grasp` decides
+//! where it can drive and how fast (through `noto_core::simulate_drive`), the
+//! finger count decides how fast it mines, and `noto_core::grasp` decides
 //! whether it can pick an item up at all. Nothing here is tuned to make a
 //! scenario succeed; a weak configuration fails for the same reason it would
 //! fail in the standalone previews.
 //!
-//! Assumptions that are not in the hand/foot models are named constants below
+//! Assumptions that are not in the Noto robot models are named constants below
 //! and listed in `data/README.md`.
 
 use std::sync::Mutex;
 use std::collections::{BTreeMap, HashSet};
 
-use hand_core::balance::{BalanceReport, Body, DriveLimits, FeedForward, Posture, Source, GRIP_SAFETY};
-use hand_core::dynamics::{self, BodyPose, DynCfg, DynDigest, Rollout};
-use hand_core::{compute_body, BalanceSummary, BodyInputs, BodyLimits, BodyPlan, BodyStatus, ConfigError, Hand, HandConfig};
+use noto_core::balance::{BalanceReport, Body, DriveLimits, FeedForward, Posture, Source, GRIP_SAFETY};
+use noto_core::dynamics::{self, BodyPose, DynCfg, DynDigest, Rollout};
+use noto_core::{compute_body, BalanceSummary, BodyInputs, BodyLimits, BodyPlan, BodyStatus, ConfigError, Hand, NotoConfig};
 use serde::{Deserialize, Serialize};
 
 use crate::kinds::{Ground, ItemKind, NodeKind, MIN_PIECE};
@@ -78,8 +78,9 @@ pub struct WorldConfig {
     pub seed: u64,
     /// Cells per side (square world). Each cell is 0.5 m.
     pub cells: usize,
-    pub hand: HandConfig,
-    /// Part presets of the robot's body (`hand_core::parts`).
+    #[serde(alias = "hand")]
+    pub noto: NotoConfig,
+    /// Part presets of the robot's body (`noto_core::parts`).
     #[serde(default)]
     pub body: BodyPlan,
     /// The landscape: the open map, or the rugged one with sea, cliffs and ridges.
@@ -96,7 +97,7 @@ pub struct WorldConfig {
 
 impl Default for WorldConfig {
     fn default() -> Self {
-        WorldConfig { seed: 7, cells: 64, hand: HandConfig::preset(hand_core::FingerCount::Five), body: BodyPlan::default(), terrain: TerrainKind::Open, odometry: OdomCfg::default(), parcels: None }
+        WorldConfig { seed: 7, cells: 64, noto: NotoConfig::preset(noto_core::FingerCount::Five), body: BodyPlan::default(), terrain: TerrainKind::Open, odometry: OdomCfg::default(), parcels: None }
     }
 }
 
@@ -284,7 +285,7 @@ pub enum ActionError {
     NotDivisible,
     /// The piece, or what would be left of it, is below [`MIN_PIECE`].
     PieceTooSmall { amount: f32 },
-    /// The body cannot bring its palm down to the item (`hand_core::act::reach`).
+    /// The body cannot bring its palm down to the item (`noto_core::act::reach`).
     CannotReach { lowest_m: f32, need_m: f32, reason: String },
     /// This base cannot push (legs), or the item cannot be pushed there.
     CannotPush { reason: String },
@@ -329,7 +330,7 @@ pub enum WorldEvent {
     /// A piece broken off `drop`: the new piece `piece` holds `amount` items.
     ItemSplit { drop: String, piece: String, item: ItemKind, amount: f32, left: f32 },
     BatteryDepleted,
-    /// A moment of an action's physics (`hand_core::act`): a contact, a lift-off,
+    /// A moment of an action's physics (`noto_core::act`): a contact, a lift-off,
     /// a slip, an impact, a heel strike, a fall. `parts` are the focus views it concerns.
     Act { act: String, kind: String, label: String, ok: bool, value: Option<f32>, parts: Vec<String> },
 }
@@ -404,15 +405,15 @@ pub struct World {
     pub ff_enabled: bool,
     /// Heat state per joint, `(τ/τ_cont)²` low-passed with the actuator's time constant.
     pub heat: BTreeMap<String, f32>,
-    /// Life used per joint (Miner damage over the reducer's rating, `hand_core::wear`; 1 = worn out).
+    /// Life used per joint (Miner damage over the reducer's rating, `noto_core::wear`; 1 = worn out).
     pub wear: BTreeMap<String, f32>,
-    /// Joint dynamics of the last posture change (`hand_core::dynamics`): the
+    /// Joint dynamics of the last posture change (`noto_core::dynamics`): the
     /// presets' masses and actuators moving the joints, for the third-person view.
     pub motion: Option<Motion>,
     last_posture: Posture,
     /// Where the rugged features went (`None` on the open map).
     pub layout: Option<RuggedLayout>,
-    /// The action being played out (`hand_core::act`), and the last one, kept for the focus views.
+    /// The action being played out (`noto_core::act`), and the last one, kept for the focus views.
     pub act: Option<ActPlay>,
     pub last_act: Option<ActPlay>,
     /// The actions' own draws (friction, aim, slips), apart from the world's stream.
@@ -507,7 +508,7 @@ fn add_stock(list: &mut Vec<(ItemKind, f32)>, kind: ItemKind, n: f32) {
 
 impl World {
     pub fn new(cfg: WorldConfig) -> Result<World, ConfigError> {
-        let hand = cfg.hand.build()?;
+        let hand = cfg.noto.build()?;
         let cells = cfg.cells.clamp(32, 160);
         let size = cells as f32 * CELL_M;
 
@@ -613,7 +614,7 @@ impl World {
         // from afar, out of reach. Every kind keeps two a wheel can get to, so
         // a quest has a way to succeed (a decoy on a mesa is the hard part).
         if layout.is_some() {
-            let wheel = hand_core::BaseKind::Wheel.spec();
+            let wheel = noto_core::BaseKind::Wheel.spec();
             let start = terrain.cell_of(base_pos.0, base_pos.1).unwrap_or((0, 0));
             let taken: HashSet<Cell> = occupied.clone();
             let times = nav::travel_times(&wheel, &terrain, &|x, z| taken.contains(&(x, z)), start, f32::INFINITY);
@@ -676,7 +677,7 @@ impl World {
             let (px, pz) = (base_pos.0 + CAMP_PARCEL_AHEAD_M * c - CAMP_PARCEL_RIGHT_M * s, base_pos.1 + CAMP_PARCEL_AHEAD_M * s + CAMP_PARCEL_RIGHT_M * c);
             drops.push(DropItem::whole(next_drop, ItemKind::Parcel, px, pz));
             next_drop += 1;
-            let wheel = hand_core::BaseKind::Wheel.spec();
+            let wheel = noto_core::BaseKind::Wheel.spec();
             let start = terrain.cell_of(base_pos.0, base_pos.1).unwrap_or((0, 0));
             let taken: HashSet<Cell> = occupied.clone();
             let times = nav::travel_times(&wheel, &terrain, &|x, z| taken.contains(&(x, z)), start, f32::INFINITY);
@@ -698,8 +699,8 @@ impl World {
 
         let grasps = ItemKind::ALL.iter().map(|&k| top_grasp_info(&hand, k, 1.0)).collect();
 
-        let (cfg_body, base_kind, fingers, cfg_seed) = (cfg.body, cfg.hand.base, cfg.hand.fingers, cfg.seed);
-        let odom = Odometry::new(cfg.odometry, cfg_seed, base_kind == hand_core::BaseKind::HumanFoot, (agent.x, agent.z, agent.yaw));
+        let (cfg_body, base_kind, fingers, cfg_seed) = (cfg.body, cfg.noto.base, cfg.noto.fingers, cfg.seed);
+        let odom = Odometry::new(cfg.odometry, cfg_seed, base_kind == noto_core::BaseKind::HumanFoot, (agent.x, agent.z, agent.yaw));
         Ok(World {
             cfg,
             hand,
@@ -841,7 +842,7 @@ impl World {
         self.waypoints.iter().find(|w| w.key == key)
     }
 
-    pub fn base_spec(&self) -> &hand_core::BaseSpec {
+    pub fn base_spec(&self) -> &noto_core::BaseSpec {
         &self.hand.base
     }
 
@@ -871,7 +872,7 @@ impl World {
     /// Friction capacity of one hand for a piece, newtons.
     pub fn grip_capacity_for(&self, item: ItemKind, amount: f32) -> f32 {
         let g = self.grasp_for(item, amount);
-        g.margin * item.spec().mass_kg * amount * hand_core::balance::G * GRIP_SAFETY
+        g.margin * item.spec().mass_kg * amount * noto_core::balance::G * GRIP_SAFETY
     }
 
     /// Time to break a piece of `amount` items in two with this hand (est:
@@ -919,22 +920,22 @@ impl World {
     /// The base spec the routes and the drive use: the mechanism's spec with the
     /// body's limits applied, the drive power scaled with the mass, and the
     /// chassis force over the loaded mass (each ground's climb limit).
-    pub fn drive_spec(&self) -> hand_core::BaseSpec {
+    pub fn drive_spec(&self) -> noto_core::BaseSpec {
         self.drive_spec_for(self.carried_kg())
     }
 
     /// The drive spec with `cargo_kg` aboard (the cargo decision asks before loading).
-    pub fn drive_spec_for(&self, cargo_kg: f32) -> hand_core::BaseSpec {
+    pub fn drive_spec_for(&self, cargo_kg: f32) -> noto_core::BaseSpec {
         let l = if (cargo_kg - self.carried_kg()).abs() < 1e-6 { self.limits() } else { self.body.drive_limits(&self.hand.base, cargo_kg) };
         let mass = self.body.mass_kg() + cargo_kg;
-        hand_core::BaseSpec {
+        noto_core::BaseSpec {
             max_speed_mps: l.max_speed_mps,
             max_slope_deg: l.max_slope_deg,
             max_step_m: l.max_step_m,
             power_w: self.hand.base.power_w * l.power_scale,
             drive_accel_mps2: (!self.body.legged).then(|| self.body.chassis.drive_force_n / mass),
             mass_kg: Some(mass),
-            walk_com_z_m: self.body.legged.then(|| hand_core::act::gait::walking_com_z(&self.body)),
+            walk_com_z_m: self.body.legged.then(|| noto_core::act::gait::walking_com_z(&self.body)),
             walk_foot_m: self.body.legged.then_some(self.body.leg.foot_len_m),
             ..self.hand.base
         }
@@ -987,7 +988,7 @@ impl World {
     /// Friction capacity of one hand for an item, newtons (from the grasp table).
     pub fn grip_capacity_n(&self, item: ItemKind) -> f32 {
         let g = self.grasp_info(item);
-        g.margin * item.spec().mass_kg * hand_core::balance::G * GRIP_SAFETY
+        g.margin * item.spec().mass_kg * noto_core::balance::G * GRIP_SAFETY
     }
 
     /// Balance states entered since the last call.
@@ -1115,7 +1116,7 @@ impl World {
                 if !info.stable {
                     two_arms = true;
                 }
-                // Bend down, close, lift, stow: the action's own time series (`hand_core::act::grasp`).
+                // Bend down, close, lift, stow: the action's own time series (`noto_core::act::grasp`).
                 let (t, face) = self.start_grasp(*drop, two_arms, *aim, *side, *memory_sigma_m)?;
                 Active::Work(WorkState { kind: WorkKind::Pick { drop: *drop, two_arms, face }, remaining_s: t })
             }
@@ -1325,7 +1326,7 @@ impl World {
         // A slipping wheel or track counts distance it did not travel (the drive model's cruise slip on this ground).
         if !self.body.legged {
             let props = self.ground_at(e.to).surface().props();
-            self.odom_over = hand_core::act::cruise_slip(&self.drive_spec(), props, e.slope_deg).map_or(0.0, |s| s / (1.0 - s).max(0.05));
+            self.odom_over = noto_core::act::cruise_slip(&self.drive_spec(), props, e.slope_deg).map_or(0.0, |s| s / (1.0 - s).max(0.05));
         }
         let left = e.move_time_s - m.progress_s;
         let t = left.min(remaining);
@@ -1758,7 +1759,7 @@ impl World {
             let h = self.heat.entry(j.joint.clone()).or_insert(0.0);
             *h += (dt / act.thermal_tau_s).min(1.0) * (j.effort * j.effort - *h);
             // Long term: the reducer's life used at this torque.
-            *self.wear.entry(j.joint.clone()).or_insert(0.0) += hand_core::wear::damage(&act, j.torque_nm, dt);
+            *self.wear.entry(j.joint.clone()).or_insert(0.0) += noto_core::wear::damage(&act, j.torque_nm, dt);
         }
         let key = format!("{}|{state}", post.source.id());
         let changed = self.balance.as_ref().map_or(true, |(k, _)| *k != key);
@@ -1798,7 +1799,7 @@ impl World {
     }
 
     /// The preset actuator that drives a joint of the balance model.
-    pub fn joint_actuator(&self, joint: &str) -> Option<hand_core::parts::Actuator> {
+    pub fn joint_actuator(&self, joint: &str) -> Option<noto_core::parts::Actuator> {
         match joint {
             n if n.starts_with("shoulder") => Some(self.body.arm.shoulder),
             n if n.starts_with("elbow") => Some(self.body.arm.elbow),
@@ -1917,27 +1918,27 @@ impl World {
 
 /// The grasp table entry of a hand for a piece lifted off the ground from above:
 /// the fingers' squeeze times the friction the controller believes, over the
-/// weight with the safety factor (`hand_core::act::grasp::top_grasp_ok`).
+/// weight with the safety factor (`noto_core::act::grasp::top_grasp_ok`).
 fn top_grasp_info(hand: &Hand, item: ItemKind, amount: f32) -> GraspInfo {
     let s = item.spec();
     let mass = s.mass_kg * amount;
-    let mu = hand_core::act::material::pad_on(material_of(item)).mean;
-    let cap = hand_core::act::grasp::capacity(hand, s.piece_size_m(amount), mass, mu);
-    let need = mass * hand_core::balance::G * GRIP_SAFETY;
+    let mu = noto_core::act::material::pad_on(material_of(item)).mean;
+    let cap = noto_core::act::grasp::capacity(hand, s.piece_size_m(amount), mass, mu);
+    let need = mass * noto_core::balance::G * GRIP_SAFETY;
     let margin = if need > 1e-6 { mu * cap.squeeze_n / need } else { 99.0 };
-    GraspInfo { item, stable: cap.contacts >= 2 && margin >= 1.0, margin: margin.min(99.0), max_payload_kg: mu * cap.squeeze_n / (hand_core::balance::G * GRIP_SAFETY), grasp_type: cap.grasp_type }
+    GraspInfo { item, stable: cap.contacts >= 2 && margin >= 1.0, margin: margin.min(99.0), max_payload_kg: mu * cap.squeeze_n / (noto_core::balance::G * GRIP_SAFETY), grasp_type: cap.grasp_type }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hand_core::{BaseKind, FingerCount};
+    use noto_core::{BaseKind, FingerCount};
 
     /// A world without the placed parcels: these tests are about the nodes and their drops.
     fn world(fingers: FingerCount, base: BaseKind) -> World {
-        let mut hand = HandConfig::preset(fingers);
+        let mut hand = NotoConfig::preset(fingers);
         hand.base = base;
-        World::new(WorldConfig { seed: 7, cells: 64, hand, body: BodyPlan::default(), terrain: TerrainKind::Open, parcels: Some(0), ..WorldConfig::default() }).unwrap()
+        World::new(WorldConfig { seed: 7, cells: 64, noto: hand, body: BodyPlan::default(), terrain: TerrainKind::Open, parcels: Some(0), ..WorldConfig::default() }).unwrap()
     }
 
     #[test]
@@ -1956,9 +1957,9 @@ mod tests {
 
     #[test]
     fn parcels_lie_about_and_one_waits_in_front_of_the_base_camp() {
-        let mut hand = HandConfig::preset(FingerCount::Five);
+        let mut hand = NotoConfig::preset(FingerCount::Five);
         hand.base = BaseKind::HumanFoot;
-        let w = World::new(WorldConfig { hand, ..WorldConfig::default() }).unwrap();
+        let w = World::new(WorldConfig { noto: hand, ..WorldConfig::default() }).unwrap();
         let parcels: Vec<&DropItem> = w.drops.iter().filter(|d| d.kind == ItemKind::Parcel).collect();
         assert_eq!(parcels.len(), w.drops.len(), "only parcels lie about at the start");
         assert!(parcels.len() >= 3, "{}", parcels.len());
@@ -1971,12 +1972,12 @@ mod tests {
         // None on a node's cell or in the water; the same seed puts them in the same places.
         let blocked = w.blocked_cells();
         assert!(parcels.iter().all(|d| w.terrain.cell_of(d.x, d.z).is_some_and(|c| !blocked.contains(&c) && !w.terrain.is_water(c.0, c.1))));
-        let again = World::new(WorldConfig { hand, ..WorldConfig::default() }).unwrap();
+        let again = World::new(WorldConfig { noto: hand, ..WorldConfig::default() }).unwrap();
         assert!(w.drops.iter().zip(&again.drops).all(|(a, b)| (a.x, a.z, a.id) == (b.x, b.z, b.id)));
         // New drops get ids after them.
         assert!(w.next_drop > parcels.iter().map(|d| d.id).max().unwrap());
         // The nodes do not move for them (their own random stream).
-        let bare = World::new(WorldConfig { hand, parcels: Some(0), ..WorldConfig::default() }).unwrap();
+        let bare = World::new(WorldConfig { noto: hand, parcels: Some(0), ..WorldConfig::default() }).unwrap();
         assert!(w.nodes.iter().zip(&bare.nodes).all(|(a, b)| (a.x, a.z) == (b.x, b.z)));
     }
 
@@ -2284,9 +2285,9 @@ mod tests {
     }
 
     fn world_with(body: BodyPlan, base: BaseKind) -> World {
-        let mut hand = HandConfig::preset(FingerCount::Five);
+        let mut hand = NotoConfig::preset(FingerCount::Five);
         hand.base = base;
-        World::new(WorldConfig { seed: 7, cells: 64, hand, body, terrain: TerrainKind::Open, ..WorldConfig::default() }).unwrap()
+        World::new(WorldConfig { seed: 7, cells: 64, noto: hand, body, terrain: TerrainKind::Open, ..WorldConfig::default() }).unwrap()
     }
 
     #[test]
@@ -2295,7 +2296,7 @@ mod tests {
             w.drops.push(DropItem::whole(600, kind, w.agent.x + 0.4, w.agent.z));
             w.command(Action::pick(600))
         };
-        let mut budget = world_with(BodyPlan { arm: hand_core::Tier::Budget, ..BodyPlan::default() }, BaseKind::HumanFoot);
+        let mut budget = world_with(BodyPlan { arm: noto_core::Tier::Budget, ..BodyPlan::default() }, BaseKind::HumanFoot);
         match place(&mut budget, ItemKind::Log) {
             Err(ActionError::LiftOverload { limiting, .. }) => assert!(limiting.contains("elbow"), "{limiting}"),
             other => panic!("{other:?}"),
@@ -2305,7 +2306,7 @@ mod tests {
         let ev = run(&mut mid, 20.0);
         assert!(ev.iter().any(|e| matches!(e.event, WorldEvent::ItemPicked { .. })), "{ev:?}");
         // Iron ore (more than mid legs carry): a bend, a squeeze and a lift take seconds, not the old fixed second.
-        let mut iron = world_with(BodyPlan::uniform(hand_core::Tier::Pro), BaseKind::HumanFoot);
+        let mut iron = world_with(BodyPlan::uniform(noto_core::Tier::Pro), BaseKind::HumanFoot);
         let t0 = iron.time_s;
         place(&mut iron, ItemKind::IronOre).unwrap();
         run(&mut iron, 20.0);
@@ -2325,16 +2326,16 @@ mod tests {
         let events = w.take_balance_events();
         let raise = events.iter().find(|e| e.report.source == Source::ArmRaise).expect("an arm-raise state");
         assert_eq!(raise.state, "flat|mine");
-        assert!(raise.report.couplings.iter().any(|c| c.target == hand_core::Segment::Foot));
-        let mut cold = world_with(BodyPlan { arm: hand_core::Tier::Budget, ..BodyPlan::default() }, BaseKind::Track);
+        assert!(raise.report.couplings.iter().any(|c| c.target == noto_core::Segment::Foot));
+        let mut cold = world_with(BodyPlan { arm: noto_core::Tier::Budget, ..BodyPlan::default() }, BaseKind::Track);
         cold.heat.insert("elbow_r".into(), 2.0);
         assert!((cold.mining_rate() - 0.5).abs() < 1e-6, "a joint at heat 2 halves the strike rate");
     }
 
     fn rugged(seed: u64, base: BaseKind) -> World {
-        let mut hand = HandConfig::preset(FingerCount::Five);
+        let mut hand = NotoConfig::preset(FingerCount::Five);
         hand.base = base;
-        World::new(WorldConfig { seed, cells: 64, hand, body: BodyPlan::default(), terrain: TerrainKind::Rugged, ..WorldConfig::default() }).unwrap()
+        World::new(WorldConfig { seed, cells: 64, noto: hand, body: BodyPlan::default(), terrain: TerrainKind::Rugged, ..WorldConfig::default() }).unwrap()
     }
 
     #[test]
@@ -2390,7 +2391,7 @@ mod tests {
         }
         // Standing on the pad, the posture knows its ground and the friction it gets.
         let (p, _) = w.posture_now();
-        assert_eq!(p.ground, hand_core::Surface::Gravel);
+        assert_eq!(p.ground, noto_core::Surface::Gravel);
         // The same move costs a wheel more on sand than on gravel.
         let mut flat = world(FingerCount::Five, BaseKind::Wheel);
         let cell = flat.terrain.cell_of(flat.agent.x, flat.agent.z).unwrap();
@@ -2498,7 +2499,7 @@ mod tests {
             let s = w.body_status(None, None);
             (w.wear.get("shoulder_r").copied().unwrap_or(0.0), w.agent.strikes, s)
         };
-        let (budget, strikes, s) = mine(BodyPlan::uniform(hand_core::Tier::Budget));
+        let (budget, strikes, s) = mine(BodyPlan::uniform(noto_core::Tier::Budget));
         let (mid, _, _) = mine(BodyPlan::default());
         assert!(strikes > 0 && budget > 0.0 && mid > 0.0);
         assert!(budget > 100.0 * mid, "spur-gear servos against a planetary QDD: {budget} vs {mid}");

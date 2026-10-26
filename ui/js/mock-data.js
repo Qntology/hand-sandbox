@@ -1,4 +1,4 @@
-// 모의 백엔드용 정적 데이터. 형태는 실제 Rust 응답(src-tauri/src/views.rs, hand-ml)과 같게 맞췄다.
+// 모의 백엔드용 정적 데이터. 형태는 실제 Rust 응답(src-tauri/src/views.rs, noto-ml)과 같게 맞췄다.
 // 사전은 data/logistics_dictionary.json 의 28개 항목을 그대로 옮긴 것이다(UI 개발용 복사본).
 const D = [
   ['carton_small', 'small cardboard box', '소형 골판지 박스', 'package', [0.20, 0.15, 0.10], 1.0, true, 'assumed typical size'],
@@ -69,7 +69,7 @@ export const BACKENDS = [
   { backend: 'rocm', compiled: false, available: false, detail: '이 빌드에는 ROCm 이 포함되지 않았습니다 (모의)' },
 ];
 
-/** 실제 hand_core::simulate_drive 와 같은 식(base.rs). */
+/** 실제 noto_core::simulate_drive 와 같은 식(base.rs). */
 export function simulateDrive(spec, course) {
   let distance = 0;
   let time = 0;

@@ -8,7 +8,7 @@
 //! * along the path, a scale error drawn per move (the wheel odometer's or
 //!   the leg kinematics' own error), plus the slip the drive physics gives on
 //!   that ground (a spinning tyre or track counts distance it did not travel,
-//!   `hand_core::act::cruise_slip`) and the foot slides a gait draws;
+//!   `noto_core::act::cruise_slip`) and the foot slides a gait draws;
 //! * a random walk in position that grows with the square root of the distance;
 //! * in heading, the gyro's angle random walk and the bias left after its
 //!   start-up calibration.

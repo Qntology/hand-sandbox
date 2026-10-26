@@ -1,4 +1,4 @@
-//! The world's side of the actions (`hand_core::act`): picking up and setting
+//! The world's side of the actions (`noto_core::act`): picking up and setting
 //! down play their time series instead of a fixed timer, a legged robot's
 //! steps are drawn one by one as it walks (slips, falls), and a wheeled or
 //! tracked robot can push an item along a route with its bumper.
@@ -12,11 +12,11 @@
 //! random stream so the world's layout does not change with them.
 
 use super::*;
-use hand_core::act::focus::{self, FocusCtx, FocusFrame};
-use hand_core::act::material::{self, ItemMaterial};
-use hand_core::act::reach::ReachMode;
-use hand_core::act::{gait, grasp as agrasp, push as apush, ActEvent, ActKind, ActRollout};
-use hand_core::kin::{self as hkin, KinLoads, KinPose};
+use noto_core::act::focus::{self, FocusCtx, FocusFrame};
+use noto_core::act::material::{self, ItemMaterial};
+use noto_core::act::reach::ReachMode;
+use noto_core::act::{gait, grasp as agrasp, push as apush, ActEvent, ActKind, ActRollout};
+use noto_core::kin::{self as hkin, KinLoads, KinPose};
 
 /// Time to get back up after a fall, seconds (est: a small humanoid's stand-up routine).
 pub const GET_UP_S: f32 = 6.0;
@@ -107,7 +107,7 @@ pub fn camera_of(sensor: &str) -> (f32, f32, f32) {
 
 /// Positioning error of the arm's end, metres (est: a backdrivable QDD arm
 /// with absolute encoders 5 mm; bus servos with gear backlash 10 mm).
-fn arm_error_m(arm: &hand_core::parts::ArmPreset) -> f32 {
+fn arm_error_m(arm: &noto_core::parts::ArmPreset) -> f32 {
     if arm.shoulder.backdrivable {
         0.005
     } else {
@@ -170,7 +170,7 @@ impl World {
         };
         let mut rollout = agrasp::grasp(&inp);
         if matches!(rollout.outcome.code, Some("reach_ground") | Some("reach_side")) {
-            let need = size[1] + hand_core::act::reach::PALM_CLEARANCE_M;
+            let need = size[1] + noto_core::act::reach::PALM_CLEARANCE_M;
             return Err(ActionError::CannotReach { lowest_m: rollout.metric("lowest_palm_z").unwrap_or(0.0), need_m: need, reason: rollout.outcome.reason_ko.clone().unwrap_or_default() });
         }
         // A short shuffle puts the (believed) item at the planned stand-off first.
@@ -343,7 +343,7 @@ impl World {
         let need_plan = self.walk.plan.as_ref().map_or(true, |(_, g, s)| *g != ground || *s != slope);
         if need_plan {
             let spec = self.drive_spec();
-            let g = gait::plan(&self.body, spec.max_speed_mps, hand_core::surface::available_mu(self.body.base, &props), e.slope_deg);
+            let g = gait::plan(&self.body, spec.max_speed_mps, noto_core::surface::available_mu(self.body.base, &props), e.slope_deg);
             self.walk.plan = Some((g, ground, slope));
         }
         let (g, _, _) = self.walk.plan.clone().expect("set above");
@@ -352,9 +352,9 @@ impl World {
             self.walk.since_step_m -= g.step_m;
             self.walk.steps += 1;
             self.walk.stance = 1 - self.walk.stance;
-            let mu = draw_lognormal(&mut self.act_rng, hand_core::surface::available_mu(self.body.base, &props), gait::GROUND_MU_COV);
+            let mu = draw_lognormal(&mut self.act_rng, noto_core::surface::available_mu(self.body.base, &props), gait::GROUND_MU_COV);
             let margin = mu - g.rcof;
-            let p = hand_core::surface::slip_probability(margin);
+            let p = noto_core::surface::slip_probability(margin);
             if self.act_rng.next_f32() >= p {
                 continue;
             }
@@ -430,26 +430,26 @@ impl World {
         };
         let r = hkin::solve_fast(&self.body, &pose, &loads);
         let props = self.ground_here().surface().props();
-        let drive = (!self.body.legged).then(|| hand_core::act::drive::state(&self.body, props, self.posture_now().0.slope_deg, 0.0, self.carried_kg(), 0.0));
+        let drive = (!self.body.legged).then(|| noto_core::act::drive::state(&self.body, props, self.posture_now().0.slope_deg, 0.0, self.carried_kg(), 0.0));
         let obj = object.map(|(k, a)| {
             let s = k.spec().piece_size_m(a);
             ([0.5 * s[0], 0.5 * s[1], 0.5 * s[2]], k.spec().mass_kg * a)
         });
-        focus::frame(&FocusCtx { body: &self.body, hand: &self.hand, report: &r, sample: sample.as_ref(), action: kind, event: event.as_ref(), ground_mu: hand_core::surface::available_mu(self.body.base, props), drive, object: obj })
+        focus::frame(&FocusCtx { body: &self.body, hand: &self.hand, report: &r, sample: sample.as_ref(), action: kind, event: event.as_ref(), ground_mu: noto_core::surface::available_mu(self.body.base, props), drive, object: obj })
     }
 
     /// Whether this body brings its palm down to a piece of `amount` items
-    /// lying on the ground (the bend plan of `hand_core::act::reach`), and the
+    /// lying on the ground (the bend plan of `noto_core::act::reach`), and the
     /// reason when it does not.
     pub fn reach_ground(&self, kind: ItemKind, amount: f32) -> Result<(), String> {
         let size = kind.spec().piece_size_m(amount);
-        let goal = hand_core::act::reach::ReachGoal::ground_object(size[1], kind.spec().mass_kg * amount, false, self.carried_kg());
-        let plan = hand_core::act::reach::plan(&self.body, &goal);
+        let goal = noto_core::act::reach::ReachGoal::ground_object(size[1], kind.spec().mass_kg * amount, false, self.carried_kg());
+        let plan = noto_core::act::reach::plan(&self.body, &goal);
         if plan.ok {
             return Ok(());
         }
         // A load the bend cannot hold with one hand may still go up with two.
-        let both = hand_core::act::reach::plan(&self.body, &hand_core::act::reach::ReachGoal { two_arms: true, ..goal });
+        let both = noto_core::act::reach::plan(&self.body, &noto_core::act::reach::ReachGoal { two_arms: true, ..goal });
         if both.ok {
             Ok(())
         } else {
@@ -459,7 +459,7 @@ impl World {
 
     /// Where an item of `kind` (a piece of `amount` items) lies relative to the
     /// robot when its right hand reaches it beside the right foot without
-    /// turning (`hand_core::act::reach::plan_side` with the cargo aboard):
+    /// turning (`noto_core::act::reach::plan_side` with the cargo aboard):
     /// forward and left (negative: right), metres. `None` when this body
     /// cannot reach it there. Planned once per item, piece and cargo.
     pub fn side_reach(&self, kind: ItemKind, amount: f32) -> Option<(f32, f32)> {
@@ -468,8 +468,8 @@ impl World {
             return *v;
         }
         let size = kind.spec().piece_size_m(amount);
-        let goal = hand_core::act::reach::ReachGoal::ground_object(size[1], kind.spec().mass_kg * amount, false, self.carried_kg());
-        let plan = hand_core::act::reach::plan_side(&self.body, &goal, 0.5 * size[2]);
+        let goal = noto_core::act::reach::ReachGoal::ground_object(size[1], kind.spec().mass_kg * amount, false, self.carried_kg());
+        let plan = noto_core::act::reach::plan_side(&self.body, &goal, 0.5 * size[2]);
         let v = plan.ok.then_some((plan.object_x, plan.object_y));
         self.side_cache.lock().unwrap_or_else(|e| e.into_inner()).insert(key, v);
         v

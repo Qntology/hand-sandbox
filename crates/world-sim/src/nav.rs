@@ -1,19 +1,19 @@
 //! Route planning on the cell grid.
 //!
 //! Every edge between neighbouring cells is judged by the same drive model the
-//! rest of the project uses, `hand_core::simulate_drive`: a smooth height
+//! rest of the project uses, `noto_core::simulate_drive`: a smooth height
 //! difference becomes a `Slope` segment and a curb difference becomes a `Step`
 //! segment. So what the planner calls passable is exactly what the "foot"
 //! preview calls passable, and edge time and energy come from the same formula.
 //! On top of that the ground of the cell being entered sets its own limit:
 //! the friction its contacts get and, for a known drive, the force left after
-//! rolling resistance (`hand_core::surface::climb_limit_deg`).
+//! rolling resistance (`noto_core::surface::climb_limit_deg`).
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-use hand_core::surface::{climb_limit_deg, energy_factor};
-use hand_core::{simulate_drive, BaseSpec, Terrain as Segment};
+use noto_core::surface::{climb_limit_deg, energy_factor};
+use noto_core::{simulate_drive, BaseSpec, Terrain as Segment};
 
 use crate::terrain::{cell_center, Terrain, CELL_M};
 
@@ -63,7 +63,7 @@ pub enum Goal {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PushLoad {
     pub mass_kg: f32,
-    pub material: hand_core::act::material::ItemMaterial,
+    pub material: noto_core::act::material::ItemMaterial,
 }
 
 /// Judges one move. `None` when the base cannot pass.
@@ -108,17 +108,17 @@ pub fn edge_with(spec: &BaseSpec, t: &Terrain, a: Cell, b: Cell, load: Option<Pu
         return None;
     }
     // How much of the cruise speed this ground leaves: shorter steps on slippery
-    // ground, wheel or track slip on soft ground (`hand_core::act`).
+    // ground, wheel or track slip on soft ground (`noto_core::act`).
     let signed = if rise >= 0.0 { slope_deg } else { -slope_deg };
     let extra = match (load, spec.mass_kg) {
         (Some(l), Some(m)) => {
             let th = signed.to_radians();
-            let mu = hand_core::act::material::item_on(l.material, t.ground_at(b.0, b.1).surface()).0.mean;
-            (l.mass_kg * hand_core::balance::G * (mu * th.cos() + th.sin())).max(0.0) / m.max(1e-3)
+            let mu = noto_core::act::material::item_on(l.material, t.ground_at(b.0, b.1).surface()).0.mean;
+            (l.mass_kg * noto_core::balance::G * (mu * th.cos() + th.sin())).max(0.0) / m.max(1e-3)
         }
         _ => 0.0,
     };
-    let factor = hand_core::act::locomotion_factor_with(spec, props, signed, extra)?;
+    let factor = noto_core::act::locomotion_factor_with(spec, props, signed, extra)?;
     let move_time = ground_only.time_s / factor;
     // The drive turns at its cruise speed whatever the slip: the power is the
     // cruise power, and the slower ground speed makes the stretch cost more.
@@ -297,7 +297,7 @@ pub fn cell_distance_m(a: Cell, b: Cell) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hand_core::BaseKind;
+    use noto_core::BaseKind;
 
     fn flat(w: usize, d: usize) -> Terrain {
         // A zone covering everything keeps the terrain at height 0.
@@ -320,7 +320,7 @@ mod tests {
         assert_eq!(p.cells.len(), 9);
         let r = simulate_drive(&spec, &[Segment::Flat { length_m: 4.0 }]);
         // On rock the tyre's slip is a fraction of a percent of the drive model's time.
-        let f = hand_core::act::locomotion_factor(&spec, Ground::Rock.surface().props(), 0.0).unwrap();
+        let f = noto_core::act::locomotion_factor(&spec, Ground::Rock.surface().props(), 0.0).unwrap();
         assert!(f > 0.99 && f <= 1.0, "{f}");
         assert!((p.time_s - r.time_s / f).abs() < 1e-3, "{} vs {}", p.time_s, r.time_s / f);
         let ef = p.edges[0].energy_factor;
@@ -432,7 +432,7 @@ mod tests {
         t.set_ground(8, 4, Ground::Grass);
         let spec = BaseSpec { mass_kg: Some(19.3), drive_accel_mps2: Some(240.0 / 19.3), ..BaseKind::Wheel.spec() };
         assert!(edge(&spec, &t, (7, 4), (8, 4)).is_some(), "alone the wheels climb it");
-        let ore = PushLoad { mass_kg: 4.0, material: hand_core::act::material::ItemMaterial::IronOre };
+        let ore = PushLoad { mass_kg: 4.0, material: noto_core::act::material::ItemMaterial::IronOre };
         assert!(edge_with(&spec, &t, (7, 4), (8, 4), Some(ore)).is_none(), "pushing 4 kg of ore up it is past the grass's traction");
         assert!(edge_with(&spec, &t, (8, 4), (7, 4), Some(ore)).is_some(), "down it the slope helps");
     }

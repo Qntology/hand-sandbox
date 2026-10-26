@@ -1,0 +1,29 @@
+[package]
+name = "noto-ml"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SigLIP2 vision-language embeddings on candle, with CUDA, Metal, Vulkan and ROCm device selection"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+image = { workspace = true }
+rayon = { workspace = true }
+tokenizers = { workspace = true }
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+# ROCm (HIP) backend from the Qntology fork, pinned to the same commit as candle-core.
+candle-rocm = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "2191c7ad898d866c4db5380ea1fc13a98f435e0c", optional = true }
+
+# Ends a Windows process that used ROCm without the DLL unload (`device::rocm_exit_now_if_used`).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"], optional = true }
+
+[features]
+default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal"]
+vulkan = ["candle-core/vulkan", "candle-nn/vulkan"]
+rocm = ["dep:candle-rocm", "dep:windows-sys", "candle-core/rocm", "candle-nn/rocm"]

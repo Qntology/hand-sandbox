@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
-use hand_ml::{probe_backends, Anchors, Backend, BackendStatus, Dictionary, Selection, Siglip2};
-use hand_runtime::{Runtime, RuntimeConfig};
+use noto_ml::{probe_backends, Anchors, Backend, BackendStatus, Dictionary, Selection, Siglip2};
+use noto_runtime::{Runtime, RuntimeConfig};
 
 /// Logistics dictionary compiled into the app.
 pub const DICTIONARY_JSON: &str = include_str!("../../data/logistics_dictionary.json");
@@ -28,7 +28,7 @@ pub struct VisionEngine {
 
 pub struct AppState {
     device: Mutex<(Backend, usize)>,
-    /// How the start-up device was chosen (`HAND_DEVICE`, first GPU, CPU fallback).
+    /// How the start-up device was chosen (`NOTO_DEVICE`, first GPU, CPU fallback).
     startup: Selection,
     probed: OnceLock<Vec<BackendStatus>>,
     vision: Mutex<Option<Arc<VisionEngine>>>,
@@ -46,9 +46,9 @@ pub struct AppState {
 
 impl AppState {
     pub fn new() -> Self {
-        // The first GPU this build has and that opens, unless HAND_DEVICE says otherwise
+        // The first GPU this build has and that opens, unless NOTO_DEVICE says otherwise
         // (logis-center `new_gpu_device`). The probe leaves the device in the cache.
-        let startup = hand_ml::preferred();
+        let startup = noto_ml::preferred();
         AppState {
             device: Mutex::new((startup.backend, startup.ordinal)),
             startup,
@@ -103,14 +103,14 @@ impl AppState {
 
     /// The device the models go on: the selected one, unless that is the CPU
     /// while this build has a GPU that opens — then the first such GPU (the
-    /// start-up order), which becomes the selection. `HAND_DEVICE=cpu` keeps
+    /// start-up order), which becomes the selection. `NOTO_DEVICE=cpu` keeps
     /// the CPU. Returns whether the selection moved.
     pub fn prefer_gpu(&self) -> bool {
         let (backend, _) = self.selected();
-        if backend != Backend::Cpu || std::env::var(hand_ml::device::DEVICE_ENV).is_ok_and(|v| v.trim().eq_ignore_ascii_case("cpu")) {
+        if backend != Backend::Cpu || std::env::var(noto_ml::device::DEVICE_ENV).is_ok_and(|v| v.trim().eq_ignore_ascii_case("cpu")) {
             return false;
         }
-        let picked = hand_ml::device::select(None);
+        let picked = noto_ml::device::select(None);
         if picked.backend == Backend::Cpu {
             return false;
         }
@@ -283,7 +283,7 @@ pub fn tips_dir() -> PathBuf {
 /// Folder with the SAM weights (`mobile_sam-tiny-vitt.safetensors` or
 /// `sam_vit_b_01ec64.safetensors`). `SAM_DIR` wins; otherwise `models/sam`.
 pub fn sam_dir() -> PathBuf {
-    if let Ok(p) = std::env::var(hand_vision::sam::DIR_ENV) {
+    if let Ok(p) = std::env::var(noto_vision::sam::DIR_ENV) {
         return PathBuf::from(p);
     }
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("models").join("sam")

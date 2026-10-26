@@ -3,7 +3,7 @@
 //! * [`terrain`], [`kinds`], [`world`]: a block-style heightfield world with
 //!   trees, boulders and ore nodes, dropped items, two waypoints and a curb
 //!   wall, plus a robot bound to the project's hand and foot models.
-//! * [`nav`]: A* routes judged by `hand_core::simulate_drive`.
+//! * [`nav`]: A* routes judged by `noto_core::simulate_drive`.
 //! * [`render`]: a software ray-caster that outputs an RGB frame, an object-id
 //!   buffer and a depth buffer, so the ground truth of every pixel is known.
 //! * [`capture`]: screenshots as WebP (lossy through libwebp when available).

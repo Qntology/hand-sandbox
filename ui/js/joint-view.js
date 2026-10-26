@@ -1,6 +1,6 @@
 // 3인칭 '관절 물리' 오버레이: world_frame(view: 'chase:<궤도>')가 돌려주는 overlay 를 그린다.
 // 관절 점(토크/피크 비율 색, 포화 고리, 멈춤 X), 무게중심과 그 수직선, 동적 ZMP, 지지 다각형, 지면 반력 화살표,
-// 그리고 오른쪽 아래 패널에 이번 자세 변화의 관절별 토크/피크 시계열과 관절 표. 계산은 모두 Rust(hand_core::dynamics)에서 한다.
+// 그리고 오른쪽 아래 패널에 이번 자세 변화의 관절별 토크/피크 시계열과 관절 표. 계산은 모두 Rust(noto_core::dynamics)에서 한다.
 import { $, clear, el } from './util.js';
 
 const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();

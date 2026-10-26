@@ -4,7 +4,7 @@
 //! topped columns (a blocky look). Smooth height changes between neighbouring
 //! cells are judged as slopes. Sharp obstacles are separate "curbs": a curb
 //! sits on top of a cell and is judged as a step. That mirrors the two kinds of
-//! terrain segment in `hand_core::Terrain` (`Slope` and `Step`).
+//! terrain segment in `noto_core::Terrain` (`Slope` and `Step`).
 
 use serde::{Deserialize, Serialize};
 

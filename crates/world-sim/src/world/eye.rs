@@ -2,7 +2,7 @@
 //! they are turned, how they shake, and what the robot believes about it.
 //! Numbers and their sources: `docs/research/camera.md` (§6 lists them).
 //!
-//! * Pose. The camera rides on the head (`hand_core::kin::head_camera`) of
+//! * Pose. The camera rides on the head (`noto_core::kin::head_camera`) of
 //!   the pose the robot holds now: the playing action's sample (a bend, a
 //!   reach that looks at the hand, a pan toward an item beside the foot), the
 //!   walking step (the CoM's rise and fall, the pelvis's sway: the head's bob
@@ -37,10 +37,10 @@
 //! * Belief. The robot knows its joints (encoders) and measures the shake
 //!   with the head camera's own IMU: the gyro integrates it, so the believed
 //!   view carries the gyro's angle random walk over the time the shake has
-//!   been integrated. Back-projection (`hand-runtime`) uses the believed view.
+//!   been integrated. Back-projection (`noto-runtime`) uses the believed view.
 
-use hand_core::kin::{self as hkin, KinPose};
-use hand_core::surface::Surface;
+use noto_core::kin::{self as hkin, KinPose};
+use noto_core::surface::Surface;
 use serde::Serialize;
 
 use super::World;
@@ -290,7 +290,7 @@ impl World {
             }
         }
         if let Some((pose, _, src)) = self.act_pose() {
-            return (pose, src == hand_core::Source::FootLift);
+            return (pose, src == noto_core::Source::FootLift);
         }
         let slope = if self.body.legged { 0.0 } else { self.posture_now().0.slope_deg };
         (KinPose { base_pitch_deg: slope, ..KinPose::stand(self.carried_kg()) }, false)
@@ -378,14 +378,14 @@ impl World {
                 .add(footfall(seed, gd, g.step_m, self.walk.steps, stab));
             (s, t)
         } else {
-            let tracked = matches!(self.body.base, hand_core::BaseKind::Track);
+            let tracked = matches!(self.body.base, noto_core::BaseKind::Track);
             let bridge = if tracked { self.body.support_len_m } else { 2.0 * hkin::WHEEL_R_M };
             (rolling(seed, gd, self.eye.travelled_m, speed, self.body.support_len_m.max(0.2), self.body.support_width_m.max(0.2), bridge), IMU_WINDOW_S)
         }
     }
 
     /// The mount's ringing `t` seconds after the last heel strike.
-    fn heel_strike(&self, g: &hand_core::act::gait::GaitPlan, ground: Surface, t: f32) -> Shake {
+    fn heel_strike(&self, g: &noto_core::act::gait::GaitPlan, ground: Surface, t: f32) -> Shake {
         let s = strike_scale(ground);
         let pulse = STRIKE_PULSE_S / s;
         // A pulse longer than both feet are down is part of the step, not a strike.
@@ -399,7 +399,7 @@ impl World {
         // and half the stance to the side of the landing foot (the body rolls away from it).
         let pitch_arm = 0.5 * g.step_m / r2;
         let side = if self.walk.stance == 0 { -1.0 } else { 1.0 };
-        let roll_arm = side * 0.5 * hand_core::parts::STANCE_WIDTH_M / r2;
+        let roll_arm = side * 0.5 * noto_core::parts::STANCE_WIDTH_M / r2;
         Shake { source: "heel_strike", dz_m: x, pitch: pitch_arm * x, roll: roll_arm * x, rate: [v, pitch_arm * v, roll_arm * v] }
     }
 }
@@ -433,7 +433,7 @@ fn footfall(seed: u64, gd: f32, step_m: f32, steps: u32, stab: f32) -> Shake {
     let s_last = s_now - step_m;
     // Footfalls alternate sides: this foot on one profile, the last on the other.
     let (side_now, side_last) = if steps % 2 == 0 { (0, 1) } else { (1, 0) };
-    let foot = hand_core::act::gait::NOMINAL_FOOT_M;
+    let foot = noto_core::act::gait::NOMINAL_FOOT_M;
     let (h_now, _) = profile(seed, gd, side_now, s_now, foot);
     let (h_last, _) = profile(seed, gd, side_last, s_last, foot);
     let dh = h_now - h_last;
@@ -443,7 +443,7 @@ fn footfall(seed: u64, gd: f32, step_m: f32, steps: u32, stab: f32) -> Shake {
         source: "footfall",
         dz_m: 0.5 * dh,
         pitch: keep * (dh / step_m.max(0.05)).atan() * 0.5,
-        roll: keep * roll_sign * (dh / hand_core::parts::STANCE_WIDTH_M).atan() * 0.5,
+        roll: keep * roll_sign * (dh / noto_core::parts::STANCE_WIDTH_M).atan() * 0.5,
         rate: [0.0; 3],
     }
 }
@@ -493,12 +493,12 @@ mod tests {
     use super::*;
     use crate::terrain::TerrainKind;
     use crate::world::{Action, WorldConfig};
-    use hand_core::{BaseKind, BodyPlan, FingerCount, HandConfig};
+    use noto_core::{BaseKind, BodyPlan, FingerCount, NotoConfig};
 
     fn world(base: BaseKind) -> World {
-        let mut hand = HandConfig::preset(FingerCount::Five);
+        let mut hand = NotoConfig::preset(FingerCount::Five);
         hand.base = base;
-        World::new(WorldConfig { seed: 7, cells: 64, hand, body: BodyPlan::default(), terrain: TerrainKind::Open, parcels: Some(0), ..WorldConfig::default() }).unwrap()
+        World::new(WorldConfig { seed: 7, cells: 64, noto: hand, body: BodyPlan::default(), terrain: TerrainKind::Open, parcels: Some(0), ..WorldConfig::default() }).unwrap()
     }
 
     #[test]
@@ -552,7 +552,7 @@ mod tests {
     #[test]
     fn harder_ground_strikes_harder_and_rougher_ground_tilts_more() {
         let w = world(BaseKind::HumanFoot);
-        let g = hand_core::act::gait::plan(&w.body, 0.6, 0.7, 0.0);
+        let g = noto_core::act::gait::plan(&w.body, 0.6, 0.7, 0.0);
         let peak = |s: Surface| (0..300).map(|i| w.heel_strike(&g, s, i as f32 * 0.001).pitch.abs()).fold(0.0, f32::max);
         assert!(peak(Surface::Firm) > peak(Surface::Grass) && peak(Surface::Grass) > peak(Surface::Sand), "firm {} grass {} sand {}", peak(Surface::Firm), peak(Surface::Grass), peak(Surface::Sand));
         // Dry sand's 194 ms pulse outlasts a short double support: no strike then.
