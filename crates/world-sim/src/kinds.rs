@@ -301,16 +301,16 @@ impl Ground {
         self == Ground::Water
     }
 
-    /// The physics of this ground (`hand_core::surface`).
-    pub fn surface(self) -> hand_core::Surface {
+    /// The physics of this ground (`noto_core::surface`).
+    pub fn surface(self) -> noto_core::Surface {
         match self {
-            Ground::Sand => hand_core::Surface::Sand,
-            Ground::Grass => hand_core::Surface::Grass,
-            Ground::Dirt => hand_core::Surface::Dirt,
-            Ground::Rock => hand_core::Surface::Rock,
-            Ground::Water => hand_core::Surface::Water,
-            Ground::WetSand => hand_core::Surface::WetSand,
-            Ground::Gravel => hand_core::Surface::Gravel,
+            Ground::Sand => noto_core::Surface::Sand,
+            Ground::Grass => noto_core::Surface::Grass,
+            Ground::Dirt => noto_core::Surface::Dirt,
+            Ground::Rock => noto_core::Surface::Rock,
+            Ground::Water => noto_core::Surface::Water,
+            Ground::WetSand => noto_core::Surface::WetSand,
+            Ground::Gravel => noto_core::Surface::Gravel,
         }
     }
 }

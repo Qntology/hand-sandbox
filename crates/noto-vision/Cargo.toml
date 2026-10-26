@@ -1,0 +1,26 @@
+[package]
+name = "noto-vision"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ML logic on keyframes: monocular depth (TIPSv2 DPT), SigLIP2 semantic location, mask tracking (SAM 3.1 interface), bearing triangulation and a time-series decision. Knows images, camera and odometry only, never the game state."
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+image = { workspace = true }
+rayon = { workspace = true }
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+candle-transformers = { workspace = true }
+noto-ml = { path = "../noto-ml" }
+noto-ts = { path = "../noto-ts" }
+
+[features]
+default = []
+# GPU backends for the depth (TIPS), semantic location (SigLIP2) and mask (SAM) models.
+cuda = ["noto-ml/cuda"]
+metal = ["noto-ml/metal"]
+vulkan = ["noto-ml/vulkan"]
+rocm = ["noto-ml/rocm"]

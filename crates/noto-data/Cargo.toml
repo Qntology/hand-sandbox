@@ -1,0 +1,16 @@
+[package]
+name = "noto-data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Layered synthetic dataset for the Noto robot (vision, tactile, material) stored in LanceDB"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+noto-core = { path = "../noto-core" }
+noto-sds = { path = "../noto-sds" }
+lancedb = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }

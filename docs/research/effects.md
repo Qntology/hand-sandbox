@@ -1,6 +1,6 @@
 # 피로 · 하중 · 미끄러짐 · 관절 부하 · 자세 안정: 환경 N:N 리서치, 벤치마크, 개선 기록
 
-조사일 2026-10-24. 이 문서에서 온 코드: `crates/hand-core/src/surface.rs`(지면 표·접촉), `wear.rs`(감속기 수명), `balance.rs`(자세에 지면이 들어감), `effects.rs`(벤치마크), `crates/world-sim`(지면 종류·경로·에너지·관절 마모), `crates/hand-runtime`(SDS 기록, `physics_status`). 단일 원인 균형 기준은 [`balance.md`](balance.md), 복합 N:N 시나리오는 [`nn-scenarios.md`](nn-scenarios.md)에 있다.
+조사일 2026-10-24. 이 문서에서 온 코드: `crates/noto-core/src/surface.rs`(지면 표·접촉), `wear.rs`(감속기 수명), `balance.rs`(자세에 지면이 들어감), `effects.rs`(벤치마크), `crates/world-sim`(지면 종류·경로·에너지·관절 마모), `crates/noto-runtime`(SDS 기록, `physics_status`). 단일 원인 균형 기준은 [`balance.md`](balance.md), 복합 N:N 시나리오는 [`nn-scenarios.md`](nn-scenarios.md)에 있다.
 
 표기: **[직접]** 출처에 인쇄된 값, **[유도: 식]** 이 문서에서 계산한 값, **[추정]** 출처를 찾지 못해 정한 값, **[대입]** 다른 계열의 값을 빌려 씀, **[2차: X]** X가 인용한 값(원문 미확인). 원문 대조 메모는 조사 노트(세션 스크래치)에 남겼고, 이 문서에는 숫자와 위치만 옮겼다. **벤치마크는 시간 측정이 아니라 기준 점수 시험**이다(속도 측정은 돌리지 않았다).
 
@@ -16,7 +16,7 @@
 
 ## 1. 지면: 미끄러짐과 지형 에너지
 
-### 1.1 지면 표 S (`hand_core::surface::SURFACES`)
+### 1.1 지면 표 S (`noto_core::surface::SURFACES`)
 
 μ는 최대 마찰 계수, Crr는 구름 저항 계수, η는 Pandolf 보행 에너지의 지형 계수다. 느슨한 지면(모래)의 μ는 고무와 지면의 마찰이 아니라 **지면 자체의 전단 한계** `tan φ`이다. 미끄러짐 끝에서 어떤 주행부든 `H = A·c + W·tan φ` 이상을 밀 수 없기 때문이다(UMD ENAE 788X 2024 강의 "Tracked Vehicles", 응집 c → 0).
 
@@ -67,7 +67,7 @@
 
 발열 상태 h: `dh/dt = ((τ/τ연속)² − h) / T_th`, h > 1이면 그 관절을 1/h로 감액(채취 속도). T_th는 qdd100의 두 내구 점(10 N·m 60 s, 6 N·m 400 s)을 맞춘 0.5 kg QDD 500–1100 s, 버스 서보 100–300 s [추정] ([`parts.md`](parts.md)). 이번 조사에서 본 Mini Cheetah 권선 1.23 K/W × 32 J/K = 39 s (Katz 2018), maxon EC 60 flat 권선 41 s·모터 90 s는 **권선만의** 시정수라 액추에이터 전체를 맞춘 qdd100 값과 바로 비교할 수 없어 바꾸지 않았다. 두 절점 열 모델(권선 + 하우징)은 저항·토크 상수가 공개되지 않은 액추에이터가 많아(Robstride, CubeMars) 보류했다(8장).
 
-### 2.2 장기 피로 (마모): Miner 누적 (`hand_core::wear`)
+### 2.2 장기 피로 (마모): Miner 누적 (`noto_core::wear`)
 
 관절이 토크 T로 dt초 버티면 수명의 `dt / (3600 · L(T))`를 쓴다(Palmgren–Miner, 1 = 정격 수명 소진). `L(T) = L_r · (T_r / T)^p`.
 
@@ -102,7 +102,7 @@
 
 고급 섀시(AgileX Tracer급)는 무겁고 구동력이 작아 마른 모래에서 구동력의 대부분을 구름 저항에 쓴다. 바퀴의 마찰 한계(풀밭·마른 모래 14.0°)는 구동력과 무관하게 같다.
 
-경로가 이미 짐 실은 질량으로 지면 한계를 보므로(1.3), 짐 결정 모델(`hand-runtime::cargo`)의 "짐 실은 경로" 게이트가 모래 때문에 길이 없으면 왕복·쪼개기로 넘어간다.
+경로가 이미 짐 실은 질량으로 지면 한계를 보므로(1.3), 짐 결정 모델(`noto-runtime::cargo`)의 "짐 실은 경로" 게이트가 모래 때문에 길이 없으면 왕복·쪼개기로 넘어간다.
 
 ### 3.2 넘어짐과 미끄러짐 중 먼저 오는 것
 
@@ -110,7 +110,7 @@
 
 XCoM(Hof 2005)·FASM(Papadopoulos & Rey 1996)은 조사했지만 이 시뮬레이터는 좌우 CoM 속도와 발 디딤을 모델링하지 않아 아직 쓰지 않았다(8장).
 
-## 4. 벤치마크 (`hand_core::effects`, `crates/hand-core/tests/effects_bench.rs`)
+## 4. 벤치마크 (`noto_core::effects`, `crates/noto-core/tests/effects_bench.rs`)
 
 ### 4.1 원칙
 

@@ -1,12 +1,12 @@
 [package]
-name = "hand-sim-app"
+name = "noto-sim-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Logistics robot hand simulator: presets, grasp and drive tests, SigLIP2 classification, Lance dataset"
+description = "Noto logistics robot simulator: presets, grasp and drive tests, SigLIP2 classification, Lance dataset"
 
 [lib]
-name = "hand_sim_app"
+name = "noto_sim_app"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -14,11 +14,11 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
-hand-core = { path = "../crates/hand-core" }
-hand-ml = { path = "../crates/hand-ml" }
-hand-data = { path = "../crates/hand-data" }
-hand-runtime = { path = "../crates/hand-runtime" }
-hand-vision = { path = "../crates/hand-vision" }
+noto-core = { path = "../crates/noto-core" }
+noto-ml = { path = "../crates/noto-ml" }
+noto-data = { path = "../crates/noto-data" }
+noto-runtime = { path = "../crates/noto-runtime" }
+noto-vision = { path = "../crates/noto-vision" }
 candle-core = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
@@ -32,8 +32,8 @@ sha2 = "0.10"
 
 [features]
 default = []
-# GPU backends. Each one switches on the matching candle backend in hand-ml.
-cuda = ["hand-ml/cuda", "hand-runtime/cuda"]
-metal = ["hand-ml/metal", "hand-runtime/metal"]
-vulkan = ["hand-ml/vulkan", "hand-runtime/vulkan"]
-rocm = ["hand-ml/rocm", "hand-runtime/rocm"]
+# GPU backends. Each one switches on the matching candle backend in noto-ml.
+cuda = ["noto-ml/cuda", "noto-runtime/cuda"]
+metal = ["noto-ml/metal", "noto-runtime/metal"]
+vulkan = ["noto-ml/vulkan", "noto-runtime/vulkan"]
+rocm = ["noto-ml/rocm", "noto-runtime/rocm"]

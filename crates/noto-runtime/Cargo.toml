@@ -1,0 +1,36 @@
+[package]
+name = "noto-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Runs the simulated robot: recognise, gate with SDS and time series, carry out quests, log everything. No UI dependency."
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+image = { workspace = true }
+base64 = "0.22"
+candle-core = { workspace = true }
+noto-core = { path = "../noto-core" }
+noto-ml = { path = "../noto-ml" }
+noto-search = { path = "../noto-search" }
+noto-quest = { path = "../noto-quest" }
+noto-sds = { path = "../noto-sds" }
+noto-ts = { path = "../noto-ts" }
+noto-vision = { path = "../noto-vision" }
+world-sim = { path = "../world-sim" }
+
+[dev-dependencies]
+candle-nn = { workspace = true }
+# The development server mirrors the test records into LanceDB like the app does.
+noto-data = { path = "../noto-data" }
+tokio = { workspace = true }
+
+[features]
+default = []
+# GPU backends of every model the runtime loads (SigLIP2, TIPS, SAM, Granite TTM).
+cuda = ["noto-vision/cuda", "noto-ml/cuda"]
+metal = ["noto-vision/metal", "noto-ml/metal"]
+vulkan = ["noto-vision/vulkan", "noto-ml/vulkan"]
+rocm = ["noto-vision/rocm", "noto-ml/rocm"]

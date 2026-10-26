@@ -8,7 +8,7 @@ import { refreshQuests, setPlaying } from './sim.js';
 import { selectCenterTab } from './layout.js';
 import { setStatus } from './toast.js';
 
-const HISTORY_KEY = 'hand-sandbox.cmd-history';
+const HISTORY_KEY = 'noto-sandbox.cmd-history';
 const ACTION_KO = {
   mine: '채취', collect: '줍기', carry: '운반', deliver: '인도', drop: '내려놓기', goto: '이동', locate: '탐색',
   mine_and_deliver: '채취·운반', fetch: '가져오기', stop: '중지', unknown: '해석 불가',

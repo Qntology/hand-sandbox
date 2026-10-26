@@ -55,8 +55,8 @@ async function main() {
   $('sb-mock').hidden = !mock;
   document.body.dataset.backend = mock ? 'mock' : 'tauri';
   if (mock) {
-    document.title = '물류 로봇 손 시뮬레이터 (모의 백엔드)';
-    window.__handSandbox = { state, bus }; // 브라우저 개발·스모크 테스트용
+    document.title = 'Noto 물류 로봇 시뮬레이터 (모의 백엔드)';
+    window.__notoSandbox = { state, bus }; // 브라우저 개발·스모크 테스트용
   }
   wireErrors();
   showVersion();
@@ -76,7 +76,7 @@ async function main() {
   initTimeseries();
   initTestTimeline();
 
-  // 손·발 프리셋이 있어야 월드 생성(HandConfig 전달)과 PiP 가 의미가 있으므로 먼저 기다린다.
+  // 손·발 프리셋이 있어야 월드 생성(NotoConfig 전달)과 PiP 가 의미가 있으므로 먼저 기다린다.
   await initHandPanel().catch(() => {});
   await Promise.allSettled([initDevice(), initDataPanel(), initLogs(), initPresets()]);
   // 필수 모델(SigLIP2 · TTM · TIPSv2 · SAM)이 장치에 올라가기 전에는 월드를 만들지 않는다.

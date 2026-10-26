@@ -3,10 +3,10 @@ name = "world-sim"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Lightweight deterministic open-world resource-gathering simulator: terrain, nodes, drops, an agent bound to the hand/foot models, a software renderer with ground truth, and WebP frame capture"
+description = "Lightweight deterministic open-world resource-gathering simulator: terrain, nodes, drops, an agent bound to the Noto robot models, a software renderer with ground truth, and WebP frame capture"
 
 [dependencies]
-hand-core = { path = "../hand-core" }
+noto-core = { path = "../noto-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 image = { workspace = true, features = ["webp"] }

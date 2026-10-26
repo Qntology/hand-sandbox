@@ -32,5 +32,5 @@ set "CUDA_COMPUTE_CAP=%CUDA_COMPUTE_CAP: =%"
 for /f "delims=" %%V in ('nvcc --version ^| findstr /c:"release"') do echo [CUDA] %%V
 echo [CUDA] NVCC_CCBIN=%NVCC_CCBIN%
 echo [CUDA] CUDA_COMPUTE_CAP=%CUDA_COMPUTE_CAP%
-if not defined HAND_DEVICE set "HAND_DEVICE=cuda"
+if not defined NOTO_DEVICE set "NOTO_DEVICE=cuda"
 exit /b 0

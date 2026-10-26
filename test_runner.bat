@@ -3,7 +3,7 @@ rem ============================================================
 rem  Sequential test run shared by every backend (endmill-sandbox test_runner.bat).
 rem    test_cuda.bat   NVIDIA CUDA        test_rocm.bat  AMD ROCm / HIP
 rem    test_vulkan.bat Vulkan             test_cpu.bat   CPU only
-rem  _cargo.bat sets the toolchain, BACKEND, WSFEAT (cargo feature flags) and HAND_DEVICE,
+rem  _cargo.bat sets the toolchain, BACKEND, WSFEAT (cargo feature flags) and NOTO_DEVICE,
 rem  then calls this file. Do not run it directly.
 rem
 rem  The game logic, the physics (balance, joint dynamics, N:N references) and the
@@ -27,7 +27,7 @@ rem Two parallel rustc/link jobs by default: with all cores at once a 7 GB machi
 rem virtual memory (os error 1455) while several links map the 160 MB lancedb rlib.
 if not defined CARGO_BUILD_JOBS set "CARGO_BUILD_JOBS=2"
 set "CT=cargo test %WSFEAT%"
-rem One package with models (hand-vision, hand-runtime): only its own dependencies take features.
+rem One package with models (noto-vision, noto-runtime): only its own dependencies take features.
 set "PT=cargo test %PKGFEAT%"
 rem Physics and data crates do not depend on the models: no GPU features.
 set "CPT=cargo test"
@@ -39,7 +39,7 @@ mkdir "%LOGDIR%"
 set "SUMMARY=%LOGDIR%\summary.log"
 set "FAILED=0"
 >"%SUMMARY%" echo ========================================
->>"%SUMMARY%" echo  hand-sandbox test run %TS%  backend=%BACKEND%  features=%WSFEAT%  HAND_DEVICE=%HAND_DEVICE%
+>>"%SUMMARY%" echo  noto-sandbox test run %TS%  backend=%BACKEND%  features=%WSFEAT%  NOTO_DEVICE=%NOTO_DEVICE%
 >>"%SUMMARY%" echo  options: ONLY=%ONLY% CARGO_BUILD_JOBS=%CARGO_BUILD_JOBS%
 >>"%SUMMARY%" echo ========================================
 echo Logs: %LOGDIR%
@@ -69,7 +69,7 @@ rem ---- 00: environment snapshot ----
   echo --- env ---
   echo BACKEND=%BACKEND%
   echo WSFEAT=%WSFEAT%
-  echo HAND_DEVICE=%HAND_DEVICE%
+  echo NOTO_DEVICE=%NOTO_DEVICE%
   echo CUDA_COMPUTE_CAP=%CUDA_COMPUTE_CAP%
   echo ROCM_PATH=%ROCM_PATH%
 ) > "%LOGDIR%\00_env.log" 2>&1
@@ -79,21 +79,21 @@ call :run 01 build_tests "%CT% --workspace --no-run"
 rem ---- 02: unit tests of every crate (physics, presets, balance, SDS, models with random weights) ----
 call :run 02 unit "%CT% --workspace --lib --no-fail-fast -- --nocapture --test-threads=1"
 rem ---- 03: joint dynamics and presets: every preset change must reach the physics ----
-call :run 03 presets_physics "%CPT% -p hand-core --test presets_physics --no-fail-fast -- --nocapture --test-threads=1"
+call :run 03 presets_physics "%CPT% -p noto-core --test presets_physics --no-fail-fast -- --nocapture --test-threads=1"
 rem ---- 04: N:N composite scenarios against the research references (no tuning to them) ----
-call :run 04 nn_scenarios "%CPT% -p hand-core --test nn_scenarios --no-fail-fast -- --nocapture --test-threads=1"
+call :run 04 nn_scenarios "%CPT% -p noto-core --test nn_scenarios --no-fail-fast -- --nocapture --test-threads=1"
 rem ---- 05: world scenarios (quests, game logic) ----
-call :run 05 scenarios "%PT% -p hand-runtime --test scenarios --no-fail-fast -- --nocapture --test-threads=1"
+call :run 05 scenarios "%PT% -p noto-runtime --test scenarios --no-fail-fast -- --nocapture --test-threads=1"
 rem ---- 06: integrated test (game pass, ML perception pass, ML decision pass) ----
-call :run 06 integrated "%PT% -p hand-runtime --test integrated --no-fail-fast -- --nocapture --test-threads=1"
+call :run 06 integrated "%PT% -p noto-runtime --test integrated --no-fail-fast -- --nocapture --test-threads=1"
 rem ---- 07: the models on the GPU backend compared with the CPU (skipped on the cpu backend) ----
 if /i "%BACKEND%"=="cpu" (
     >>"%SUMMARY%" echo 07_gpu_parity: skipped - cpu backend
 ) else (
-    call :run 07 gpu_parity "%PT% -p hand-vision --test gpu_backend --no-fail-fast -- --nocapture --test-threads=1"
+    call :run 07 gpu_parity "%PT% -p noto-vision --test gpu_backend --no-fail-fast -- --nocapture --test-threads=1"
 )
 rem ---- 08: Lance tables ----
-call :run 08 lance "%CPT% -p hand-data --no-fail-fast -- --test-threads=1"
+call :run 08 lance "%CPT% -p noto-data --no-fail-fast -- --test-threads=1"
 
 >>"%SUMMARY%" echo ========================================
 if "%FAILED%"=="0" (

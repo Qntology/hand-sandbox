@@ -2,15 +2,15 @@
 //! Usage: cargo run --release -p world-sim --example capture_demo -- <out_dir> [seed]
 use std::time::Instant;
 
-use hand_core::{BaseKind, FingerCount, HandConfig};
+use noto_core::{BaseKind, FingerCount, NotoConfig};
 use world_sim::{encode_webp, Camera, World, WorldConfig};
 
 fn main() {
     let out = std::env::args().nth(1).expect("output directory");
     let seed: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(7);
-    let mut hand = HandConfig::preset(FingerCount::Five);
-    hand.base = BaseKind::Track;
-    let mut w = World::new(WorldConfig { seed, cells: 64, hand, ..WorldConfig::default() }).unwrap();
+    let mut noto = NotoConfig::preset(FingerCount::Five);
+    noto.base = BaseKind::Track;
+    let mut w = World::new(WorldConfig { seed, cells: 64, noto, ..WorldConfig::default() }).unwrap();
     // Look at the nearest node.
     let n = w
         .nodes

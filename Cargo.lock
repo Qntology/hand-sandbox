@@ -3489,142 +3489,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hand-core"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "hand-data"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "futures",
- "hand-core",
- "hand-sds",
- "lancedb",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "hand-ml"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "candle-core",
- "candle-nn",
- "candle-rocm",
- "image",
- "rayon",
- "serde",
- "serde_json",
- "tokenizers",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "hand-quest"
-version = "0.1.0"
-dependencies = [
- "hand-search",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "hand-runtime"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "candle-core",
- "candle-nn",
- "hand-core",
- "hand-data",
- "hand-ml",
- "hand-quest",
- "hand-sds",
- "hand-search",
- "hand-ts",
- "hand-vision",
- "image",
- "serde",
- "serde_json",
- "tokio",
- "world-sim",
-]
-
-[[package]]
-name = "hand-sds"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "sha2",
-]
-
-[[package]]
-name = "hand-search"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "hand-sim-app"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "candle-core",
- "hand-core",
- "hand-data",
- "hand-ml",
- "hand-runtime",
- "hand-vision",
- "image",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sha2",
- "tauri",
- "tauri-build",
- "tokio",
-]
-
-[[package]]
-name = "hand-ts"
-version = "0.1.0"
-dependencies = [
- "candle-core",
- "candle-nn",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "hand-vision"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "candle-core",
- "candle-nn",
- "candle-transformers",
- "hand-ml",
- "hand-ts",
- "image",
- "rayon",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5683,6 +5547,142 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df9761775871bdef83bee530e60050f7e54b1105350d6884eb0fb4f46c2f9405"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "noto-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "noto-data"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "lancedb",
+ "noto-core",
+ "noto-sds",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "noto-ml"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "candle-nn",
+ "candle-rocm",
+ "image",
+ "rayon",
+ "serde",
+ "serde_json",
+ "tokenizers",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "noto-quest"
+version = "0.1.0"
+dependencies = [
+ "noto-search",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "noto-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "candle-core",
+ "candle-nn",
+ "image",
+ "noto-core",
+ "noto-data",
+ "noto-ml",
+ "noto-quest",
+ "noto-sds",
+ "noto-search",
+ "noto-ts",
+ "noto-vision",
+ "serde",
+ "serde_json",
+ "tokio",
+ "world-sim",
+]
+
+[[package]]
+name = "noto-sds"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "noto-search"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "noto-sim-app"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "candle-core",
+ "image",
+ "noto-core",
+ "noto-data",
+ "noto-ml",
+ "noto-runtime",
+ "noto-vision",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tauri",
+ "tauri-build",
+ "tokio",
+]
+
+[[package]]
+name = "noto-ts"
+version = "0.1.0"
+dependencies = [
+ "candle-core",
+ "candle-nn",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "noto-vision"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "candle-nn",
+ "candle-transformers",
+ "image",
+ "noto-ml",
+ "noto-ts",
+ "rayon",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -9677,8 +9677,8 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 name = "world-sim"
 version = "0.1.0"
 dependencies = [
- "hand-core",
  "image",
+ "noto-core",
  "rayon",
  "serde",
  "serde_json",

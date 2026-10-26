@@ -94,7 +94,7 @@ pub const MODELS: [ModelSpec; 4] = [
         repo: "lmz/candle-sam",
         revision: "8b4cb7c743f3b3cb8afd212a86ae15b1bbfdac97",
         license: "Apache-2.0",
-        files: &[FileSpec { name: hand_vision::sam::TINY_FILE, bytes: 40_613_024, sha256: "5ad43a841b57cc798e2837e251c15aa9f602868a1780d195459383d117784cf7" }],
+        files: &[FileSpec { name: noto_vision::sam::TINY_FILE, bytes: 40_613_024, sha256: "5ad43a841b57cc798e2837e251c15aa9f602868a1780d195459383d117784cf7" }],
     },
 ];
 
@@ -128,7 +128,7 @@ fn file_state(dir: &Path, f: &FileSpec) -> (u64, bool) {
 /// when that is what the folder has.
 pub fn present(m: &ModelSpec) -> bool {
     match m.id {
-        "sam" => hand_vision::SamModel::find_weights(&sam_dir()).is_some(),
+        "sam" => noto_vision::SamModel::find_weights(&sam_dir()).is_some(),
         _ => m.files.iter().all(|f| file_state(&folder(m.id), f).1),
     }
 }
@@ -185,7 +185,7 @@ const CANCELLED: &str = "취소됨";
 
 /// Downloads every missing file of the models in `ids`, one file after another.
 async fn run(dl: Arc<Downloads>, ids: Vec<&'static ModelSpec>) {
-    let client = match reqwest::Client::builder().user_agent(concat!("hand-sim-app/", env!("CARGO_PKG_VERSION"))).build() {
+    let client = match reqwest::Client::builder().user_agent(concat!("noto-sim-app/", env!("CARGO_PKG_VERSION"))).build() {
         Ok(c) => c,
         Err(e) => {
             dl.update(|p| {
@@ -490,10 +490,10 @@ pub async fn models_activate(state: App<'_>) -> Result<Value, String> {
 /// build cannot use (built without the `cuda` feature).
 fn gpu_hint(state: &AppState) -> Option<String> {
     let (backend, _) = state.selected();
-    if backend != hand_ml::Backend::Cpu {
+    if backend != noto_ml::Backend::Cpu {
         return None;
     }
-    if hand_ml::device::GPU_ORDER.iter().any(|b| b.compiled()) {
+    if noto_ml::device::GPU_ORDER.iter().any(|b| b.compiled()) {
         return Some("GPU 백엔드가 이 빌드에 있지만 열리지 않아 CPU에서 돕니다 (장치 칩의 설명 참고)".into());
     }
     let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
@@ -526,7 +526,7 @@ fn activate(state: &Arc<AppState>) -> Result<(), String> {
         step("sam", &mut || rt.use_sam(&sam_dir(), &device))?;
         let v = rt.api_models_status()?;
         let dev = |k: &str| v["devices"][k].as_str().unwrap_or("-").to_string();
-        Ok([("siglip2", hand_ml::device_label(engine.model.device())), ("ttm", dev("ttm")), ("tips", dev("depth")), ("sam", dev("track"))]
+        Ok([("siglip2", noto_ml::device_label(engine.model.device())), ("ttm", dev("ttm")), ("tips", dev("depth")), ("sam", dev("track"))]
             .into_iter()
             .map(|(k, d)| (k.to_string(), d))
             .collect::<std::collections::BTreeMap<_, _>>())
@@ -564,7 +564,7 @@ mod tests {
 
     #[test]
     fn file_state_reads_parts_and_finished_files() {
-        let dir = std::env::temp_dir().join(format!("hand-models-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("noto-models-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let f = FileSpec { name: "w.bin", bytes: 10, sha256: "" };
@@ -582,7 +582,7 @@ mod tests {
     /// Downloads what is missing (from Hugging Face), loads all four models
     /// on the start-up device, and runs the depth model and a scan with them.
     /// Needs the network and about 2.2 GB of disk the first time:
-    /// `cargo test -p hand-sim-app --lib -- --ignored --nocapture all_models`.
+    /// `cargo test -p noto-sim-app --lib -- --ignored --nocapture all_models`.
     #[test]
     #[ignore]
     fn all_models_download_load_and_run() {
@@ -615,7 +615,7 @@ mod tests {
         println!("[MODELS] loaded on {:?} in {:.1} s · {live:?}", state.selected(), t0.elapsed().as_secs_f32());
         assert!(state.models_ready());
         // With a GPU in the build that opens, every model is on it.
-        if hand_ml::device::select(None).backend != hand_ml::Backend::Cpu && std::env::var(hand_ml::device::DEVICE_ENV).map_or(true, |v| !v.eq_ignore_ascii_case("cpu")) {
+        if noto_ml::device::select(None).backend != noto_ml::Backend::Cpu && std::env::var(noto_ml::device::DEVICE_ENV).map_or(true, |v| !v.eq_ignore_ascii_case("cpu")) {
             assert!(live.values().all(|d| !d.starts_with("CPU") && d != "cpu"), "a model is not on the GPU: {live:?}");
         }
         state
@@ -623,7 +623,7 @@ mod tests {
                 assert!(rt.stand_ins().is_empty(), "stand-ins left: {:?}", rt.stand_ins());
                 let d = rt.depth_view(80.0).map_err(|e| format!("{e:#}"))?;
                 println!("[MODELS] depth {} on {} · {:.0} ms · {:?}", d.mode, d.device, d.infer_ms, d.metrics);
-                assert_eq!(d.mode, hand_vision::tips::MODE);
+                assert_eq!(d.mode, noto_vision::tips::MODE);
                 let s = rt.scan_now("test").map_err(|e| format!("{e:#}"))?;
                 println!("[MODELS] scan {} on {} · {} tiles · {} judged", s.mode, s.device, s.tiles, s.judged.len());
                 assert_ne!(s.mode, "oracle");
@@ -634,7 +634,7 @@ mod tests {
 
     #[test]
     fn hash_prefix_matches_a_known_digest() {
-        let dir = std::env::temp_dir().join(format!("hand-models-hash-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("noto-models-hash-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let p = dir.join("abc");
         fs::write(&p, b"abcdef").unwrap();

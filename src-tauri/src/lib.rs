@@ -1,5 +1,5 @@
-//! Logistics robot hand simulator: Tauri shell over `hand-core`, `hand-ml`,
-//! `hand-data` and the simulated world (`hand-runtime`).
+//! Noto logistics robot simulator: Tauri shell over `noto-core`, `noto-ml`,
+//! `noto-data` and the simulated world (`noto-runtime`).
 
 pub mod commands;
 pub mod models;
@@ -49,12 +49,12 @@ pub fn run() {
             models::models_activate,
         ])
         .build(tauri::generate_context!())
-        .expect("error while building the logistics hand simulator")
+        .expect("error while building the Noto logistics robot simulator")
         .run(|_app, event| {
             if let tauri::RunEvent::Exit = event {
                 // A Windows process that used ROCm ends here without the DLL unload
                 // that can hang in rocBLAS (no-op for every other build and device).
-                hand_ml::device::rocm_exit_now_if_used(0);
+                noto_ml::device::rocm_exit_now_if_used(0);
             }
         });
 }

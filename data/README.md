@@ -1,6 +1,6 @@
 # 데이터 출처와 계획
 
-이 폴더에는 물류 로봇 손 시뮬레이터가 쓰는 사전과 출처 기록이 있습니다. 합성 데이터셋은 LanceDB(Lance 포맷)에 저장하며, 저장 위치는 실행 시 지정합니다.
+이 폴더에는 Noto 물류 로봇 시뮬레이터가 쓰는 사전과 출처 기록이 있습니다. 합성 데이터셋은 LanceDB(Lance 포맷)에 저장하며, 저장 위치는 실행 시 지정합니다.
 
 ## 1. 물류 어휘 사전
 
@@ -47,7 +47,7 @@
 | 촉각·압력 맵 | 촉각 모델 필요 | `tactile` (스키마 정의됨) |
 | SigLIP2 임베딩 | 비전 파이프라인 단계 | `embeddings` (스키마 정의됨) |
 
-준비도 판정은 `hand-data/src/layers.rs`의 `Layer::readiness`와 같습니다.
+준비도 판정은 `noto-data/src/layers.rs`의 `Layer::readiness`와 같습니다.
 
 ## 6. 실데이터 계획
 
@@ -55,7 +55,7 @@
 
 ## 7. 월드 시뮬레이터의 가정값
 
-`world-sim`, `hand-core::body`, `hand-runtime`의 숫자 대부분은 **근거 없는 가정값**입니다. 실제 로봇의 측정값이 아니므로 결과(소요 시간, 에너지, 성공·실패)를 실제 성능으로 해석하면 안 됩니다. 아래 표의 값은 코드의 상수와 같으며, 바꿀 때는 이 표도 같이 고칩니다.
+`world-sim`, `noto-core::body`, `noto-runtime`의 숫자 대부분은 **근거 없는 가정값**입니다. 실제 로봇의 측정값이 아니므로 결과(소요 시간, 에너지, 성공·실패)를 실제 성능으로 해석하면 안 됩니다. 아래 표의 값은 코드의 상수와 같으며, 바꿀 때는 이 표도 같이 고칩니다.
 
 | 값 | 위치 | 기본값 | 근거 |
 | --- | --- | --- | --- |
@@ -66,21 +66,21 @@
 | 줍기·인도에 걸리는 시간 | `PICKUP_TIME_S`, `DELIVER_TIME_S` | 각 1.0 s | 가정 |
 | 조작 전력(채취·줍기·내려놓기) | `MANIPULATION_POWER_W` | 30 W | 가정 |
 | 제자리 회전 속도 | `TURN_RATE_RAD_S` | 2.5 rad/s | 가정 |
-| 손 패드 · 지면과 아이템의 마찰 (v0.6) | `hand_core::act::material::{pad_on, item_on}` | 패드–나무 0.60, 돌·철광석 0.83, 석탄 0.45 (산포 10%); 아이템–지면 0.41–0.62 (정지·운동, 산포 10%) | CTU Code 2014, Nikolić 2024, Teffo & Naudé 2013, NAVFAC DM-7.02, Linthorne & Cooper 2013, Fall 2014 (`docs/research/actions.md` §1.2–1.3). v0.5의 `ITEM_FRICTION` 0.6(재질 구분 없음)을 대체. 석탄 패드 마찰과 산포는 추정 |
-| 행위 시계열 (v0.6) | `hand_core::act` | 굽힘(관절 범위·토크), 잡기(조준·쥠 안전계수 2·연질 접촉·충돌·들기 관성), 놓기(낙하·반발), 밀기(한계면·안정 반경), 걷기(LIPM·미끄럼·넘어짐), 주행(견인–미끄럼) | `docs/research/actions.md` §1. 관절 범위, 착지 속도, 범퍼 강성, 일어나는 시간 6 s 등은 추정 |
+| 손 패드 · 지면과 아이템의 마찰 (v0.6) | `noto_core::act::material::{pad_on, item_on}` | 패드–나무 0.60, 돌·철광석 0.83, 석탄 0.45 (산포 10%); 아이템–지면 0.41–0.62 (정지·운동, 산포 10%) | CTU Code 2014, Nikolić 2024, Teffo & Naudé 2013, NAVFAC DM-7.02, Linthorne & Cooper 2013, Fall 2014 (`docs/research/actions.md` §1.2–1.3). v0.5의 `ITEM_FRICTION` 0.6(재질 구분 없음)을 대체. 석탄 패드 마찰과 산포는 추정 |
+| 행위 시계열 (v0.6) | `noto_core::act` | 굽힘(관절 범위·토크), 잡기(조준·쥠 안전계수 2·연질 접촉·충돌·들기 관성), 놓기(낙하·반발), 밀기(한계면·안정 반경), 걷기(LIPM·미끄럼·넘어짐), 주행(견인–미끄럼) | `docs/research/actions.md` §1. 관절 범위, 착지 속도, 범퍼 강성, 일어나는 시간 6 s 등은 추정 |
 | 오도메트리 드리프트 (v0.7) | `world_sim::odometry` | 바퀴 축척 0.58%, 다리 1.67% (이동마다 1σ), 무작위 보행 6.25 mm/√m, 자이로 각 무작위 보행 0.0069 °/√s · 바이어스 3.5 °/h, 미끄럼 s/(1−s) | Wheel-INS 표 III, Camurri 2020 §7.2, Borenstein & Feng 1996 p. 21, MILUV 표 3–4 (`docs/research/perception.md` §1.1) |
-| 기억과 시각 일정 (v0.7) | `hand_runtime::vision`, `precision` | σ(d) = √(σ₀² + (r·d)² + w²·d), 칼만 혼합, 패턴 1.5 s · 행위 전 1 s, 2σ ≤ 허용 오차, 위치 보정 8 m 안 · 검증 게이트 χ²(2) 99% | Smith, Self & Cheeseman 1986, Matthies & Shafer 1987, Matthis 2018, Johansson 2001, Bar-Shalom & Fortmann 1988 (§1.2–1.3). 2σ 기준, 8 m 범위는 추정 |
+| 기억과 시각 일정 (v0.7) | `noto_runtime::vision`, `precision` | σ(d) = √(σ₀² + (r·d)² + w²·d), 칼만 혼합, 패턴 1.5 s · 행위 전 1 s, 2σ ≤ 허용 오차, 위치 보정 8 m 안 · 검증 게이트 χ²(2) 99% | Smith, Self & Cheeseman 1986, Matthies & Shafer 1987, Matthis 2018, Johansson 2001, Bar-Shalom & Fortmann 1988 (§1.2–1.3). 2σ 기준, 8 m 범위는 추정 |
 | 택배 상자 (v0.7) | `ItemKind::Parcel`, `material::Cardboard` | 0.7 kg, 16 × 12 × 10 cm, 패드 마찰 0.60, 지면 0.50 (운동 0.75×), 반발 0.25 | Amaral 2026(초록), CTU Code 2014, Kang Lin 2023 (§1.4). 크기는 대입 |
-| 어깨 외전 · 넓은 발 (v0.7) | `hand_core::kin` | 외전 129°, 내전 19.5°, 고관절 외전 30° | 휴머노이드 일곱 URDF/MJCF 중앙값 (§1.5). 고관절 외전은 추정 |
-| 걸음의 CoM 진폭 · 압력 중심 (v0.7) | `hand_core::act::gait` | 0.015 m(1 km/h) → 0.034 m(6 km/h), 동역학적 상사; 압력 중심 −7.45 … 70.55% 발 길이 | Massaad 2007 그림 1A, Jeon & Cho 2020 표 1–2 (§1.6). 발꿈치 중심 15% 발 길이는 추정 |
-| 몸통 리프트 (v0.7) | `hand_core::parts::TORSO_LIFT` | 0.40 m, 0.10 m/s, 450 N, 2.5 kg, $600 | Fetch 사양·URDF (§1.7). 질량·가격은 추정 |
+| 어깨 외전 · 넓은 발 (v0.7) | `noto_core::kin` | 외전 129°, 내전 19.5°, 고관절 외전 30° | 휴머노이드 일곱 URDF/MJCF 중앙값 (§1.5). 고관절 외전은 추정 |
+| 걸음의 CoM 진폭 · 압력 중심 (v0.7) | `noto_core::act::gait` | 0.015 m(1 km/h) → 0.034 m(6 km/h), 동역학적 상사; 압력 중심 −7.45 … 70.55% 발 길이 | Massaad 2007 그림 1A, Jeon & Cho 2020 표 1–2 (§1.6). 발꿈치 중심 15% 발 길이는 추정 |
+| 몸통 리프트 (v0.7) | `noto_core::parts::TORSO_LIFT` | 0.40 m, 0.10 m/s, 450 N, 2.5 kg, $600 | Fetch 사양·URDF (§1.7). 질량·가격은 추정 |
 | 채취 속도 | `World::mining_rate` | 손가락 수 / 5 (5지 = 1.0) | 가정 |
 | 노드 경도 | `NodeSpec::hardness` | 나무 2.0, 바위 1.5, 석탄·철 3.0 | Minecraft 관례를 따른 값. "도구 필요" 규칙은 두지 않음 |
 | 노드 드롭 수 | `NodeSpec::drop_count` | 나무 3, 바위 2, 석탄 광석 2, 철 광석 1 | 가정 |
 | 아이템 크기·질량 | `ItemSpec` | 원목 0.15 m 정육면체 2.4 kg(밀도 약 700 kg/m³), 돌 0.10 m 2.6 kg, 석탄 0.10 m 1.4 kg, 철광석 0.10 m 4.0 kg | 일반적인 밀도에서 계산한 가정값 |
 | 적재 한계 | `BaseKind::carry_capacity_kg` | 바퀴 20, 메카넘 15, 트랙 30, 사람 발 25 kg | 가정. v0.3부터는 부품 프리셋의 지지 한계(다리 연속 토크, 섀시 구조)로 더 낮아질 수 있음 |
 | 배터리 용량 | 가슴 프리셋 `battery_wh` | 보급 160, 중급 324, 고급 420 Wh | 21700 셀 팩 계산(`docs/research/parts.md` §3). 프리셋이 없을 때의 옛 가정(순항 전력 × 1800 s)은 `body::compute`에만 남음 |
-| 관절 마모 (v0.5) | `hand_core::wear` | 감속기 정격 수명의 Miner 누적: 평기어 서보 10만 회 @ 정지 토크 1/5 (STS3215 시험), 유성 QDD 7,000 h @ 연속 토크 (Harmonic Drive CSF 대입), 사이클로이드 6,000 h (Nabtesco RV) | 데이터시트, 대입은 `docs/research/effects.md` §2.2. v0.4의 "채취 타격 400회" 가정을 대체 |
+| 관절 마모 (v0.5) | `noto_core::wear` | 감속기 정격 수명의 Miner 누적: 평기어 서보 10만 회 @ 정지 토크 1/5 (STS3215 시험), 유성 QDD 7,000 h @ 연속 토크 (Harmonic Drive CSF 대입), 사이클로이드 6,000 h (Nabtesco RV) | 데이터시트, 대입은 `docs/research/effects.md` §2.2. v0.4의 "채취 타격 400회" 가정을 대체 |
 
 ### 부품 프리셋과 밸런스 (v0.3)
 
@@ -96,7 +96,7 @@
 | 유지하는 안정 여유 | `MARGIN_KEEP` | 지지면 반길이의 20% | 설계 선택(로봇 ZMP 여유 표준 없음) |
 | 발목 전략 범위 | `Body::ankle_band` | 발 길이 10% (바퀴형 2 cm) | 추정(Horak & Nashner의 발목/고관절 전략을 단순화) |
 | 섀시 구조 적재 | `drive_limits` | 보급 8, 중급 30, 고급 100 kg | 고급은 AgileX Tracer 사양, 나머지는 추정 |
-| 지면별 마찰 · 구름 저항 · 보행 에너지 (v0.5) | `hand_core::surface::SURFACES` | 지면 8종 × 발·바퀴·트랙 (예: 마른 모래 μ 0.55, Crr 바퀴 0.30, η 2.1) | Wong, Gillespie, Bosch, Soule & Goldman, Lukić 등 (`docs/research/effects.md` §1). 풀밭의 발·트랙 μ, 젖은 모래의 발 μ·η, 트랙 Crr 일부, 메카넘 계수 0.8은 추정. v0.4의 단일 상수 0.03 · 0.6을 대체 |
+| 지면별 마찰 · 구름 저항 · 보행 에너지 (v0.5) | `noto_core::surface::SURFACES` | 지면 8종 × 발·바퀴·트랙 (예: 마른 모래 μ 0.55, Crr 바퀴 0.30, η 2.1) | Wong, Gillespie, Bosch, Soule & Goldman, Lukić 등 (`docs/research/effects.md` §1). 풀밭의 발·트랙 μ, 젖은 모래의 발 μ·η, 트랙 Crr 일부, 메카넘 계수 0.8은 추정. v0.4의 단일 상수 0.03 · 0.6을 대체 |
 | 보행 전단 | `surface::GAIT_RCOF` | 0.223 | 사람 보통 속도 RCOF (Chang 2013), 로봇 발에 대입 |
 | 정지 거리 | `STOP_DISTANCE_M` | 0.5 m (한 셀) | 설계값 |
 | 관절 열 시정수 | `Actuator::thermal_tau_s` | 버스 서보 200 s, QDD 600–900 s | qdd100 자료로 맞춘 추정, 서보는 공개값 없음 |
@@ -120,7 +120,7 @@
 
 ### 정밀도 게이트의 임계값
 
-`hand-runtime::config::GateCfg`와 `EmbeddingCfg`의 기본값입니다. **아직 실제 SigLIP2 점수 분포로 보정하지 않았습니다.** 모의 인식기(`OraclePerception`: 정답 ID 버퍼 + 주입한 오류)와 SigLIP 시그모이드 점수의 일반적인 범위를 보고 정했을 뿐입니다.
+`noto-runtime::config::GateCfg`와 `EmbeddingCfg`의 기본값입니다. **아직 실제 SigLIP2 점수 분포로 보정하지 않았습니다.** 모의 인식기(`OraclePerception`: 정답 ID 버퍼 + 주입한 오류)와 SigLIP 시그모이드 점수의 일반적인 범위를 보고 정했을 뿐입니다.
 
 | 값 | 기본값 | 뜻 |
 | --- | --- | --- |

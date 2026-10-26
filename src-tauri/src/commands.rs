@@ -1,19 +1,19 @@
-//! Tauri commands. Each one is a thin wrapper over `views`, `hand-ml` or
-//! `hand-data`. Heavy work (model load, inference, Lance writes) runs off the
+//! Tauri commands. Each one is a thin wrapper over `views`, `noto-ml` or
+//! `noto-data`. Heavy work (model load, inference, Lance writes) runs off the
 //! UI thread.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use base64::Engine;
-use hand_core::{GraspSetup, HandConfig, Payload, Terrain};
-use hand_data::schema::{
+use noto_core::{GraspSetup, NotoConfig, Payload, Terrain};
+use noto_data::schema::{
     TABLE_DICTIONARY, TABLE_CONTACTS, TABLE_EMBEDDINGS, TABLE_JOINT_STATES, TABLE_POINT_CLOUD,
     TABLE_SAMPLES, TABLE_TACTILE, TABLE_VISION,
 };
-use hand_data::{dictionary_batch, random_scene, simulate_scene, LanceStore};
-use hand_ml::classify::{classify, Prediction};
-use hand_ml::{Backend, BackendStatus, DictEntry, Dictionary};
+use noto_data::{dictionary_batch, random_scene, simulate_scene, LanceStore};
+use noto_ml::classify::{classify, Prediction};
+use noto_ml::{Backend, BackendStatus, DictEntry, Dictionary};
 use serde::Serialize;
 use tauri::State;
 
@@ -30,13 +30,13 @@ pub fn presets() -> PresetsView {
 }
 
 #[tauri::command]
-pub fn hand_geometry(config: HandConfig, closure: f32) -> Result<HandView, String> {
+pub fn hand_geometry(config: NotoConfig, closure: f32) -> Result<HandView, String> {
     views::hand_view(&config, closure)
 }
 
 #[tauri::command]
 pub fn grasp_test(
-    config: HandConfig,
+    config: NotoConfig,
     payload: Payload,
     setup: GraspSetup,
 ) -> Result<GraspView, String> {

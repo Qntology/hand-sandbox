@@ -135,7 +135,7 @@
 .jp-bar > i { display: block; height: 100%; }
 .jp-notes { margin: 6px 0 0; padding-left: 14px; color: var(--text-dim); }
 .viewport-canvas-wrap[data-w="tiny"] .joint-panel { display: none; }
-/* 포커스 시점: 행위가 쓰는 부위의 힘·관절 그림 (hand_core::act::focus) */
+/* 포커스 시점: 행위가 쓰는 부위의 힘·관절 그림 (noto_core::act::focus) */
 .focus-hud { position: absolute; right: 10px; bottom: 58px; z-index: 7; width: 300px; padding: 8px 10px; font-size: 0.66rem; color: var(--text); }
 .focus-hud .fh-head { display: flex; justify-content: space-between; align-items: center; gap: 6px; margin-bottom: 4px; }
 .focus-hud .fh-head select { min-height: 22px; font-size: 0.62rem; }

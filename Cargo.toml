@@ -1,16 +1,16 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/hand-core",
-    "crates/hand-ml",
-    "crates/hand-data",
+    "crates/noto-core",
+    "crates/noto-ml",
+    "crates/noto-data",
     "crates/world-sim",
-    "crates/hand-sds",
-    "crates/hand-ts",
-    "crates/hand-search",
-    "crates/hand-quest",
-    "crates/hand-vision",
-    "crates/hand-runtime",
+    "crates/noto-sds",
+    "crates/noto-ts",
+    "crates/noto-search",
+    "crates/noto-quest",
+    "crates/noto-vision",
+    "crates/noto-runtime",
     "src-tauri",
 ]
 
@@ -59,11 +59,11 @@ opt-level = 3
 opt-level = 3
 
 # The ML stand-ins and the region tracker run per keyframe in the integrated test.
-[profile.dev.package.hand-vision]
+[profile.dev.package.noto-vision]
 opt-level = 3
 
 # The joint dynamics run a 2 ms rigid-body simulation per posture change inside the world tests.
-[profile.dev.package.hand-core]
+[profile.dev.package.noto-core]
 opt-level = 3
 
 [profile.release]

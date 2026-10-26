@@ -1,4 +1,4 @@
-# Hand Sandbox UI
+# Noto Sandbox UI
 
 Tauri 2 데스크톱 앱의 프런트엔드입니다. 빌드 단계와 npm 패키지 없이 정적 파일(HTML · CSS · ES 모듈)만으로 동작하며,
 디자인 토큰과 레이아웃(떠 있는 카드 4개, 8px 간격 리사이저, 28px 상태줄)은 `endmill-sandbox` 를 따릅니다.
@@ -44,7 +44,7 @@ python3 -m http.server 8765
 모의 백엔드 대신 실제 월드 런타임을 보려면 개발용 서버를 씁니다. 서버는 `ui/`를 내려 주고, `index.html`에 `window.__TAURI__.core.invoke` shim을 끼워 넣어 월드 명령 11개를 `POST /invoke/<명령>`으로 런타임에 보냅니다. 나머지 명령(손·발 구성, 파지 시험 등)은 브라우저 모의 백엔드로 갑니다.
 
 ```sh
-cargo run --release -p hand-runtime --example serve [포트] [ui 폴더]   # 기본 http://127.0.0.1:8787/
+cargo run --release -p noto-runtime --example serve [포트] [ui 폴더]   # 기본 http://127.0.0.1:8787/
 ```
 
 127.0.0.1에서만 받고 인증이 없으니 자기 컴퓨터에서 보는 용도로만 쓰세요. 로그와 SDS 원장은 `RUNTIME_DIR`(기본 `data/runtime`)에 저장됩니다.

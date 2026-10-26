@@ -121,7 +121,7 @@ function renderLanes() {
   }
   if (!status?.active) {
     lanes.game.append(el('div', { class: 'tl-empty', text: state.mock
-      ? '통합 테스트는 실제 Rust 런타임에서만 동작합니다. 개발 서버(cargo run -p hand-runtime --example serve)나 Tauri 앱에서 여세요.'
+      ? '통합 테스트는 실제 Rust 런타임에서만 동작합니다. 개발 서버(cargo run -p noto-runtime --example serve)나 Tauri 앱에서 여세요.'
       : '위 툴바의 명령 칸이나 월드 화면 입력줄에 명령을 넣고 실행하세요. "자동 기록"이 켜져 있으면 재생하는 동안 1 게임(지금 월드에서 촬영) → 2 ML 인식 → 3 ML 결정(명령을 시작한 순간의 월드를 복제해 다시 수행)이 저절로 쌓입니다.' }));
     return;
   }

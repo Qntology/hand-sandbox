@@ -1,4 +1,4 @@
-# hand-sandbox v0.4 — GPU 가속, 관절 동역학과 3인칭 뷰, 복합 N:N
+# noto-sandbox v0.4 — GPU 가속, 관절 동역학과 3인칭 뷰, 복합 N:N
 
 작성일 2026-10-24. v0.3([`PLAN-v0.3.md`](PLAN-v0.3.md)) 위에 세 가지를 더했다. 복합 N:N의 근거와 개선 기록은 [`research/nn-scenarios.md`](research/nn-scenarios.md)에 있다. 벤치마크(속도 측정)는 돌리지 않았다.
 
@@ -6,18 +6,18 @@
 
 | 요청 | 반영 |
 |---|---|
-| commerce·endmill-sandbox의 `.bat`과 Rust 로직으로 ROCm·CUDA·Vulkan 가속 | `_env_{cuda,rocm,vulkan,cpu}.bat`(MSVC 탐지, ROCm 트랙 선택 `_rocm_select.ps1`, CUDA 13 전처리 플래그, compute capability 자동), `dev_/build_/check_/test_/serve_<백엔드>.bat`, 단계별 로그를 남기는 `test_runner.bat`. Rust: 시작 장치 자동 선택(`HAND_DEVICE`), 백엔드별 장치 캐시, 메모리 풀 반납, Windows ROCm 종료 처리 (1장) |
+| commerce·endmill-sandbox의 `.bat`과 Rust 로직으로 ROCm·CUDA·Vulkan 가속 | `_env_{cuda,rocm,vulkan,cpu}.bat`(MSVC 탐지, ROCm 트랙 선택 `_rocm_select.ps1`, CUDA 13 전처리 플래그, compute capability 자동), `dev_/build_/check_/test_/serve_<백엔드>.bat`, 단계별 로그를 남기는 `test_runner.bat`. Rust: 시작 장치 자동 선택(`NOTO_DEVICE`), 백엔드별 장치 캐시, 메모리 풀 반납, Windows ROCm 종료 처리 (1장) |
 | LLM·비전·마스크·깊이 모델 가속, 임베딩·비전 임베딩 배치 | 이 저장소에는 LLM이 없다(명령 해석은 사전 + SigLIP2 텍스트). SigLIP2 비전·텍스트, TIPSv2 깊이, SAM 마스크, Granite TTM이 선택한 GPU에서 돌고, 깊이·밀집 비전 임베딩·SAM 이미지 인코더는 키프레임 단위로 일괄 처리된다 (1장) |
 | 마스크·깊이 모델은 참조 저장소에 가속이 없으니 멀티모달·임베딩 로직을 보고 다층적으로 | commerce의 규칙(장치 캐시, 장치별 배치 모양, 한 번 인코딩 후 재사용, 풀 반납)을 깊이·마스크에 그대로 적용. SAM은 키프레임마다 인코더 한 번, 프롬프트는 디코더 한 번 (1.3장) |
-| 1인칭이라 물리 엔진이 안 보임 → 각 관절 물리까지 보이는 3인칭 | 관절 동역학 엔진(`hand_core::dynamics`)과 추적 카메라 3인칭 뷰. 관절마다 각도·토크·피크 비율·포화·멈춤, CoM·동적 ZMP·지지면·지면 반력 (2장) |
+| 1인칭이라 물리 엔진이 안 보임 → 각 관절 물리까지 보이는 3인칭 | 관절 동역학 엔진(`noto_core::dynamics`)과 추적 카메라 3인칭 뷰. 관절마다 각도·토크·피크 비율·포화·멈춤, CoM·동적 ZMP·지지면·지면 반력 (2장) |
 | 프리셋이 물리 엔진에 제대로 반영되는지 확인 | `presets_physics`(부위·등급별로 바뀌어야 할 물리량과 관절 액추에이터), `presets_flow`(UI가 쓰는 API → 월드 → 동역학 → 오버레이 → SDS) 시험 (3장) |
-| N:N 리서치, 기준값, 기존 시험 안에서 중요도가 다른 복합 시나리오, 논문 근거, 벤치맥싱 없이 개선 | `hand_core::nn` 시나리오 S1–S4·S6·S7 + 홀드아웃, 가중치는 BESTest·Mini-BESTest·REBA·RULA·NIOSH CLI/SLI·DARPA에서. 퀘스트 중 실시간 채점(`nn_status`). 개선 세 가지와 전후 기록 (4장) |
+| N:N 리서치, 기준값, 기존 시험 안에서 중요도가 다른 복합 시나리오, 논문 근거, 벤치맥싱 없이 개선 | `noto_core::nn` 시나리오 S1–S4·S6·S7 + 홀드아웃, 가중치는 BESTest·Mini-BESTest·REBA·RULA·NIOSH CLI/SLI·DARPA에서. 퀘스트 중 실시간 채점(`nn_status`). 개선 세 가지와 전후 기록 (4장) |
 
 ## 1. GPU
 
 ### 1.1 장치
 
-`hand_ml::device`: 시작할 때 이 빌드의 GPU 백엔드를 CUDA → ROCm → Vulkan → Metal 순으로 열어 보고 첫 번째를 쓴다(`HAND_DEVICE=cpu|cuda|rocm|vulkan|metal|gpu[:번호]`로 고정). 모든 모델은 같은 캐시에서 장치를 받는다(이전에는 앱이 CPU로 시작했고 모델을 불러올 때마다 장치를 새로 열었다). 일괄 호출 뒤에는 장치 풀의 남는 메모리를 돌려준다(CUDA·ROCm 256 MB 유지, Vulkan은 64 MB 넘을 때만). Windows에서 ROCm을 쓴 프로세스는 `TerminateProcess`로 끝나 rocBLAS 종료 멈춤을 피한다(commerce `ROCM-EXIT`).
+`noto_ml::device`: 시작할 때 이 빌드의 GPU 백엔드를 CUDA → ROCm → Vulkan → Metal 순으로 열어 보고 첫 번째를 쓴다(`NOTO_DEVICE=cpu|cuda|rocm|vulkan|metal|gpu[:번호]`로 고정). 모든 모델은 같은 캐시에서 장치를 받는다(이전에는 앱이 CPU로 시작했고 모델을 불러올 때마다 장치를 새로 열었다). 일괄 호출 뒤에는 장치 풀의 남는 메모리를 돌려준다(CUDA·ROCm 256 MB 유지, Vulkan은 64 MB 넘을 때만). Windows에서 ROCm을 쓴 프로세스는 `TerminateProcess`로 끝나 rocBLAS 종료 멈춤을 피한다(commerce `ROCM-EXIT`).
 
 ### 1.2 배치 정책 (`BatchPolicy`)
 
@@ -38,13 +38,13 @@
 
 ### 1.4 검증 (이 PC: RTX 3050 Laptop 4 GB, CUDA 13.3, 드라이버 610.62)
 
-`test_cuda.bat -p hand-vision --test gpu_backend`: 같은 무작위 가중치로 CPU와 CUDA 결과 비교. SigLIP2 이미지·밀집·텍스트 상대 오차 ≤ 2.2e-7, TIPS 일괄 3.3e-6 (단일 대 일괄 행 2.4e-6), SAM 인코더 7.7e-5 · 디코더 5.4e-5 · IoU 6.1e-6. 이 시험이 실제 버그를 찾았다: `candle-transformers`의 SAM 마스크 디코더가 비연속 행렬로 matmul을 해 CUDA에서 실패한다(CPU는 통과). 디코더를 `hand-vision/src/sam_decoder.rs`로 가져와 행을 연속으로 만들었다. 또 SAM의 LayerNorm2d는 가중치 기본값이 0이라 무작위 가중치 비교가 무의미했던 것을 시험에서 바로잡았다.
+`test_cuda.bat -p noto-vision --test gpu_backend`: 같은 무작위 가중치로 CPU와 CUDA 결과 비교. SigLIP2 이미지·밀집·텍스트 상대 오차 ≤ 2.2e-7, TIPS 일괄 3.3e-6 (단일 대 일괄 행 2.4e-6), SAM 인코더 7.7e-5 · 디코더 5.4e-5 · IoU 6.1e-6. 이 시험이 실제 버그를 찾았다: `candle-transformers`의 SAM 마스크 디코더가 비연속 행렬로 matmul을 해 CUDA에서 실패한다(CPU는 통과). 디코더를 `noto-vision/src/sam_decoder.rs`로 가져와 행을 연속으로 만들었다. 또 SAM의 LayerNorm2d는 가중치 기본값이 0이라 무작위 가중치 비교가 무의미했던 것을 시험에서 바로잡았다.
 
 ROCm(이 PC에 AMD GPU 없음)과 Vulkan은 빌드 스크립트와 기능 플래그만 준비했고 실행 검증은 하지 않았다. `check_cuda.bat`(작업 공간 전체 CUDA 빌드)은 통과.
 
 ## 2. 관절 동역학과 3인칭 뷰
 
-`hand_core::dynamics`: 프리셋으로 만든 상체 강체 트리(골반 → 허리 요 → 허리 피치 또는 강체 → 가슴 → 목·머리, 어깨·팔꿈치·손). 질량·CoM은 프리셋 값(`balance`와 같은 분할), 관성은 그려지는 상자의 값(추정). `M(q)q̈ = τ − h`를 RNEA(재귀 뉴턴–오일러)와 그 열로 만든 질량 행렬로 풀고 2 ms 반암시적 오일러로 적분. 관절마다 프리셋 액추에이터의 토크–속도 직선으로 자른 계산 토크 제어, 역구동 불가 서보는 과부하에 밀리지 않고 멈춘다. 다리와 바퀴는 전신 뉴턴–오일러 합인 지면 반력의 정역학으로 토크를 낸다. 동적 ZMP·여유·머리 기울기·골반 좌우 가속을 기록한다.
+`noto_core::dynamics`: 프리셋으로 만든 상체 강체 트리(골반 → 허리 요 → 허리 피치 또는 강체 → 가슴 → 목·머리, 어깨·팔꿈치·손). 질량·CoM은 프리셋 값(`balance`와 같은 분할), 관성은 그려지는 상자의 값(추정). `M(q)q̈ = τ − h`를 RNEA(재귀 뉴턴–오일러)와 그 열로 만든 질량 행렬로 풀고 2 ms 반암시적 오일러로 적분. 관절마다 프리셋 액추에이터의 토크–속도 직선으로 자른 계산 토크 제어, 역구동 불가 서보는 과부하에 밀리지 않고 멈춘다. 다리와 바퀴는 전신 뉴턴–오일러 합인 지면 반력의 정역학으로 토크를 낸다. 동적 ZMP·여유·머리 기울기·골반 좌우 가속을 기록한다.
 
 정합성 시험: 정지 토크가 준정적 모델과 3% 안, 정지 상태의 ZMP = CoM 투영, 수동 진자의 에너지 보존 2% 안, 출발 시 ZMP 관성 이동 `x_com − z·a/g`, 보급형 팔꿈치(STS3215)는 원목에서 멈추고 중급은 든다, 체중 이동 뒤 발 들기.
 
