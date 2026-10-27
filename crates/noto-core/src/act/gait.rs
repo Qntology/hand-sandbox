@@ -40,6 +40,15 @@
 //!   needs lands inside its legs' reach (the capture point `x + ẋ·√(z_c/g)`,
 //!   Pratt 2006), otherwise it falls.
 //!
+//! The soles (v1.0, `docs/research/tactile.md` §3) are four compliant
+//! patches on a passive toe joint (`contact::sole_contact`): once a stance
+//! foot's centre of pressure passes the toe hinge the joint dorsiflexes
+//! against its spring–damper and the heel comes up (the ankle with it, the
+//! support shrunk to the forefoot), the trailing foot pushes off on its toes,
+//! and every stance sample checks each patch against the step's drawn
+//! friction. The COP table stays the target; the plan (`plan_z`) does not
+//! depend on the toes.
+//!
 //! Samples are solved by `kin` (the stance and swing legs by inverse
 //! kinematics, the CoM's acceleration as inertia), so the foot and joint
 //! focus views get the ground reaction, the centre of pressure and every
@@ -51,6 +60,7 @@ use std::sync::Mutex;
 use serde::Serialize;
 
 use crate::balance::{Body, G, KNEE_LEVER_WALK_M, REACTION_DELAY_S};
+use crate::contact::{self, SoleModel, TOE_HINGE_FL};
 use crate::kin::{self, KinLoads, KinPose, ANKLE_H_M, SHANK_M, THIGH_M};
 use crate::parts::*;
 use crate::surface::{self, SurfaceProps};
@@ -410,11 +420,63 @@ pub struct StepStat {
     pub impact_n: f32,
     pub grf_peak_bw: f32,
     pub grf_min_bw: f32,
+    /// The most of the step's drawn friction a stance foot used (shear over `μ·N`, per sample).
+    pub cone_use_max: f32,
+    /// The trailing foot's largest toe-patch force while it pushed off, N.
+    pub toe_push_n: f32,
+}
+
+/// What the soles did over a walk (`SoleLog::sample` per solved sample).
+#[derive(Clone, Debug, Default)]
+struct SoleLog {
+    /// Per foot: the toe joint's angle and whether the heel has come up this stance.
+    toe: [f32; 2],
+    heel_up: [bool; 2],
+    /// Per foot: when its stance began (its heel strike), and whether this
+    /// walk saw that strike (the foot trailing at the start did not: its
+    /// stance began before the walk, so its heel-off share is not known).
+    strike_t: [Option<f32>; 2],
+    struck: [bool; 2],
+    /// Peak pressure per patch (heel, midfoot, metatarsal, toes) over every stance, kPa.
+    peak_kpa: [f32; 4],
+    toe_peak_n: f32,
+    /// The heel patch's largest force, N.
+    heel_peak_n: f32,
+    toe_deg_max: f32,
+    /// Stance samples, and those with the toes loaded.
+    stance_samples: u32,
+    toe_samples: u32,
+    /// The farthest the centre of pressure got along a sole, share of its length.
+    cop_reach_fl: f32,
+    /// Heel-off instants as shares of the stance.
+    heel_off_frac: Vec<f32>,
+    /// The smallest share of a loaded sole that still stuck.
+    stick_min: f32,
+    /// Toe-off instants as shares of the double support.
+    toe_off_ds: Vec<f32>,
+}
+
+impl SoleLog {
+    fn new() -> SoleLog {
+        SoleLog { stick_min: 1.0, ..SoleLog::default() }
+    }
 }
 
 /// Walks `steps` steps (or until a fall) on a ground whose friction the
 /// controller believes is `mu_belief` (`None`: the ground's own, as the map
 /// says); `seed` draws each step's friction and slip.
+///
+/// The feet are the four-patch soles of `contact` on a passive toe joint:
+/// while a stance foot's centre of pressure is behind the toe hinge the foot
+/// is flat; once it passes the hinge the moment about it turns the toe joint
+/// against its spring–damper and the rear foot rolls up (`heel_off`, the
+/// ankle carried with it and the support shrunk to the forefoot); the
+/// trailing foot pushes off on its toes in double support (`toe_push`) and
+/// lifts once it has handed its load over (`toe_off`: its sole carries less
+/// than [`TOE_OFF_LOAD_BW`], or the double support's end when the table's
+/// hand-over has not got there before it). Every stance sample checks each
+/// foot's shear against the step's drawn friction; the check is a record
+/// (views, metrics): whether a step slips stays the step's slip draw.
 pub fn walk(body: &Body, ground: &SurfaceProps, mu_belief: Option<f32>, slope_deg: f32, cargo_kg: f32, speed: f32, steps: u32, seed: u64) -> (ActRollout, Vec<StepStat>) {
     let mut d = Draw::new(seed);
     let mu_mean = surface::available_mu(body.base, ground);
@@ -433,6 +495,15 @@ pub fn walk(body: &Body, ground: &SurfaceProps, mu_belief: Option<f32>, slope_de
     let k_ground = super::material::ground_stiffness(crate::surface::Surface::from_id(ground.id).unwrap_or_default());
     let k_eff = 1.0 / (1.0 / SOLE_STIFFNESS + 1.0 / k_ground);
     let (f_imp, dt_imp) = super::material::impact(TOUCHDOWN_MPS, m_imp, k_eff);
+    let sole = SoleModel::of(body);
+    let fl = body.leg.foot_len_m;
+    let hinge = (TOE_HINGE_FL - contact::ANKLE_FL) * fl;
+    // The samples are solved on level ground; on a slope the sole also holds
+    // the weight's pull along it, `N·tan θ`, signed: forward walking uphill
+    // (positive `slope_deg`), backward downhill. The plan's required friction
+    // adds its size, `|tan θ|`.
+    let tan_slope = slope_deg.to_radians().tan();
+    let mut log = SoleLog::new();
     let mut samples = Vec::new();
     let mut events = Vec::new();
     let mut stats = Vec::new();
@@ -440,6 +511,70 @@ pub fn walk(body: &Body, ground: &SurfaceProps, mu_belief: Option<f32>, slope_de
     let mut t0 = 0.0f32;
     let mut x_base = 0.0f32; // the stance ankle's x along the walk
     let mut slips = 0u32;
+    let side_ko = |s: usize| if s == 0 { "오른" } else { "왼" };
+    // Each stance foot's own centre of pressure `t` into a step (the gait's
+    // table: the stance foot's from its landing, the trailing foot's from the
+    // step before), relative to the stance ankle. `kin` only knows the whole
+    // body's ZMP, which in double support it clamps into each foot; the soles
+    // take the feet's own.
+    let sm = StepModel::of(&g);
+    let stance_t = g.step_s + t_ds;
+    let foot_cops = |t: f32, stance: usize| -> [Option<f32>; 2] {
+        let mut c = [None; 2];
+        c[stance] = Some(sm.sole(t / stance_t));
+        if t < t_ds {
+            c[1 - stance] = Some(-lam + sm.sole((g.step_s + t) / stance_t));
+        }
+        c
+    };
+    // One solved sample's soles: the toe joints step on, the drawn friction checked; returns the step's cone use and the trailing toe force.
+    let feel = |log: &mut SoleLog, events: &mut Vec<ActEvent>, r: &kin::KinReport, pose: &KinPose, cops: [Option<f32>; 2], t: f32, dt: f32, mu: f32, single: bool| -> (f32, f32) {
+        let mut use_max = 0.0f32;
+        let mut toe_n = 0.0f32;
+        for s in 0..2 {
+            let name = if s == 0 { "foot_r" } else { "foot_l" };
+            let Some(c) = r.contact(name) else { continue };
+            if pose.feet[s][1] > 1e-4 || c.normal_n <= 1e-6 {
+                log.toe[s] = 0.0;
+                log.heel_up[s] = false;
+                continue;
+            }
+            if log.strike_t[s].is_none() && log.struck[s] {
+                log.strike_t[s] = Some(t);
+            }
+            let ankle = pose.feet[s][0];
+            let cop = cops[s].unwrap_or(c.cop[0]);
+            let sc = contact::sole_contact(&sole, ankle, c.normal_n, [c.shear_n + c.normal_n * tan_slope, c.shear_y_n], c.torsion_nm, cop, pose.toe_deg[s], mu);
+            use_max = use_max.max(sc.cone_use);
+            log.stick_min = log.stick_min.min(sc.stick_share);
+            log.stance_samples += 1;
+            if sc.patches[3].normal_n > TOE_OFF_LOAD_BW * m * G {
+                log.toe_samples += 1;
+            }
+            for i in 0..4 {
+                log.peak_kpa[i] = log.peak_kpa[i].max(sc.patches[i].peak_kpa);
+            }
+            log.cop_reach_fl = log.cop_reach_fl.max((sc.cop_x - (ankle - contact::ANKLE_FL * fl)) / fl);
+            if !single {
+                toe_n = toe_n.max(sc.patches[3].normal_n);
+            }
+            log.toe_peak_n = log.toe_peak_n.max(sc.patches[3].normal_n);
+            log.heel_peak_n = log.heel_peak_n.max(sc.patches[0].normal_n);
+            // The toe joint turns under the moment of the load about the hinge (the spring–damper, `SoleModel::toe_step_deg`).
+            let moment = toe_moment(c.normal_n, cop - ankle, hinge);
+            let before = log.toe[s];
+            log.toe[s] = sole.toe_step_deg(before, moment, dt);
+            log.toe_deg_max = log.toe_deg_max.max(log.toe[s]);
+            if before <= 1e-3 && log.toe[s] > 1e-3 && !log.heel_up[s] {
+                log.heel_up[s] = true;
+                if let Some(t_s) = log.strike_t[s] {
+                    log.heel_off_frac.push((t - t_s) / (g.step_s + t_ds).max(1e-3));
+                }
+                events.push(ActEvent::new(t, "heel_off", format!("{}발 뒤꿈치 들림 · 압력 중심이 발가락 관절 앞 {:.0} mm", side_ko(s), (cop - ankle - hinge) * 1000.0), &[Part::Foot, Part::FootJoints], Some(moment), true));
+            }
+        }
+        (use_max, toe_n)
+    };
     'steps: for k in 0..steps {
         let stance = (k % 2) as usize;
         let swing = 1 - stance;
@@ -451,6 +586,13 @@ pub fn walk(body: &Body, ground: &SurfaceProps, mu_belief: Option<f32>, slope_de
         let slipped = d.uniform() < p;
         let mut peak = 0.0f32;
         let mut low = f32::INFINITY;
+        let mut use_max = 0.0f32;
+        let mut push = (0.0f32, 0.0f32, 0.0f32);
+        // The landing foot's stance begins.
+        log.strike_t[stance] = None;
+        log.struck[stance] = true;
+        log.heel_up[stance] = false;
+        let mut toe_off_t: Option<f32> = None;
         // Double support: the centre of pressure moves from the trailing foot to the new stance foot, the CoM at its lowest.
         for (i, c) in path_ds.iter().enumerate() {
             let u = i as f32 / n_ds as f32;
@@ -464,19 +606,33 @@ pub fn walk(body: &Body, ground: &SurfaceProps, mu_belief: Option<f32>, slope_de
             pose.hip = [c.x, c.z + (HIP_M - body.com_height_m())];
             pose.feet[stance] = [0.0, 0.0];
             pose.feet[swing] = [-lam, 0.0];
+            pose.toe_deg = log.toe;
             // The pelvis moves from over the old stance foot to over the new one.
             pose.pelvis_y = ys * (2.0 * u - 1.0);
             pose.shoulder_deg = [8.0, -8.0];
             let loads = KinLoads { accel: [c.ax, 0.0, c.az], ..KinLoads::default() };
             let r = kin::solve_fast(body, &pose, &loads);
+            let (cu, toe_n) = feel(&mut log, &mut events, &r, &pose, foot_cops(t, stance), t0 + t, t_ds / n_ds as f32, mu, false);
+            use_max = use_max.max(cu);
+            if toe_n > push.0 {
+                push = (toe_n, t0 + t, log.toe[swing]);
+            }
+            // The trailing foot lifts once it has handed its load over to the new stance foot.
+            let trail_n = r.contact(if swing == 0 { "foot_r" } else { "foot_l" }).map_or(0.0, |c| c.normal_n);
+            if toe_off_t.is_none() && i > 0 && trail_n <= TOE_OFF_LOAD_BW * m * G {
+                toe_off_t = Some(t0 + t);
+            }
             samples.push(ActSample { t: t0 + t, phase: "double_support", pose: shift(pose, x_base), loads, margin: r.margin, zmp: [r.zmp[0] + x_base, r.zmp[1]], com: [r.com[0] + x_base, r.com[1], r.com[2]], peak_ratio: r.worst().map_or(0.0, |j| j.ratio), grip: None, object: None });
         }
-        events.push(ActEvent::new(t0, "heel_strike", format!("{}발 착지 · 충격 {:.0} N ({:.0} ms) · 필요 마찰 {:.2} / 지면 {:.2}", if stance == 0 { "오른" } else { "왼" }, f_imp, dt_imp * 1000.0, g.rcof, mu), &[Part::Foot, Part::FootJoints], Some(f_imp), true));
+        events.push(ActEvent::new(t0, "heel_strike", format!("{}발 착지 · 충격 {:.0} N ({:.0} ms) · 필요 마찰 {:.2} / 지면 {:.2}", side_ko(stance), f_imp, dt_imp * 1000.0, g.rcof, mu), &[Part::Foot, Part::FootJoints], Some(f_imp), true));
+        if push.0 > 0.0 {
+            events.push(ActEvent::new(push.1, "toe_push", format!("{}발 발가락으로 밀기 · 발가락 {:.0} N ({:.0}% 체중) · 발가락 관절 {:.0}°", side_ko(swing), push.0, 100.0 * push.0 / (m * G), push.2), &[Part::Foot, Part::FootJoints], Some(push.0), true));
+        }
         // A slip at the transition: the slide over the reaction delay, then a catch or a fall.
         if slipped {
             slips += 1;
             let (fell, slide) = slip_outcome(&g, mu);
-            stats.push(StepStat { index: k, stance, mu, rcof: g.rcof, slip_p: p, slipped, fell, slide_m: slide, impact_n: f_imp, grf_peak_bw: peak, grf_min_bw: low });
+            stats.push(StepStat { index: k, stance, mu, rcof: g.rcof, slip_p: p, slipped, fell, slide_m: slide, impact_n: f_imp, grf_peak_bw: peak, grf_min_bw: low, cone_use_max: use_max, toe_push_n: push.0 });
             if fell {
                 events.push(ActEvent::new(t0 + t_ds * 0.5, "fall", format!("미끄러져 넘어짐: 마찰 {mu:.2} < 필요 {:.2}, {:.0} mm 미끄러짐", g.rcof, slide * 1000.0), &[Part::Foot, Part::FootJoints, Part::Waist], Some(slide), false));
                 outcome = Outcome::fail("fall", format!("{}번째 걸음에서 미끄러져 넘어짐 (지면 마찰 {mu:.2} < 필요 {:.2}, 미끄럼 {:.0} mm)", k + 1, g.rcof, slide * 1000.0));
@@ -495,24 +651,34 @@ pub fn walk(body: &Body, ground: &SurfaceProps, mu_belief: Option<f32>, slope_de
             let sw = super::min_jerk(u);
             // The swing foot is off the ground from the first instant of single support.
             pose.feet[swing] = [-lam + 2.0 * lam * sw, (SWING_LIFT_M * (std::f32::consts::PI * u).sin()).max(SWING_OFF_M)];
+            pose.toe_deg = [0.0; 2];
+            pose.toe_deg[stance] = log.toe[stance];
             pose.pelvis_y = ys;
             pose.shoulder_deg = if stance == 0 { [-8.0, 8.0] } else { [8.0, -8.0] };
             let loads = KinLoads { accel: [c.ax, 0.0, c.az], ..KinLoads::default() };
             let r = kin::solve_fast(body, &pose, &loads);
+            let (cu, _) = feel(&mut log, &mut events, &r, &pose, foot_cops(t_ds + t, stance), t0 + t_ds + t, t_ss / n_ss as f32, mu, true);
+            use_max = use_max.max(cu);
             let bw = (G + c.az) / G;
             peak = peak.max(bw);
             low = low.min(bw);
             samples.push(ActSample { t: t0 + t_ds + t, phase: "single_support", pose: shift(pose, x_base), loads, margin: r.margin, zmp: [r.zmp[0] + x_base, r.zmp[1]], com: [r.com[0] + x_base, r.com[1], r.com[2]], peak_ratio: r.worst().map_or(0.0, |j| j.ratio), grip: None, object: None });
         }
-        events.push(ActEvent::new(t0 + t_ds, "toe_off", format!("{}발 들림", if swing == 0 { "오른" } else { "왼" }), &[Part::Foot], None, true));
+        let lift_t = toe_off_t.unwrap_or(t0 + t_ds);
+        log.toe_off_ds.push((lift_t - t0) / t_ds.max(1e-6));
+        let why = if toe_off_t.is_some() { format!("하중을 넘김 (체중의 {:.0}% 아래)", TOE_OFF_LOAD_BW * 100.0) } else { "양발 지지 끝".to_string() };
+        events.push(ActEvent::new(lift_t, "toe_off", format!("{}발 들림 · {why}", side_ko(swing)), &[Part::Foot], None, true));
         if !slipped {
-            stats.push(StepStat { index: k, stance, mu, rcof: g.rcof, slip_p: p, slipped, fell: false, slide_m: 0.0, impact_n: f_imp, grf_peak_bw: peak, grf_min_bw: low });
+            stats.push(StepStat { index: k, stance, mu, rcof: g.rcof, slip_p: p, slipped, fell: false, slide_m: 0.0, impact_n: f_imp, grf_peak_bw: peak, grf_min_bw: low, cone_use_max: use_max, toe_push_n: push.0 });
         }
         t0 += g.step_s;
         x_base += lam;
     }
+    // The events of a step went in as they happened; the toe and heel ones interleave with the strikes.
+    events.sort_by(|a, b| a.t.total_cmp(&b.t));
     let walked = stats.len() as f32;
-    let metrics = vec![
+    let mean_of = |xs: &[f32]| if xs.is_empty() { 0.0 } else { xs.iter().sum::<f32>() / xs.len() as f32 };
+    let mut metrics = vec![
         ("speed_mps", g.speed),
         ("speed_cmd_mps", g.speed_cmd),
         ("step_m", g.step_m),
@@ -534,14 +700,97 @@ pub fn walk(body: &Body, ground: &SurfaceProps, mu_belief: Option<f32>, slope_de
         ("com_amp_m", g.com_amp_m),
         ("duration_s", t0),
     ];
+    // The soles (`contact`): per-patch peak pressure, the toes' push, the toe joint, the heel-off point, friction use.
+    if log.stance_samples > 0 {
+        metrics.extend([
+            ("heel_peak_kpa", log.peak_kpa[0]),
+            ("midfoot_peak_kpa", log.peak_kpa[1]),
+            ("meta_peak_kpa", log.peak_kpa[2]),
+            ("toe_peak_kpa", log.peak_kpa[3]),
+            ("toe_peak_bw", log.toe_peak_n / (m * G)),
+            ("heel_peak_bw", log.heel_peak_n / (m * G)),
+            ("toe_contact_share", log.toe_samples as f32 / log.stance_samples as f32),
+            ("toe_deg_max", log.toe_deg_max),
+            ("cop_reach_fl", log.cop_reach_fl),
+            ("sole_stick_min", log.stick_min),
+            ("cone_use_max", stats.iter().map(|s| s.cone_use_max).fold(0.0, f32::max)),
+            ("toe_push_n", mean_of(&stats.iter().map(|s| s.toe_push_n).filter(|x| *x > 0.0).collect::<Vec<_>>())),
+        ]);
+        if !log.heel_off_frac.is_empty() {
+            metrics.push(("heel_off_frac", mean_of(&log.heel_off_frac)));
+        }
+        if !log.toe_off_ds.is_empty() {
+            metrics.push(("toe_off_ds_frac", mean_of(&log.toe_off_ds)));
+        }
+    }
     let notes = if g.shortened { vec![format!("마찰 {:.2}에 맞춰 보폭을 {:.2} m로 줄임 (속도 {:.2} → {:.2} m/s)", g.mu_est, g.step_m, g.speed_cmd, g.speed)] } else { vec![] };
     (ActRollout { kind: ActKind::Walk, samples, events, outcome, duration_s: t0, metrics, notes }, stats)
 }
 
+/// A stance foot's share of the body weight below which the trailing foot
+/// counts as having handed its load over and lifts (est: the share the sole
+/// log already counts a toe patch as loaded from).
+pub const TOE_OFF_LOAD_BW: f32 = 0.01;
+
+/// The moment a stance foot's load turns its toe joint with, N·m: the
+/// normal force `normal_n` at the foot's own centre of pressure `cop_x`
+/// (from its ankle) about the toe hinge `hinge_x` (from its ankle);
+/// positive once the centre of pressure is ahead of the hinge. `walk` and
+/// [`toe_angles`] both turn the toe by it.
+fn toe_moment(normal_n: f32, cop_x: f32, hinge_x: f32) -> f32 {
+    normal_n * (cop_x - hinge_x)
+}
+
+/// The toe joints `t` into a step of the plan, without the walk's own
+/// solved samples (for drawing a gait): the stance foot's (its rear foot
+/// rolling up once the centre of pressure passes the toe hinge) and the
+/// trailing foot's (pushing off on its toes in double support), degrees.
+/// The inputs are `walk`'s: each foot's centre of pressure from the gait's
+/// table, the toe joint's spring–damper under [`toe_moment`], the stance
+/// foot carrying the weight with the CoM's vertical acceleration and the
+/// trailing foot the share the double support has not yet handed over
+/// (`kin` splits it by the lateral ZMP, which the pelvis carries across
+/// linearly). What differs is only that `walk` takes the normal forces from
+/// its solved samples.
+pub fn toe_angles(body: &Body, g: &GaitPlan, cargo_kg: f32, t: f32) -> [f32; 2] {
+    let sole = SoleModel::of(body);
+    let sm = StepModel::of(g);
+    let w = (body.mass_kg() + cargo_kg) * G;
+    let hinge = (TOE_HINGE_FL - contact::ANKLE_FL) * body.leg.foot_len_m;
+    let t_ds = g.ds_frac * g.step_s;
+    let stance_t = g.step_s + t_ds;
+    let t = t.clamp(0.0, g.step_s);
+    let normal = |tt: f32| w * (G + sm.z(tt).1) / G;
+    let n = 24usize;
+    // The stance foot over single support up to `until`, from heel strike's flat foot.
+    let ss = |until: f32| {
+        let mut th = 0.0f32;
+        let dt = (until - t_ds).max(0.0) / n as f32;
+        for i in 0..n {
+            let tt = t_ds + (i as f32 + 0.5) * dt;
+            th = sole.toe_step_deg(th, toe_moment(normal(tt), sm.sole(tt / stance_t), hinge), dt);
+        }
+        th
+    };
+    if t >= t_ds {
+        return [ss(t), 0.0];
+    }
+    // The trailing foot: on from where its single support left it, its centre of pressure the table's.
+    let mut th = ss(g.step_s);
+    let dt = t / n as f32;
+    for i in 0..n {
+        let tt = (i as f32 + 0.5) * dt;
+        let share = 1.0 - (tt / t_ds.max(1e-4)).clamp(0.0, 1.0);
+        th = sole.toe_step_deg(th, toe_moment(normal(tt) * share, sm.sole((g.step_s + tt) / stance_t), hinge), dt);
+    }
+    [0.0, th]
+}
+
 /// The walking pose a fraction `u` (0..1) into a step whose stance foot is
 /// `stance` (0 right, 1 left), feet relative to the stance ankle at x = 0: the
-/// same LIPM as [`walk`], for drawing a robot as it walks a route. Returns the
-/// pose, its loads (the CoM's acceleration) and the phase.
+/// same pendulum as [`walk`], for drawing a robot as it walks a route, with
+/// the toe joints of [`toe_angles`]. Returns the pose, its loads (the CoM's
+/// acceleration) and the phase.
 pub fn pose_at(body: &Body, g: &GaitPlan, stance: usize, u: f32, cargo_kg: f32) -> (KinPose, KinLoads, &'static str) {
     let t_ds = g.ds_frac * g.step_s;
     let t_ss = g.step_s - t_ds;
@@ -550,13 +799,16 @@ pub fn pose_at(body: &Body, g: &GaitPlan, stance: usize, u: f32, cargo_kg: f32) 
     let ys = if stance == 0 { -0.5 * STANCE_WIDTH_M } else { 0.5 * STANCE_WIDTH_M };
     let t = u.clamp(0.0, 1.0) * g.step_s;
     let c = com_at(g, t);
+    let toes = toe_angles(body, g, cargo_kg, t);
     let mut pose = KinPose::stand(cargo_kg);
     pose.feet[stance] = [0.0, 0.0];
     pose.hip = [c.x, c.z + (HIP_M - body.com_height_m())];
+    pose.toe_deg[stance] = toes[0];
     let loads = KinLoads { accel: [c.ax, 0.0, c.az], ..KinLoads::default() };
     if t < t_ds {
         let v = t / t_ds.max(1e-4);
         pose.feet[swing] = [-lam, 0.0];
+        pose.toe_deg[swing] = toes[1];
         pose.pelvis_y = ys * (2.0 * v - 1.0);
         (pose, loads, "double_support")
     } else {
@@ -659,6 +911,32 @@ mod tests {
         let w = b.mass_kg() * G;
         let (hi, lo) = fz.iter().fold((0.0f32, f32::INFINITY), |(h, l), p| (h.max(p.1 / w), if p.1 > 0.5 * w { l.min(p.1 / w) } else { l }));
         assert!(hi > 1.05 && lo < 0.95, "humps {hi} valley {lo}");
+    }
+
+    #[test]
+    fn the_heel_comes_up_past_the_toe_hinge_and_the_trailing_toes_push() {
+        let b = legs(Tier::Mid);
+        let (r, _) = walk(&b, Surface::Firm.props(), None, 0.0, 0.0, 0.9, 8, 1);
+        // Heel off and the toes' push come from the sole, in time order with the strikes.
+        assert!(r.events.iter().any(|e| e.kind == "heel_off"));
+        assert!(r.events.iter().filter(|e| e.kind == "toe_push").count() >= 6);
+        assert!(r.events.windows(2).all(|w| w[1].t >= w[0].t));
+        let f = r.metric("heel_off_frac").unwrap();
+        assert!(f > 0.3 && f < 0.95, "heel off late in the stance: {f}");
+        let toe = r.metric("toe_deg_max").unwrap();
+        assert!(toe > 1.0 && toe <= contact::TOE_DORSI_MAX_DEG, "{toe}");
+        assert!(r.metric("toe_push_n").unwrap() > 0.0 && r.metric("cone_use_max").unwrap() < 1.0);
+        // A foot on its toes (the trailing foot pushing off): the support starts at its metatarsal
+        // band, ahead of its ankle, and its heel carries nothing.
+        let s = r.samples.iter().find(|s| (0..2).any(|k| s.pose.feet[k][1] <= 1e-4 && s.pose.toe_deg[k] > 1.0)).expect("a foot on its toes");
+        let k = (0..2).find(|&k| s.pose.feet[k][1] <= 1e-4 && s.pose.toe_deg[k] > 1.0).unwrap();
+        let rep = kin::solve(&b, &s.pose, &s.loads);
+        assert!(rep.support[0] > s.pose.feet[k][0], "{:?} vs ankle {}", rep.support, s.pose.feet[k][0]);
+        let sole = rep.contact(if k == 0 { "foot_r" } else { "foot_l" }).and_then(|c| c.sole).unwrap();
+        assert!(sole.rocker && sole.patches[0].normal_n == 0.0 && sole.patches[3].normal_n > 0.0, "{sole:?}");
+        // Walking up a slope the soles also hold the weight's pull along it.
+        let (up, _) = walk(&b, Surface::Firm.props(), None, 8.0, 0.0, 0.9, 8, 1);
+        assert!(up.metric("cone_use_max").unwrap() > r.metric("cone_use_max").unwrap() + 0.1);
     }
 
     #[test]

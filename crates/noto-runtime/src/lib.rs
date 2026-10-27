@@ -13,6 +13,7 @@
 //!   (positions in its believed frame that spread as its odometry drifts).
 
 mod actsds;
+mod benchsds;
 pub mod api;
 pub mod cargo;
 pub mod chase;
@@ -29,6 +30,7 @@ pub mod precision;
 pub mod record;
 pub mod runtime;
 pub mod testrun;
+pub mod views;
 pub mod vision;
 
 pub use config::{CameraCfg, GateCfg, NoiseCfg, RuntimeConfig};

@@ -267,7 +267,7 @@ mod tests {
     }
 
     fn piece(w: &World, kind: ItemKind, amount: f32) -> DropItem {
-        DropItem { id: 900, kind, x: w.agent.x + 0.4, z: w.agent.z, amount }
+        DropItem { amount, ..DropItem::whole(900, kind, w.agent.x + 0.4, w.agent.z) }
     }
 
     #[test]

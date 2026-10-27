@@ -110,6 +110,17 @@ impl Siglip2 {
         self.policy
     }
 
+    /// Resizes the vision tower's position table with the reference's
+    /// antialiased filter (`true`, the default) or plain bilinear (`false`,
+    /// this port before v1.0). Only images change; cached text vectors stay valid.
+    pub fn set_position_antialias(&mut self, on: bool) {
+        self.vision.set_position_antialias(on);
+    }
+
+    pub fn position_antialias(&self) -> bool {
+        self.vision.position_antialias()
+    }
+
     /// Replaces the batch policy (tests, or a caller with its own memory budget).
     /// The fingerprint follows, because fixed-shape text batches change the vectors.
     pub fn set_batch_policy(&mut self, policy: BatchPolicy) {
@@ -144,6 +155,11 @@ impl Siglip2 {
     /// Image-text pair probability for a cosine similarity.
     pub fn pair_probability(&self, cosine: f32) -> f32 {
         sigmoid(self.logit_scale.exp() * cosine + self.logit_bias)
+    }
+
+    /// The learned `(exp(t), b)` of `σ(exp(t)·cos + b)`, as the checkpoint has them.
+    pub fn logit_scale_bias(&self) -> (f32, f32) {
+        (self.logit_scale.exp(), self.logit_bias)
     }
 
     /// Unit-length embedding of one image.
@@ -411,6 +427,20 @@ mod tests {
         let norm: f32 = a.iter().map(|v| v * v).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-4);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn the_position_filter_changes_only_grids_the_table_is_shrunk_for() {
+        let mut m = tiny_model();
+        assert!(m.position_antialias(), "the reference's antialiased filter is the default");
+        // 64x32 at patch 4 within 16 patches is a 3x5 grid: the 4-row table shrinks to 3.
+        let wide = test_image(64, 32);
+        let square = test_image(16, 16);
+        let (a_wide, a_sq) = (m.embed_image(&wide).unwrap(), m.embed_image(&square).unwrap());
+        m.set_position_antialias(false);
+        let (b_wide, b_sq) = (m.embed_image(&wide).unwrap(), m.embed_image(&square).unwrap());
+        assert_eq!(a_sq, b_sq, "a 4x4 grid takes the table as it is");
+        assert!(a_wide.iter().zip(&b_wide).any(|(x, y)| (x - y).abs() > 1e-5), "shrinking averages rows instead of sampling them");
     }
 
     #[test]

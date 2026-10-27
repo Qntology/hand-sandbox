@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::base::{BaseKind, BaseSpec};
 use crate::hand::FingerCount;
+use crate::morph::{column_kg, mounted_belly, mounted_chest, mounted_head, Manip, Morphology};
 use crate::parts::*;
 use crate::surface::{self, Contact, Surface};
 
@@ -285,6 +286,41 @@ pub struct BalanceReport {
     pub ff_predicted_m: f32,
     pub ff_gain: f32,
     pub couplings: Vec<Coupling>,
+    /// What the feet, wheels or tracks resist through the ground: friction
+    /// use per contact and the largest horizontal hand force before the base
+    /// slides or tips (v1.0).
+    #[serde(default)]
+    pub traction: Traction,
+}
+
+/// What a standing base resists through the ground (v1.0,
+/// `docs/research/tactile.md` §4): how much of its friction each contact
+/// uses on the posture's slope, and the largest horizontal force the hands
+/// may take, each way, before the contacts slide (`contact::friction_room_n`:
+/// friction `μ·N` less what the slope already asks) or the ZMP leaves the
+/// support (`x_zmp = x_com + F_x·z_hand / W`). The hands are not limited by
+/// it here; the report says how far they may go.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Traction {
+    /// The ground's friction for this base.
+    pub mu: f32,
+    /// Shear over `μ·N` at each stance contact (right, left foot; a wheeled
+    /// or tracked base's contact twice): the slope's pull and the acceleration.
+    pub contact_use: [f32; 2],
+    /// Pushing (the hands pushed back, as when pushing an object forward) and
+    /// pulling (the hands pulled forward): the force at which the contacts slide, N.
+    pub push_slide_n: f32,
+    pub pull_slide_n: f32,
+    /// The force at which the ZMP reaches the back (pushing) or the front (pulling) edge of the support, N.
+    pub push_tip_n: f32,
+    pub pull_tip_n: f32,
+    /// The smaller of the two each way, and whether sliding is what limits it.
+    pub push_max_n: f32,
+    pub pull_max_n: f32,
+    pub push_slides_first: bool,
+    pub pull_slides_first: bool,
+    /// Height of the hands the force acts at, metres.
+    pub hand_z_m: f32,
 }
 
 impl BalanceReport {
@@ -343,18 +379,33 @@ enum Group {
 /// A robot assembled from presets.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Body {
+    /// The plan as built: its form's upper layers are the built ones
+    /// ([`Body::morph`]), so `plan.id()` names the robot that exists; the
+    /// lower body stays as asked (the drive is `base`).
     pub plan: BodyPlan,
     pub base: BaseKind,
     pub fingers: FingerCount,
+    /// The form as built: `plan.morph` fitted to the drive (`Morphology::fit`).
+    pub morph: Morphology,
+    /// Mirror of [`Body::legged`] (the form's lower body is legs), kept so the
+    /// serialised body and older readers stay as they were; read the method.
     pub legged: bool,
+    /// The head preset as mounted (`morph::mounted_head`: no neck servos on a
+    /// fixed head, the camera alone on the chassis, nothing without a camera).
     pub head: HeadPreset,
+    /// The chest preset as built (`morph::mounted_chest`: only the computer in its box without a humanoid torso).
     pub chest: ChestPreset,
+    /// The belly preset as built (`morph::mounted_belly`: nothing without a humanoid torso).
     pub belly: BellyPreset,
+    /// One arm's preset; [`Body::arm_count`] says how many there are.
     pub arm: ArmPreset,
     pub leg: LegPreset,
     pub chassis: ChassisPreset,
     /// The torso lift on the mast (wheeled and tracked bases with one).
     pub lift: Option<LiftPreset>,
+    /// The parallel-jaw gripper of a single gripper arm (`Manip::Gripper1`).
+    pub gripper: Option<GripperPreset>,
+    /// Mass at the end of each arm: the hand of the finger count, the gripper, or nothing without arms.
     pub hand_kg: f32,
     /// Support length along travel and width, metres.
     pub support_len_m: f32,
@@ -377,42 +428,56 @@ fn rot_xz(p: [f32; 3], pivot: [f32; 3], a: f32) -> [f32; 3] {
 }
 
 impl Body {
+    /// Builds the robot of `plan` on `base` with a `fingers` hand. The plan's
+    /// form is fitted to the drive first (`Morphology::fit`), so any plan
+    /// builds; `Morphology::validate` says what the fit had to change.
     pub fn new(plan: &BodyPlan, base: BaseKind, fingers: FingerCount) -> Body {
+        let morph = plan.morph.fit(base);
         let leg = plan.leg_preset();
-        let legged = base == BaseKind::HumanFoot;
+        let legged = morph.legged();
         let spec = base.spec();
         let (support_len_m, support_width_m) = if legged {
             (leg.foot_len_m, STANCE_WIDTH_M + leg.foot_width_m)
         } else {
             (spec.footprint_m, CHASSIS_WIDTH_M)
         };
+        let gripper = (morph.manip == Manip::Gripper1).then(|| plan.gripper_preset());
+        let hand_kg = match morph.manip {
+            Manip::None => 0.0,
+            Manip::Gripper1 => gripper.as_ref().map_or(0.0, |g| g.mass_kg),
+            Manip::Arms2 | Manip::Arm1 => hand_mass_kg(fingers),
+        };
         Body {
-            plan: *plan,
+            plan: BodyPlan { morph: Morphology { lower: plan.morph.lower, ..morph }, ..*plan },
             base,
             fingers,
+            morph,
             legged,
-            head: plan.head_preset(),
-            chest: plan.chest_preset(),
-            belly: plan.belly_preset(),
+            head: mounted_head(plan.head_preset(), morph.head),
+            chest: mounted_chest(plan.chest_preset(), morph.torso),
+            belly: mounted_belly(plan.belly_preset(), morph.torso),
             arm: plan.arm_preset(),
             leg,
             chassis: plan.chassis_preset(),
-            lift: plan.lift_preset(base),
-            hand_kg: hand_mass_kg(fingers),
+            lift: BodyPlan { morph, ..*plan }.lift_preset(base),
+            gripper,
+            hand_kg,
             support_len_m,
             support_width_m,
         }
     }
 
-    /// The mast and its lift (if any), kg: fixed to the chassis.
+    /// The mast, the column or the camera pole and the lift (if any), kg:
+    /// fixed to the chassis (`morph::column_kg`; today's humanoid: the mast).
     pub fn mast_kg(&self) -> f32 {
-        MAST_KG + self.lift.as_ref().map_or(0.0, |l| l.mass_kg)
+        column_kg(self.morph.torso, self.morph.head) + self.lift.as_ref().map_or(0.0, |l| l.mass_kg)
     }
 
-    /// Robot mass without cargo.
+    /// Robot mass without cargo: the parts the form has.
     pub fn mass_kg(&self) -> f32 {
-        let lower = if self.legged { 2.0 * (self.leg.mass_kg + self.leg.foot_mass_kg) } else { self.chassis.mass_kg + self.mast_kg() };
-        self.head.mass_kg + self.chest.mass_kg + self.chest.battery_kg + self.belly.mass_kg + 2.0 * (self.arm.mass_kg + self.hand_kg) + lower
+        let lower = if self.legged() { 2.0 * (self.leg.mass_kg + self.leg.foot_mass_kg) } else { self.chassis.mass_kg + self.mast_kg() };
+        let cargo = self.cargo_geom().map_or(0.0, |c| c.struct_kg);
+        self.head.mass_kg + self.chest.mass_kg + self.chest.battery_kg + self.belly.mass_kg + self.arm_count() as f32 * (self.arm.mass_kg + self.hand_kg) + lower + cargo
     }
 
     pub fn battery_j(&self) -> f64 {
@@ -421,7 +486,7 @@ impl Body {
 
     /// Height of the CoM standing quietly, metres.
     pub fn com_height_m(&self) -> f32 {
-        self.build(&Posture::quiet(0.0)).com[2]
+        self.build(&self.quiet(0.0)).com[2]
     }
 
     /// How one arm's mass splits: upper arm mass, its CoM distance from the
@@ -437,7 +502,7 @@ impl Body {
     /// Support polygon `[x0, x1, y0, y1]` of a posture, before any base pitch
     /// (`pitch` is the base's pitch for a wheeled robot, 0 for legs).
     pub fn support_rect(&self, post: &Posture, pitch: f32) -> [f32; 4] {
-        if self.legged {
+        if self.legged() {
             let c = post.slope_deg.to_radians().cos();
             let (x0, x1) = (-0.25 * self.leg.foot_len_m * c, 0.75 * self.leg.foot_len_m * c);
             if post.single_support {
@@ -454,7 +519,7 @@ impl Body {
 
     /// Pitch of a wheeled base on the posture's slope and step, radians (0 for legs).
     pub fn base_pitch(&self, post: &Posture) -> f32 {
-        if self.legged {
+        if self.legged() {
             0.0
         } else {
             post.slope_deg.to_radians() + (post.step_m / self.support_len_m.max(0.1)).atan()
@@ -462,8 +527,8 @@ impl Body {
     }
 
     fn arm_points(&self, side: usize, elev_deg: f32, elbow_deg: f32, load: f32) -> (Vec<Pt>, [f32; 3], [f32; 3]) {
-        let y = if side == 0 { -SHOULDER_HALF_WIDTH_M } else { SHOULDER_HALF_WIDTH_M };
-        let sh = [0.0, y, SHOULDER_M];
+        // On the trunk, the column carriage or the deck (`morph`).
+        let sh = self.shoulder_mount(side);
         let (m_up, r_up, m_fore) = self.arm_split();
         let a = elev_deg.to_radians();
         let b = (elev_deg + elbow_deg).to_radians();
@@ -486,23 +551,36 @@ impl Body {
     fn points(&self, post: &Posture) -> Vec<Pt> {
         let mut v = Vec::new();
         let up = |seg, m, p| Pt { seg, group: Group::Upper, m, p };
-        v.push(up(Segment::Head, self.head.mass_kg, [0.0, 0.0, SHOULDER_M + 0.07 + self.head.com_up_m]));
-        v.push(up(Segment::Chest, self.chest.mass_kg, [0.0, 0.0, WAIST_M + self.chest.com_up_m]));
-        let belly_z = WAIST_M - self.belly.com_down_m;
-        if self.plan.battery_low {
-            v.push(Pt { seg: Segment::Belly, group: Group::Pelvis, m: self.chest.battery_kg, p: [0.0, 0.0, belly_z] });
-        } else {
-            v.push(up(Segment::Chest, self.chest.battery_kg, [0.0, 0.0, WAIST_M + self.chest.com_up_m]));
+        // A head on the trunk (or the column top) leans with it; a camera on a
+        // mast or the chassis is one of the mounts below.
+        if self.head_on_trunk() {
+            if let Some(h) = self.head_com() {
+                v.push(up(Segment::Head, self.head.mass_kg, h));
+            }
         }
-        v.push(Pt { seg: Segment::Belly, group: Group::Pelvis, m: self.belly.mass_kg, p: [0.0, 0.0, belly_z] });
+        if self.has_torso() {
+            v.push(up(Segment::Chest, self.chest.mass_kg, [0.0, 0.0, WAIST_M + self.chest.com_up_m]));
+            let belly_z = WAIST_M - self.belly.com_down_m;
+            if self.plan.battery_low {
+                v.push(Pt { seg: Segment::Belly, group: Group::Pelvis, m: self.chest.battery_kg, p: [0.0, 0.0, belly_z] });
+            } else {
+                v.push(up(Segment::Chest, self.chest.battery_kg, [0.0, 0.0, WAIST_M + self.chest.com_up_m]));
+            }
+            v.push(Pt { seg: Segment::Belly, group: Group::Pelvis, m: self.belly.mass_kg, p: [0.0, 0.0, belly_z] });
+        }
         if post.cargo_kg > 0.0 {
-            v.push(Pt { seg: Segment::Belly, group: Group::Pelvis, m: post.cargo_kg, p: [CARGO_X_M, 0.0, CARGO_Z_M] });
+            // In the bay on the pelvis, or on the chassis (a bed, a tote).
+            let (p, on_pelvis) = self.cargo_point();
+            v.push(Pt { seg: Segment::Belly, group: if on_pelvis { Group::Pelvis } else { Group::Lower }, m: post.cargo_kg, p });
         }
-        for side in 0..2 {
+        for side in 0..self.arm_count() {
             let (pts, _, _) = self.arm_points(side, post.arm_elev_deg[side], post.elbow_deg[side], post.hand_load_kg[side]);
             v.extend(pts);
         }
-        if self.legged {
+        for mm in self.mount_masses() {
+            v.push(Pt { seg: mm.segment, group: Group::Lower, m: mm.kg, p: mm.at });
+        }
+        if self.legged() {
             for (i, y) in [-STANCE_WIDTH_M / 2.0, STANCE_WIDTH_M / 2.0].into_iter().enumerate() {
                 // The swing leg is the left one (index 1) in single support; it lifts the step height.
                 let swing = post.single_support && i == 1;
@@ -512,7 +590,9 @@ impl Body {
                 v.push(Pt { seg: Segment::Foot, group: g, m: self.leg.foot_mass_kg, p: [0.25 * self.leg.foot_len_m + if swing { 0.15 } else { 0.0 }, y, 0.04 + lift] });
             }
         } else {
-            v.push(Pt { seg: Segment::Leg, group: Group::Lower, m: self.mast_kg(), p: [0.0, 0.0, 0.35] });
+            if let Some((m, p)) = self.column() {
+                v.push(Pt { seg: Segment::Leg, group: Group::Lower, m, p });
+            }
             v.push(Pt { seg: Segment::Foot, group: Group::Lower, m: self.chassis.mass_kg, p: [0.0, 0.0, self.chassis.com_m] });
         }
         v
@@ -554,7 +634,7 @@ impl Body {
     /// ankles for a legged base (people stand ~5 cm ahead, Loram 2007), at the
     /// centre for a wheeled one.
     fn home_x(&self) -> f32 {
-        if self.legged {
+        if self.legged() {
             0.15 * self.leg.foot_len_m
         } else {
             0.0
@@ -564,7 +644,7 @@ impl Body {
     /// Shift held without leaning: the ankle band of a legged base (est 10% of
     /// the foot), a small offset for a wheeled one.
     fn ankle_band(&self) -> f32 {
-        if self.legged {
+        if self.legged() {
             0.10 * self.leg.foot_len_m
         } else {
             0.02
@@ -579,12 +659,12 @@ impl Body {
         let m = self.mass_kg() + post.cargo_kg + post.hand_load_kg.iter().sum::<f32>();
         let arm_len = UPPER_ARM_M + FOREARM_M + 0.06;
         let mut s = 0.0;
-        for i in 0..2 {
+        for i in 0..self.arm_count() {
             let a = post.arm_elev_deg[i].to_radians();
             let reach = arm_len * a.sin();
             s += 0.05 * m * 0.53 * reach + post.hand_load_kg[i] * reach;
         }
-        s += post.cargo_kg * CARGO_X_M;
+        s += post.cargo_kg * self.cargo_point().0[0];
         s / m
     }
 
@@ -596,8 +676,9 @@ impl Body {
     /// Solves the compensation for `post` and reports balance, joints and the N:N cells.
     /// `grip_capacity_n` is the friction capacity of one hand (from `sim::grasp`).
     pub fn solve(&self, post: &Posture, ff: &FeedForward, grip_capacity_n: f32) -> BalanceReport {
-        // The disturbance against the same posture with the source removed.
-        let base_post = Posture { arm_elev_deg: [0.0, 0.0], elbow_deg: [10.0, 10.0], hand_load_kg: [0.0, 0.0], cargo_kg: if post.source == Source::CarryFront { 0.0 } else { post.cargo_kg }, ..*post };
+        // The disturbance against the same posture with the source removed (the arms at rest).
+        let (rest_elev, rest_elbow) = self.rest_arms_deg();
+        let base_post = Posture { arm_elev_deg: rest_elev, elbow_deg: rest_elbow, hand_load_kg: [0.0, 0.0], cargo_kg: if post.source == Source::CarryFront { 0.0 } else { post.cargo_kg }, ..*post };
         let uncomp = self.build(post);
         let reference = self.build(&base_post);
         let home = self.home_x();
@@ -626,7 +707,7 @@ impl Body {
             0.0
         };
         // Pelvis over the stance foot: only what is above the stance leg moves.
-        let shift_y = if self.legged && post.single_support {
+        let shift_y = if self.legged() && post.single_support {
             let moved: f32 = uncomp.pts.iter().filter(|p| p.group != Group::Lower).map(|p| p.m).sum();
             (-STANCE_WIDTH_M / 2.0 - uncomp.com[1]) * uncomp.mass / moved.max(1e-3)
         } else {
@@ -659,7 +740,7 @@ impl Body {
         // Head: body pitch and lean reach the camera, the neck cancels part of it.
         let keep = 1.0 - self.head.gaze_stabilization;
         let head_pitch = (fin.pitch + lean).to_degrees() * keep;
-        let head_roll = if self.legged && post.single_support { (shift_y / HIP_M).atan().to_degrees() * keep } else { 0.0 };
+        let head_roll = if self.legged() && post.single_support { (shift_y / HIP_M).atan().to_degrees() * keep } else { 0.0 };
 
         let joints = self.joint_loads(post, &fin, lean, shift_y, grip_capacity_n);
         let comp_joint = |j: &JointLoad, eps: f32| {
@@ -688,6 +769,11 @@ impl Body {
         if margin < 0.0 {
             feasible = false;
             limiting = Some(format!("균형 여유 {:.2} < 0", margin));
+        }
+        // A load in a hand the form does not have: nothing holds it (never quietly dropped).
+        if let Some(s) = (self.arm_count()..2).find(|s| post.hand_load_kg[*s] > 0.0) {
+            feasible = false;
+            limiting = Some(format!("{} 없음: 손 하중 {:.1} kg를 들 팔이 없음", if s == 0 { "오른팔" } else { "왼팔" }, post.hand_load_kg[s]));
         }
 
         let mut rep = BalanceReport {
@@ -718,9 +804,45 @@ impl Body {
             ff_predicted_m: predicted,
             ff_gain: ff.gain,
             couplings: Vec::new(),
+            traction: Traction::default(),
         };
+        rep.traction = self.traction(post, fin.mass, zmp, fin.support);
         rep.couplings = self.couplings(post, &rep, eps_ff, eps_noff, &reference);
         rep
+    }
+
+    /// What the base resists through the ground in a posture whose mass, ZMP
+    /// and support are given ([`Traction`]).
+    pub fn traction(&self, post: &Posture, mass_kg: f32, zmp: [f32; 2], support: [f32; 4]) -> Traction {
+        let mu = surface::available_mu(self.base, post.ground.props());
+        let th = post.slope_deg.to_radians();
+        let w = mass_kg * G;
+        let n = w * th.cos();
+        // The ground holds the slope's pull and the acceleration (positive uphill / forward).
+        let shear = w * th.sin() + mass_kg * post.accel_mps2;
+        let use_ = if n > 1e-6 && mu > 1e-6 { shear.abs() / (mu * n) } else { 0.0 };
+        let contact_use = if self.legged && post.single_support { [use_, 0.0] } else { [use_, use_] };
+        // Hands at the posture's arm (the `balance` arm: upper arm from hanging, forearm on from it).
+        let e = post.arm_elev_deg[0].to_radians();
+        let f = (post.arm_elev_deg[0] + post.elbow_deg[0]).to_radians();
+        let hand_z = (SHOULDER_M - UPPER_ARM_M * e.cos() - (FOREARM_M + 0.06) * f.cos()).max(0.05);
+        let room = crate::contact::friction_room_n(mu, n, shear);
+        let (push_slide, pull_slide) = (room[0], room[1]);
+        let push_tip = ((zmp[0] - support[0]).max(0.0) * w / hand_z).max(0.0);
+        let pull_tip = ((support[1] - zmp[0]).max(0.0) * w / hand_z).max(0.0);
+        Traction {
+            mu,
+            contact_use,
+            push_slide_n: push_slide,
+            pull_slide_n: pull_slide,
+            push_tip_n: push_tip,
+            pull_tip_n: pull_tip,
+            push_max_n: push_slide.min(push_tip),
+            pull_max_n: pull_slide.min(pull_tip),
+            push_slides_first: push_slide < push_tip,
+            pull_slides_first: pull_slide < pull_tip,
+            hand_z_m: hand_z,
+        }
     }
 
     fn joint_loads(&self, post: &Posture, e: &Eval, lean: f32, shift_y: f32, grip_capacity_n: f32) -> Vec<JointLoad> {
@@ -740,7 +862,8 @@ impl Body {
             q
         };
         let mut out = Vec::new();
-        for side in 0..2 {
+        // Only the joints the form has: its arms, the waist of a humanoid torso, a pan-tilt's tilt.
+        for side in 0..self.arm_count() {
             let (pts, sh, el) = self.arm_points(side, post.arm_elev_deg[side], post.elbow_deg[side], post.hand_load_kg[side]);
             let pts: Vec<Pt> = pts.into_iter().map(|p| Pt { p: tilt(p.p), ..p }).collect();
             let (sh, el) = (tilt(sh), tilt(el));
@@ -758,9 +881,11 @@ impl Body {
         if let Some(pitch) = &self.belly.pitch {
             out.push(jl("waist", Segment::Belly, pitch, moment(&mut e.pts.iter().filter(|p| p.group == Group::Upper), waist)));
         }
-        let neck = tilt([0.0, 0.0, SHOULDER_M + 0.07]);
-        out.push(jl("neck", Segment::Head, &self.head.neck, moment(&mut e.pts.iter().filter(|p| p.seg == Segment::Head), neck)));
-        if self.legged {
+        if let Some(pivot) = self.neck_pivot() {
+            let neck = tilt(pivot);
+            out.push(jl("neck", Segment::Head, &self.head.neck, moment(&mut e.pts.iter().filter(|p| p.seg == Segment::Head), neck)));
+        }
+        if self.legged() {
             let n_support = if post.single_support { 1.0 } else { 2.0 };
             let above_feet: f32 = e.mass - e.pts.iter().filter(|p| p.seg == Segment::Foot).map(|p| p.m).sum::<f32>();
             let x_ank = 0.0;
@@ -786,14 +911,14 @@ impl Body {
 
     fn couplings(&self, post: &Posture, r: &BalanceReport, eps_ff: f32, eps_noff: f32, reference: &Eval) -> Vec<Coupling> {
         let src = post.source;
-        let foot_len = if self.legged { self.leg.foot_len_m } else { self.support_len_m };
+        let foot_len = if self.legged() { self.leg.foot_len_m } else { self.support_len_m };
         let j = |name: &str| r.joint(name);
         let cell = |target: Segment, axis: &str, unit: &str, value: f32, value_noff: f32, joint: Option<&JointLoad>, comp: bool| {
             let k = |eps: f32| joint.map(|j| if comp { j.peak_ratio * (1.0 + eps) } else { j.peak_ratio });
             Coupling { source: src, target, axis: axis.into(), value, unit: unit.into(), value_noff, effort: k(eps_ff), effort_noff: k(eps_noff), torque_nm: joint.map(|j| j.torque_nm) }
         };
         let quiet_ankle = {
-            let q = Posture { source: Source::Quiet, ..Posture::quiet(post.cargo_kg) };
+            let q = Posture { source: Source::Quiet, ..self.quiet(post.cargo_kg) };
             let e = self.evaluate(&q, 0.0, 0.0);
             self.joint_loads(&q, &e, 0.0, 0.0, 1.0).into_iter().find(|j| j.joint == "ankle" || j.joint == "drive").map(|j| j.torque_nm).unwrap_or(0.0)
         };
@@ -813,7 +938,7 @@ impl Body {
         if let Some(g) = j("grip_r") {
             v.push(cell(Segment::Hand, "grip_effort", "", g.effort, g.effort, Some(g), false));
         }
-        if self.legged {
+        if self.legged() {
             let leg_joint = if post.single_support && post.step_m == 0.0 { j("hip_roll") } else { j("knee") };
             if let Some(lj) = leg_joint {
                 v.push(cell(Segment::Leg, "peak_ratio", "", lj.peak_ratio, lj.peak_ratio, Some(lj), lj.joint == "hip_roll"));
@@ -844,11 +969,11 @@ impl Body {
         let mut speed = spec.max_speed_mps;
         let mut slope = spec.max_slope_deg;
         let mut step = spec.max_step_m;
-        let quiet = self.solve(&Posture::quiet(cargo_kg), &FeedForward::default(), 1.0);
+        let quiet = self.solve(&self.quiet(cargo_kg), &FeedForward::default(), 1.0);
         let half = 0.5 * (quiet.support[1] - quiet.support[0]);
         let accel = (G * (quiet.margin_x - MARGIN_KEEP).max(0.02) * half / quiet.com[2].max(0.1)).min(3.0);
         let capacity;
-        if self.legged {
+        if self.legged() {
             let v_fr = (self.leg.froude * G * HIP_M).sqrt();
             if v_fr < speed {
                 speed = v_fr;
@@ -895,7 +1020,7 @@ impl Body {
             let mut tip = 0.0;
             let mut d = 0.5;
             while d <= 45.0 {
-                let p = Posture { source: Source::Slope, slope_deg: d, ..Posture::quiet(cargo_kg) };
+                let p = Posture { source: Source::Slope, slope_deg: d, ..self.quiet(cargo_kg) };
                 if self.solve(&p, &FeedForward::default(), 1.0).margin_x < MARGIN_KEEP {
                     break;
                 }
@@ -916,9 +1041,27 @@ impl Body {
                 Tier::Mid => 30.0,
                 Tier::Pro => 100.0,
             };
+            // The chassis carries its rating less everything on it (a truck
+            // without arms or a torso keeps more of it for the bed).
             capacity = (structural - (self.mass_kg() - self.chassis.mass_kg)).max(0.0);
         }
-        let capacity_kg = capacity.min(self.base.carry_capacity_kg());
+        // What the cargo place takes: a bed its own rating, the bay or a tote the
+        // base's limit (`BaseKind::carry_capacity_kg`), no place nothing.
+        let capacity_kg = match self.cargo_geom() {
+            Some(c) => match c.payload_kg {
+                Some(p) => {
+                    if p < capacity {
+                        reasons.push(format!("짐칸 정격 하중 {p:.0} kg"));
+                    }
+                    capacity.min(p)
+                }
+                None => capacity.min(self.base.carry_capacity_kg()),
+            },
+            None => {
+                reasons.push("적재 공간 없음 (집게로 든 것만 운반)".to_string());
+                0.0
+            }
+        };
         DriveLimits { max_speed_mps: speed.max(0.01), max_slope_deg: slope.max(0.0), max_step_m: step.max(0.0), power_scale: m / ref_m, accel_limit_mps2: accel, capacity_kg, reasons }
     }
 
@@ -939,7 +1082,7 @@ impl Body {
 
     /// [`Body::planned_accel`] with the drive limits already computed (the world caches them).
     pub fn planned_accel_within(&self, l: &DriveLimits, slope_deg: f32, cargo_kg: f32, ground: Surface, dir: f32, min_ramp_s: f32) -> f32 {
-        let p = Posture { source: if slope_deg.abs() >= 3.0 { Source::Slope } else { Source::Quiet }, slope_deg, ground, ..Posture::quiet(cargo_kg) };
+        let p = Posture { source: if slope_deg.abs() >= 3.0 { Source::Slope } else { Source::Quiet }, slope_deg, ground, ..self.quiet(cargo_kg) };
         let r = self.solve(&p, &FeedForward::default(), 1e3);
         let s = r.support;
         let keep = MARGIN_KEEP * 0.5 * (s[1] - s[0]);
@@ -947,7 +1090,7 @@ impl Body {
         let mut a = (G * room.max(0.0) / r.com[2].max(0.1)).min(l.accel_limit_mps2);
         let props = ground.props();
         let slope = slope_deg.to_radians();
-        if !self.legged && dir > 0.0 {
+        if !self.legged() && dir > 0.0 {
             let m = self.mass_kg() + cargo_kg;
             let trac = self.chassis.drive_force_n / m - G * (slope.sin() + surface::rolling_resistance(self.base, props) * slope.cos());
             a = a.min(trac.max(0.0));
@@ -964,7 +1107,7 @@ impl Body {
     /// downhill, where gravity does the pushing, no drive limit).
     pub fn capacity_on(&self, spec: &BaseSpec, ground: Surface, slope_deg: f32) -> f32 {
         let cap = self.drive_limits(spec, 0.0).capacity_kg;
-        if self.legged {
+        if self.legged() {
             return cap;
         }
         let th = slope_deg.to_radians();
@@ -975,14 +1118,22 @@ impl Body {
         cap.min((self.chassis.drive_force_n / (G * need) - self.mass_kg()).max(0.0))
     }
 
-    /// Lifts `load_kg` with one arm, or with both when one is not enough.
-    /// Returns the report of the posture that worked, or the one-arm attempt.
+    /// Lifts `load_kg` with one arm, or with both when one is not enough (and
+    /// the form has two). Returns the report of the posture that worked, or the
+    /// one-arm attempt; without a manipulator, the quiet posture marked
+    /// infeasible (`조작기 없음`).
     pub fn lift(&self, load_kg: f32, cargo_kg: f32, ff: &FeedForward, grip_capacity_n: f32) -> (BalanceReport, bool) {
-        let one = self.solve(&Posture::arm_lift(load_kg, false, cargo_kg), ff, grip_capacity_n);
-        if one.feasible {
+        if !self.has_manipulator() {
+            let mut r = self.solve(&Posture { source: Source::ArmLift, ..self.quiet(cargo_kg) }, ff, grip_capacity_n);
+            r.feasible = false;
+            r.limiting = Some("조작기 없음 (no_manipulator): 물건을 들 팔·집게가 없음".to_string());
+            return (r, false);
+        }
+        let one = self.solve(&self.lift_posture(load_kg, false, cargo_kg), ff, grip_capacity_n);
+        if one.feasible || self.arm_count() < 2 {
             return (one, false);
         }
-        let two = self.solve(&Posture::arm_lift(load_kg, true, cargo_kg), ff, grip_capacity_n);
+        let two = self.solve(&self.lift_posture(load_kg, true, cargo_kg), ff, grip_capacity_n);
         if two.feasible {
             (two, true)
         } else {
@@ -1201,6 +1352,26 @@ mod tests {
         assert!((learned.margin - (learned.margin_x.min(learned.margin_y))).abs() < 1e-4, "a learned gain leaves no dip");
         let c = learned.couplings.iter().find(|c| c.target == Segment::Foot && c.axis == "ankle_rise").unwrap();
         assert!(c.effort.unwrap() <= c.effort_noff.unwrap());
+    }
+
+    #[test]
+    fn traction_bounds_what_the_hands_may_push_and_a_slope_uses_it_up() {
+        let b = body(Tier::Mid, BaseKind::HumanFoot);
+        let flat = b.solve(&Posture::arm_lift(0.0, true, 0.0), &FeedForward::default(), 100.0).traction;
+        assert!(flat.mu > 0.0 && flat.contact_use[0] < 1e-6 && flat.contact_use[1] < 1e-6, "{flat:?}");
+        // Each way the smaller of sliding and tipping limits the hands, and the report says which.
+        assert!((flat.push_max_n - flat.push_slide_n.min(flat.push_tip_n)).abs() < 1e-4);
+        assert_eq!(flat.push_slides_first, flat.push_slide_n < flat.push_tip_n);
+        assert!(flat.push_max_n > 0.0 && flat.pull_max_n > 0.0 && flat.hand_z_m > 0.3);
+        // On firm ground a 20 kg robot tips (its ZMP leaves the feet) long before its feet slide.
+        assert!(!flat.push_slides_first && !flat.pull_slides_first, "{flat:?}");
+        // Standing on a slope the feet already hold the slope's pull: friction use rises, the room to push uphill shrinks.
+        let up = b.solve(&Posture { slope_deg: 10.0, ..Posture::arm_lift(0.0, true, 0.0) }, &FeedForward::default(), 100.0).traction;
+        assert!(up.contact_use[0] > 0.2 && up.contact_use[0] < 1.0, "{up:?}");
+        assert!(up.push_slide_n < flat.push_slide_n && up.pull_slide_n > flat.push_slide_n - 1e-3, "{up:?}");
+        // A slicker ground gives less to push against.
+        let ice = b.solve(&Posture { ground: Surface::WetSand, ..Posture::arm_lift(0.0, true, 0.0) }, &FeedForward::default(), 100.0).traction;
+        assert!(ice.mu < flat.mu && ice.push_slide_n < flat.push_slide_n);
     }
 
     #[test]

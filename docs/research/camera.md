@@ -358,3 +358,29 @@ f_px = (W/2) / tan(HFOV/2) **[유도: 핀홀]**, HFOV는 위 데이터시트 값
 [38] Kim T, Kim S, Lee D (2023). Tunable impact and vibration absorbing neck for robust visual-inertial state estimation for dynamic legged robots. *IEEE RA-L* 8(3):1431–1438. doi:10.1109/LRA.2023.3240369 (초록만; 수치 없음, §1.3)
 
 벤치마크 전용 출처 B1–B4는 7장 표에 전체 서지를 적었다.
+
+## 10. 등각(아이소메트릭) 3인칭 시점과 추적 카메라 프레이밍 (v1.0)
+
+요청 R2의 "로봇 위치를 안정적으로 잡는 3인칭 등각 시점". 기존 추적 카메라(`chase`)는 로봇이 돌 때마다 같이 돌고 언덕을 넘을 때 튄다. 등각 시점은 세계에 고정된 방향에서 직교 투영으로 내려다본다. 코드: `crates/world-sim/src/iso.rs`(시점·투영·잘라내기·기운 링크), `render.rs`(`Rays::Ortho`, 맵 밖 광선 자르기), `crates/noto-runtime/src/views.rs`(시점 id, 추적, 오버레이). 빛은 [`lighting.md`](lighting.md).
+
+| 항목 | 값 | 구분 | 근거 |
+|---|---|---|---|
+| 방위 | 45° + k·90° (k = 0–3, 네 대각선), 세계 고정 — 로봇이 돌아도 화면이 돌지 않음 | 인용 (등각 정의) | Wikipedia "Isometric video game graphics" [I1] |
+| 내려다보는 각 (참 등각) | arcsin(tan 30°) = arctan(1/√2) = 35.264°: 세 세계 축이 화면에서 120° 간격, 모두 √(2/3) = 0.8165배로 짧아짐 | 인용 (기하 항등식) | [I1], Wikipedia "Isometric projection" [I2] |
+| 내려다보는 각 (2:1 디메트릭) | 30°: 땅 축의 화면 기울기 arctan(sin 30°) = 26.565° (2:1 픽셀). 26.565°는 화면의 선 각도이지 카메라 피치가 아님 | 인용 | [I1] |
+| 투영 | 직교: 평행 광선이 프레임 중심 뒤 100 m 평면에서 출발(맵 밖이어도 됨 — `trace`가 맵 경계·최고 물체 높이에서 자름). 깊이는 그 평면에서 잼. 안개 없음 | 설계 | — |
+| 확대 | 프레임 반높이 = 3 × 로봇 경계 구 반지름 / 배율 (최소 1.5 m), 배율 0.25–4 | 설계 | — |
+| 중심 추적 | 로봇 바닥점 + 높이/2를 임계 감쇠 스프링으로 따라감: ω = 2/T, x(t) = 목표 + (c₀ + c₁t)·e^(−ωt), c₀ = x₀ − 목표, c₁ = v₀ + ωc₀ (시뮬 시간으로 정확히 풂) | 인용 (식) | Lowe 2004 "Critically Damped Ease-In/Ease-Out Smoothing", GPG4 1.10 — Unity `Mathf.SmoothDamp`가 근사하는 식 [I3] |
+| 추적 시간 T | 0.5 s (T 뒤 약 59%, 4T 뒤 99% 따라옴, 넘침 없음) | 설계 (Cinemachine도 "작을수록 빠름"이라고만 함) | [I3] |
+| 추적이 무시하는 것 | 머리 카메라 흔들림·차체 기울기 (로봇의 땅 위 위치만 따라감). 시간이 거꾸로 가거나(새 월드) 2.5 s 넘게 비면 바로 붙음. 상태는 `Runtime`에 둠 — `World` 복제·재생은 그대로 | 설계 | — |
+| 잘라내기 | 로봇을 가릴 수 있는 물체만 자른다. ① 시선 통로: 로봇에서 카메라 쪽으로 뻗은 띠(폭 = 로봇 반폭 + 0.5 m, 양쪽)에 바닥면이 걸치는 물체는 로봇 발밑을 지나는 시선 높이까지 — 평행 광선은 카메라 쪽으로 1 m 갈 때 tan(피치) m(참 등각 1/√2) 오르므로, 로봇 앞 거리 a에서 땅 + a·tan(피치)보다 낮은 것은 로봇의 어느 곳도 가리지 못한다. 단 땅 + 0.5 m 아래로는 자르지 않아 발치의 택배·계단은 남는다. ② 머리 위: 바닥면이 로봇에서 반폭 + 0.5 m 안에 드는 물체(지붕, 로봇이 아래 선 선반)는 로봇 꼭대기 + 0.3 m에서 자름. 그 밖의 물체(뒤쪽·옆쪽 나무, 언덕 위 나무 꼭대기)는 그대로. 지형은 자르지 않음. 그림자는 자르기 전 장면에서 | 유도 (직교 시선 기하) / 설계 (여유 0.5 m · 0.3 m) | 시험 `the_cutaway_cuts_only_what_can_hide_the_robot`, `trees_that_cannot_hide_the_robot_stay_whole` |
+| 로봇 링크 | 차체 피치(앞 들림)·롤(오른쪽 내려감)을 땅 위 기준점에 대해 적용(바퀴·트랙만, 다리형은 0 — 머리 카메라의 `tilt_deg`와 같은 값, `World::chassis_attitude`). 바퀴형 자세는 이미 지나는 길의 경사만큼 차체 상자를 숙여 두므로(`kin`의 `base_pitch_deg`), 그 피치(차체 상자의 앞 축에서 읽음)를 먼저 되돌린 뒤 접지점 평면의 피치·롤을 준다 — 경사에서 두 번 기울지 않는다(`BaseTilt`, 시험 `a_pose_that_already_pitches_its_chassis_is_not_pitched_twice`) | 유도 (v0.9 차체 자세) | §0, PLAN-v0.9 |
+| 오버레이 | 관절·CoM·ZMP·지지 다각형·지면 반력을 직교 투영으로 (추적 카메라와 같은 생성기에 투영 함수만 바꿈) | 설계 | — |
+
+**API**. `world_frame`의 `view`: `agent`, `top`, `chase[:<궤도°>]`, `focus:<hand|side|low>`, `iso[:<방향>[:<배율>[:30]]]`. 방향은 0–3 단계 또는 각도(가장 가까운 45°/135°/225°/315°로). 모르는 시점 id나 읽을 수 없는 숫자는 오류다(전에는 조용히 1인칭으로 바뀌었다). 응답의 `overlay.camera`는 `kind`("chase"/"iso"), 중심, 방위, 피치, 반높이, 배율, 그리고 카메라가 보는 나침반 방위를 준다. 등각 시점은 사람이 보는 화면이고 로봇의 인식 입력이 아니다(`camera`는 null).
+
+**추적 카메라 프레이밍 (v1.0)**. 거리·높이·조준점을 고정 2.6 m · 1.6 m · 0.75 m 대신 로봇 링크 상자의 크기(높이, 수직축에서 가장 먼 링크, 경계 구)에서 정한다: 경계 구가 수직 시야의 60%를 채우는 거리, 조준점 위 18.1°(v0.9 카메라: 2.6 m 뒤 0.85 m 위, atan(0.85/2.6)), 조준 높이 = 로봇 높이의 0.6(v0.9: 약 1.25 m 로봇에 0.75 m) — 모두 [설계]. 기본 로봇에서는 v0.9 프레이밍과 거의 같고(시험 `the_chase_framing_follows_the_robots_size`), 작은 트럭형은 그만큼 가까이 온다. 링크는 차체 피치·롤로 기울여 그린다.
+
+[I1] Wikipedia, "Isometric video game graphics". https://en.wikipedia.org/wiki/Isometric_video_game_graphics (2026 열람, 기하 항등식에만)
+[I2] Wikipedia, "Isometric projection". https://en.wikipedia.org/wiki/Isometric_projection (2026 열람)
+[I3] Unity Technologies, UnityCsReference `Mathf.SmoothDamp` (주석: "Based on Game Programming Gems 4 Chapter 1.10"; Lowe T, "Critically Damped Ease-In/Ease-Out Smoothing", 2004). https://github.com/Unity-Technologies/UnityCsReference/blob/master/Runtime/Export/Math/Mathf.cs

@@ -111,7 +111,7 @@ pub fn push(inp: &PushInput) -> ActRollout {
     let mut events = Vec::new();
     let mut metrics: Vec<(&'static str, f32)> = Vec::new();
     let mut notes = Vec::new();
-    if body.legged {
+    if body.legged() {
         let out = Outcome::fail("push_legs", "다리형은 범퍼가 없어 바닥의 물체를 밀지 않음 (들어서 옮김)");
         return ActRollout { kind: ActKind::Push, samples, events, outcome: out, duration_s: 0.0, metrics, notes };
     }
@@ -193,7 +193,7 @@ pub fn push(inp: &PushInput) -> ActRollout {
         let v = PUSH_MPS * st.speed_factor;
         let n = (leg.len_m / (v * SAMPLE_S)).ceil().max(1.0) as usize;
         for i in 0..n {
-            let pose = KinPose { base_pitch_deg: leg.slope_deg, ..KinPose::stand(inp.cargo_kg) };
+            let pose = KinPose { base_pitch_deg: leg.slope_deg, ..body.stand(inp.cargo_kg) };
             samples.push(ActSample { t: t + i as f32 * SAMPLE_S, phase: "push", pose, loads: KinLoads { bumper_force: [-f_slide, 0.0, 0.0], ..KinLoads::default() }, margin: st.margin, zmp: [0.0, 0.0], com: [pushed + i as f32 * v * SAMPLE_S, 0.0, 0.0], peak_ratio: st.need_n / (2.0 * body.chassis.drive_force_n).max(1e-3), grip: None, object: Some([bumper_x + 0.5 * side, y_off, 0.5 * inp.size_m[1]]) });
         }
         t += leg.len_m / v.max(1e-3);

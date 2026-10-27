@@ -19,6 +19,8 @@ async function loadTerrain() {
     const ctx = c.getContext('2d');
     const img = ctx.createImageData(g.cells_w, g.cells_d);
     const H = (x, z) => g.heights_cm[z * g.cells_w + x];
+    // 사이트가 있으면 턱마다 종류(0 턱 벽, 1 계단 디딤, 2 현관·집 바닥, 3 경사로)가 온다: 턱 벽만 노랗게.
+    const kinds = g.curb_kind ?? null;
     for (let z = 0; z < g.cells_d; z++) {
       for (let x = 0; x < g.cells_w; x++) {
         const i = z * g.cells_w + x;
@@ -29,7 +31,11 @@ async function loadTerrain() {
           return nx >= 0 && nz >= 0 && nx < g.cells_w && nz < g.cells_d && h - H(nx, nz) >= 50;
         });
         let rgb = colors.get(g.ground[i]) ?? [90, 90, 90];
-        if (g.curb_cm[i] > 0) rgb = [232, 196, 48];
+        if (kinds && kinds[i]) {
+          // 현관·계단·경사로: 그 바닥 색, 높을수록 밝게 (시뮬레이터의 위에서 본 그림과 같은 규칙).
+          const k = 0.8 + 0.4 * Math.min(g.curb_cm[i] / 100, 0.5);
+          rgb = rgb.map((v) => Math.min(255, v * k));
+        } else if (g.curb_cm[i] > 0) rgb = [232, 196, 48];
         else if (cliff) rgb = [40, 38, 36];
         else {
           const k = 1 - Math.min(h * 0.0035, 0.35);
@@ -51,6 +57,33 @@ const NODE_COLOR = {
   tree: '#4f9a5b', boulder: '#8b8d94', coal_ore: '#6b6b78', iron_ore_node: '#c4764a',
   rock: '#8b8d94', iron_ore: '#c4764a', chest: '#d6b65e',
 };
+
+// 사이트의 고정물 색: 벽·문·선반·포장 테이블 (현관·계단·경사로는 지형 그림에 있다).
+const FIXTURE_COLOR = { wall: '#4a4644', door: '#9a6a42', shelf: '#3a6ab0', table: '#6a7c8e' };
+
+// 집·물류센터: 칸마다 0.5 m 네모로 고정물을, 건물 이름을 가운데에 그린다.
+function drawSite(ctx, site, X, Y, s) {
+  if (!site) return;
+  const half = 0.25;
+  for (const f of site.fixtures ?? []) {
+    const color = FIXTURE_COLOR[f.kind];
+    if (!color) continue;
+    ctx.fillStyle = color;
+    for (const [cx, cy] of f.cells) ctx.fillRect(X(cx - half), Y(cy + half), Math.max(1, 2 * half * s), Math.max(1, 2 * half * s));
+  }
+  ctx.font = `9px ${cssVar('--font-sans')}`;
+  ctx.textAlign = 'center';
+  ctx.fillStyle = cssVar('--text-dim');
+  const mid = (r) => [(r[0] + r[2]) / 2, (r[1] + r[3]) / 2];
+  for (const h of site.houses ?? []) {
+    const [mx, my] = mid(h.rect);
+    ctx.fillText(h.reachable_wheels ? h.label_ko : `${h.label_ko} (계단만)`, X(mx), Y(my) + 3);
+  }
+  if (site.warehouse) {
+    const [mx] = mid(site.warehouse.rect);
+    ctx.fillText(site.warehouse.label_ko, X(mx), Y(site.warehouse.rect[3]) + 10);
+  }
+}
 
 function draw() {
   const canvas = $('minimap');
@@ -81,6 +114,7 @@ function draw() {
   ctx.strokeStyle = cssVar('--border-strong');
   ctx.lineWidth = 1;
   ctx.strokeRect(X(0) + 0.5, Y(by) + 0.5, bx * s - 1, by * s - 1);
+  drawSite(ctx, snap.site, X, Y, s);
 
   for (const n of snap.nodes) {
     ctx.fillStyle = NODE_COLOR[n.kind] ?? '#999';
@@ -90,6 +124,10 @@ function draw() {
   }
   ctx.fillStyle = cssVar('--text-bright');
   for (const d of snap.drops) ctx.fillRect(X(d.pos[0]) - 1.5, Y(d.pos[1]) - 1.5, 3, 3);
+  // 현관·선반·테이블 위의 택배: 받침 위에 있다는 테두리 (높이는 pos[2]).
+  ctx.strokeStyle = cssVar('--warning');
+  ctx.lineWidth = 1;
+  for (const d of snap.drops) if (d.support) ctx.strokeRect(X(d.pos[0]) - 3.5, Y(d.pos[1]) - 3.5, 7, 7);
 
   // 목표 웨이포인트: 활성 퀘스트의 현재 단계 문구에 이름이 들어 있는 곳
   const q = state.quests.find((x) => x.state === 'active');

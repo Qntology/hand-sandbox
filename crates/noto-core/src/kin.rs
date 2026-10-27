@@ -23,6 +23,14 @@
 //! the hip and the ankle (two-link inverse kinematics). A wheeled or tracked
 //! base carries the pelvis on its mast at hip height.
 //!
+//! The form (`morph`) decides which blocks exist: the legs or the chassis, the
+//! humanoid pelvis and trunk or a column carriage or nothing (a deck), a head
+//! on a neck, fixed on the trunk, a camera on a mast or the chassis, none to
+//! two arms on the trunk, the carriage or the deck, and the cargo in the bay,
+//! on a bed or in a tote. Joints that do not exist are not reported, so a
+//! look-up by name returns `None`; the pose's arrays stay two-armed and an
+//! absent arm's angles are ignored.
+//!
 //! Signs: a joint's `torque` is the moment, about +y (left), of the loads on
 //! its far side: gravity and inertia of the links beyond it and the hand
 //! forces for the upper joints and the hip, the ground reaction under the
@@ -33,6 +41,7 @@ use serde::{Deserialize, Serialize};
 use crate::balance::{Body, JointLoad, CARGO_X_M, CARGO_Z_M, G, HIP_HALF_WIDTH_M};
 use crate::base::BaseKind;
 use crate::dynamics::{BodyPose, JointPoint, LinkBox};
+use crate::morph::{column_top_m, HeadMount, Torso, COLUMN_TOP_M, DECK_Z_M};
 use crate::parts::*;
 use crate::Source;
 
@@ -130,6 +139,16 @@ pub struct ContactPatch {
     /// Along a track: pressure at the rear and the front end, kPa, and the loaded length, m.
     pub pressure_kpa: Option<[f32; 2]>,
     pub loaded_len_m: Option<f32>,
+    /// Shear the ground gives across (y, left positive), N, and the twist
+    /// about the vertical, N·m (the statics are sagittal plus lateral: no yaw moment, 0).
+    pub shear_y_n: f32,
+    pub torsion_nm: f32,
+    /// A stance foot's sole as four patches (heel, midfoot, metatarsal heads,
+    /// toes) on the passive toe joint (`contact::sole_contact`; the friction
+    /// is not known here, so the shear spreads by stiffness): the patch
+    /// loads, the toe angle and the loaded stretch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sole: Option<crate::contact::SoleContact>,
 }
 
 /// The pose of one instant. Angles in degrees, lengths in metres, base frame
@@ -173,6 +192,12 @@ pub struct KinPose {
     /// base with a lift; 0 otherwise).
     #[serde(default)]
     pub lift_m: f32,
+    /// Toe dorsiflexion per foot (right, left), degrees: 0 with the foot
+    /// flat; above 0 the rear foot has rolled up about the toe hinge (heel
+    /// off, the toes still down), the ankle carried up and forward with it
+    /// (`contact::rocker_ankle_shift`) and the support shrunk to the forefoot.
+    #[serde(default)]
+    pub toe_deg: [f32; 2],
 }
 
 impl KinPose {
@@ -194,6 +219,7 @@ impl KinPose {
             cargo_kg,
             closure: 0.0,
             lift_m: 0.0,
+            toe_deg: [0.0, 0.0],
         }
     }
 
@@ -222,6 +248,7 @@ impl KinPose {
             cargo_kg: l(a.cargo_kg, b.cargo_kg),
             closure: l(a.closure, b.closure),
             lift_m: l(a.lift_m, b.lift_m),
+            toe_deg: l2(a.toe_deg, b.toe_deg),
         }
     }
 }
@@ -235,6 +262,28 @@ pub struct KinLoads {
     pub bumper_force: [f32; 3],
     /// Acceleration of the whole body (base start or stop forward, the gait's CoM bounce upward), m/s².
     pub accel: [f32; 3],
+    /// Force the world puts on the body anywhere else (a wall, another robot,
+    /// a falling object, a partner pulling on a shared load), newtons, base
+    /// frame, acting at [`KinLoads::body_point`] (`act::collide`). It enters
+    /// the ground reaction, the ZMP and margin, the contacts and the joints
+    /// solved bottom up from them (the stance ankles and knees, a wide
+    /// stance's hip roll); the joints solved top down from the links' own
+    /// loads (the hips' pitch, the waist, the arms, the neck) do not see it.
+    #[serde(default, skip_serializing_if = "is_zero3")]
+    pub body_force: [f32; 3],
+    /// Where [`KinLoads::body_force`] acts, metres, in the frame of the solved
+    /// report's boxes and masses: the base frame with a wheeled base's
+    /// `base_pitch_deg` already applied (unlike the bumper's point, which is
+    /// fixed on the chassis and pitched here). A point read off a solved
+    /// pose's boxes goes in as it is; a point fixed on an unpitched chassis
+    /// must be pitched by the caller first.
+    #[serde(default, skip_serializing_if = "is_zero3")]
+    pub body_point: [f32; 3],
+}
+
+/// An unused force or point (keeps the JSON of loads without one as it was).
+fn is_zero3(v: &[f32; 3]) -> bool {
+    *v == [0.0; 3]
 }
 
 impl KinLoads {
@@ -332,9 +381,12 @@ pub struct Rom {
     /// Ankle dorsiflexion (shank forward of vertical with the foot flat).
     pub ankle_dorsi_max: f32,
     pub hip_flex_max: f32,
-    /// Waist pitch forward (0: the belly preset has no pitch joint).
+    /// Waist pitch forward (0: the belly preset has no pitch joint, or no humanoid torso).
     pub waist_max: f32,
+    /// The camera's pitch (the neck, or a mast's pan-tilt) and its pan either side (0 without one).
     pub neck_max: f32,
+    #[serde(default)]
+    pub pan_max: f32,
     pub shoulder: [f32; 2],
     pub elbow_max: f32,
     /// Shoulder abduction, adduction negative.
@@ -348,19 +400,21 @@ pub struct Rom {
 impl Rom {
     /// The ranges of a robot built from the presets.
     pub fn of(body: &Body) -> Rom {
+        let (neck_max, pan_max) = body.head_range_deg();
         Rom {
             knee_max: KNEE_FLEX_MAX_DEG,
             ankle_dorsi_max: ANKLE_DORSI_MAX_DEG,
             hip_flex_max: HIP_FLEX_MAX_DEG,
             waist_max: if body.belly.pitch.is_some() { WAIST_PITCH_MAX_DEG } else { 0.0 },
-            neck_max: NECK_PITCH_MAX_DEG,
+            neck_max,
+            pan_max,
             shoulder: [-60.0, 180.0],
             elbow_max: 150.0,
             shoulder_abd: [-SHOULDER_ADD_MAX_DEG, SHOULDER_ABD_MAX_DEG],
             // The straight leg swung out to the hip abduction limit, less the
             // standing stance (the feet stand under the hips).
-            stance_out_max_m: if body.legged { ((HIP_M - ANKLE_H_M) * HIP_ABD_MAX_DEG.to_radians().sin() + HIP_HALF_WIDTH_M - 0.5 * STANCE_WIDTH_M).max(0.0) } else { 0.0 },
-            lift_max_m: if body.legged { 0.0 } else { body.lift.as_ref().map_or(0.0, |l| l.stroke_m) },
+            stance_out_max_m: if body.legged() { ((HIP_M - ANKLE_H_M) * HIP_ABD_MAX_DEG.to_radians().sin() + HIP_HALF_WIDTH_M - 0.5 * STANCE_WIDTH_M).max(0.0) } else { 0.0 },
+            lift_max_m: if body.legged() { 0.0 } else { body.lift.as_ref().map_or(0.0, |l| l.stroke_m) },
         }
     }
 }
@@ -425,20 +479,77 @@ pub const CAMERA_UP_M: f32 = 0.07;
 /// face of the drawn head, half its 0.14 m depth).
 pub const CAMERA_FWD_M: f32 = 0.07;
 
+/// The head camera of today's chain; [`camera`] for every form (the same
+/// numbers for a head on a neck). Kept so callers keep compiling.
 pub fn head_camera(body: &Body, pose: &KinPose) -> HeadCamera {
-    let hip_c: V3 = if body.legged { [pose.hip[0], pose.pelvis_y, pose.hip[1]] } else { [0.0, pose.pelvis_y, HIP_M - pose.lift_m] };
+    camera(body, pose)
+}
+
+/// The neck joint on a pose (base frame, before the base's pitch) and the
+/// angle of what it stands on from vertical, degrees: the top of the trunk on
+/// the hip, pelvis and waist chain, or the column carriage lowered by the lift.
+fn neck_of(body: &Body, pose: &KinPose) -> (V3, f32) {
+    if body.morph.torso == Torso::Mast {
+        return ([0.0, pose.pelvis_y, COLUMN_TOP_M - pose.lift_m], 0.0);
+    }
+    let hip_c: V3 = if body.legged() { [pose.hip[0], pose.pelvis_y, pose.hip[1]] } else { [0.0, pose.pelvis_y, HIP_M - pose.lift_m] };
     let waist = add(hip_c, scale(up_dir(pose.pelvis_deg), PELVIS_M));
     let trunk = pose.trunk_deg();
     let v = up_dir(trunk);
-    let neck = add(waist, scale(v, TRUNK_M + NECK_UP_M));
-    let head = trunk + pose.neck_deg;
-    // The pan turns the head about the neck's long axis; the lens is ahead of it.
-    let pan = pose.neck_pan_deg.to_radians();
-    let fwd = fore_aft(head);
+    (add(waist, scale(v, TRUNK_M + NECK_UP_M)), trunk)
+}
+
+/// The lens of a camera head pitched `head_deg` from level (down positive)
+/// and panned `pan_deg` (left positive) about `pivot`: [`CAMERA_UP_M`] up the
+/// head and [`CAMERA_FWD_M`] ahead of it.
+fn lens(pivot: V3, head_deg: f32, pan_deg: f32) -> V3 {
+    // The pan turns the head about its long axis; the lens is ahead of it.
+    let pan = pan_deg.to_radians();
+    let fwd = fore_aft(head_deg);
     let ahead = [fwd[0] * pan.cos(), pan.sin(), fwd[2] * pan.cos()];
-    let eye = add(add(neck, scale(up_dir(head), CAMERA_UP_M)), scale(ahead, CAMERA_FWD_M));
-    let pitch = if body.legged { 0.0 } else { pose.base_pitch_deg };
-    HeadCamera { pos: if pitch != 0.0 { pitch_about_origin(eye, pitch) } else { eye }, pitch_down_deg: head - pitch, pan_deg: pose.neck_pan_deg }
+    add(add(pivot, scale(up_dir(head_deg), CAMERA_UP_M)), scale(ahead, CAMERA_FWD_M))
+}
+
+/// Where the camera is on a pose for the form's camera mount
+/// (`Body::camera_mount`), see [`HeadCamera`]:
+///
+/// * a head on a neck (today's): the hip, pelvis, waist, trunk and neck chain
+///   [`solve`] draws, pitched and panned by the neck;
+/// * a head fixed on the trunk: the same chain, pitched by the trunk and its
+///   fixed tilt only (no neck joint: `neck_deg` and the pan do nothing);
+/// * a head on a column (`Torso::Mast`): on the carriage, lowered by the lift;
+/// * a camera on a mast or a pole: at its height, pitched and panned by its
+///   pan-tilt when it has one, else level;
+/// * a camera on the chassis front: at its height on the deck's front edge, level;
+/// * no camera: the neck's place on a trunk or the middle of the deck top (a
+///   defined viewpoint for callers that need one).
+///
+/// A wheeled or tracked base's pitch tilts every one of them.
+pub fn camera(body: &Body, pose: &KinPose) -> HeadCamera {
+    let pitch = if body.legged() { 0.0 } else { pose.base_pitch_deg };
+    let at = |eye: V3, head: f32, pan: f32| HeadCamera { pos: if pitch != 0.0 { pitch_about_origin(eye, pitch) } else { eye }, pitch_down_deg: head - pitch, pan_deg: pan };
+    match body.camera_mount() {
+        HeadMount::Neck => {
+            let (neck, trunk) = neck_of(body, pose);
+            let head = trunk + pose.neck_deg;
+            at(lens(neck, head, pose.neck_pan_deg), head, pose.neck_pan_deg)
+        }
+        HeadMount::Fixed { tilt_deg } => {
+            let (neck, trunk) = neck_of(body, pose);
+            let head = trunk + tilt_deg as f32;
+            at(lens(neck, head, 0.0), head, 0.0)
+        }
+        HeadMount::MastCamera { height_mm, pan_tilt } => {
+            let pivot = [body.mast_camera_x(), 0.0, height_mm as f32 / 1000.0 - CAMERA_UP_M];
+            let (tilt, pan) = if pan_tilt { (pose.neck_deg, pose.neck_pan_deg) } else { (0.0, 0.0) };
+            at(lens(pivot, tilt, pan), tilt, pan)
+        }
+        HeadMount::ChassisFront { height_mm } => at([0.5 * body.support_len_m, 0.0, height_mm as f32 / 1000.0], 0.0, 0.0),
+        HeadMount::None => {
+            let p = if body.has_torso() || body.has_column() { neck_of(body, pose).0 } else { [0.0, 0.0, DECK_Z_M] };
+            at(p, 0.0, 0.0)
+        }
+    }
 }
 
 /// Rotates a point or a direction about the y axis through the origin by a base pitch (nose up positive).
@@ -539,7 +650,9 @@ pub fn solve_fast(body: &Body, pose: &KinPose, loads: &KinLoads) -> KinReport {
 
 fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinReport {
     let rom = Rom::of(body);
-    let legged = body.legged;
+    let legged = body.legged();
+    let torso = body.morph.torso;
+    let n_arms = body.arm_count();
     let mut masses: Vec<Mass> = Vec::new();
     let mut boxes: Vec<LinkBox> = Vec::new();
     let mut out_of_range: Vec<String> = Vec::new();
@@ -565,7 +678,9 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
             let lift = pose.feet[s][1].max(0.0);
             stance[s] = lift <= 1e-4;
             let hip2 = [hip_c[0], hip_c[2]];
-            let ankle2 = [pose.feet[s][0], ANKLE_H_M + lift];
+            // A stance foot on its toes: the rear foot turned up about the toe hinge carries the ankle with it.
+            let rock = if stance[s] && pose.toe_deg[s] > 1e-3 { crate::contact::rocker_ankle_shift(body.leg.foot_len_m, ANKLE_H_M, pose.toe_deg[s]) } else { [0.0, 0.0] };
+            let ankle2 = [pose.feet[s][0] + rock[0], ANKLE_H_M + lift + rock[1]];
             // A swing foot moves with the pelvis; a stance foot stays where it stands.
             let y = foot_y[s] + if stance[s] { 0.0 } else { pose.pelvis_y };
             hips[s] = [hip_c[0], hip_c[1] + if s == 0 { -HIP_HALF_WIDTH_M } else { HIP_HALF_WIDTH_M }, hip_c[2]];
@@ -596,7 +711,8 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
                     out_of_range.push(format!("hip_roll_{} 외전 {:.0}° > {:.0}°", tag(s), hip_abd_deg[s], HIP_ABD_MAX_DEG));
                 }
             }
-            let shank = (knee[0] - ankle2[0]).atan2(knee[1] - ankle2[1]).to_degrees();
+            // Dorsiflexion: the shank from vertical, less the rear foot's pitch on its toes.
+            let shank = (knee[0] - ankle2[0]).atan2(knee[1] - ankle2[1]).to_degrees() - if stance[s] { pose.toe_deg[s].max(0.0) } else { 0.0 };
             let thigh = (knee[0] - hip2[0]).atan2(hip2[1] - knee[1]).to_degrees();
             // Hip flexion: the trunk's pitch plus the thigh's forward swing.
             leg_angles[s] = (shank, knee_flex, pose.pelvis_deg + thigh);
@@ -620,37 +736,88 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
             }
         }
     } else {
-        masses.push(Mass { group: Grp::Base, m: body.mast_kg(), p: [0.0, 0.0, 0.35] });
+        if let Some((m, p)) = body.column() {
+            masses.push(Mass { group: Grp::Base, m, p });
+        }
         masses.push(Mass { group: Grp::Base, m: body.chassis.mass_kg, p: [0.0, 0.0, body.chassis.com_m] });
+        // A deck's electronics, a camera off the trunk, a bed plate or a tote: fixed to the chassis.
+        for mm in body.mount_masses() {
+            masses.push(Mass { group: if mm.segment == Segment::Head { Grp::Head } else { Grp::Base }, m: mm.kg, p: mm.at });
+        }
     }
 
-    // ----- pelvis, trunk, head -----
+    // ----- pelvis, trunk, head (or the column carriage, or the deck) -----
     let u = up_dir(pose.pelvis_deg);
     let waist = add(hip_c, scale(u, PELVIS_M));
-    let trunk_deg = pose.trunk_deg();
+    // What the arms and the head stand on, from vertical: the trunk, or an upright column or deck.
+    let trunk_deg = if torso == Torso::Humanoid { pose.trunk_deg() } else { 0.0 };
     let v = up_dir(trunk_deg);
-    let shoulder_c = add(waist, scale(v, TRUNK_M));
-    let neck = add(shoulder_c, scale(v, NECK_UP_M));
-    let head_dir = up_dir(trunk_deg + pose.neck_deg);
-    let belly_p = add(hip_c, scale(u, PELVIS_M - body.belly.com_down_m));
-    masses.push(Mass { group: Grp::Pelvis, m: body.belly.mass_kg, p: belly_p });
-    let chest_p = add(waist, scale(v, body.chest.com_up_m));
-    masses.push(Mass { group: Grp::Trunk, m: body.chest.mass_kg, p: chest_p });
-    if body.plan.battery_low {
-        masses.push(Mass { group: Grp::Pelvis, m: body.chest.battery_kg, p: belly_p });
-    } else {
-        masses.push(Mass { group: Grp::Trunk, m: body.chest.battery_kg, p: chest_p });
+    let (shoulder_c, neck) = match torso {
+        Torso::Humanoid => {
+            let shoulder_c = add(waist, scale(v, TRUNK_M));
+            (shoulder_c, add(shoulder_c, scale(v, NECK_UP_M)))
+        }
+        // The carriage slides down the column with the torso lift.
+        Torso::Mast => ([0.0, pose.pelvis_y, SHOULDER_M - pose.lift_m], [0.0, pose.pelvis_y, COLUMN_TOP_M - pose.lift_m]),
+        // On a deck, or on the carriage of the mast's lift.
+        Torso::None => (body.shoulder_at(0, pose.lift_m), [0.0, 0.0, DECK_Z_M]),
+    };
+    // A camera on a mast pitches about its own pivot, fixed to the chassis.
+    let neck = match body.camera_mount() {
+        HeadMount::MastCamera { height_mm, .. } => [body.mast_camera_x(), 0.0, height_mm as f32 / 1000.0 - CAMERA_UP_M],
+        _ => neck,
+    };
+    // The head pitches with the neck, its fixed tilt, or a mast's pan-tilt.
+    let head_tilt = match body.camera_mount() {
+        HeadMount::Neck => pose.neck_deg,
+        HeadMount::Fixed { tilt_deg } => tilt_deg as f32,
+        HeadMount::MastCamera { pan_tilt: true, .. } => pose.neck_deg,
+        _ => 0.0,
+    };
+    let head_dir = up_dir(trunk_deg + head_tilt);
+    if torso == Torso::Humanoid {
+        let belly_p = add(hip_c, scale(u, PELVIS_M - body.belly.com_down_m));
+        masses.push(Mass { group: Grp::Pelvis, m: body.belly.mass_kg, p: belly_p });
+        let chest_p = add(waist, scale(v, body.chest.com_up_m));
+        masses.push(Mass { group: Grp::Trunk, m: body.chest.mass_kg, p: chest_p });
+        if body.plan.battery_low {
+            masses.push(Mass { group: Grp::Pelvis, m: body.chest.battery_kg, p: belly_p });
+        } else {
+            masses.push(Mass { group: Grp::Trunk, m: body.chest.battery_kg, p: chest_p });
+        }
     }
     if pose.cargo_kg > 0.0 {
-        // The bay rides on the pelvis in front of the belly.
-        let fwd = [u[2], 0.0, -u[0]];
-        let bay = add(add(hip_c, scale(u, CARGO_Z_M - HIP_M)), scale(fwd, CARGO_X_M));
-        masses.push(Mass { group: Grp::Pelvis, m: pose.cargo_kg, p: bay });
+        let (at, on_pelvis) = body.cargo_point();
+        if on_pelvis {
+            // The bay rides on the pelvis in front of the belly.
+            let fwd = [u[2], 0.0, -u[0]];
+            let bay = add(add(hip_c, scale(u, CARGO_Z_M - HIP_M)), scale(fwd, CARGO_X_M));
+            masses.push(Mass { group: Grp::Pelvis, m: pose.cargo_kg, p: bay });
+        } else {
+            // On the bed or in the tote: it sits on the chassis.
+            masses.push(Mass { group: Grp::Base, m: pose.cargo_kg, p: at });
+        }
     }
-    masses.push(Mass { group: Grp::Head, m: body.head.mass_kg, p: add(neck, scale(head_dir, body.head.com_up_m)) });
-    boxes.push(oriented_box("pelvis", Segment::Belly, add(hip_c, scale(u, 0.06)), pose.pelvis_deg, [0.09, 0.14, 0.07]));
-    boxes.push(oriented_box("trunk", Segment::Chest, add(waist, scale(v, 0.16)), trunk_deg, [0.10, 0.16, 0.16]));
-    boxes.push(oriented_box("head", Segment::Head, add(neck, scale(head_dir, 0.07)), trunk_deg + pose.neck_deg, [0.07, 0.08, 0.07]));
+    if body.head_on_trunk() {
+        masses.push(Mass { group: Grp::Head, m: body.head.mass_kg, p: add(neck, scale(head_dir, body.head.com_up_m)) });
+    } else if let (true, Some(m)) = (body.has_neck(), masses.iter_mut().find(|m| m.group == Grp::Head)) {
+        // A mast's pan-tilt swings the camera about its pivot.
+        m.p = add(neck, scale(head_dir, body.head.com_up_m));
+    }
+    if torso == Torso::Humanoid {
+        boxes.push(oriented_box("pelvis", Segment::Belly, add(hip_c, scale(u, 0.06)), pose.pelvis_deg, [0.09, 0.14, 0.07]));
+        boxes.push(oriented_box("trunk", Segment::Chest, add(waist, scale(v, 0.16)), trunk_deg, [0.10, 0.16, 0.16]));
+    }
+    if body.head_on_trunk() {
+        boxes.push(oriented_box("head", Segment::Head, add(neck, scale(head_dir, 0.07)), trunk_deg + head_tilt, [0.07, 0.08, 0.07]));
+    } else if matches!(body.camera_mount(), HeadMount::MastCamera { .. }) {
+        boxes.push(oriented_box("head", Segment::Head, add(neck, scale(head_dir, 0.05)), head_tilt, [0.04, 0.07, 0.04]));
+    }
+    if body.mast_arms() {
+        // The arm's carriage on the mast, where the lift has it.
+        let c = body.shoulder_at(0, pose.lift_m);
+        boxes.push(oriented_box("carriage", Segment::Leg, [body.mast_camera_x(), 0.0, c[2]], 0.0, [0.04, 0.05, 0.04]));
+    }
 
     // ----- arms -----
     let (m_up, r_up, m_fore) = body.arm_split();
@@ -661,8 +828,26 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
     let mut flex_axes = [[0.0f32, 1.0, 0.0]; 2];
     let trunk_fwd = fore_aft(trunk_deg);
     for s in 0..2 {
-        let y = if s == 0 { -SHOULDER_HALF_WIDTH_M } else { SHOULDER_HALF_WIDTH_M };
-        let sh = [shoulder_c[0], shoulder_c[1] + y, shoulder_c[2]];
+        let sh = match torso {
+            Torso::Humanoid | Torso::Mast => {
+                let y = if s == 0 { -SHOULDER_HALF_WIDTH_M } else { SHOULDER_HALF_WIDTH_M };
+                [shoulder_c[0], shoulder_c[1] + y, shoulder_c[2]]
+            }
+            Torso::None => body.shoulder_at(s, pose.lift_m),
+        };
+        if s >= n_arms {
+            // No such arm: its points stay at its would-be shoulder and nothing is solved for it.
+            // A load asked of it is never quietly dropped: nothing holds it.
+            let f = loads.hand_force[s];
+            let n = (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt();
+            if n > 1e-3 {
+                out_of_range.push(format!("{} 없음: 손 하중 {:.0} N을 받을 팔이 없음", if s == 0 { "오른팔" } else { "왼팔" }, n));
+            }
+            shoulders[s] = sh;
+            elbows[s] = sh;
+            hands[s] = sh;
+            continue;
+        }
         // Shoulder flexion is measured from hanging along the trunk.
         let up_ang = pose.shoulder_deg[s] - trunk_deg;
         let mut du = down_dir(up_ang);
@@ -704,10 +889,10 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
         out_of_range.push(if rom.waist_max == 0.0 { format!("허리 피치 관절 없음 (요청 {:.0}°)", pose.waist_deg) } else { format!("waist_pitch {:.0}° > {:.0}°", pose.waist_deg, rom.waist_max) });
     }
     if pose.neck_deg.abs() > rom.neck_max + 0.5 {
-        out_of_range.push(format!("neck {:.0}° > {:.0}°", pose.neck_deg, rom.neck_max));
+        out_of_range.push(if rom.neck_max == 0.0 { format!("목 관절 없음 (요청 {:.0}°)", pose.neck_deg) } else { format!("neck {:.0}° > {:.0}°", pose.neck_deg, rom.neck_max) });
     }
-    if pose.neck_pan_deg.abs() > NECK_PAN_MAX_DEG + 0.5 {
-        out_of_range.push(format!("neck_pan {:.0}° > {:.0}°", pose.neck_pan_deg, NECK_PAN_MAX_DEG));
+    if pose.neck_pan_deg.abs() > rom.pan_max + 0.5 {
+        out_of_range.push(if rom.pan_max == 0.0 { format!("목 팬 관절 없음 (요청 {:.0}°)", pose.neck_pan_deg) } else { format!("neck_pan {:.0}° > {:.0}°", pose.neck_pan_deg, rom.pan_max) });
     }
     if legged {
         for s in 0..2 {
@@ -761,7 +946,8 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
     for m in &masses {
         com = add(com, scale(m.p, m.m / mass.max(1e-6)));
     }
-    let hand_f = loads.hand_force;
+    // A hand the form does not have takes no force (a load asked of it is out of range, above).
+    let hand_f = [0, 1].map(|s| if s < n_arms { loads.hand_force[s] } else { [0.0; 3] });
     let mut s_force = scale(g_eff, mass);
     let mut m_o = [0.0f32; 3];
     for m in &masses {
@@ -774,6 +960,10 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
     if let Some(b) = bumper {
         s_force = add(s_force, loads.bumper_force);
         m_o = add(m_o, cross(b, loads.bumper_force));
+    }
+    if loads.body_force != [0.0; 3] {
+        s_force = add(s_force, loads.body_force);
+        m_o = add(m_o, cross(loads.body_point, loads.body_force));
     }
     let fz = s_force[2].min(-1e-6);
     let zmp = [-m_o[1] / fz, m_o[0] / fz];
@@ -797,23 +987,36 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
         }
     };
     let arm_groups = |s: usize| [Grp::Upper(s), Grp::Fore(s), Grp::Hand(s)];
-    let above_waist = [Grp::Head, Grp::Trunk, Grp::Upper(0), Grp::Fore(0), Grp::Hand(0), Grp::Upper(1), Grp::Fore(1), Grp::Hand(1)];
+    // The head is carried by the trunk (or the column carriage) only when it sits on it.
+    let head_grp: &[Grp] = if body.head_on_trunk() { &[Grp::Head] } else { &[] };
     let mut joints: Vec<KinJoint> = Vec::new();
-    joints.push(jnt("waist_pitch", Segment::Belly, waist, Some(pose.waist_deg), body.belly.pitch.as_ref(), moment(waist, &above_waist, &[0, 1])[1], pose.waist_deg.abs() <= rom.waist_max + 0.5));
-    joints.push(jnt("neck", Segment::Head, neck, Some(pose.neck_deg), Some(&body.head.neck), moment(neck, &[Grp::Head], &[])[1], pose.neck_deg.abs() <= rom.neck_max + 0.5));
+    if torso == Torso::Humanoid {
+        let above_waist: Vec<Grp> = head_grp.iter().copied().chain([Grp::Trunk, Grp::Upper(0), Grp::Fore(0), Grp::Hand(0), Grp::Upper(1), Grp::Fore(1), Grp::Hand(1)]).collect();
+        joints.push(jnt("waist_pitch", Segment::Belly, waist, Some(pose.waist_deg), body.belly.pitch.as_ref(), moment(waist, &above_waist, &[0, 1])[1], pose.waist_deg.abs() <= rom.waist_max + 0.5));
+    }
+    if body.has_neck() {
+        joints.push(jnt("neck", Segment::Head, neck, Some(pose.neck_deg), Some(&body.head.neck), moment(neck, &[Grp::Head], &[])[1], pose.neck_deg.abs() <= rom.neck_max + 0.5));
+    }
     // The torso lift holds up the carriage and everything on it (the pelvis
-    // and the bay, the trunk, the head, the arms) and what the hands carry;
-    // a linear actuator, its "torque" is that force in newtons.
+    // and the bay, the trunk, the head, the arms; on a column the arms and the
+    // head; on a camera's mast the arm) and what the hands carry; a linear
+    // actuator, its "torque" is that force in newtons.
     if let (false, Some(lift)) = (legged, body.lift.as_ref()) {
-        let carried = [Grp::Head, Grp::Trunk, Grp::Pelvis, Grp::Upper(0), Grp::Fore(0), Grp::Hand(0), Grp::Upper(1), Grp::Fore(1), Grp::Hand(1)];
+        let carried: Vec<Grp> = head_grp.iter().copied().chain([Grp::Trunk, Grp::Pelvis, Grp::Upper(0), Grp::Fore(0), Grp::Hand(0), Grp::Upper(1), Grp::Fore(1), Grp::Hand(1)]).collect();
         let f: f32 = -(masses.iter().filter(|m| carried.contains(&m.group)).map(|m| m.m * g_eff[2]).sum::<f32>() + hand_f[0][2] + hand_f[1][2]);
         let in_range = (-1e-3..=rom.lift_max_m + 1e-3).contains(&pose.lift_m);
         if !in_range {
             out_of_range.push(format!("torso_lift {:.2} m > {:.2} m", pose.lift_m, rom.lift_max_m));
         }
-        joints.push(KinJoint { name: "torso_lift".into(), segment: Segment::Leg, pos: hip_c, angle_deg: None, actuator: lift.name.into(), torque: f, peak: lift.force_n, cont: lift.force_n, ratio: f.abs() / lift.force_n.max(1e-3), effort: f.abs() / lift.force_n.max(1e-3), in_range, structural: false });
+        let pos = match torso {
+            Torso::Humanoid => hip_c,
+            Torso::Mast => [0.0, pose.pelvis_y, SHOULDER_M - pose.lift_m],
+            // The arm's carriage on the camera's mast.
+            Torso::None => [body.mast_camera_x(), 0.0, body.shoulder_at(0, pose.lift_m)[2]],
+        };
+        joints.push(KinJoint { name: "torso_lift".into(), segment: Segment::Leg, pos, angle_deg: None, actuator: lift.name.into(), torque: f, peak: lift.force_n, cont: lift.force_n, ratio: f.abs() / lift.force_n.max(1e-3), effort: f.abs() / lift.force_n.max(1e-3), in_range, structural: false });
     }
-    for s in 0..2 {
+    for s in 0..n_arms {
         let abducted = pose.shoulder_abd_deg[s].abs() > 1e-6;
         // About the arm's own flexion axis once it is turned out (+y otherwise).
         let about = |m: V3| if abducted { dot(m, flex_axes[s]) } else { m[1] };
@@ -833,10 +1036,24 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
     if legged {
         let fl = body.leg.foot_len_m;
         let fw = body.leg.foot_width_m;
-        let rects: Vec<[f32; 4]> = (0..2).map(|s| [ankles[s][0] - 0.25 * fl, ankles[s][0] + 0.75 * fl, ankles[s][1] - fw * 0.5, ankles[s][1] + fw * 0.5]).collect();
+        // The sole where it stands (a foot on its toes keeps its toes where the flat foot had them).
+        let planted: [f32; 2] = std::array::from_fn(|s| if stance[s] { pose.feet[s][0] } else { ankles[s][0] });
+        let rects: Vec<[f32; 4]> = (0..2).map(|s| [planted[s] - 0.25 * fl, planted[s] + 0.75 * fl, ankles[s][1] - fw * 0.5, ankles[s][1] + fw * 0.5]).collect();
         let on: Vec<usize> = (0..2).filter(|s| stance[*s]).collect();
         let on = if on.is_empty() { vec![0] } else { on };
-        support = on.iter().fold([f32::INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::NEG_INFINITY], |r, &s| [r[0].min(rects[s][0]), r[1].max(rects[s][1]), r[2].min(rects[s][2]), r[3].max(rects[s][3])]);
+        // The sole's patches for the drawn report only (the planners' searches skip them; the views add the friction).
+        let sole_model = draw.then(|| crate::contact::SoleModel::of(body));
+        // A foot on its toes supports only from the metatarsal band forward (the stretch its sole loads).
+        let rocker_x = |s: usize| -> Option<[f32; 2]> {
+            (stance[s] && pose.toe_deg[s] > 1e-3).then(|| {
+                let hinge = planted[s] + (crate::contact::TOE_HINGE_FL - crate::contact::ANKLE_FL) * fl;
+                [hinge - (crate::contact::TOE_HINGE_FL - crate::contact::SOLE_BOUNDS_FL[2]) * fl, rects[s][1]]
+            })
+        };
+        support = on.iter().fold([f32::INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::NEG_INFINITY], |r, &s| {
+            let x = rocker_x(s).unwrap_or([rects[s][0], rects[s][1]]);
+            [r[0].min(x[0]), r[1].max(x[1]), r[2].min(rects[s][2]), r[3].max(rects[s][3])]
+        });
         // Vertical load of each stance foot from the lateral ZMP (all on one in single support).
         let shares: [f32; 2] = if on.len() == 2 {
             let r = ((ankles[1][1] - zmp[1]) / (ankles[1][1] - ankles[0][1]).max(1e-3)).clamp(0.0, 1.0);
@@ -849,8 +1066,10 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
             let share = shares[s];
             let f = scale(grf, share);
             let rect = rects[s];
-            let cop = [zmp[0].clamp(rect[0], rect[1]), if on.len() == 2 { ankles[s][1] } else { zmp[1].clamp(rect[2], rect[3]) }];
-            contacts.push(ContactPatch { name: format!("foot_{}", tag(s)), normal_n: if stance[s] { f[2].max(0.0) } else { 0.0 }, shear_n: if stance[s] { f[0] } else { 0.0 }, cop, rect, pressure_kpa: None, loaded_len_m: None });
+            let xr = rocker_x(s).unwrap_or([rect[0], rect[1]]);
+            let cop = [zmp[0].clamp(xr[0], xr[1]), if on.len() == 2 { ankles[s][1] } else { zmp[1].clamp(rect[2], rect[3]) }];
+            let sole = sole_model.as_ref().filter(|_| stance[s]).map(|m| crate::contact::sole_contact(m, planted[s], f[2].max(0.0), [f[0], f[1]], 0.0, cop[0], pose.toe_deg[s], 0.0));
+            contacts.push(ContactPatch { name: format!("foot_{}", tag(s)), normal_n: if stance[s] { f[2].max(0.0) } else { 0.0 }, shear_n: if stance[s] { f[0] } else { 0.0 }, cop, rect, pressure_kpa: None, loaded_len_m: None, shear_y_n: if stance[s] { f[1] } else { 0.0 }, torsion_nm: 0.0, sole });
             let cop3 = [cop[0], cop[1], 0.0];
             let (ank_t, knee_t, hip_t, roll_t) = if stance[s] {
                 // Bottom up: the ground reaction under the foot, the foot and the shank below the joint.
@@ -899,7 +1118,7 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
                 let peak = 2.0 * n / (l * 2.0 * BELT_W_M) / 1000.0;
                 if e > 0.0 { (0.0, peak, l) } else { (peak, 0.0, l) }
             };
-            contacts.push(ContactPatch { name: "track".into(), normal_n: n, shear_n: shear, cop: zmp, rect: support, pressure_kpa: Some([rear, front]), loaded_len_m: Some(loaded) });
+            contacts.push(ContactPatch { name: "track".into(), normal_n: n, shear_n: shear, cop: zmp, rect: support, pressure_kpa: Some([rear, front]), loaded_len_m: Some(loaded), shear_y_n: grf[1], torsion_nm: 0.0, sole: None });
             joints.push(KinJoint { name: "drive".into(), segment: Segment::Foot, pos: tilt([0.0, 0.0, WHEEL_R_M]), angle_deg: None, actuator: body.chassis.name.into(), torque: shear, peak: 2.0 * f, cont: f, ratio: shear.abs() / (2.0 * f).max(1e-3), effort: shear.abs() / f.max(1e-3), in_range: true, structural: false });
         } else {
             // Front and rear axle loads from the ZMP between them; all wheels drive, traction by load.
@@ -907,7 +1126,7 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
             let nf = (n * (zmp[0] - xr) / (xf - xr)).clamp(0.0, n);
             for (name, jname, x, nn) in [("axle_front", "drive_front", xf, nf), ("axle_rear", "drive_rear", xr, n - nf)] {
                 let sh = if n > 1e-6 { shear * nn / n } else { 0.0 };
-                contacts.push(ContactPatch { name: name.into(), normal_n: nn, shear_n: sh, cop: [x, 0.0], rect: [x - 0.02, x + 0.02, -0.5 * w, 0.5 * w], pressure_kpa: None, loaded_len_m: None });
+                contacts.push(ContactPatch { name: name.into(), normal_n: nn, shear_n: sh, cop: [x, 0.0], rect: [x - 0.02, x + 0.02, -0.5 * w, 0.5 * w], pressure_kpa: None, loaded_len_m: None, shear_y_n: if n > 1e-6 { grf[1] * nn / n } else { 0.0 }, torsion_nm: 0.0, sole: None });
                 let fa = 0.5 * f;
                 joints.push(KinJoint { name: jname.into(), segment: Segment::Foot, pos: tilt([x, 0.0, WHEEL_R_M]), angle_deg: None, actuator: body.chassis.name.into(), torque: sh, peak: 2.0 * fa, cont: fa, ratio: sh.abs() / (2.0 * fa).max(1e-3), effort: sh.abs() / fa.max(1e-3), in_range: true, structural: false });
             }
@@ -963,7 +1182,8 @@ fn limb_box(name: &'static str, segment: Segment, a: V3, b: V3, w: f32) -> LinkB
 /// for direct drive; segment lengths as `hand`). `axis` is the arm's flexion
 /// axis (+y in the sagittal plane): the fingers spread along it.
 fn hand_boxes(side: usize, wrist: V3, dir: V3, axis: V3, closure: f32, body: &Body) -> Vec<LinkBox> {
-    let n = u8::from(body.fingers) as usize;
+    // A parallel-jaw gripper has two jaws whatever the hand config says.
+    let n = if body.gripper_only() { 2 } else { u8::from(body.fingers) as usize };
     let mut v = vec![limb_box(if side == 0 { "palm_r" } else { "palm_l" }, Segment::Hand, wrist, add(wrist, scale(dir, 0.10)), 0.035)];
     // The palm side faces forward of the forearm in the arm's plane.
     let palm_n = cross(dir, axis);
@@ -987,17 +1207,34 @@ fn hand_boxes(side: usize, wrist: V3, dir: V3, axis: V3, closure: f32, body: &Bo
     v
 }
 
-/// Chassis, mast, bumper and the wheels or tracks, pitched with the base.
+/// Chassis, the mast (under a humanoid), the column or the camera pole,
+/// bumper, the wheels or tracks, and what the form puts on the deck
+/// (`Body::deck_boxes`: a deck arm's base, a bed, a tote, a chassis camera),
+/// pitched with the base.
 fn base_boxes(body: &Body, pitch_deg: f32) -> Vec<LinkBox> {
     let len = body.support_len_m;
     let w = body.support_width_m;
     let p = |q: V3| pitch_about_origin(q, pitch_deg);
     let ax = EYE3.map(|a| pitch_about_origin(a, pitch_deg));
-    let mut v = vec![
-        LinkBox { name: "chassis", segment: Segment::Foot, center: p([0.0, 0.0, WHEEL_R_M + 0.05]), axes: ax, half: [len * 0.5, w * 0.5 - BELT_W_M, 0.05] },
-        LinkBox { name: "mast", segment: Segment::Leg, center: p([0.0, 0.0, 0.5 * (WHEEL_R_M + 0.1 + HIP_M)]), axes: ax, half: [0.03, 0.03, 0.5 * (HIP_M - WHEEL_R_M - 0.1)] },
-        LinkBox { name: "bumper", segment: Segment::Foot, center: p([0.5 * len + WHEEL_R_M + BUMPER_GAP_M - 0.01, 0.0, 0.5 * (BUMPER_Z_M[0] + BUMPER_Z_M[1])]), axes: ax, half: [0.01, w * 0.5, 0.5 * (BUMPER_Z_M[1] - BUMPER_Z_M[0])] },
-    ];
+    let mut v = vec![LinkBox { name: "chassis", segment: Segment::Foot, center: p([0.0, 0.0, WHEEL_R_M + 0.05]), axes: ax, half: [len * 0.5, w * 0.5 - BELT_W_M, 0.05] }];
+    // What stands on the chassis: today's mast at hip height, a column to the carriage's top, a camera pole.
+    let deck = WHEEL_R_M + 0.1;
+    match (body.morph.torso, body.camera_mount()) {
+        (Torso::Humanoid, _) => v.push(LinkBox { name: "mast", segment: Segment::Leg, center: p([0.0, 0.0, 0.5 * (deck + HIP_M)]), axes: ax, half: [0.03, 0.03, 0.5 * (HIP_M - WHEEL_R_M - 0.1)] }),
+        (Torso::Mast, head) => {
+            let top = column_top_m(head);
+            v.push(LinkBox { name: "column", segment: Segment::Leg, center: p([0.0, 0.0, 0.5 * (deck + top)]), axes: ax, half: [0.04, 0.04, 0.5 * (top - deck)] });
+        }
+        (Torso::None, HeadMount::MastCamera { height_mm, .. }) => {
+            let top = height_mm as f32 / 1000.0 - CAMERA_UP_M;
+            v.push(LinkBox { name: "pole", segment: Segment::Leg, center: p([body.mast_camera_x(), 0.0, 0.5 * (deck + top)]), axes: ax, half: [0.01, 0.01, 0.5 * (top - deck).max(0.0)] });
+        }
+        _ => {}
+    }
+    v.push(LinkBox { name: "bumper", segment: Segment::Foot, center: p([0.5 * len + WHEEL_R_M + BUMPER_GAP_M - 0.01, 0.0, 0.5 * (BUMPER_Z_M[0] + BUMPER_Z_M[1])]), axes: ax, half: [0.01, w * 0.5, 0.5 * (BUMPER_Z_M[1] - BUMPER_Z_M[0])] });
+    for b in body.deck_boxes() {
+        v.push(LinkBox { center: p(b.center), axes: ax, ..b });
+    }
     if body.base == BaseKind::Track {
         for y in [-0.5 * w + 0.5 * BELT_W_M, 0.5 * w - 0.5 * BELT_W_M] {
             v.push(LinkBox { name: "track", segment: Segment::Foot, center: p([0.0, y, WHEEL_R_M]), axes: ax, half: [len * 0.5 + WHEEL_R_M, BELT_W_M * 0.5, WHEEL_R_M] });

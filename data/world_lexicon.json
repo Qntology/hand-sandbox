@@ -1,6 +1,11 @@
 {
   "version": 1,
   "format": "logis-center bias.json node format: every node is {semantic, bias, prejudice, exact_match}. bias and prejudice are comma separated phrase lists that get embedded; exact_match lists words that identify the node without any embedding. 'surface' (an addition of this project) lists complete word forms that match whole only. Vocabulary lives here, never in code.",
+  "vision_prompting": {
+    "about": "How the vision phrases are put to SigLIP2 (v1.0, docs/research/ml-ab.md). 'templates' wrap every vision phrase ({} is the phrase, which already has its article) and the vectors are averaged per phrase: the prompt ensembling of the OpenAI CLIP repository's Prompt_Engineering_for_ImageNet notebook, its render and game templates included, with the article moved into the phrase. 'background' names what most of an outdoor frame is; the dense locator lets every patch choose between the labels and these, and scene-generic phrases that also appear in a prejudice list are not subtracted from an entity when the background set is in use.",
+    "templates": ["a photo of {}.", "a rendering of {}.", "{} in a video game.", "a low resolution photo of {}.", "a cropped photo of {}.", "a bad photo of {}."],
+    "background": ["a grass field", "green grass", "bare brown dirt ground", "a gravel path", "the blue sky", "water", "a grey rock wall", "a house"]
+  },
   "resource": {
     "log": {
       "semantic": "a wooden log: the trunk piece that chopping a tree yields, used as building and fuel wood",
@@ -30,7 +35,8 @@
       "semantic": "a small corrugated cardboard parcel box lying on the ground, waiting to be picked up and delivered",
       "bias": "택배, 택배 상자, 택배상자, 상자, 소포, 박스, 택배박스, 골판지 상자, 종이 상자, parcel, parcel box, package, box, carton, cardboard box, 小包, 段ボール箱, 包裹, 箱子",
       "prejudice": "원목, 돌, 석탄, 철광석, log, stone, coal, iron ore",
-      "exact_match": ["택배", "택배 상자", "택배상자", "택배박스", "상자", "소포", "박스", "골판지 상자", "종이 상자", "parcel", "parcels", "package", "packages", "box", "boxes", "carton", "cartons", "小包", "段ボール箱", "包裹", "箱子"]
+      "exact_match": ["택배", "택배 상자", "택배상자", "택배박스", "상자", "소포", "박스", "골판지 상자", "종이 상자", "parcel", "parcels", "package", "packages", "box", "boxes", "carton", "cartons", "小包", "段ボール箱", "包裹", "箱子"],
+      "placed": true
     }
   },
   "place": {
@@ -38,13 +44,38 @@
       "semantic": "the base camp: the waypoint where the robot starts and where it recharges",
       "bias": "베이스캠프, 베이스, 캠프, 기지, 본진, 거점, 출발점, base camp, base, camp, home base, starting point, ベースキャンプ, 基地, 大本营",
       "prejudice": "창고, 보관소, warehouse, storage",
-      "exact_match": ["베이스캠프", "베이스 캠프", "베이스", "캠프", "기지", "본진", "거점", "출발점", "base camp", "basecamp", "camp", "base", "ベースキャンプ", "基地", "大本营"]
+      "exact_match": ["베이스캠프", "베이스 캠프", "베이스", "캠프", "기지", "본진", "거점", "출발점", "base camp", "basecamp", "camp", "base", "ベースキャンプ", "基地", "大本营"],
+      "home": true
     },
     "warehouse": {
-      "semantic": "the warehouse: the waypoint where gathered items are stored",
-      "bias": "창고, 물류창고, 보관소, 저장소, 적재소, 하치장, warehouse, storage, depot, storehouse, stockroom, 倉庫, 仓库",
-      "prejudice": "베이스캠프, 기지, base camp, camp",
-      "exact_match": ["창고", "물류창고", "보관소", "저장소", "적재소", "하치장", "warehouse", "storage", "depot", "storehouse", "倉庫", "仓库"]
+      "semantic": "the warehouse: the waypoint where gathered items are stored; with a site, the logistics centre with shelves and packing tables around it",
+      "bias": "창고, 물류창고, 물류센터, 보관소, 저장소, 적재소, 하치장, warehouse, logistics center, distribution center, storage, depot, storehouse, stockroom, 倉庫, 物流センター, 仓库, 物流中心",
+      "prejudice": "베이스캠프, 기지, 집, base camp, camp, house",
+      "exact_match": ["창고", "물류창고", "물류센터", "물류 센터", "보관소", "저장소", "적재소", "하치장", "warehouse", "logistics center", "logistics centre", "distribution center", "storage", "depot", "storehouse", "倉庫", "物流センター", "仓库", "物流中心"]
+    },
+    "house": {
+      "semantic": "a house on the map: couriers leave parcels on the landing at its front door",
+      "bias": "집, 주택, 단독주택, 가정집, 민가, 남의 집, house, family house, residence, dwelling, 家, 住宅, 房子",
+      "prejudice": "창고, 물류센터, 베이스캠프, warehouse, logistics center, base camp",
+      "exact_match": ["집", "주택", "단독주택", "가정집", "민가", "house", "houses", "residence", "家", "住宅", "房子"]
+    },
+    "doorstep": {
+      "semantic": "the landing in front of a house's door, reached by porch steps or a ramp, where parcels are left",
+      "bias": "현관, 현관 앞, 집 앞, 문 앞, 문앞, 대문 앞, 현관문 앞, 계단 위, doorstep, porch, front door, front porch, door step, 玄関, 门口",
+      "prejudice": "선반, 테이블, 창고, shelf, table, warehouse",
+      "exact_match": ["현관", "현관 앞", "집 앞", "집앞", "문 앞", "문앞", "대문 앞", "현관문 앞", "doorstep", "porch", "front door", "front porch", "玄関", "门口"]
+    },
+    "shelf": {
+      "semantic": "a shelving unit in the logistics centre: parcels lie on its decks",
+      "bias": "선반, 선반 위, 진열대, 랙, 적재 선반, 철제 선반, shelf, shelves, shelving, rack, storage rack, 棚, 货架",
+      "prejudice": "테이블, 현관, table, doorstep, floor",
+      "exact_match": ["선반", "선반 위", "진열대", "랙", "적재 선반", "철제 선반", "shelf", "shelves", "shelving", "rack", "棚", "货架"]
+    },
+    "table": {
+      "semantic": "a packing table in the logistics centre: parcels wait on its top",
+      "bias": "테이블, 탁자, 작업대, 포장대, 포장 테이블, table, packing table, workbench, packing bench, テーブル, 桌子",
+      "prejudice": "선반, 현관, shelf, doorstep, floor",
+      "exact_match": ["테이블", "테이블 위", "탁자", "탁자 위", "작업대", "포장대", "포장 테이블", "table", "tables", "packing table", "workbench", "テーブル", "桌子"]
     }
   },
   "verb": {
@@ -105,7 +136,8 @@
   },
   "preposition": {
     "direction": ["to", "into", "towards", "toward", "at", "onto", "near", "beside"],
-    "source": ["from", "out of"]
+    "source": ["from", "out of"],
+    "located": ["있는", "있던", "놓인", "놓여있는", "놓여 있는", "놓여진", "올려진", "올려둔", "둔"]
   },
   "quantity": {
     "counters": ["개", "조각", "덩이", "덩어리", "그루", "토막", "알", "개씩", "묶음", "stack", "stacks", "piece", "pieces", "pcs", "pc", "ea"],
@@ -192,6 +224,34 @@
       "semantic": "the warehouse waypoint: a blue flag on a thin white pole",
       "bias": "a blue flag on a thin white pole, a small blue banner on a post, a blue marker flag",
       "prejudice": "an orange flag on a pole, a tree, a grey boulder"
+    },
+    "house": {
+      "kind": "structure",
+      "link": "house",
+      "semantic": "a small single-storey house with pale walls, a red roof and a front door",
+      "bias": "a small house with pale walls and a red roof, a house front with a brown door, a one storey house",
+      "prejudice": "a cardboard parcel box, a tree, a grey boulder, a warehouse shed"
+    },
+    "doorstep": {
+      "kind": "structure",
+      "link": "doorstep",
+      "semantic": "concrete porch steps and a landing in front of a house door",
+      "bias": "concrete porch steps, a landing in front of a front door, entry stairs of a house, a small ramp beside steps",
+      "prejudice": "a cardboard parcel box, a curb, a grey boulder"
+    },
+    "shelf": {
+      "kind": "structure",
+      "link": "shelf",
+      "semantic": "a blue steel shelving unit with grey decks in a warehouse",
+      "bias": "a blue steel shelving unit, warehouse shelves with grey decks, a boltless storage rack",
+      "prejudice": "a cardboard parcel box, a packing table, a tree"
+    },
+    "table": {
+      "kind": "structure",
+      "link": "table",
+      "semantic": "a grey packing table with four legs in a warehouse",
+      "bias": "a grey packing table, a workbench with four legs, a flat table top in a warehouse",
+      "prejudice": "a cardboard parcel box, a shelving unit, a tree"
     }
   }
 }

@@ -28,7 +28,10 @@ use serde::Serialize;
 
 use crate::kin::{KinLoads, KinPose};
 
+pub mod cocarry;
+pub mod collide;
 pub mod drive;
+pub mod fall;
 pub mod focus;
 pub mod gait;
 pub mod grasp;
@@ -137,7 +140,7 @@ impl Part {
 pub struct ActEvent {
     /// Seconds from the start of the action.
     pub t: f32,
-    /// `contact`, `lift_off`, `slip`, `drop`, `release`, `impact`, `bend_bottom`, `stand`, `heel_strike`, `toe_off`, `foot_slip`, `fall`, `recover`, `breakaway`, `push_lost`, `collision`, `wheel_slip`, `stuck`.
+    /// `contact`, `incipient_slip`, `lift_off`, `pivot`, `slip`, `drop`, `release`, `impact`, `bend_bottom`, `stand`, `heel_strike`, `heel_off`, `toe_push`, `toe_off`, `foot_slip`, `fall`, `recover`, `breakaway`, `push_lost`, `collision`, `wheel_slip`, `stuck`.
     pub kind: &'static str,
     pub label_ko: String,
     /// The parts whose focus views show it.
@@ -171,6 +174,11 @@ pub struct Grip {
     /// Fingers touching the object.
     pub contacts: u8,
     pub closure: f32,
+    /// Each touching finger's pad at this instant (point, face normal, normal
+    /// and tangential force, friction, limit-surface use, stick ratio, slip
+    /// state; `contact::FingerContact`), when the action modelled them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<crate::contact::FingerContacts>,
 }
 
 /// One sample of an action.

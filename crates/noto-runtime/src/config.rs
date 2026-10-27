@@ -128,6 +128,13 @@ pub struct RuntimeConfig {
     /// Parcels lying in new worlds (`None`: the default number).
     #[serde(default)]
     pub parcels: Option<usize>,
+    /// How new worlds are lit (`world_sim::light`): flat by default, or a sun.
+    #[serde(default)]
+    pub lighting: world_sim::Lighting,
+    /// Houses and a logistics centre in new worlds (`world_sim::site`); `None`
+    /// (the default) builds the map without them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site: Option<world_sim::SiteCfg>,
 }
 
 fn default_noto() -> NotoConfig {
@@ -161,6 +168,8 @@ impl Default for RuntimeConfig {
             vision: crate::vision::VisionCfg::default(),
             odometry: world_sim::OdomCfg::default(),
             parcels: None,
+            lighting: world_sim::Lighting::Flat,
+            site: None,
         }
     }
 }

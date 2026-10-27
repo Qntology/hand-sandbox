@@ -42,6 +42,8 @@ cargo test --workspace
 
 속도 벤치마크는 실행하지 않습니다. 작업 단위의 기준은 문서화된 참조 수치와 정합성 테스트입니다. 물리의 "벤치마크"는 기준 점수 시험입니다: `cargo test -p noto-core --test effects_bench -- --nocapture`가 환경 시나리오마다 셀 원값·기준·z·점수를 출력하고(`[FX]`), 엔진 파일이 채점 출처를 쓰지 않는지 검사합니다. 복합 N:N은 `--test nn_scenarios`, 행위(잡기·놓기·밀기·걷기·굽히기)는 `--test action_bench`(`[AX]` 셀, `[AX-SUM]` 시나리오, `[AX-WHY]` 실패 이유, `[AX-HELD]` 홀드아웃)입니다. 메모리가 8 GB 안팎인 PC에서는 링크가 겹쳐 가상 메모리가 모자랄 수 있으니(`os error 1455`) `CARGO_BUILD_JOBS=2`로 돌리세요.
 
+영역 사이의 기준 편차("어색함")는 `cargo test -p noto-core --test uncanny_report -- --nocapture`(행동·환경·복합 N:N)와 `cargo test -p noto-runtime --test uncanny_runtime -- --nocapture`(머리 카메라·간헐 시각까지)가 영역마다 기준 칸 수·중앙 |z|·RMS z·허용폭 안 비율·게이트·미구현을 같은 식으로 내고(`[UX]`), 가장 먼 영역을 다음 작업으로 적습니다(`[UX-SUM]`). 엔진 파일 전체가 어느 영역의 채점 출처도 쓰지 않는지는 `--test source_split`이 중앙 등록부(`noto_core::bench`)로 검사합니다. 방법과 오늘의 숫자는 [`docs/research/uncanny.md`](docs/research/uncanny.md)에 있습니다.
+
 Windows에서는 백엔드별 스크립트가 MSVC·CUDA·HIP SDK 환경을 맞추고 단계별 로그(`test_logs\<시각>_<백엔드>\`)를 남깁니다. `test_*.bat`에 인자를 주면 그 cargo 테스트 하나만 돌립니다.
 
 ```bash

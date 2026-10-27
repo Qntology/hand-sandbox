@@ -4,6 +4,8 @@
 //! Every keyframe the ML logic analyses leaves:
 //! * `depth|<mode>|<label>`: absrel and delta1 against the renderer (evaluation),
 //!   and the `scale` calibration (triangulated range / depth range) when a fix exists;
+//!   on the ground-aligned path (`<model>+ground`) also the fit's `align_a`,
+//!   `align_b`, `align_inliers` and `align_err` (v1.0);
 //! * `locate|<label>|<mode>`: peak score, margin, presence, pixel error (evaluation);
 //! * `tracker|<label>|<mode>`: IoU with the previous keyframe, area, score, IoU
 //!   with the truth (evaluation), agreement `alive`;
@@ -33,13 +35,21 @@ use crate::runtime::Runtime;
 
 /// Default score floor for semantic points used as prompts, per locator mode,
 /// until the SDS has a baseline (stand-in scores live in 0..1; SigLIP2 pair
-/// probabilities are much smaller on this renderer, so its floor is 0).
+/// probabilities are much smaller on this renderer, so its floor is 0; the
+/// v1.0 path gates the real locator with its calibrated threshold instead,
+/// `MlPipeline::passes_calibration`, and so does the stand-in measured on it).
 fn default_floor(mode: &str) -> f32 {
-    if mode.starts_with("stand-in") {
+    if mode.starts_with("stand-in") && !mode.contains("measured") {
         0.35
     } else {
         0.0
     }
+}
+
+/// Whether a mode is one of the stand-ins (whose SDS statistics keep the
+/// backoff to the label's and the track's scopes they always had).
+fn is_stand_in(mode: &str) -> bool {
+    mode.starts_with("stand-in")
 }
 
 /// z-score of `x` against the baseline of `scope/axis`, if the SDS has one.
@@ -53,10 +63,13 @@ pub(crate) struct MlOut {
 }
 
 impl Runtime {
-    /// The learned metric scale of the depth model for a label, if any.
+    /// The learned metric scale of the depth model for a label, if any. A real
+    /// model only takes a scale learned under its own mode: the track's global
+    /// scope mixes every mode, the stand-in's exact 0.8 included.
     pub(crate) fn depth_scale(&self, label: &str) -> Option<f32> {
-        let scope = Scope::new(Track::Depth, &self.ml.depth_mode(), label);
-        self.sds.calibration_factor(&scope, "scale").map(|(f, _, _, _)| f as f32)
+        let mode = self.ml.depth_mode();
+        let scope = Scope::new(Track::Depth, &mode, label);
+        self.sds.calibration_factor(&scope, "scale").filter(|(_, _, _, key)| is_stand_in(&mode) || *key != scope.key_global()).map(|(f, _, _, _)| f as f32)
     }
 
     /// Runs the ML tracks on a keyframe, fills its view and overlay, and
@@ -69,11 +82,18 @@ impl Runtime {
             .iter()
             .map(|l| {
                 let s = Scope::new(Track::Locate, l, &lmode);
-                let f = self.sds.adaptive_baseline(&s, "score").map(|(m, sd, _)| (m - 2.0 * sd) as f32).unwrap_or(floor_default).max(floor_default.min(0.2));
+                // A real locator reads only its own mode's baseline: the label's
+                // scope mixes the stand-in's 0..1 scores in.
+                let learned = self.sds.adaptive_baseline_scoped(&s, "score").filter(|(_, key)| is_stand_in(&lmode) || *key == s.key_secondary()).map(|(b, _)| b);
+                let f = learned.map(|(m, sd, _)| (m - 2.0 * sd) as f32).unwrap_or(floor_default).max(floor_default.min(0.2));
                 (l.clone(), f)
             })
             .collect();
-        let frame = self.ml.analyse(&rgb, &kf.intr, &kf.pose, Some(&kf.truth), wanted, &|l| floors.get(l).copied().unwrap_or(floor_default), prefer)?;
+        // The robot's map around it: ground height relative to the ground under the camera.
+        let ground0 = self.world.surface_m(kf.pose.x, kf.pose.z);
+        let world = &self.world;
+        let height = move |x: f32, z: f32| world.surface_m(x, z) - ground0;
+        let frame = self.ml.analyse_with(&rgb, &kf.intr, &kf.pose, Some(&kf.truth), wanted, &|l| floors.get(l).copied().unwrap_or(floor_default), prefer, Some(&height))?;
         let (dmode, tmode) = (self.ml.depth_mode(), self.ml.track_mode());
         let label = frame.target.as_ref().map(|t| t.label.clone()).or_else(|| wanted.first().cloned()).unwrap_or_default();
 
@@ -82,6 +102,12 @@ impl Runtime {
         if let Some(m) = &frame.depth_metrics {
             self.sds.record_baseline(&dscope, "absrel", m.absrel as f64);
             self.sds.record_baseline(&dscope, "delta1", m.delta1 as f64);
+        }
+        if let Some(f) = &frame.align {
+            self.sds.record_baseline(&dscope, "align_a", f.a as f64);
+            self.sds.record_baseline(&dscope, "align_b", f.b as f64);
+            self.sds.record_baseline(&dscope, "align_inliers", f.inlier_share as f64);
+            self.sds.record_baseline(&dscope, "align_err", f.median_rel_err as f64);
         }
         // locate
         let point = frame.points.iter().find(|p| wanted.contains(&p.label)).cloned();

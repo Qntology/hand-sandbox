@@ -3,6 +3,10 @@
 //! A [`Plan`](noto_search::Plan) becomes a list of steps. For each requested
 //! resource the steps are locate, approach, mine and collect; a plan that
 //! brings the items somewhere then adds one carry and one deliver step.
+//! An item that lies where it was put (a parcel) is checked by looking down at
+//! it instead of being mined, is picked from where the command said it lies
+//! ("선반에서 택배 집기"), and with no destination said goes back to the base
+//! camp ("베이스캠프로 복귀").
 //! This crate holds the data and the legal state transitions only. Running a
 //! quest against the world is `noto-runtime`'s job.
 
@@ -105,6 +109,17 @@ pub trait Labels {
         let _ = id;
         true
     }
+    /// Korean name of a place a search starts from: the places of a site
+    /// (houses, doorsteps, shelves, tables) have no waypoint to name them.
+    fn origin_ko(&self, id: &str) -> String {
+        match id {
+            "house" => "집".into(),
+            "doorstep" => "현관 앞".into(),
+            "shelf" => "선반".into(),
+            "table" => "포장 테이블".into(),
+            other => self.place_ko(other),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -130,13 +145,30 @@ impl std::fmt::Display for QuestError {
 
 impl std::error::Error for QuestError {}
 
-/// The third step of a target: mining its node, or touching what lies there.
+/// The third step of a target: mining its node, or looking down at what lies
+/// there (a parcel near the feet leaves a level camera's view) to check it.
 fn mine_label(labels: &dyn Labels, resource: &str, name: &str) -> String {
     if labels.resource_mined(resource) {
         format!("{name} 채취")
     } else {
-        format!("{name} 손으로 확인")
+        format!("{name} 내려다보며 확인")
     }
+}
+
+/// The four gathering steps of one target. With a search hint ("창고 선반에서")
+/// the search names where it looks, and a placed item is picked from there.
+fn gather_steps(steps: &mut Vec<Step>, t: &noto_search::Target, labels: &dyn Labels) {
+    let name = labels.resource_ko(&t.resource);
+    let at: Vec<String> = t.origin.iter().map(|p| labels.origin_ko(&p.place)).collect();
+    let locate = if at.is_empty() { format!("{name} 탐색") } else { format!("{} {name} 탐색", at.join(" ")) };
+    steps.push(step(StepKind::Locate, locate, Some(&t.resource)));
+    steps.push(step(StepKind::Approach, format!("{name} 가까이 접근"), Some(&t.resource)));
+    steps.push(step(StepKind::Mine, mine_label(labels, &t.resource, &name), Some(&t.resource)));
+    let collect = match at.last() {
+        Some(place) if !labels.resource_mined(&t.resource) => format!("{place}에서 {name} 집기 {}개", t.quantity),
+        _ => format!("{name} 줍기 {}개", t.quantity),
+    };
+    steps.push(step(StepKind::Collect, collect, Some(&t.resource)));
 }
 
 fn step(kind: StepKind, label: String, resource: Option<&str>) -> Step {
@@ -151,24 +183,18 @@ impl Quest {
         match plan {
             Plan::Fetch { targets, destination } => {
                 for t in targets {
-                    let name = labels.resource_ko(&t.resource);
-                    steps.push(step(StepKind::Locate, format!("{name} 탐색"), Some(&t.resource)));
-                    steps.push(step(StepKind::Approach, format!("{name} 가까이 접근"), Some(&t.resource)));
-                    steps.push(step(StepKind::Mine, mine_label(labels, &t.resource, &name), Some(&t.resource)));
-                    steps.push(step(StepKind::Collect, format!("{name} 줍기 {}개", t.quantity), Some(&t.resource)));
+                    gather_steps(&mut steps, t, labels);
                 }
                 let place = labels.place_ko(&destination.place);
-                steps.push(step(StepKind::Carry, format!("{place}{} 운반", noto_search::text::euro(&place)), None));
+                // Nowhere said: the parcels go back with the robot to where it set out.
+                let carry = if destination.implied() { "복귀" } else { "운반" };
+                steps.push(step(StepKind::Carry, format!("{place}{} {carry}", noto_search::text::euro(&place)), None));
                 steps.push(step(StepKind::Deliver, format!("{place}에 인도"), None));
                 title = format!("{} → {place} 운반", item_list(targets, labels));
             }
             Plan::Collect { targets } => {
                 for t in targets {
-                    let name = labels.resource_ko(&t.resource);
-                    steps.push(step(StepKind::Locate, format!("{name} 탐색"), Some(&t.resource)));
-                    steps.push(step(StepKind::Approach, format!("{name} 가까이 접근"), Some(&t.resource)));
-                    steps.push(step(StepKind::Mine, mine_label(labels, &t.resource, &name), Some(&t.resource)));
-                    steps.push(step(StepKind::Collect, format!("{name} 줍기 {}개", t.quantity), Some(&t.resource)));
+                    gather_steps(&mut steps, t, labels);
                 }
                 title = format!("{} 채취", item_list(targets, labels));
             }
@@ -405,7 +431,7 @@ mod tests {
     }
 
     fn target(r: &str, q: u32) -> Target {
-        Target { resource: r.into(), quantity: q, via: Via::Exact, score: 1.0, text: r.into() }
+        Target { resource: r.into(), quantity: q, via: Via::Exact, score: 1.0, text: r.into(), origin: vec![] }
     }
 
     fn place(p: &str) -> PlaceRef {
@@ -438,6 +464,47 @@ mod tests {
         assert_eq!(q.steps[4].resource.as_deref(), Some("stone"));
         assert_eq!(q.steps.last().unwrap().kind, StepKind::Deliver);
         assert_eq!(q.title, "원목 2개, 돌 3개 → 창고 운반");
+    }
+
+    struct Parcels;
+    impl Labels for Parcels {
+        fn resource_ko(&self, id: &str) -> String {
+            if id == "parcel" { "택배".into() } else { id.into() }
+        }
+        fn place_ko(&self, id: &str) -> String {
+            match id {
+                "base_camp" => "베이스캠프".into(),
+                "warehouse" => "창고".into(),
+                other => other.into(),
+            }
+        }
+        fn resource_mined(&self, id: &str) -> bool {
+            id != "parcel"
+        }
+    }
+
+    #[test]
+    fn a_parcel_is_looked_down_at_picked_where_it_lies_and_brought_back_to_the_base() {
+        // "창고 선반에서 택배 가져와": a search hint, a pick from the shelf, the implied way home.
+        let mut t = target("parcel", 1);
+        t.origin = vec![place("warehouse"), place("shelf")];
+        let home = PlaceRef { place: "base_camp".into(), via: Via::Exact, score: 1.0, text: String::new() };
+        let q = Quest::from_plan("q".into(), &Plan::Fetch { targets: vec![t], destination: home.clone() }, &Parcels, 0).unwrap();
+        let labels: Vec<&str> = q.steps.iter().map(|s| s.label_ko.as_str()).collect();
+        assert_eq!(labels, vec!["창고 선반 택배 탐색", "택배 가까이 접근", "택배 내려다보며 확인", "선반에서 택배 집기 1개", "베이스캠프로 복귀", "베이스캠프에 인도"]);
+        // Said out loud, the base camp is a delivery like any other; with no hint the parcel is picked up as before.
+        let said = PlaceRef { text: "베이스캠프로".into(), ..home };
+        let q = Quest::from_plan("q".into(), &Plan::Fetch { targets: vec![target("parcel", 2)], destination: said }, &Parcels, 0).unwrap();
+        assert_eq!(q.steps[0].label_ko, "택배 탐색");
+        assert_eq!(q.steps[3].label_ko, "택배 줍기 2개");
+        assert_eq!(q.steps[4].label_ko, "베이스캠프로 운반");
+        // From a doorstep: the site place has its own Korean name.
+        let mut t = target("parcel", 1);
+        t.origin = vec![place("doorstep")];
+        let q = Quest::from_plan("q".into(), &Plan::Collect { targets: vec![t] }, &Parcels, 0).unwrap();
+        assert_eq!(q.steps[3].label_ko, "현관 앞에서 택배 집기 1개");
+        let v = serde_json::to_value(&q).unwrap();
+        assert_eq!(v["plan"]["targets"][0]["origin"][0]["place"], "doorstep");
     }
 
     #[test]

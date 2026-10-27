@@ -4,7 +4,9 @@
 //! topped columns (a blocky look). Smooth height changes between neighbouring
 //! cells are judged as slopes. Sharp obstacles are separate "curbs": a curb
 //! sits on top of a cell and is judged as a step. That mirrors the two kinds of
-//! terrain segment in `noto_core::Terrain` (`Slope` and `Step`).
+//! terrain segment in `noto_core::Terrain` (`Slope` and `Step`). A site's
+//! porches, stair treads and ramps (`crate::site`) are curbs too, tagged with a
+//! [`CurbKind`]: a stair keeps the step rule, a ramp joins its cells as a slope.
 
 use serde::{Deserialize, Serialize};
 
@@ -71,6 +73,42 @@ pub struct RuggedLayout {
     pub water_cells: usize,
 }
 
+/// Largest curb difference between two cells, centimetres, that a ramp joins
+/// as a smooth slope instead of a step (est: the 1:12 ramp rises 4.2 cm per
+/// 0.5 m cell, plus a centimetre of rounding to whole centimetres).
+pub const RAMP_SMOOTH_MAX_CM: i32 = 6;
+
+/// What a cell's curb is. The map's curb wall is a sharp edge at the cell's
+/// border (a step between cells); a site's structures raise cells the same
+/// way (`crate::site`) and say what the raise is, so the route planner, the
+/// renderer and the map tell a stair from a kerb and a ramp from a step.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum CurbKind {
+    /// A kerb: a sharp step at the cell's edge (the curb wall).
+    #[default]
+    Curb = 0,
+    /// A stair tread: a step like a curb, built as a stair.
+    Step = 1,
+    /// A raised floor slab (a porch landing, a house floor): level on top, a step at its edge.
+    Floor = 2,
+    /// A ramp: between two cells of which one is a ramp cell, a curb
+    /// difference up to [`RAMP_SMOOTH_MAX_CM`] is a slope, not a step.
+    Ramp = 3,
+}
+
+impl CurbKind {
+    pub fn from_u8(v: u8) -> CurbKind {
+        match v {
+            1 => CurbKind::Step,
+            2 => CurbKind::Floor,
+            3 => CurbKind::Ramp,
+            _ => CurbKind::Curb,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Terrain {
     pub w: usize,
@@ -78,6 +116,9 @@ pub struct Terrain {
     heights_cm: Vec<i16>,
     curb_cm: Vec<u8>,
     ground: Vec<Ground>,
+    /// [`CurbKind`] per cell; empty when every curb is a kerb (maps without a site).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    curb_kind: Vec<u8>,
 }
 
 fn smoothstep(t: f32) -> f32 {
@@ -147,6 +188,7 @@ impl Terrain {
             heights_cm,
             curb_cm: vec![0; w * d],
             ground,
+            curb_kind: Vec::new(),
         }
     }
 
@@ -186,6 +228,41 @@ impl Terrain {
     pub fn set_ground(&mut self, cx: usize, cz: usize, g: Ground) {
         let i = self.idx(cx, cz);
         self.ground[i] = g;
+    }
+
+    /// What the curb on a cell is ([`CurbKind::Curb`] unless a site said otherwise).
+    pub fn curb_kind(&self, cx: usize, cz: usize) -> CurbKind {
+        if self.curb_kind.is_empty() {
+            return CurbKind::Curb;
+        }
+        CurbKind::from_u8(self.curb_kind[self.idx(cx, cz)])
+    }
+
+    pub fn set_curb_kind(&mut self, cx: usize, cz: usize, k: CurbKind) {
+        if self.curb_kind.is_empty() {
+            if k == CurbKind::Curb {
+                return;
+            }
+            self.curb_kind = vec![CurbKind::Curb as u8; self.w * self.d];
+        }
+        let i = self.idx(cx, cz);
+        self.curb_kind[i] = k as u8;
+    }
+
+    /// The curb kinds as codes per cell (row by row), empty when every curb is a kerb.
+    pub fn curb_kind_codes(&self) -> &[u8] {
+        &self.curb_kind
+    }
+
+    /// The curb difference from `a` to `b` when a ramp joins them smoothly,
+    /// metres (signed, up positive); `None` when it is a step or there is none.
+    pub fn ramp_rise_m(&self, a: (usize, usize), b: (usize, usize)) -> Option<f32> {
+        if self.curb_kind.is_empty() {
+            return None;
+        }
+        let ramp = self.curb_kind(a.0, a.1) == CurbKind::Ramp || self.curb_kind(b.0, b.1) == CurbKind::Ramp;
+        let d = self.curb_cm[self.idx(b.0, b.1)] as i32 - self.curb_cm[self.idx(a.0, a.1)] as i32;
+        (ramp && d != 0 && d.abs() <= RAMP_SMOOTH_MAX_CM).then(|| d as f32 / 100.0)
     }
 
     /// Sets a cell height, quantised to the grid step. Used by scenario setup

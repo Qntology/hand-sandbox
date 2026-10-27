@@ -4,11 +4,17 @@
 //! `prejudice` prompts in the same node format as the command words. An image
 //! tile is scored against every entity at once; the caller decides how a raw
 //! cosine becomes a probability (SigLIP uses `sigmoid(scale * cos + bias)`).
+//!
+//! [`VisionPrompting`] (the lexicon's `vision_prompting` key, v1.0) adds
+//! prompt templates, averaged per phrase in embedding space, and a background
+//! set: scene-generic phrases that are not subtracted from an entity as its
+//! prejudice when [`VisionBank::build_with`] is given the prompting.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
+use serde::Deserialize;
 
 use crate::lexicon::{EntityKind, Lexicon};
 use crate::semantic::{cosine, PhraseEmbedder};
@@ -37,22 +43,88 @@ pub struct VisionBank {
     pub entities: Vec<EntityVectors>,
 }
 
+/// Prompt templates and background phrases (the lexicon's `vision_prompting`).
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct VisionPrompting {
+    /// `{}` stands for a phrase.
+    #[serde(default)]
+    pub templates: Vec<String>,
+    #[serde(default)]
+    pub background: Vec<String>,
+}
+
+impl VisionPrompting {
+    /// Reads the `vision_prompting` key of a lexicon file; empty when it has none.
+    pub fn from_lexicon_json(raw: &str) -> Result<VisionPrompting> {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            vision_prompting: Option<VisionPrompting>,
+        }
+        let r: Raw = serde_json::from_str(raw).context("parsing vision_prompting of the world lexicon")?;
+        Ok(r.vision_prompting.unwrap_or_default())
+    }
+
+    /// A phrase in one template.
+    pub fn apply(template: &str, phrase: &str) -> String {
+        if template.contains("{}") {
+            template.replace("{}", phrase)
+        } else {
+            format!("{template} {phrase}")
+        }
+    }
+
+    /// Whether a phrase is one of the background phrases.
+    pub fn is_background(&self, phrase: &str) -> bool {
+        self.background.iter().any(|b| b.eq_ignore_ascii_case(phrase.trim()))
+    }
+}
+
+/// The unit mean of unit vectors.
+fn mean_unit(vs: &[Arc<[f32]>]) -> Option<Arc<[f32]>> {
+    let first = vs.first()?;
+    let mut m = vec![0.0f32; first.len()];
+    for v in vs {
+        for (a, b) in m.iter_mut().zip(v.iter()) {
+            *a += b;
+        }
+    }
+    let n = m.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+    Some(m.into_iter().map(|x| x / n).collect::<Vec<f32>>().into())
+}
+
 impl VisionBank {
     /// Embeds every vision prompt once (the embedder deduplicates and caches).
     pub fn build(lex: &Lexicon, emb: &dyn PhraseEmbedder) -> Result<VisionBank> {
-        let mut texts: Vec<String> = Vec::new();
+        VisionBank::build_with(lex, emb, None)
+    }
+
+    /// [`VisionBank::build`] with prompting: every phrase's vector is the unit
+    /// mean over its templated forms, and prejudice phrases that are
+    /// background phrases are left out (a grass field is behind almost every
+    /// tile; subtracting it lowers true detections, it does not separate
+    /// look-alikes).
+    pub fn build_with(lex: &Lexicon, emb: &dyn PhraseEmbedder, prompting: Option<&VisionPrompting>) -> Result<VisionBank> {
+        let templates: &[String] = prompting.map_or(&[], |p| p.templates.as_slice());
+        let skip = |t: &str| prompting.map_or(false, |p| p.is_background(t));
+        let mut phrases: Vec<String> = Vec::new();
         let mut seen = HashSet::new();
         for e in &lex.vision {
-            for p in e.bias.iter().chain(&e.prejudice) {
+            for p in e.bias.iter().chain(e.prejudice.iter().filter(|p| !skip(&p.text))) {
                 if seen.insert(p.text.clone()) {
-                    texts.push(p.text.clone());
+                    phrases.push(p.text.clone());
                 }
             }
         }
-        let vecs = emb.embed_phrases(&texts)?;
-        if vecs.len() != texts.len() {
-            bail!("embedder returned {} vectors for {} prompts", vecs.len(), texts.len());
+        // The forms that go to the embedder: the phrases, or every phrase in every template.
+        let forms: Vec<String> = if templates.is_empty() { phrases.clone() } else { phrases.iter().flat_map(|p| templates.iter().map(move |t| VisionPrompting::apply(t, p))).collect() };
+        let vecs = emb.embed_phrases(&forms)?;
+        if vecs.len() != forms.len() {
+            bail!("embedder returned {} vectors for {} prompts", vecs.len(), forms.len());
         }
+        let per = templates.len().max(1);
+        let vecs: Vec<Arc<[f32]>> = if templates.is_empty() { vecs } else { vecs.chunks(per).map(|c| mean_unit(c).expect("a chunk per phrase")).collect() };
+        let texts = phrases;
         let by_text: HashMap<&str, Arc<[f32]>> = texts.iter().map(String::as_str).zip(vecs).collect();
         let entities = lex
             .vision
@@ -66,7 +138,9 @@ impl VisionBank {
                     .iter()
                     .filter_map(|p| by_text.get(p.text.as_str()).map(|v| (v.clone(), p.weight)))
                     .collect(),
-                prejudice: e.prejudice.iter().filter_map(|p| by_text.get(p.text.as_str()).cloned()).collect(),
+                // A background phrase is never subtracted, even when another
+                // entity has it as a bias phrase (so it has a vector).
+                prejudice: e.prejudice.iter().filter(|p| !skip(&p.text)).filter_map(|p| by_text.get(p.text.as_str()).cloned()).collect(),
             })
             .collect();
         Ok(VisionBank { entities })
@@ -164,6 +238,31 @@ mod tests {
         let r = raw.iter().find(|e| e.id == "tree").unwrap().bias;
         let h = half.iter().find(|e| e.id == "tree").unwrap().bias;
         assert!((r * 0.5 - h).abs() < 1e-6);
+    }
+
+    #[test]
+    fn background_phrases_are_not_subtracted_and_templates_are_averaged() {
+        let prompting = VisionPrompting { templates: vec!["a photo of {}".into(), "{} in a game".into()], background: vec!["Grey Boulder".into()] };
+        let bank = VisionBank::build_with(&lex(), &BigramEmbedder, Some(&prompting)).unwrap();
+        let tree = bank.entities.iter().find(|e| e.id == "tree").unwrap();
+        assert!(tree.prejudice.is_empty(), "the tree's only prejudice is a background phrase");
+        // A bias vector is the unit mean of the templated forms.
+        let a = bigram_vector("a photo of green leafy tree");
+        let b = bigram_vector("green leafy tree in a game");
+        let mut m: Vec<f32> = a.iter().zip(&b).map(|(x, y)| x + y).collect();
+        let n = m.iter().map(|x| x * x).sum::<f32>().sqrt();
+        m.iter_mut().for_each(|x| *x /= n);
+        assert!((cosine(&tree.bias[0].0, &m) - 1.0).abs() < 1e-5);
+        assert_eq!(VisionPrompting::apply("a photo of {}.", "a tree"), "a photo of a tree.");
+    }
+
+    #[test]
+    fn the_lexicon_carries_its_prompting() {
+        let raw = include_str!("../../../data/world_lexicon.json");
+        let p = VisionPrompting::from_lexicon_json(raw).unwrap();
+        assert!(!p.templates.is_empty() && p.templates.iter().all(|t| t.contains("{}")));
+        assert!(p.is_background("a grass field"));
+        assert_eq!(VisionPrompting::from_lexicon_json(r#"{"version": 1}"#).unwrap(), VisionPrompting::default());
     }
 
     #[test]

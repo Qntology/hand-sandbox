@@ -192,7 +192,7 @@ fn phase(id: &str, subsystem: &'static str, weight: f32, posture: Posture, cause
 /// S8 is [`holdout`]).
 pub fn library(body: &Body) -> Vec<ScenarioSpec> {
     let load = load10(body);
-    let walk = body.legged;
+    let walk = body.legged();
     let mut out = Vec::new();
     // S1: lifting on a 10° slope. Mini-BESTest sensory : anticipatory = 6 : 6; segments
     // sensory side head/chest/foot equal, lifting side REBA maxima.
@@ -312,7 +312,7 @@ pub fn holdout(body: &Body, seed: u64, count: usize) -> Vec<ScenarioSpec> {
             0 => ("경사 + 들기", vec![phase("lift", "anticipatory", 1.0, lift_posture(body, load, slope), &[Cause::ArmLift, Cause::Slope])]),
             1 => ("짐 + 제동", vec![PhaseSpec { imposed: true, ..phase("brake", "reactive", 1.0, Posture { source: Source::Accel, accel_mps2: -brake, ..Posture::quiet(load) }, &[Cause::CarryFront, Cause::Brake]) }]),
             2 => ("경사 + 짐 + 제동", vec![PhaseSpec { imposed: true, ..phase("brake", "reactive", 1.0, Posture { source: Source::Accel, accel_mps2: -brake, slope_deg: slope, ..Posture::quiet(load) }, &[Cause::CarryFront, Cause::Brake, Cause::Slope]) }]),
-            _ => ("짐 + 턱", vec![phase("step", "anticipatory", 1.0, Posture { source: Source::StepUp, step_m: step, single_support: body.legged, ..Posture::quiet(load) }, &[Cause::CarryFront, Cause::StepUp])]),
+            _ => ("짐 + 턱", vec![phase("step", "anticipatory", 1.0, Posture { source: Source::StepUp, step_m: step, single_support: body.legged(), ..Posture::quiet(load) }, &[Cause::CarryFront, Cause::StepUp])]),
         };
         let id: &'static str = Box::leak(format!("H{}-{i}", seed % 1000).into_boxed_str());
         out.push(ScenarioSpec { id, name_ko: name, seg_w: [1.0 / 7.0; 7], weights_from: "DARPA DRC: 과제당 통과/실패, 동일 가중", needs_legs: kind == 3, holdout: true, phases });
@@ -346,11 +346,12 @@ pub fn composite_reference(source: Source, target: Segment, axis: &str, accel: f
     }
 }
 
+/// A cell with a reference is a likeness cell of the shared judge (`crate::bench::judge`); one without is recorded.
 fn scored(c: &mut Cell) {
-    if let (Some(r), Some(t)) = (c.reference, c.tolerance) {
-        let z = (c.value - r) / t.max(1e-6);
-        c.z = Some(z);
-        c.score = Some((100.0 - 10.0 * z.abs()).max(0.0));
+    if let (Some(reference), Some(tolerance)) = (c.reference, c.tolerance) {
+        let v = crate::bench::judge(Some(c.value), crate::bench::Rule::Like { reference, tolerance });
+        c.z = v.z;
+        c.score = v.score;
     }
 }
 
@@ -470,7 +471,7 @@ pub fn score_phase(spec: &PhaseSpec, seg_w: &[f32; 7], cells: Vec<Cell>, r: &Bal
 /// scenario), scored, and the phases combined.
 pub fn evaluate(body: &Body, spec: &ScenarioSpec, ff: &FeedForward) -> ScenarioResult {
     let cfg = DynCfg::default();
-    if spec.needs_legs && !body.legged {
+    if spec.needs_legs && !body.legged() {
         return ScenarioResult { id: spec.id, name_ko: spec.name_ko, holdout: spec.holdout, skipped: Some("다리가 없는 베이스에는 이 동작(17 cm 턱 · 한 발 서기)이 없음".into()), phases: vec![], score: 0.0, gated: false, gates: vec![], passed: false, weights_from: spec.weights_from };
     }
     let mut prev = Posture::quiet(spec.phases.first().map_or(0.0, |p| p.posture.cargo_kg));

@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::base::BaseKind;
 use crate::hand::FingerCount;
+use crate::morph::{HeadMount, Morphology, Torso};
 use crate::wear::Reducer;
 
 /// Hip height above the ground (or the chassis mast top for wheeled bases), metres.
@@ -296,6 +297,23 @@ pub struct LiftPreset {
 /// stroke, and 0.9 kg of motor and brake), and its cost (est).
 pub const TORSO_LIFT: LiftPreset = LiftPreset { name: "몸통 리프트 (Fetch 급 0.40 m · 450 N)", stroke_m: 0.40, speed_mps: 0.10, force_n: 450.0, mass_kg: 2.5, power_w: 30.0, cost_usd: 600.0, src: "Fetch 사양 · 질량·가격 추정" };
 
+/// Mass of a belt-axis lift of `stroke_m`, kg: the axis (igus drylin
+/// ZLW-1040, 1.0 kg + 0.14 kg per 100 mm of stroke) and 0.9 kg of stepper and
+/// brake, the estimate [`TORSO_LIFT`]'s 2.5 kg is rounded from (est).
+pub const fn lift_mass_kg(stroke_m: f32) -> f32 {
+    1.0 + 1.4 * stroke_m + 0.9
+}
+
+/// The lift of a mast that carries the arm's carriage below its camera (no
+/// torso, `morph::Morphology::mast_arms`): Stretch RE1 takes its arm from the
+/// floor to 1.10 m on such a lift (Kemp et al., ICRA 2022, Sec. II). The
+/// stroke here is the form's own (`Morphology::mast_lift_m`: from
+/// `morph::MAST_LIFT_TOP_M` down to a deck arm's shoulder height, 0.84 m for
+/// the Stretch-like form), and its mass follows the stroke by the same
+/// belt-axis estimate ([`lift_mass_kg`]: 3.08 kg at 0.84 m). No source gives
+/// the lift's speed or force: they are [`TORSO_LIFT`]'s (est); its cost est.
+pub const MAST_LIFT: LiftPreset = LiftPreset { name: "마스트 리프트 (Stretch 급)", stroke_m: 0.84, speed_mps: 0.10, force_n: 450.0, mass_kg: lift_mass_kg(0.84), power_w: 30.0, cost_usd: 600.0, src: "행정: Stretch RE1 리프트 · 속도·힘·질량·가격 추정" };
+
 impl HeadPreset {
     pub fn of(tier: Tier) -> HeadPreset {
         match tier.no_plus() {
@@ -360,6 +378,31 @@ impl ChassisPreset {
     }
 }
 
+/// A parallel-jaw gripper at the end of a single arm (`morph::Manip::Gripper1`).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct GripperPreset {
+    pub tier: Tier,
+    pub name: &'static str,
+    pub mass_kg: f32,
+    /// Jaw force, peak and continuous, N (`None` where no source gives it).
+    pub peak_n: Option<f32>,
+    pub cont_n: Option<f32>,
+    pub src: &'static str,
+}
+
+impl GripperPreset {
+    pub fn of(tier: Tier) -> GripperPreset {
+        match tier.no_plus() {
+            // SO-101 jaw: one STS3215, ~0.13 kg, ~21 N peak / ~7 N continuous (est) [29].
+            Tier::Budget => GripperPreset { tier: Tier::Budget, name: "SO-101 집게 (STS3215 ×1)", mass_kg: 0.13, peak_n: Some(21.0), cont_n: Some(7.0), src: "29 · 힘 추정" },
+            // A two-finger XM430 jaw (est, research §2, as `hand_mass_kg(Two)`).
+            Tier::Mid => GripperPreset { tier: Tier::Mid, name: "2지 XM430 집게 (추정)", mass_kg: 0.35, peak_n: None, cont_n: None, src: "est" },
+            // Robotiq 2F-85: 0.9 kg, 20–235 N [37].
+            _ => GripperPreset { tier: Tier::Pro, name: "Robotiq 2F-85", mass_kg: 0.9, peak_n: Some(235.0), cont_n: Some(20.0), src: "37" },
+        }
+    }
+}
+
 /// Mass of the hand for a finger count (est from the hands in research §2:
 /// a two-finger XM430 jaw ~0.35 kg, an underactuated three-finger ~0.40 kg,
 /// five-finger dexterous hands 0.54–0.60 kg).
@@ -388,6 +431,10 @@ pub struct BodyPlan {
     /// A torso lift on the mast of a wheeled or tracked base ([`TORSO_LIFT`]; nothing on legs).
     #[serde(default)]
     pub lift: bool,
+    /// The robot's form layer by layer (`morph`); the default is today's
+    /// humanoid. Its lower body follows the drive (`NotoConfig.base`).
+    #[serde(default)]
+    pub morph: Morphology,
 }
 
 impl Default for BodyPlan {
@@ -398,11 +445,43 @@ impl Default for BodyPlan {
 
 impl BodyPlan {
     pub fn uniform(tier: Tier) -> BodyPlan {
-        BodyPlan { head: tier, chest: tier, belly: tier, arm: tier, leg: tier, battery_low: false, lift: false }
+        BodyPlan { head: tier, chest: tier, belly: tier, arm: tier, leg: tier, battery_low: false, lift: false, morph: Morphology::default() }
     }
 
-    /// Short id such as `mid` or `h:mid c:pro b:mid a:budget l:mid bat:low`.
+    /// Short id such as `mid` or `h:mid c:pro b:mid a:budget l:mid bat:low`,
+    /// with the form's key after a `+` when the upper layers are not the
+    /// humanoid's (`mid+truck`; `morph::Morphology::upper_key`).
     pub fn id(&self) -> String {
+        match self.morph.upper_key() {
+            Some(k) => format!("{}+{k}", self.tier_id()),
+            None => self.tier_id(),
+        }
+    }
+
+    /// `Ok` when the plan's form can be built on the drive `base` (its lower
+    /// body is that drive, its sizes in range: `morph::Morphology::validate`)
+    /// and an arm can load its own tote or bed (the hand gets over it,
+    /// `act::grasp::stow_pose`, with the plan's lift), else the reasons in
+    /// Korean. `balance::Body::new` builds any plan by fitting the form
+    /// (`Morphology::fit`); this says what the fit would change and what the
+    /// built robot cannot do (an arm on a trunk or a column high over a low
+    /// tote or bed keeps what it picks in its hand).
+    pub fn validate(&self, base: BaseKind) -> Result<(), String> {
+        let mut v = self.morph.issues(base);
+        let body = crate::balance::Body::new(self, base, FingerCount::Five);
+        if let Some(c) = body.cargo_geom().filter(|c| body.has_manipulator() && !c.on_pelvis) {
+            if crate::act::grasp::stow_pose(&body, false, 0.0).is_none() {
+                v.push(format!("팔이 {}에 닿지 않음 (내려놓을 점 {:.2} m): 집은 물건을 직접 실을 수 없음 — 리프트를 달거나 배 앞 적재함을 쓸 것", c.cargo.label_ko(), c.release[1]));
+            }
+        }
+        if v.is_empty() {
+            Ok(())
+        } else {
+            Err(v.join("; "))
+        }
+    }
+
+    fn tier_id(&self) -> String {
         let u = [self.head, self.chest, self.belly, self.arm].iter().all(|t| *t == self.head) && self.leg == self.head;
         if u && !self.battery_low && !self.lift {
             return self.head.id().to_string();
@@ -458,15 +537,40 @@ impl BodyPlan {
     pub fn chassis_preset(&self) -> ChassisPreset {
         ChassisPreset::of(self.leg)
     }
-    /// The torso lift on a wheeled or tracked base, when the plan has one.
+    /// The torso lift on a wheeled or tracked base, when the plan has one and
+    /// the form has a trunk or a column for its carriage to slide on; a mast
+    /// that carries the arm always has its own lift ([`MAST_LIFT`], its stroke
+    /// from the form's mast, `Morphology::mast_lift_m`). Call it with the form
+    /// fitted to the drive (`Morphology::fit`), as `Body::new` does.
     pub fn lift_preset(&self, base: BaseKind) -> Option<LiftPreset> {
-        (self.lift && base != BaseKind::HumanFoot).then_some(TORSO_LIFT)
+        if base == BaseKind::HumanFoot {
+            return None;
+        }
+        if let Some((_, stroke_m)) = self.morph.mast_lift_m() {
+            return Some(LiftPreset { stroke_m, mass_kg: lift_mass_kg(stroke_m), ..MAST_LIFT });
+        }
+        (self.lift && self.morph.torso != Torso::None).then_some(TORSO_LIFT)
     }
 
-    /// Approximate parts cost, US dollars, for two arms and two legs (or one chassis).
+    /// The gripper of a single gripper arm (`Manip::Gripper1`), on the arm's tier.
+    pub fn gripper_preset(&self) -> GripperPreset {
+        GripperPreset::of(self.arm)
+    }
+
+    /// Approximate parts cost, US dollars, of the parts the form has: the
+    /// head (without its neck servos when it is fixed), the chest, the belly
+    /// with a humanoid torso, each arm, two legs or one chassis (and the lift).
     pub fn cost_usd(&self, base: BaseKind) -> f32 {
-        let lower = if base == BaseKind::HumanFoot { 2.0 * self.leg_preset().cost_usd } else { self.chassis_preset().cost_usd + self.lift_preset(base).map_or(0.0, |l| l.cost_usd) };
-        self.head_preset().cost_usd + self.chest_preset().cost_usd + self.belly_preset().cost_usd + 2.0 * self.arm_preset().cost_usd + lower
+        let m = self.morph.fit(base);
+        let lower = if base == BaseKind::HumanFoot { 2.0 * self.leg_preset().cost_usd } else { self.chassis_preset().cost_usd + BodyPlan { morph: m, ..*self }.lift_preset(base).map_or(0.0, |l| l.cost_usd) };
+        let h = self.head_preset();
+        let head = match m.head {
+            HeadMount::Neck | HeadMount::MastCamera { pan_tilt: true, .. } => h.cost_usd,
+            HeadMount::Fixed { .. } | HeadMount::MastCamera { .. } | HeadMount::ChassisFront { .. } => h.cost_usd - 2.0 * h.neck.price_usd,
+            HeadMount::None => 0.0,
+        };
+        let belly = if m.torso == Torso::Humanoid { self.belly_preset().cost_usd } else { 0.0 };
+        head + self.chest_preset().cost_usd + belly + m.arm_count() as f32 * self.arm_preset().cost_usd + lower
     }
 }
 
@@ -499,6 +603,31 @@ mod tests {
         let back: BodyPlan = serde_json::from_str(r#"{"head":"mid","chest":"mid","belly":"mid","arm":"mid","leg":"budget_plus"}"#).unwrap();
         assert_eq!(back.leg, Tier::BudgetPlus);
         assert!(!back.battery_low, "the battery position defaults to the chest");
+        assert_eq!(back.morph, Morphology::default(), "a plan without a form is today's humanoid");
+    }
+
+    #[test]
+    fn a_form_suffixes_the_id_and_changes_the_cost() {
+        let truck = BodyPlan { morph: Morphology::named("truck").unwrap(), ..BodyPlan::default() };
+        assert_eq!(truck.id(), "mid+truck");
+        let lifted = BodyPlan { lift: true, morph: Morphology::named("mast_gripper").unwrap(), ..BodyPlan::default() };
+        assert_eq!(lifted.id(), "h:mid c:mid b:mid a:mid l:mid lift+mast_gripper");
+        // The humanoid forms keep today's ids, whatever their lower body.
+        for f in ["legs_humanoid", "wheel_humanoid", "track_humanoid"] {
+            assert_eq!(BodyPlan { morph: Morphology::named(f).unwrap(), ..BodyPlan::default() }.id(), "mid");
+        }
+        // No arms and no belly cost less; a bare deck has no carriage for a lift, a mast with an arm always has its own.
+        assert!(truck.cost_usd(BaseKind::Wheel) < BodyPlan::default().cost_usd(BaseKind::Wheel));
+        let deck = BodyPlan { lift: true, morph: Morphology::named("deck_gripper").unwrap(), ..BodyPlan::default() };
+        assert!(deck.lift_preset(BaseKind::Wheel).is_none());
+        let mast = BodyPlan { morph: Morphology::named("mast_gripper").unwrap(), ..BodyPlan::default() };
+        assert_eq!(mast.lift_preset(BaseKind::Wheel).map(|l| l.name), Some(MAST_LIFT.name));
+        assert_eq!(lifted.lift_preset(BaseKind::Wheel), mast.lift_preset(BaseKind::Wheel));
+        assert!(mast.lift_preset(BaseKind::HumanFoot).is_none());
+        let json = serde_json::to_string(&truck).unwrap();
+        let back: BodyPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, truck);
+        assert_eq!(GripperPreset::of(Tier::Budget).mass_kg, 0.13);
     }
 
     #[test]

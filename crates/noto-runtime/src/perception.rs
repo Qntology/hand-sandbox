@@ -95,6 +95,12 @@ pub struct ScanOutput {
 pub trait Recognizer: Send {
     /// `oracle` or `embedding`.
     fn mode(&self) -> &str;
+    /// What the SDS `vision` statistics of this recogniser are kept under:
+    /// its mode, plus anything that changes what its scores mean (a
+    /// calibrated embedding recogniser is `embedding+cal`).
+    fn scope(&self) -> String {
+        self.mode().to_string()
+    }
     fn scan(&mut self, input: ScanInput<'_>) -> Result<ScanOutput>;
     /// Changes the injected errors. Only the stand-in recogniser has any.
     fn set_noise(&mut self, _noise: &NoiseCfg) {}
@@ -202,17 +208,150 @@ fn gauss(rng: &mut Rng) -> f32 {
     (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
 }
 
+/// Outcome model of the real tile recogniser (SigLIP2 through
+/// `embedding::EmbeddingPerception`) after the gates' score and margin floor,
+/// measured on rendered keyframes by the A/B harness (`tests/ml_ab.rs`,
+/// `[MLAB] scan/errmodel`, `docs/research/ml-ab.md`). It describes what the
+/// real recogniser was seen to do, it is not a choice:
+///
+/// * a source or drop in view is reported under its own label within the
+///   gates' 1 m with probability `σ(det_a·ln(pixels) + det_b)`;
+/// * `false_per_scan` wrong candidates (another label, or nothing within
+///   1 m) pass the floor per scan on average (Poisson);
+/// * a right candidate's ground position is off by `pos_sd_m` per axis;
+/// * the scores and margins of passing candidates, right and wrong.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ScanErrModel {
+    pub det_a: f32,
+    pub det_b: f32,
+    pub false_per_scan: f32,
+    pub pos_sd_m: f32,
+    /// Score of a right candidate, (mean, SD).
+    pub score_true: (f32, f32),
+    /// Score of a wrong candidate, (mean, SD).
+    pub score_false: (f32, f32),
+    /// Margin over the runner-up of a passing candidate, (mean, SD).
+    pub margin: (f32, f32),
+    /// The score and margin floors the passing candidates were measured at
+    /// (draws stay at or above them).
+    pub score_floor: f32,
+    pub margin_floor: f32,
+}
+
+impl ScanErrModel {
+    /// SigLIP2 (`siglip2-base-patch16-naflex`) through the tile scan as the
+    /// v1.0 runtime uses it, on this renderer (`[MLAB] scan/errmodel`).
+    pub const SIGLIP_MEASURED: ScanErrModel = ScanErrModel {
+        det_a: 0.0,
+        det_b: 0.0,
+        false_per_scan: 0.0,
+        pos_sd_m: 0.0,
+        score_true: (0.5, 0.0),
+        score_false: (0.5, 0.0),
+        margin: (0.1, 0.0),
+        score_floor: 0.30,
+        margin_floor: 0.04,
+    };
+}
+
 pub struct OraclePerception {
     table: EntityTable,
     noise: NoiseCfg,
     rng: Rng,
     min_pixels: u32,
+    /// The measured error model of the real recogniser; `None` is the chosen
+    /// noise of [`NoiseCfg`] (before v1.0).
+    honest: Option<ScanErrModel>,
 }
 
 impl OraclePerception {
     pub fn new(lex: &Lexicon, noise: NoiseCfg, min_pixels: u32) -> OraclePerception {
         let rng = Rng::new(noise.seed);
-        OraclePerception { table: EntityTable::from_lexicon(lex), noise, rng, min_pixels }
+        OraclePerception { table: EntityTable::from_lexicon(lex), noise, rng, min_pixels, honest: None }
+    }
+
+    /// The stand-in spoiled the way the real tile recogniser was measured to
+    /// be wrong ([`ScanErrModel`]) instead of by [`NoiseCfg`]; `None` goes back.
+    /// Its SDS statistics are kept apart (`scope`).
+    pub fn set_honest(&mut self, model: Option<ScanErrModel>) {
+        self.honest = model;
+    }
+
+    pub fn honest(&self) -> Option<&ScanErrModel> {
+        self.honest.as_ref()
+    }
+
+    /// One candidate of the honest stand-in.
+    #[allow(clippy::too_many_arguments)]
+    fn measured_candidate(&mut self, m: &ScanErrModel, label: &str, bbox: [f32; 4], pixels: u32, depth_m: f32, world: Option<(f32, f32)>, right: bool, truth: Option<(String, String)>) -> Option<Candidate> {
+        let (kind, link) = self.table.get(label).cloned()?;
+        let (mean, sd) = if right { m.score_true } else { m.score_false };
+        let score = (mean + sd * gauss(&mut self.rng)).clamp(m.score_floor, 0.99);
+        let margin = (m.margin.0 + m.margin.1 * gauss(&mut self.rng)).clamp(m.margin_floor, 1.0);
+        let world = world.map(|(x, z)| if right { (x + m.pos_sd_m * gauss(&mut self.rng), z + m.pos_sd_m * gauss(&mut self.rng)) } else { (x, z) });
+        Some(Candidate {
+            label: label.to_string(),
+            kind,
+            link,
+            score,
+            margin,
+            runner_up: look_alike(label).map(String::from),
+            bbox,
+            pixels,
+            depth_m,
+            world,
+            truth: truth.as_ref().map(|t| t.0.clone()),
+            truth_label: truth.map(|t| t.1),
+        })
+    }
+
+    fn scan_measured(&mut self, input: ScanInput<'_>, m: ScanErrModel) -> Result<ScanOutput> {
+        let (w, h) = (input.frame.width as f32, input.frame.height as f32);
+        let view = input.world.head_view(input.camera).est;
+        let centroids = visible_centroids(input.frame, input.camera, &view);
+        let mut out = ScanOutput { device: "cpu (oracle, measured)".into(), ..ScanOutput::default() };
+        for v in input.world.visible_objects(input.frame) {
+            let Some((kind, _)) = self.table.get(&v.label).cloned() else { continue };
+            let bbox = [v.bbox[0] as f32 / w, v.bbox[1] as f32 / h, (v.bbox[2] + 1) as f32 / w, (v.bbox[3] + 1) as f32 / h];
+            let (px, py) = ((bbox[0] + bbox[2]) * 0.5 * w, (bbox[1] + bbox[3]) * 0.5 * h);
+            let world = centroids.get(&v.entity).copied().or_else(|| input.camera.world_point3_in(&view, px, py, v.depth_m)).map(|p| centre_from_surface(&view, p, centre_offset_m(kind)));
+            // Places were never part of the measurement: reported as they are.
+            let p_det = if kind == EntKind::Waypoint { 1.0 } else { 1.0 / (1.0 + (-(m.det_a * (v.pixels.max(1) as f32).ln() + m.det_b)).exp()) };
+            if self.rng.next_f32() < p_det {
+                if let Some(c) = self.measured_candidate(&m, &v.label, bbox, v.pixels, v.depth_m, world, true, Some((v.entity.clone(), v.label.clone()))) {
+                    out.candidates.push(c);
+                }
+            }
+        }
+        // Wrong candidates: a Poisson count, each a random label somewhere on the ground in view.
+        let mut k = 0u32;
+        let (limit, mut p) = ((-m.false_per_scan.max(0.0)).exp(), 1.0f32);
+        loop {
+            p *= self.rng.next_f32();
+            if p <= limit || k >= 64 {
+                break;
+            }
+            k += 1;
+        }
+        let labels: Vec<String> = self.table.labels().into_iter().filter(|l| self.table.get(l).map_or(false, |(k, _)| *k != EntKind::Waypoint)).map(String::from).collect();
+        for _ in 0..k {
+            if labels.is_empty() {
+                break;
+            }
+            let label = labels[self.rng.below(labels.len() as u32) as usize].clone();
+            let (bw, bh) = (0.10 + 0.10 * self.rng.next_f32(), 0.12 + 0.10 * self.rng.next_f32());
+            let (x0, y0) = (self.rng.range_f32(0.0, 1.0 - bw), self.rng.range_f32(0.45, 1.0 - bh));
+            let bbox = [x0, y0, x0 + bw, y0 + bh];
+            let (cx, cy) = (((bbox[0] + bbox[2]) * 0.5 * w) as usize, ((bbox[1] + bbox[3]) * 0.5 * h) as usize);
+            let depth = input.frame.depth.get(cy.min(input.frame.height - 1) * input.frame.width + cx.min(input.frame.width - 1)).copied().unwrap_or(f32::INFINITY);
+            let kind = self.table.get(&label).map(|e| e.0).unwrap_or(EntKind::Drop);
+            let world = input.camera.world_point3_in(&view, (bbox[0] + bbox[2]) * 0.5 * w, (bbox[1] + bbox[3]) * 0.5 * h, depth).map(|p| centre_from_surface(&view, p, centre_offset_m(kind)));
+            if let Some(c) = self.measured_candidate(&m, &label, bbox, (bw * w * bh * h) as u32, depth, world, false, None) {
+                out.candidates.push(c);
+            }
+        }
+        out.candidates.sort_by(|a, b| a.depth_m.total_cmp(&b.depth_m).then_with(|| a.label.cmp(&b.label)));
+        Ok(out)
     }
 
     pub fn noise(&self) -> &NoiseCfg {
@@ -235,11 +374,22 @@ impl Recognizer for OraclePerception {
         "oracle"
     }
 
+    fn scope(&self) -> String {
+        if self.honest.is_some() {
+            "oracle(siglip2-measured)".into()
+        } else {
+            "oracle".into()
+        }
+    }
+
     fn set_noise(&mut self, noise: &NoiseCfg) {
         OraclePerception::set_noise(self, noise.clone());
     }
 
     fn scan(&mut self, input: ScanInput<'_>) -> Result<ScanOutput> {
+        if let Some(m) = self.honest {
+            return self.scan_measured(input, m);
+        }
         let (w, h) = (input.frame.width as f32, input.frame.height as f32);
         // The head camera as the robot believes it is (joints and the head IMU).
         let view = input.world.head_view(input.camera).est;
@@ -435,6 +585,33 @@ mod tests {
         w.nodes[0].x += 18.0;
         let mut p = OraclePerception::new(&lexicon(), NoiseCfg::none(), 400);
         assert!(scan_once(&mut p, &w, &cam).candidates.is_empty());
+    }
+
+    #[test]
+    fn the_honest_oracle_reports_and_errs_as_its_measured_model_says() {
+        let (w, cam) = world_with_tree_ahead();
+        let f = w.render(&cam);
+        let sure = ScanErrModel { det_a: 0.0, det_b: 50.0, false_per_scan: 0.0, pos_sd_m: 0.0, score_true: (0.7, 0.0), score_false: (0.4, 0.0), margin: (0.1, 0.0), score_floor: 0.3, margin_floor: 0.04 };
+        let mut p = OraclePerception::new(&lexicon(), NoiseCfg::none(), 6);
+        assert_eq!(Recognizer::scope(&p), "oracle");
+        p.set_honest(Some(sure));
+        assert_eq!(Recognizer::scope(&p), "oracle(siglip2-measured)", "its statistics stay apart");
+        let s = p.scan(ScanInput { world: &w, frame: &f, camera: &cam }).unwrap();
+        let tree = s.candidates.iter().find(|c| c.truth.as_deref() == Some("n1")).expect("always detected");
+        assert_eq!(tree.label, "tree");
+        assert!((tree.score - 0.7).abs() < 1e-6 && (tree.margin - 0.1).abs() < 1e-6);
+        // Never detected, two wrong candidates per scan on average, all at the floor or above.
+        let blind = ScanErrModel { det_b: -50.0, false_per_scan: 2.0, score_false: (0.2, 0.1), ..sure };
+        p.set_honest(Some(blind));
+        let (mut wrong, scans) = (0usize, 300);
+        for _ in 0..scans {
+            let s = p.scan(ScanInput { world: &w, frame: &f, camera: &cam }).unwrap();
+            let things: Vec<&Candidate> = s.candidates.iter().filter(|c| c.kind != EntKind::Waypoint).collect();
+            assert!(things.iter().all(|c| c.truth.is_none() && c.score >= 0.3 && c.margin >= 0.04));
+            wrong += things.len();
+        }
+        let rate = wrong as f32 / scans as f32;
+        assert!((1.7..2.3).contains(&rate), "{rate} wrong per scan");
     }
 
     #[test]

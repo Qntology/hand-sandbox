@@ -6,8 +6,12 @@
 //! 3. lexical matching (exact word, word behind a closed tail, unique prefix);
 //! 4. embedding span search over the tokens nothing else used (optional);
 //! 5. roles: which place is the destination (by its tail or preposition),
-//!    which quantity belongs to which resource, what the verbs ask for;
-//! 6. the plan, or a [`Problem`] saying what is missing.
+//!    which is where the items lie (an origin: "집 앞에서", "창고 선반에서",
+//!    "선반에 있는"), which quantity belongs to which resource, what the verbs
+//!    ask for;
+//! 6. the plan, or a [`Problem`] saying what is missing. A fetch of placed
+//!    items (parcels) that names no destination brings them to the lexicon's
+//!    home place (the base camp); origins become search hints on the targets.
 
 use std::collections::HashSet;
 
@@ -30,6 +34,10 @@ pub struct Target {
     pub score: f32,
     /// The words as typed.
     pub text: String,
+    /// Where the command says the items lie, outermost first ("창고 선반에서":
+    /// the warehouse, then its shelf): a search hint, never a position.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub origin: Vec<PlaceRef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -37,7 +45,16 @@ pub struct PlaceRef {
     pub place: String,
     pub via: Via,
     pub score: f32,
+    /// The words as typed; empty when the place was implied, not said (the home
+    /// place of a fetch without a destination).
     pub text: String,
+}
+
+impl PlaceRef {
+    /// Whether the command named the place, or the parser filled it in.
+    pub fn implied(&self) -> bool {
+        self.text.is_empty()
+    }
 }
 
 /// Something to set down from the robot's own cargo.
@@ -281,6 +298,7 @@ impl Parser {
                 via: hits[k].via,
                 score: hits[k].score,
                 text: hits[k].text.clone(),
+                origin: Vec::new(),
             });
         }
 
@@ -303,7 +321,19 @@ impl Parser {
                     _ => None,
                 })
             };
-            places.push((k, from_tail.or_else(from_prep).unwrap_or(Role::Unspecified)));
+            // "선반에 있는 택배": a place at which the item lies, not one it goes to.
+            let located = h.tail_kind == TailKind::Direction
+                && hits.get(k + 1).is_some_and(|n| n.start == h.end && n.category == Category::Filler && self.lex.located_words.contains(&n.text));
+            let role = if located { Some(Role::Origin) } else { from_tail.or_else(from_prep) };
+            places.push((k, role.unwrap_or(Role::Unspecified)));
+        }
+        // A bare place right before an origin is part of it ("창고 선반에서", "물류센터 테이블에서").
+        for i in (0..places.len().saturating_sub(1)).rev() {
+            let (k, next) = (places[i].0, places[i + 1]);
+            if places[i].1 == Role::Unspecified && next.1 == Role::Origin && hits[k].end == hits[next.0].start {
+                places[i].1 = Role::Origin;
+                trace.push(TraceLine::new("roles", format!("{:?} joins the origin {:?}", hits[k].text, hits[next.0].text)));
+            }
         }
         let verbs: HashSet<&str> = hits
             .iter()
@@ -341,7 +371,24 @@ impl Parser {
                 "장소가 둘 이상인데 어느 쪽이 도착 지점인지 알 수 없습니다. '창고로'처럼 말해 주세요.",
             )));
         }
-        if !origins.is_empty() {
+        if !origins.is_empty() && !targets.is_empty() {
+            // Where to look: every origin place once, in the order said (outermost first).
+            let mut hint: Vec<PlaceRef> = Vec::new();
+            for &k in &origins {
+                if !hint.iter().any(|p| p.place == hits[k].node) {
+                    hint.push(place_ref(k));
+                }
+            }
+            trace.push(TraceLine::new(
+                "roles",
+                format!("search hint: look for the items at {}", hint.iter().map(|p| format!("{:?}", p.text)).collect::<Vec<_>>().join(" > ")),
+            ));
+            for t in &mut targets {
+                t.origin = hint.clone();
+            }
+            let names: Vec<&str> = origins.iter().map(|&k| hits[k].text.as_str()).collect();
+            warnings.push(format!("출발 지점({})은 찾을 곳의 힌트로만 씁니다.", names.join(", ")));
+        } else if !origins.is_empty() {
             let names: Vec<&str> = origins.iter().map(|&k| hits[k].text.as_str()).collect();
             if destination.is_none() && targets.is_empty() {
                 problem = problem.or(Some(Problem::new(
@@ -381,8 +428,16 @@ impl Parser {
             trace.push(TraceLine::new("roles", format!("drop {} from the cargo{}", if items.is_empty() { "everything".to_string() } else { format!("{} kind(s)", items.len()) }, destination.map(|k| format!(" at {:?}", hits[k].text)).unwrap_or_default())));
             Some(Plan::Drop { items, place: destination.map(place_ref) })
         } else if !targets.is_empty() {
+            let home = self.lex.home().filter(|_| targets.iter().all(|t| self.lex.is_placed(&t.resource)));
             match destination {
                 Some(k) => Some(Plan::Fetch { targets: targets.clone(), destination: place_ref(k) }),
+                // Parcels with nowhere said: back to the home place, where they are collected.
+                None if verbs.contains("deliver") && home.is_some() => {
+                    let (home, name) = home.map(|n| (n.id.clone(), n.exact_match.first().cloned().unwrap_or_else(|| n.id.clone()))).unwrap_or_default();
+                    warnings.push(format!("도착 지점을 말하지 않아 놓여 있던 물건을 {name}{} 가져옵니다.", crate::text::euro(&name)));
+                    trace.push(TraceLine::new("roles", format!("no destination: placed items go to the home place {home:?}")));
+                    Some(Plan::Fetch { targets: targets.clone(), destination: PlaceRef { place: home, via: Via::Exact, score: 1.0, text: String::new() } })
+                }
                 None if verbs.contains("deliver") => {
                     problem = Some(Problem::new(
                         "missing_destination",

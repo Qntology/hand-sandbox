@@ -243,10 +243,12 @@ pub enum Ground {
     WetSand,
     /// Compacted gravel, the pads under the waypoints.
     Gravel,
+    /// Concrete floor of a site's buildings, porches, stairs and ramps (`crate::site`).
+    Floor,
 }
 
 impl Ground {
-    pub const ALL: [Ground; 7] = [Ground::Sand, Ground::Grass, Ground::Dirt, Ground::Rock, Ground::Water, Ground::WetSand, Ground::Gravel];
+    pub const ALL: [Ground; 8] = [Ground::Sand, Ground::Grass, Ground::Dirt, Ground::Rock, Ground::Water, Ground::WetSand, Ground::Gravel, Ground::Floor];
 
     pub fn color(self) -> [u8; 3] {
         match self {
@@ -257,6 +259,7 @@ impl Ground {
             Ground::Water => [56, 112, 178],
             Ground::WetSand => [168, 150, 104],
             Ground::Gravel => [176, 168, 152],
+            Ground::Floor => [206, 206, 200],
         }
     }
 
@@ -269,6 +272,7 @@ impl Ground {
             Ground::Water => "water",
             Ground::WetSand => "wet_sand",
             Ground::Gravel => "gravel",
+            Ground::Floor => "floor",
         }
     }
 
@@ -281,6 +285,7 @@ impl Ground {
             Ground::Water => "바다",
             Ground::WetSand => "젖은 모래",
             Ground::Gravel => "자갈 패드",
+            Ground::Floor => "콘크리트 바닥",
         }
     }
 
@@ -294,6 +299,7 @@ impl Ground {
             Ground::Water => 4,
             Ground::WetSand => 5,
             Ground::Gravel => 6,
+            Ground::Floor => 7,
         }
     }
 
@@ -311,6 +317,8 @@ impl Ground {
             Ground::Water => noto_core::Surface::Water,
             Ground::WetSand => noto_core::Surface::WetSand,
             Ground::Gravel => noto_core::Surface::Gravel,
+            // Dry concrete: the firm floor of the laboratory tests.
+            Ground::Floor => noto_core::Surface::Firm,
         }
     }
 }

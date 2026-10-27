@@ -26,10 +26,19 @@
 //!    anything farther.
 //! 5. The map is resized bilinearly to the keyframe's own size.
 //!
-//! Numerics follow the Python line by line (exact-erf GELU everywhere, the
+//! Numerics follow the Python line by line (exact-erf GELU in the ViT, the
 //! align-corners upsample inside the fusion blocks, the skip resized to the
-//! upsampled path when their sizes differ). They have not been compared with
-//! PyTorch outputs on the real weights.
+//! upsampled path when their sizes differ). The readout projection's GELU is
+//! the tanh approximation (`readout_act: "gelu_pytorch_tanh"` in the
+//! checkpoint's `config.json`, also Hugging Face's `Tipsv2DptConfig` default);
+//! before v1.0 this port used the exact form there
+//! ([`TipsConfig::readout_gelu_tanh`]). v1.0 compared the port with the
+//! Hugging Face implementation on rendered keyframes (`docs/research/ml-ab.md`).
+//!
+//! Besides the expected depth, the bin distribution gives a spread (its
+//! standard deviation): [`TipsDepth::predict_batch_spread`] returns it for the
+//! A/B harness, and [`TipsDepth::max_rel_spread`] can mark pixels whose
+//! distribution is too flat as unknown.
 
 use std::path::Path;
 
@@ -39,6 +48,9 @@ use candle_nn::{
     conv2d, conv2d_no_bias, conv_transpose2d, layer_norm, linear, Conv2d, Conv2dConfig, ConvTranspose2d,
     ConvTranspose2dConfig, LayerNorm, Linear, VarBuilder,
 };
+
+// The position table resize of the reference, shared with the SigLIP2 tower.
+use noto_ml::vision::antialias_bilinear_weights;
 
 use crate::depth::{clamp_metric, DepthModel};
 use crate::frame::{DepthKind, DepthMap, Rgb};
@@ -111,6 +123,10 @@ pub struct TipsConfig {
     pub min_depth: f32,
     /// Centre of the last bin, metres: the farthest the model can answer.
     pub max_depth: f32,
+    /// The readout projection's GELU is the tanh approximation
+    /// (`gelu_pytorch_tanh`), as the checkpoint's config says; `false` is the
+    /// exact erf form this port used before v1.0.
+    pub readout_gelu_tanh: bool,
 }
 
 impl Default for TipsConfig {
@@ -130,6 +146,7 @@ impl Default for TipsConfig {
             depth_bins: 256,
             min_depth: 1e-3,
             max_depth: 10.0,
+            readout_gelu_tanh: true,
         }
     }
 }
@@ -196,6 +213,10 @@ impl TipsConfig {
             depth_bins: us(&["num_depth_bins"], d.depth_bins),
             min_depth: fl(&["min_depth"], d.min_depth as f64) as f32,
             max_depth: fl(&["max_depth"], d.max_depth as f64) as f32,
+            readout_gelu_tanh: match ["readout_act", "readout_activation"].iter().find_map(|k| v[*k].as_str()) {
+                Some(a) => a.contains("tanh"),
+                None => d.readout_gelu_tanh,
+            },
         })
     }
 
@@ -427,37 +448,12 @@ impl Encoder {
     }
 }
 
-/// Weights of PyTorch's antialiased bilinear resize along one axis
-/// (`_compute_indices_min_size_weights_aa` with `align_corners=False`), as a
-/// row-major `dst x src` matrix. Upsampling reduces to ordinary bilinear with
-/// half-pixel centres; downsampling widens the triangle to the scale factor so
-/// every input sample contributes.
-fn antialias_bilinear_weights(src: usize, dst: usize) -> Vec<f32> {
-    let scale = src as f64 / dst as f64;
-    let (support, inv_scale) = if scale >= 1.0 { (scale, 1.0 / scale) } else { (1.0, 1.0) };
-    let triangle = |x: f64| (1.0 - x.abs()).max(0.0);
-    let mut weights = vec![0f32; dst * src];
-    for o in 0..dst {
-        let center = scale * (o as f64 + 0.5);
-        // `as i64` truncates toward zero like the C++ `static_cast<int64_t>`.
-        let lo = ((center - support + 0.5) as i64).max(0) as usize;
-        let hi = ((center + support + 0.5) as i64).min(src as i64).max(lo as i64) as usize;
-        let taps: Vec<f64> = (lo..hi).map(|j| triangle((j as f64 - center + 0.5) * inv_scale)).collect();
-        let total: f64 = taps.iter().sum();
-        if total > 0.0 {
-            for (k, t) in taps.iter().enumerate() {
-                weights[o * src + lo + k] = (t / total) as f32;
-            }
-        }
-    }
-    weights
-}
-
 /// `ReassembleBlocks` with the `project` readout for one level.
 struct ReassembleLevel {
     readout: Linear,
     out_projection: Conv2d,
     resize: Resize,
+    gelu_tanh: bool,
 }
 
 enum Resize {
@@ -482,6 +478,7 @@ impl ReassembleLevel {
             readout: linear(2 * d, d, vb.pp("readout_projects").pp(level))?,
             out_projection: conv2d(d, ch, 1, Conv2dConfig::default(), vb.pp("out_projections").pp(level))?,
             resize,
+            gelu_tanh: cfg.readout_gelu_tanh,
         })
     }
 
@@ -490,7 +487,8 @@ impl ReassembleLevel {
     fn forward(&self, tap: &Tap) -> candle_core::Result<Tensor> {
         let (b, n, d) = tap.patches.dims3()?;
         let readout = tap.cls.unsqueeze(1)?.broadcast_as((b, n, d))?;
-        let x = self.readout.forward(&Tensor::cat(&[&tap.patches, &readout], 2)?.contiguous()?)?.gelu_erf()?;
+        let x = self.readout.forward(&Tensor::cat(&[&tap.patches, &readout], 2)?.contiguous()?)?;
+        let x = if self.gelu_tanh { x.gelu()? } else { x.gelu_erf()? };
         let x = x.transpose(1, 2)?.contiguous()?.reshape((b, d, tap.rows, tap.cols))?;
         let x = self.out_projection.forward(&x)?;
         match &self.resize {
@@ -586,8 +584,10 @@ impl DepthHead {
         })
     }
 
-    /// Depth in metres, `(batch, 1, 8 * rows, 8 * cols)` (rounded up on odd grids).
-    fn forward(&self, taps: &[Tap]) -> candle_core::Result<Tensor> {
+    /// Depth in metres, `(batch, 1, 8 * rows, 8 * cols)` (rounded up on odd
+    /// grids), and with `spread` the standard deviation of the bin
+    /// distribution in metres, same shape.
+    fn forward(&self, taps: &[Tap], spread: bool) -> candle_core::Result<(Tensor, Option<Tensor>)> {
         let levels: Vec<Tensor> = taps
             .iter()
             .zip(&self.reassemble)
@@ -601,7 +601,12 @@ impl DepthHead {
         }
         let out = self.project.forward(&out)?.relu()?;
         let logits = self.classifier.forward(&out.permute((0, 2, 3, 1))?.contiguous()?)?;
-        decode_bins(&logits, &self.centers, self.min_depth)?.unsqueeze(1)
+        if spread {
+            let (mean, sd) = decode_bins_spread(&logits, &self.centers, self.min_depth)?;
+            Ok((mean.unsqueeze(1)?, Some(sd.unsqueeze(1)?)))
+        } else {
+            Ok((decode_bins(&logits, &self.centers, self.min_depth)?.unsqueeze(1)?, None))
+        }
     }
 }
 
@@ -622,6 +627,19 @@ fn decode_bins(logits: &Tensor, centers: &Tensor, min_depth: f64) -> candle_core
     p.broadcast_mul(centers)?.sum(D::Minus1)
 }
 
+/// [`decode_bins`] plus the standard deviation of the same distribution over
+/// the bin centres, `sqrt(E[c^2] - E[c]^2)`, metres. A flat distribution (the
+/// head does not know) has a large spread and its expectation drifts toward
+/// the middle of the range.
+fn decode_bins_spread(logits: &Tensor, centers: &Tensor, min_depth: f64) -> candle_core::Result<(Tensor, Tensor)> {
+    let p = (logits.relu()? + min_depth)?;
+    let p = p.broadcast_div(&p.sum_keepdim(D::Minus1)?)?;
+    let mean = p.broadcast_mul(centers)?.sum(D::Minus1)?;
+    let second = p.broadcast_mul(&centers.sqr()?)?.sum(D::Minus1)?;
+    let var = (second - mean.sqr()?)?.relu()?;
+    Ok((mean, var.sqrt()?))
+}
+
 /// `google/tipsv2-b14-dpt` metric depth.
 pub struct TipsDepth {
     cfg: TipsConfig,
@@ -630,6 +648,9 @@ pub struct TipsDepth {
     device: Device,
     /// Patch grid keyframes are resized to; see [`InputGrid`].
     pub input_grid: InputGrid,
+    /// Pixels whose bin spread exceeds this share of their depth are marked
+    /// unknown (`INFINITY`). `None` (the default) keeps every answer.
+    pub max_rel_spread: Option<f32>,
 }
 
 impl TipsDepth {
@@ -658,11 +679,20 @@ impl TipsDepth {
         cfg.validate()?;
         let encoder = Encoder::new(&cfg, vb.pp("vision_encoder"))?;
         let head = DepthHead::new(&cfg, vb.pp("depth_head"))?;
-        Ok(TipsDepth { cfg, encoder, head, device: device.clone(), input_grid: InputGrid::default() })
+        Ok(TipsDepth { cfg, encoder, head, device: device.clone(), input_grid: InputGrid::default(), max_rel_spread: None })
     }
 
     pub fn config(&self) -> &TipsConfig {
         &self.cfg
+    }
+
+    /// Switches the readout GELU between the tanh form of the reference
+    /// (`true`) and the exact form (`false`, this port before v1.0).
+    pub fn set_readout_gelu_tanh(&mut self, on: bool) {
+        self.cfg.readout_gelu_tanh = on;
+        for level in &mut self.head.reassemble {
+            level.gelu_tanh = on;
+        }
     }
 
     /// Metric depth at the keyframe's size. Takes `&self` so one loaded model
@@ -679,6 +709,17 @@ impl TipsDepth {
     /// sample), so every map equals the single-frame one up to float
     /// rounding. The idle device pool is trimmed afterwards.
     pub fn predict_batch(&self, frames: &[&Rgb]) -> anyhow::Result<Vec<DepthMap>> {
+        Ok(self.run_batch(frames, false)?.into_iter().map(|(d, _)| d).collect())
+    }
+
+    /// [`TipsDepth::predict_batch`] with the spread of each pixel's bin
+    /// distribution (metres, same size), for measuring how far the
+    /// expectation can be trusted.
+    pub fn predict_batch_spread(&self, frames: &[&Rgb]) -> anyhow::Result<Vec<(DepthMap, DepthMap)>> {
+        Ok(self.run_batch(frames, true)?.into_iter().map(|(d, s)| (d, s.expect("spread was asked for"))).collect())
+    }
+
+    fn run_batch(&self, frames: &[&Rgb], want_spread: bool) -> anyhow::Result<Vec<(DepthMap, Option<DepthMap>)>> {
         use std::collections::BTreeMap;
         let mut groups: BTreeMap<(u32, u32), Vec<usize>> = BTreeMap::new();
         for (i, f) in frames.iter().enumerate() {
@@ -689,20 +730,34 @@ impl TipsDepth {
         }
         let policy = noto_ml::BatchPolicy::for_device(&self.device);
         let p = self.cfg.patch_size;
-        let mut out: Vec<Option<DepthMap>> = (0..frames.len()).map(|_| None).collect();
+        let mut out: Vec<Option<(DepthMap, Option<DepthMap>)>> = (0..frames.len()).map(|_| None).collect();
+        let spread = want_spread || self.max_rel_spread.is_some();
         for (&(w, h), idx) in &groups {
             let (cols, rows) = self.input_grid.grid_for(w, h);
             for chunk in idx.chunks(policy.image_rows(cols * rows)) {
                 let inputs = chunk.iter().map(|&i| model_input(frames[i], (cols * p) as u32, (rows * p) as u32, &self.device)).collect::<anyhow::Result<Vec<_>>>()?;
                 let pixels = Tensor::cat(&inputs, 0)?;
                 let taps = self.encoder.taps(&pixels)?;
-                let depth = self.head.forward(&taps)?.upsample_bilinear2d(h as usize, w as usize, false)?;
+                let (depth, sd) = self.head.forward(&taps, spread)?;
+                let depth = depth.upsample_bilinear2d(h as usize, w as usize, false)?;
+                let sd = sd.map(|t| t.upsample_bilinear2d(h as usize, w as usize, false)).transpose()?;
                 for (k, &i) in chunk.iter().enumerate() {
                     let mut map = DepthMap { width: w, height: h, kind: DepthKind::Metric, data: depth.get(k)?.flatten_all()?.to_vec1()? };
                     // The expectation cannot leave the bin range; this only removes float
                     // rounding past the last centre.
                     clamp_metric(&mut map, self.cfg.max_depth);
-                    out[i] = Some(map);
+                    let sd = match &sd {
+                        Some(t) => Some(DepthMap { width: w, height: h, kind: DepthKind::Metric, data: t.get(k)?.flatten_all()?.to_vec1()? }),
+                        None => None,
+                    };
+                    if let (Some(limit), Some(s)) = (self.max_rel_spread, &sd) {
+                        for (d, e) in map.data.iter_mut().zip(&s.data) {
+                            if *e > limit * *d {
+                                *d = f32::INFINITY;
+                            }
+                        }
+                    }
+                    out[i] = Some((map, if want_spread { sd } else { None }));
                 }
             }
         }

@@ -27,10 +27,10 @@ pub mod vision;
 use serde::Serialize;
 
 pub use lexical::{Category, Hit, Via};
-pub use lexicon::{EntityKind, Lexicon, Node, Phrase, VisionEntity};
+pub use lexicon::{EntityKind, Lexicon, Node, Phrase, StructureEntity, VisionEntity};
 pub use parse::{DropTarget, ParsedCommand, Parser, PlaceRef, Plan, Problem, Target};
 pub use semantic::{PhraseEmbedder, SemanticBank, SemanticOpts};
-pub use vision::{EntityScore, VisionBank};
+pub use vision::{EntityScore, VisionBank, VisionPrompting};
 
 /// One line of the search trace, for the log view.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]

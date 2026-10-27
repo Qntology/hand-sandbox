@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::kinds::{ItemKind, NodeKind};
+use crate::site::Support;
 use crate::terrain::TerrainKind;
 
 pub fn node_id(id: u32) -> String {
@@ -99,9 +100,13 @@ pub struct DropView {
     pub id: String,
     pub item: ItemKind,
     pub label_ko: String,
+    /// `y` is the top of what it rests on: the ground, a porch, a shelf deck, a table.
     pub pos: Pos3,
     /// How much of one item the piece is.
     pub amount: f32,
+    /// What it rests on when that is not the ground (`site::Support`).
+    #[serde(default, skip_serializing_if = "Support::is_ground")]
+    pub support: Support,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -115,10 +120,14 @@ pub struct WorldSnapshot {
     pub nodes: Vec<NodeView>,
     pub drops: Vec<DropView>,
     pub terrain: TerrainKind,
+    /// Houses, the logistics centre and their fixtures (`crate::site`), when the world has a site.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site: Option<SiteView>,
 }
 
 /// Terrain as flat arrays, sent once per world because it never changes while
-/// the world runs. `ground` holds 0 sand, 1 grass, 2 dirt, 3 rock, 4 water, 5 wet sand.
+/// the world runs. `ground` holds 0 sand, 1 grass, 2 dirt, 3 rock, 4 water, 5 wet sand,
+/// 6 gravel, 7 a site's concrete floor.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TerrainGrid {
     pub cells_w: usize,
@@ -128,6 +137,96 @@ pub struct TerrainGrid {
     pub curb_cm: Vec<u8>,
     pub ground: Vec<u8>,
     pub kind: TerrainKind,
+    /// `terrain::CurbKind` per cell (0 kerb, 1 stair tread, 2 raised floor, 3 ramp); empty without a site.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub curb_kind: Vec<u8>,
+}
+
+/// A site for the UI (metres, world frame: x, z; heights are world y).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SiteView {
+    pub houses: Vec<HouseView>,
+    pub warehouse: Option<WarehouseView>,
+    /// Walls, doors, landings, stairs, ramps, shelves and tables (not the floors and roofs).
+    pub fixtures: Vec<FixtureView>,
+    /// Places where parcels can lie.
+    pub slots: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HouseView {
+    pub id: u32,
+    pub label_ko: String,
+    /// The body, walls included: x0, z0, x1, z1.
+    pub rect_m: [f32; 4],
+    /// Heading of the front (inside to outside), degrees: 0 = +x, 90 = +z.
+    pub front_deg: f32,
+    /// Floor and porch height above the ground.
+    pub floor_m: f32,
+    pub door: [f32; 2],
+    pub porch_m: [f32; 4],
+    pub stairs: StairView,
+    pub ramp: Option<RampView>,
+    pub reachable_legs: bool,
+    pub reachable_wheels: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StairView {
+    pub risers: u8,
+    pub riser_m: f32,
+    pub tread_m: f32,
+    pub width_m: f32,
+    /// Tread cells: x, z, top.
+    pub treads: Vec<[f32; 3]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RampView {
+    /// Ramp cells from the porch down: x, z, top.
+    pub cells: Vec<[f32; 3]>,
+    pub rise_m: f32,
+    pub run_m: f32,
+    pub run_per_rise: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WarehouseView {
+    pub label_ko: String,
+    pub rect_m: [f32; 4],
+    pub door: [f32; 2],
+    pub door_width_m: f32,
+    pub door_front_deg: f32,
+    pub aisle_m: f32,
+    pub shelves: usize,
+    pub tables: usize,
+    /// Task zones with their maintained illuminance (EN 12464-1).
+    pub zones: Vec<ZoneView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ZoneView {
+    pub kind: String,
+    pub label_ko: String,
+    pub rect_m: [f32; 4],
+    pub em_lx: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FixtureView {
+    pub id: u32,
+    /// `wall`, `door`, `landing`, `step`, `ramp`, `shelf`, `table`.
+    pub kind: String,
+    pub label_ko: String,
+    /// Cell centres: x, z.
+    pub cells: Vec<[f32; 2]>,
+    pub yaw_deg: f32,
+    pub base_m: f32,
+    pub top_m: f32,
+    /// Heights items rest at (shelf decks, a table top), world y.
+    pub levels_m: Vec<f32>,
+    /// Whether it blocks the cells it stands on.
+    pub blocks: bool,
 }
 
 /// What one grasp test says about holding an item with the current hand.

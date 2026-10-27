@@ -128,6 +128,7 @@ fn the_engine_never_names_an_action_benchmark_source() {
     // reference would make the score say nothing.
     let files = [
         ("kin.rs", include_str!("../src/kin.rs")),
+        ("morph.rs", include_str!("../src/morph.rs")),
         ("act/mod.rs", include_str!("../src/act/mod.rs")),
         ("act/reach.rs", include_str!("../src/act/reach.rs")),
         ("act/grasp.rs", include_str!("../src/act/grasp.rs")),
@@ -136,9 +137,16 @@ fn the_engine_never_names_an_action_benchmark_source() {
         ("act/drive.rs", include_str!("../src/act/drive.rs")),
         ("act/material.rs", include_str!("../src/act/material.rs")),
         ("act/focus.rs", include_str!("../src/act/focus.rs")),
+        ("contact.rs", include_str!("../src/contact.rs")),
+        ("sim.rs", include_str!("../src/sim.rs")),
+        ("act/collide.rs", include_str!("../src/act/collide.rs")),
+        ("act/fall.rs", include_str!("../src/act/fall.rs")),
+        ("act/cocarry.rs", include_str!("../src/act/cocarry.rs")),
         ("world-sim world.rs", include_str!("../../world-sim/src/world.rs")),
         ("world-sim world/acts.rs", include_str!("../../world-sim/src/world/acts.rs")),
         ("world-sim nav.rs", include_str!("../../world-sim/src/nav.rs")),
+        ("world-sim site.rs", include_str!("../../world-sim/src/site.rs")),
+        ("world-sim fixture.rs", include_str!("../../world-sim/src/fixture.rs")),
     ];
     let sources = [
         "Guillery", "Johansson", "Westling", "Flanagan", "Menzer", "Reiser", "Bazrgari", "Kingma", "Plamondon", "Hwang", "von Arx", "Dolan", "NIOSH", "Waters", "Liberty Mutual", "Snook", "Steele",

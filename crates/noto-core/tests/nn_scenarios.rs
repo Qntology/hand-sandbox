@@ -111,7 +111,8 @@ fn the_controller_never_reads_the_references() {
     let balance = include_str!("../src/balance.rs");
     // Everything before the reference section (its types and table) is the controller.
     let controller = balance.split("/// Context the references depend on.").next().unwrap();
-    for (name, src) in [("balance.rs (controller part)", controller), ("dynamics.rs", include_str!("../src/dynamics.rs"))] {
+    // The form (`morph.rs`) places the masses the controller balances: it is controller code too.
+    for (name, src) in [("balance.rs (controller part)", controller), ("dynamics.rs", include_str!("../src/dynamics.rs")), ("morph.rs", include_str!("../src/morph.rs"))] {
         for needle in ["reference(", "composite_reference", "nn::", "Reference {"] {
             assert!(!src.contains(needle), "{name} mentions `{needle}`");
         }

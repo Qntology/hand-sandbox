@@ -20,5 +20,6 @@ pub use records::{BalanceRow, KeyframeRow, MirrorBatch, QuestRun, StepRecord, Su
 pub use scope::{Ledger, Scope, Track};
 pub use stats::{decay_shape, DecayShape, ScopeStat, Welford};
 pub use store::{
-    write_atomic, AxisStatus, ConfusionStatus, GateRate, LedgerStatus, ReferenceReport, SdsStatus, SdsStore, SDS_RECIPE,
+    write_atomic, AreaAxis, AreaReport, AxisStatus, ConfusionStatus, GateRate, LedgerStatus, OpenOptions, OtherRevs, ReferenceReport, ScopePolicy, SdsStatus, SdsStore,
+    SDS_RECIPE, UNSTAMPED,
 };
