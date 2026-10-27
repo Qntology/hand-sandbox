@@ -13,8 +13,14 @@ rem  step 07 compares them with the CPU. No step measures speed.
 rem
 rem  Every step writes its own log:  test_logs\<timestamp>_<backend>\NN_name.log
 rem  Failures do not stop the run. At the end:
-rem    summary.log     exit code and duration of every step, test results, check counts
-rem    highlights.log  every check line ([GPU] [NN] [NN-SUM] [PRESET] [DYN])
+rem    summary.log     exit code and duration of every step, test results, check counts,
+rem                    the cross-area deviation report ([UX] [UX-SUM])
+rem    highlights.log  every check line ([GPU] [NN] [PRESET] [DYN] and the benchmarks'
+rem                    [AX] [FX] [CAM] [VX] [CX] [TX] [KX] [MX] [UX] with -SUM / -HELD / -WHY / -CELL)
+rem
+rem  Steps 09-19 are the reference benchmarks (scores against research references, not
+rem  speed) and the engine / benchmark source split. A benchmark whose test file is not in
+rem  the tree yet (collision, tactile, cooperation, morphology) is reported as skipped.
 rem  Options (set before running the wrapper):
 rem    NOPAUSE=1          skip the final pause
 rem    ONLY=03,07         run only these step numbers (step 01 build always runs)
@@ -94,6 +100,20 @@ if /i "%BACKEND%"=="cpu" (
 )
 rem ---- 08: Lance tables ----
 call :run 08 lance "%CPT% -p noto-data --no-fail-fast -- --test-threads=1"
+rem ---- 09-16: reference benchmarks, one area each (docs\research\*.md; no tuning to them) ----
+call :bench 09 action_bench
+call :bench 10 effects_bench
+call :bench 11 camera_bench
+call :bench 12 vision_bench
+call :bench 13 collision_bench
+call :bench 14 tactile_bench
+call :bench 15 coop_bench
+call :bench 16 morph_bench
+rem ---- 17: no engine file names a benchmark source; decisions never read a reference ----
+call :bench 17 source_split
+rem ---- 18-19: cross-area deviation ("uncanniness") report: core areas, then with camera and vision ----
+call :bench 18 uncanny_report
+call :bench 19 uncanny_runtime
 
 >>"%SUMMARY%" echo ========================================
 if "%FAILED%"=="0" (
@@ -108,6 +128,28 @@ echo.
 echo Logs saved in: %LOGDIR%
 if not defined NOPAUSE pause
 endlocal & exit /b %FAILED%
+
+rem ------------------------------------------------------------
+rem  :bench <NN> <test>  runs crates\<crate>\tests\<test>.rs of the crate that has it
+rem  (noto-core and world-sim without model features, noto-runtime with them); a test
+rem  that is not in the tree is reported as skipped.
+rem ------------------------------------------------------------
+:bench
+if exist "%~dp0crates\noto-core\tests\%~2.rs" (
+    call :run %~1 %~2 "%CPT% -p noto-core --test %~2 --no-fail-fast -- --nocapture --test-threads=1"
+    exit /b 0
+)
+if exist "%~dp0crates\world-sim\tests\%~2.rs" (
+    call :run %~1 %~2 "%CPT% -p world-sim --test %~2 --no-fail-fast -- --nocapture --test-threads=1"
+    exit /b 0
+)
+if exist "%~dp0crates\noto-runtime\tests\%~2.rs" (
+    call :run %~1 %~2 "%PT% -p noto-runtime --test %~2 --no-fail-fast -- --nocapture --test-threads=1"
+    exit /b 0
+)
+echo [%~1_%~2] skipped - no test file
+>>"%SUMMARY%" echo %~1_%~2: skipped - not in the tree
+exit /b 0
 
 rem ------------------------------------------------------------
 rem  :run <NN> <name> "<command>"

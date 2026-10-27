@@ -157,9 +157,15 @@ pub fn exposure_s(lux: f32) -> f32 {
 }
 
 /// The head camera's RGB timing and gyro (research §4.1–4.2: the D435i's
-/// OV2740 and BMI055, the OAK-D Lite's IMX214 and BMI270).
+/// OV2740 and BMI055, the OAK-D Lite's IMX214 and BMI270) at the flat
+/// lighting's [`SCENE_LUX`].
 pub fn sensor_timing(sensor: &str) -> SensorTiming {
-    let exposure = exposure_s(SCENE_LUX);
+    sensor_timing_at(sensor, SCENE_LUX)
+}
+
+/// The same at an illuminance of `lux` (`World::scene_lux`, the lighting's).
+pub fn sensor_timing_at(sensor: &str, lux: f32) -> SensorTiming {
+    let exposure = exposure_s(lux);
     if sensor.contains("OAK") {
         SensorTiming { rgb: "IMX214 (rolling)", exposure_s: exposure, readout_s: RGB_READOUT_S, gyro_arw_deg: 0.010 }
     } else {
@@ -292,7 +298,7 @@ impl World {
         if let Some((pose, _, src)) = self.act_pose() {
             return (pose, src == noto_core::Source::FootLift);
         }
-        let slope = if self.body.legged { 0.0 } else { self.posture_now().0.slope_deg };
+        let slope = if self.body.legged() { 0.0 } else { self.posture_now().0.slope_deg };
         (KinPose { base_pitch_deg: slope, ..KinPose::stand(self.carried_kg()) }, false)
     }
 
@@ -300,7 +306,7 @@ impl World {
     pub fn head_view(&self, cam: &Camera) -> HeadView {
         let (mut pose, walking) = self.camera_pose();
         // A rigid chassis lies on the ground under its contacts; legs keep the torso level.
-        let (tilt, tilt_rate) = if self.body.legged {
+        let (tilt, tilt_rate) = if self.body.legged() {
             ((0.0, 0.0), [0.0, 0.0])
         } else {
             let (x, z, yaw) = (self.agent.x, self.agent.z, self.agent.yaw);
@@ -317,9 +323,9 @@ impl World {
             pos[0] -= pose.hip[0];
         }
         // The neck takes back its share of the base's tilt on a slope.
-        let base = if self.body.legged { 0.0 } else { pose.base_pitch_deg };
+        let base = if self.body.legged() { 0.0 } else { pose.base_pitch_deg };
         let head_pitch_deg = hc.pitch_down_deg + base * self.body.head.gaze_stabilization;
-        let timing = sensor_timing(self.body.head.sensor);
+        let timing = sensor_timing_at(self.body.head.sensor, self.scene_lux());
         let (shake, window_s) = self.shake();
         // What the gyro got wrong integrating the shake: its angle random walk over the window.
         let arw = (timing.gyro_arw_deg * window_s.max(0.0).sqrt()).to_radians();
@@ -369,7 +375,7 @@ impl World {
         let gd = roughness_gd(ground);
         let seed = self.cfg.seed;
         let stab = self.body.head.gaze_stabilization;
-        if self.body.legged {
+        if self.body.legged() {
             let Some((g, _, _)) = self.walk.plan.as_ref() else { return (Shake::still(), 0.0) };
             let t = self.walk.since_step_m / speed;
             let u = (self.walk.since_step_m / g.step_m.max(1e-3)).clamp(0.0, 1.0);

@@ -14,6 +14,12 @@
 //!
 //! Objects (trees, boulders) do not occlude here: the planner does not know
 //! where they are, only the terrain.
+//!
+//! A per-cell prior can weigh the unseen ground ([`next_viewpoint_with`]):
+//! with a site the robot is told where parcels are kept (porches, the
+//! logistics centre, `crate::site::Site::prior`), as it is told where the
+//! waypoints are, so a look that shows a porch is worth more than one that
+//! shows open grass. The prior comes from the places, never from the parcels.
 
 use noto_core::BaseSpec;
 
@@ -135,8 +141,10 @@ pub struct Viewpoint {
     pub cell: Cell,
     /// Unseen cells a full turn there would show.
     pub gain: usize,
+    /// Those cells weighted by the prior (`gain` without one).
+    pub weighted: f32,
     pub time_s: f32,
-    /// Gain per second of driving plus [`LOOK_COST_S`].
+    /// Weighted gain per second of driving plus [`LOOK_COST_S`].
     pub score: f32,
     /// Heading of the 45° sector with the most unseen cells, radians.
     pub face_yaw: f32,
@@ -160,6 +168,27 @@ pub fn next_viewpoint(
     range_m: f32,
     avoid: &[(f32, f32)],
 ) -> Option<Viewpoint> {
+    next_viewpoint_with(t, spec, blocked, start, cov, eye_above_m, pitch_deg, vfov_deg, range_m, avoid, None)
+}
+
+/// [`next_viewpoint`] with each unseen cell weighed by `prior` (row by row,
+/// 1 = no preference): the score is the weighted gain per second, and a
+/// viewpoint still needs [`MIN_GAIN`] unseen cells.
+#[allow(clippy::too_many_arguments)]
+pub fn next_viewpoint_with(
+    t: &Terrain,
+    spec: &BaseSpec,
+    blocked: &dyn Fn(usize, usize) -> bool,
+    start: Cell,
+    cov: &Coverage,
+    eye_above_m: f32,
+    pitch_deg: f32,
+    vfov_deg: f32,
+    range_m: f32,
+    avoid: &[(f32, f32)],
+    prior: Option<&[f32]>,
+) -> Option<Viewpoint> {
+    let weight = |i: usize| prior.and_then(|p| p.get(i)).copied().unwrap_or(1.0);
     let times = nav::travel_times(spec, t, blocked, start, 900.0);
     let mut cands: Vec<(usize, usize, f32)> = Vec::new();
     for cz in (1..t.d).step_by(3) {
@@ -182,29 +211,34 @@ pub fn next_viewpoint(
     for (k, &(cx, cz, tt)) in cands.iter().enumerate() {
         let eye = Eye { range_m: range_m.min(SEARCH_RANGE_M), ..Eye::at(t, (cx, cz), eye_above_m, pitch_deg, vfov_deg) };
         let mut gain = 0usize;
-        let mut sectors = [0usize; 8];
+        let mut weighted = 0.0f32;
+        let mut sectors = [0.0f32; 8];
         let tag = k as u32;
         let w = t.w;
         viewshed(t, &eye, 0.0, std::f32::consts::TAU, &mut |i| {
             if stamp[i] != tag && !cov.seen[i] && !t.is_water(i % w, i / w) {
                 stamp[i] = tag;
                 gain += 1;
+                let wi = weight(i);
+                weighted += wi;
                 let (px, pz) = cell_center(i % w, i / w);
                 let a = (pz - eye.z).atan2(px - eye.x).rem_euclid(std::f32::consts::TAU);
-                sectors[((a / std::f32::consts::FRAC_PI_4) as usize).min(7)] += 1;
+                sectors[((a / std::f32::consts::FRAC_PI_4) as usize).min(7)] += wi;
             }
         });
         if gain < MIN_GAIN {
             continue;
         }
-        let score = gain as f32 / (tt + LOOK_COST_S);
+        let score = weighted / (tt + LOOK_COST_S);
         if best.as_ref().map_or(true, |b| score > b.score) {
-            let s = (0..8).max_by_key(|&i| sectors[i]).unwrap_or(0);
+            // The fullest sector, the last of equals (as `max_by_key` on the counts picked it before).
+            let s = (0..8).fold(0usize, |b, i| if sectors[i] >= sectors[b] { i } else { b });
             best = Some(Viewpoint {
                 x: eye.x,
                 z: eye.z,
                 cell: (cx, cz),
                 gain,
+                weighted,
                 time_s: tt,
                 score,
                 face_yaw: (s as f32 + 0.5) * std::f32::consts::FRAC_PI_4,

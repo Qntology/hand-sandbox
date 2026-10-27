@@ -323,7 +323,7 @@ fn task_postures(body: &Body, s: &FxScenario, cargo: f32, ground: Surface) -> (P
             let p = Posture { slope_deg: s.slope_deg, ground, ..Posture::arm_raise(cargo) };
             (p, p)
         }
-        Task::Travel if body.legged => {
+        Task::Travel if body.legged() => {
             let p = Posture { source: Source::FootLift, single_support: true, slope_deg: s.slope_deg, ground, moving: true, ..Posture::quiet(cargo) };
             (p, p)
         }
@@ -350,10 +350,10 @@ pub fn probe(body: &Body, s: &FxScenario) -> Probe {
     let worst = limbs(&rep).into_iter().max_by(|a, b| a.peak_ratio.total_cmp(&b.peak_ratio));
     let hot = limbs(&held).into_iter().max_by(|a, b| a.effort.total_cmp(&b.effort));
     let m = body.mass_kg() + cargo;
-    let drive = (!body.legged).then(|| body.chassis.drive_force_n / m);
+    let drive = (!body.legged()).then(|| body.chassis.drive_force_n / m);
     let travel = matches!(s.task, Task::Travel);
     let c = surface::contact(body.base, &props, post.slope_deg, post.accel_mps2, travel);
-    let level = surface::contact(body.base, &props, 0.0, if body.legged { 0.0 } else { post.accel_mps2 }, travel);
+    let level = surface::contact(body.base, &props, 0.0, if body.legged() { 0.0 } else { post.accel_mps2 }, travel);
     // Statics: on a slope the robot tips at atan(d / h) and slides past the friction limit.
     let tip_deg = (0.5 * (rep.support[1] - rep.support[0]) / rep.com[2].max(0.1)).atan().to_degrees();
     let slide_first = surface::friction_slope_limit_deg(body.base, &props) < tip_deg;
@@ -404,31 +404,12 @@ pub fn probe(body: &Body, s: &FxScenario) -> Probe {
 
 // ----- cells and scoring -----
 
+/// The shared judge (`crate::bench::judge`); the gate is worded as this benchmark prints it.
 fn judge(c: &mut FxCell) {
-    let Some(v) = c.value else {
-        if !matches!(c.rule, Rule::Raw) {
-            c.score = Some(0.0);
-        }
-        return;
-    };
-    match c.rule {
-        Rule::Like { reference, tolerance } => {
-            let z = (v - reference) / tolerance.max(1e-6);
-            c.z = Some(z);
-            c.score = Some((100.0 - 10.0 * z.abs()).max(0.0));
-        }
-        Rule::AtLeast { reference, tolerance } => {
-            let z = ((v - reference) / tolerance.max(1e-6)).min(0.0);
-            c.z = Some(z);
-            c.score = Some((100.0 - 10.0 * z.abs()).max(0.0));
-        }
-        Rule::AtMost { limit } => {
-            if v > limit {
-                c.gate = Some(format!("{} {} {v:.2} > {limit:.2}", c.effect.label_ko(), c.axis));
-            }
-        }
-        Rule::Raw => {}
-    }
+    let v = crate::bench::judge(c.value, c.rule.into());
+    c.z = v.z;
+    c.score = v.score;
+    c.gate = v.broken.map(|(x, limit)| format!("{} {} {x:.2} > {limit:.2}", c.effect.label_ko(), c.axis));
 }
 
 fn cell(effect: Effect, axis: &'static str, value: Option<f32>, rule: Rule, cite: &'static str) -> FxCell {
@@ -440,7 +421,7 @@ fn cell(effect: Effect, axis: &'static str, value: Option<f32>, rule: Rule, cite
 /// The cells of a scenario from the engine's answers.
 pub fn cells(body: &Body, s: &FxScenario, p: &Probe) -> Vec<FxCell> {
     let mut v = Vec::new();
-    let wheels = !body.legged && body.base != crate::base::BaseKind::Track;
+    let wheels = !body.legged() && body.base != crate::base::BaseKind::Track;
     let mass = body.mass_kg();
     let cargo = s.cargo_frac * mass;
     // Slip.
@@ -448,7 +429,7 @@ pub fn cells(body: &Body, s: &FxScenario, p: &Probe) -> Vec<FxCell> {
     let lab = matches!(s.ground, Ground::Lab { .. });
     v.push(cell(Effect::Slip, "utilisation", p.utilisation, if lab { Rule::Raw } else { Rule::AtMost { limit: 1.0 } }, "마찰 이용률 > 1이면 미끄러짐 (정역학)"));
     v.push(cell(Effect::Slip, "slip_probability", p.slip_probability, Rule::Raw, ""));
-    if body.legged {
+    if body.legged() {
         if let Some((rise, tol)) = ramp_rcof_rise(s.slope_deg) {
             let value = p.required_mu.zip(p.required_mu_level).map(|(a, b)| a - b);
             v.push(cell(Effect::Slip, "ramp_rcof_rise", value, Rule::Like { reference: rise, tolerance: tol }, CITE_RAMP));
@@ -465,7 +446,7 @@ pub fn cells(body: &Body, s: &FxScenario, p: &Probe) -> Vec<FxCell> {
     }
     // Load.
     v.push(cell(Effect::Load, "cargo_over_capacity", Some(cargo / p.capacity_kg.max(1e-3)), Rule::AtMost { limit: 1.0 }, "적재 한도"));
-    if body.legged {
+    if body.legged() {
         v.push(cell(Effect::Load, "capacity_frac", Some(p.capacity_kg / mass), Rule::Like { reference: CARRY_FRAC.0, tolerance: CARRY_FRAC.1 }, CITE_CARRY));
         if (s.cargo_frac - 0.40).abs() < 1e-3 {
             v.push(cell(Effect::Load, "speed_ratio", Some(p.speed_ratio), Rule::Like { reference: LOAD_SPEED.0, tolerance: LOAD_SPEED.1 }, CITE_LOAD_SPEED));
@@ -480,7 +461,7 @@ pub fn cells(body: &Body, s: &FxScenario, p: &Probe) -> Vec<FxCell> {
         v.push(cell(Effect::Fatigue, "endurance_ratio", ratio, Rule::AtLeast { reference: 1.0, tolerance: 0.38 }, CITE_ENDURANCE));
         v.push(cell(Effect::Fatigue, "wear_per_h", p.wear_per_h, Rule::Raw, ""));
     }
-    if body.legged && s.ground.id() == "sand" {
+    if body.legged() && s.ground.id() == "sand" {
         v.push(cell(Effect::Fatigue, "energy_factor", p.energy_factor, Rule::Like { reference: SAND_ENERGY.0, tolerance: SAND_ENERGY.1 }, CITE_SAND_ENERGY));
     } else {
         v.push(cell(Effect::Fatigue, "energy_factor", p.energy_factor, Rule::Raw, ""));
@@ -525,7 +506,7 @@ pub fn score(s: &FxScenario, cells: Vec<FxCell>, probe: Option<Probe>) -> FxResu
 
 /// Runs one scenario on a robot.
 pub fn evaluate(body: &Body, s: &FxScenario) -> FxResult {
-    if s.needs_legs && !body.legged {
+    if s.needs_legs && !body.legged() {
         return FxResult { id: s.id, name_ko: s.name_ko, holdout: s.holdout, skipped: Some("보행 측정이라 다리가 없는 베이스는 건너뜀".into()), cells: vec![], effect_scores: [None; 5], score: 0.0, gates: vec![], passed: false, probe: None };
     }
     let p = probe(body, s);

@@ -17,6 +17,8 @@ pub struct PhaseStat {
     pub phase: String,
     pub subsystem: String,
     pub weight: f32,
+    /// The ladder the phase is a rung of (a scenario counts a ladder once, at its worst rung).
+    pub ladder: Option<String>,
     pub count: u32,
     pub score_mean: f32,
     pub gated: u32,
@@ -40,6 +42,7 @@ impl NnLive {
             phase: r.id.clone(),
             subsystem: r.subsystem.into(),
             weight: r.weight,
+            ladder: r.ladder.map(Into::into),
             min_margin: f32::INFINITY,
             ..PhaseStat::default()
         });
@@ -62,6 +65,8 @@ impl NnLive {
 
     /// Per scenario: the phases seen so far, combined with their weights
     /// (renormalised over the phases seen, so a partial scenario is marked).
+    /// A ladder's rungs share one weight and the ladder counts once, at its
+    /// worst rung seen, as `noto_core::nn::combine` scores a scenario.
     pub fn summary(&self) -> Vec<serde_json::Value> {
         let mut by: BTreeMap<&str, Vec<&PhaseStat>> = BTreeMap::new();
         for p in self.phases.values() {
@@ -69,8 +74,20 @@ impl NnLive {
         }
         by.into_iter()
             .map(|(id, ps)| {
-                let w: f32 = ps.iter().map(|p| p.weight).sum();
-                let score = ps.iter().map(|p| p.weight * p.score_mean).sum::<f32>() / w.max(1e-6);
+                let mut parts: Vec<(f32, f32)> = Vec::new();
+                let mut ladders: BTreeMap<&str, (f32, f32)> = BTreeMap::new();
+                for p in &ps {
+                    match p.ladder.as_deref() {
+                        Some(l) => {
+                            let e = ladders.entry(l).or_insert((p.weight, f32::INFINITY));
+                            e.1 = e.1.min(p.score_mean);
+                        }
+                        None => parts.push((p.weight, p.score_mean)),
+                    }
+                }
+                parts.extend(ladders.values().copied());
+                let w: f32 = parts.iter().map(|x| x.0).sum();
+                let score = parts.iter().map(|(w, s)| w * s).sum::<f32>() / w.max(1e-6);
                 serde_json::json!({
                     "scenario": id, "name_ko": ps[0].name_ko, "phases_seen": ps.iter().map(|p| p.phase.clone()).collect::<Vec<_>>(),
                     "score": (score as f64 * 10.0).round() / 10.0, "events": ps.iter().map(|p| p.count).sum::<u32>(), "gated": ps.iter().map(|p| p.gated).sum::<u32>(),
@@ -78,5 +95,48 @@ impl NnLive {
                 })
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn phase(id: &str, weight: f32, ladder: Option<&'static str>, score: f32) -> PhaseResult {
+        PhaseResult {
+            id: id.into(),
+            subsystem: "reactive",
+            weight,
+            ladder,
+            cells: vec![],
+            seg_scores: [None; 7],
+            score,
+            item: 2,
+            gates: vec![],
+            beyond_human: vec![],
+            static_margin: 0.5,
+            min_margin: 0.4,
+            peak_ratio: 0.3,
+            worst_joint: None,
+            sustained_effort: 0.2,
+        }
+    }
+
+    #[test]
+    fn a_ladder_counts_once_at_its_worst_rung() {
+        let mut live = NnLive::default();
+        live.record("S4", "짐 들고 제동", &phase("carry", 0.625, None, 90.0));
+        live.record("S4", "짐 들고 제동", &phase("brake_0.5", 0.375, Some("brake"), 80.0));
+        live.record("S4", "짐 들고 제동", &phase("brake_2.5", 0.375, Some("brake"), 40.0));
+        let s = live.summary();
+        // nn::combine: (0.625·90 + 0.375·min(80, 40)) / (0.625 + 0.375) = 71.25; summing every rung would give 73.6.
+        let score = s[0]["score"].as_f64().unwrap();
+        assert!((score - 71.3).abs() < 0.051, "{score}");
+        // One rung seen: the same as without a ladder.
+        let mut one = NnLive::default();
+        one.record("S4", "짐 들고 제동", &phase("carry", 0.625, None, 90.0));
+        one.record("S4", "짐 들고 제동", &phase("brake_0.5", 0.375, Some("brake"), 80.0));
+        assert!((one.summary()[0]["score"].as_f64().unwrap() - 86.3).abs() < 0.051);
+        assert_eq!(live.phases().filter(|p| p.ladder.as_deref() == Some("brake")).count(), 2);
     }
 }

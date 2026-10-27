@@ -183,6 +183,11 @@ pub struct PrecisionGates {
     /// Granite TTM, when its weights are loaded. It joins the fusion as one more predictor.
     ttm: Option<Arc<TtmForecaster>>,
     pub counters: GateCounters,
+    /// Secondary of the `vision` scopes: empty for the stand-in recogniser
+    /// (its statistics live in the label's scope, as before v1.0), the
+    /// recogniser's mode otherwise. A real recogniser reads only its own
+    /// mode's statistics, so a stand-in's learned floor never gates it.
+    scope_mode: String,
 }
 
 /// Runs `f` with the extra predictors that are available (Granite TTM, if loaded).
@@ -247,7 +252,23 @@ fn record_memory(sds: &mut SdsStore, mem: &MemCtx, label: &str, travelled: f32, 
 
 impl PrecisionGates {
     pub fn new(cfg: GateCfg) -> PrecisionGates {
-        PrecisionGates { cfg, next_id: 1, landmarks: Vec::new(), series: HashMap::new(), margins: HashMap::new(), ttm: None, counters: GateCounters::default() }
+        PrecisionGates { cfg, next_id: 1, landmarks: Vec::new(), series: HashMap::new(), margins: HashMap::new(), ttm: None, counters: GateCounters::default(), scope_mode: String::new() }
+    }
+
+    /// The recogniser whose candidates these gates judge (`oracle`, `embedding`).
+    pub fn set_recognizer_mode(&mut self, mode: &str) {
+        self.scope_mode = if mode == "oracle" { String::new() } else { mode.to_string() };
+    }
+
+    /// The SDS `vision` scope of a label for the current recogniser.
+    pub fn vision_scope(&self, label: &str) -> Scope {
+        Scope::new(Track::Vision, label, &self.scope_mode)
+    }
+
+    /// Keeps a learned statistic only when it is the current recogniser's own:
+    /// any scope for the stand-in, the mode's own scope for a real recogniser.
+    fn own<T>(&self, got: Option<(T, String)>, scope: &Scope) -> Option<T> {
+        got.filter(|(_, key)| self.scope_mode.is_empty() || *key == scope.key_secondary()).map(|(v, _)| v)
     }
 
     pub fn cfg(&self) -> &GateCfg {
@@ -359,15 +380,15 @@ impl PrecisionGates {
         let mut floor = fixed;
         let mut source = format!("고정 {fixed:.2}");
         if self.cfg.adaptive {
-            let scope = Scope::new(Track::Vision, label, "");
-            if let Some((mean, sd, n)) = sds.adaptive_baseline(&scope, "score") {
+            let scope = self.vision_scope(label);
+            if let Some((mean, sd, n)) = self.own(sds.adaptive_baseline_scoped(&scope, "score"), &scope) {
                 let learned = (mean - self.cfg.adaptive_k * sd).min(fixed + 0.25);
                 if learned > floor {
                     floor = learned;
                     source = format!("SDS 학습 {learned:.2} (접촉 확인 {n}건, 평균 {mean:.2}±{sd:.2})");
                 }
             }
-            if let Some((rate, n)) = sds.agreement_rate(&scope, "touch") {
+            if let Some((rate, n)) = self.own(sds.agreement_rate_scoped(&scope, "touch"), &scope) {
                 if rate < 0.8 {
                     let extra = (0.8 - rate) * 0.5;
                     floor += extra;
@@ -437,7 +458,7 @@ impl PrecisionGates {
     }
 
     fn judge_one(&mut self, c: Candidate, tick: u64, sds: &mut SdsStore, mem: &MemCtx) -> Judged {
-        let vscope = Scope::new(Track::Vision, &c.label, "");
+        let vscope = self.vision_scope(&c.label);
         sds.record_baseline(&vscope, "score_all", c.score as f64);
         sds.record_baseline(&vscope, "margin", c.margin as f64);
 
@@ -483,7 +504,7 @@ impl PrecisionGates {
                 let need = self.cfg.temporal_min_history;
                 if plausible && hist.len() >= need {
                     let past = past_errors(sds, &c.label);
-                    let sd = sds.adaptive_baseline(&vscope, "score_all").map(|b| b.1);
+                    let sd = self.own(sds.adaptive_baseline_scoped(&vscope, "score_all"), &vscope).map(|b| b.1);
                     let gcfg = GateConfig { widen_sd: self.cfg.temporal_widen_sd, min_history: need };
                     let (v, f) = with_extra(&self.ttm, |extra| (temporal_gate(&hist, c.score as f64, sd, extra, &past, &gcfg), forecast(&hist, 1, extra, &past)));
                     let fscope = Scope::new(Track::Forecast, &c.label, "");

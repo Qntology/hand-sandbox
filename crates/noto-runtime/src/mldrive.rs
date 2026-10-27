@@ -922,7 +922,7 @@ impl Runtime {
         let dest = t.destination.as_deref().and_then(|k| self.world.waypoint_by_key(k)).map(|w| (w.id, w.x, w.z));
         // A body that cannot bring its hand to the ground pushes the piece to the destination instead.
         if let Err(why) = self.world.reach_ground(d.kind, d.amount) {
-            if dest.is_none() || self.world.body.legged {
+            if dest.is_none() || self.world.body.legged() {
                 return fail("reach_ground", format!("[ML] {}을(를) 집을 수 없습니다: {why}", d.kind.spec().label_ko));
             }
             t.push = Some((id, 0));

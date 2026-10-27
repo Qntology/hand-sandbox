@@ -18,18 +18,20 @@ use noto_core::dynamics::{self, BodyPose, DynCfg, DynDigest, Rollout};
 use noto_core::{compute_body, BalanceSummary, BodyInputs, BodyLimits, BodyPlan, BodyStatus, ConfigError, Hand, NotoConfig};
 use serde::{Deserialize, Serialize};
 
+use crate::fixture::Fixture;
 use crate::kinds::{Ground, ItemKind, NodeKind, MIN_PIECE};
 use crate::nav::{self, Cell, EdgePlan, Goal};
 use crate::odometry::{OdomCfg, Odometry};
 use crate::render;
 use crate::rng::Rng;
+use crate::site::{self, Site, SiteCfg, Support};
 use crate::snapshot::*;
 use crate::terrain::{cell_center, FlatZone, RuggedLayout, Terrain, TerrainKind, CELL_M};
 
 mod acts;
 mod eye;
 pub use acts::{camera_of, material_of, ActPlay, PushState, WalkState, GET_UP_S, PUSH_START_SLACK_M, SIDE_SHUFFLE_MAX_M};
-pub use eye::{chassis_accel_rms, exposure_s, profile, roughness_gd, sensor_timing, strike_peak_mps2, strike_scale, EyeState, HeadView, SensorTiming, Shake, SCENE_LUX};
+pub use eye::{chassis_accel_rms, exposure_s, profile, roughness_gd, sensor_timing, sensor_timing_at, strike_peak_mps2, strike_scale, EyeState, HeadView, SensorTiming, Shake, EXPOSURE_MAX_S, SCENE_LUX};
 
 /// Length of one simulation tick, seconds.
 pub const TICK_S: f32 = 0.1;
@@ -93,11 +95,19 @@ pub struct WorldConfig {
     /// and one in front of the base camp), `Some(0)` none.
     #[serde(default)]
     pub parcels: Option<usize>,
+    /// How the scene is lit (`light`): the flat pre-v1.0 lighting by default, or a sun.
+    #[serde(default)]
+    pub lighting: crate::light::Lighting,
+    /// Houses with porch stairs and a logistics centre (`crate::site`); the
+    /// parcels then lie on porches, shelves and tables. `None` (the default)
+    /// is the map without them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site: Option<SiteCfg>,
 }
 
 impl Default for WorldConfig {
     fn default() -> Self {
-        WorldConfig { seed: 7, cells: 64, noto: NotoConfig::preset(noto_core::FingerCount::Five), body: BodyPlan::default(), terrain: TerrainKind::Open, odometry: OdomCfg::default(), parcels: None }
+        WorldConfig { seed: 7, cells: 64, noto: NotoConfig::preset(noto_core::FingerCount::Five), body: BodyPlan::default(), terrain: TerrainKind::Open, odometry: OdomCfg::default(), parcels: None, lighting: crate::light::Lighting::Flat, site: None }
     }
 }
 
@@ -135,12 +145,21 @@ pub struct DropItem {
     pub x: f32,
     pub z: f32,
     pub amount: f32,
+    /// What it rests on: the ground, or a site's porch, shelf deck or table.
+    pub support: Support,
+    /// Height of the surface it rests on, metres (world y); used when `support` is not the ground.
+    pub y_m: f32,
 }
 
 impl DropItem {
     /// A whole item.
     pub fn whole(id: u32, kind: ItemKind, x: f32, z: f32) -> DropItem {
-        DropItem { id, kind, x, z, amount: 1.0 }
+        DropItem { id, kind, x, z, amount: 1.0, support: Support::Ground, y_m: 0.0 }
+    }
+
+    /// A whole item resting on a site's support whose top is `y_m` high.
+    pub fn on(id: u32, kind: ItemKind, x: f32, z: f32, support: Support, y_m: f32) -> DropItem {
+        DropItem { id, kind, x, z, amount: 1.0, support, y_m }
     }
 
     pub fn mass_kg(&self) -> f32 {
@@ -430,6 +449,10 @@ pub struct World {
     pub eye: EyeState,
     /// Side reaches planned so far, by item, piece (thousandths) and cargo (tenths of a kg).
     side_cache: Mutex<std::collections::HashMap<(ItemKind, i32, i32), Option<(f32, f32)>>>,
+    /// Houses and the logistics centre (`WorldConfig::site`), `None` without them.
+    pub site: Option<Site>,
+    /// Their walls, doors, stairs, shelves and tables (`crate::fixture`).
+    pub fixtures: Vec<Fixture>,
 }
 
 impl Clone for World {
@@ -471,6 +494,8 @@ impl Clone for World {
             odom_over: self.odom_over,
             eye: self.eye.clone(),
             side_cache: Mutex::new(self.side_cache.lock().unwrap_or_else(|e| e.into_inner()).clone()),
+            site: self.site.clone(),
+            fixtures: self.fixtures.clone(),
         }
     }
 }
@@ -525,6 +550,18 @@ impl World {
             zones.push((wall_x, zc, 1.4));
             zc += 2.0;
         }
+        // The curb wall's open gap, and the way a wheel takes between the waypoints through it.
+        let gap_from = (0.86 * cells as f32) as usize;
+        let gap_to = gap_from + 2;
+        let gap = (wall_x, (gap_from as f32 + 1.0) * CELL_M);
+        let way = [base_pos, (base_pos.0, gap.1), gap, wh_pos];
+        // A site's buildings stand on flat ground: their places are chosen first (`site::plan`).
+        let site_plan = cfg.site.as_ref().map(|sc| {
+            let keep = site::Keep { base: base_pos, warehouse: wh_pos, wall_cx, way: way.to_vec(), way_m: 2.2 };
+            site::plan(cfg.seed, cells, sc, &keep)
+        });
+        let site_zones = site_plan.as_ref().map_or(Vec::new(), |p| p.zones());
+        zones.extend(site_zones.iter().copied());
         let mut terrain = Terrain::generate(cfg.seed, cells, cells, &zones);
 
         // Compacted gravel pads under the waypoints.
@@ -540,8 +577,6 @@ impl World {
         }
 
         // The curb wall: 5, 10 and 15 cm sections and one open gap.
-        let gap_from = (0.86 * cells as f32) as usize;
-        let gap_to = gap_from + 2;
         for cz in 0..cells {
             if (gap_from..gap_to).contains(&cz) {
                 continue;
@@ -560,10 +595,21 @@ impl World {
         // The rugged map: sea, cliffs and ridges away from the way a wheel
         // takes between the waypoints (through the gap in the curb wall).
         let layout = (cfg.terrain == TerrainKind::Rugged).then(|| {
-            let gap = (wall_x, (gap_from as f32 + 1.0) * CELL_M);
-            let clear: Vec<FlatZone> = vec![(base_pos.0, base_pos.1, 3.5), (wh_pos.0, wh_pos.1, 3.5)];
-            terrain.stamp_rugged(cfg.seed, &clear, &[base_pos, (base_pos.0, gap.1), gap, wh_pos], 2.2)
+            let mut clear: Vec<FlatZone> = vec![(base_pos.0, base_pos.1, 3.5), (wh_pos.0, wh_pos.1, 3.5)];
+            clear.extend(site_zones.iter().copied());
+            terrain.stamp_rugged(cfg.seed, &clear, &way, 2.2)
         });
+        // The houses and the logistics centre: floors, porches, stairs and ramps, walls, shelves, tables.
+        let mut next_fixture = 1u32;
+        let (mut site, fixtures) = match &site_plan {
+            Some(p) => {
+                let (s, f) = site::build(p, &mut terrain, &mut next_fixture);
+                (Some(s), f)
+            }
+            None => (None, Vec::new()),
+        };
+        let reserved: Vec<site::Rect> = site.as_ref().map_or(Vec::new(), |s| s.reserved.clone());
+        let on_site = |cx: usize, cz: usize| reserved.iter().any(|r| r.contains((cx, cz)));
 
         let mut rng = Rng::new(cfg.seed ^ 0xA5A5_5A5A_1234_8765);
         let mut occupied: HashSet<Cell> = HashSet::new();
@@ -596,6 +642,7 @@ impl World {
                 let near_wall = cx.abs_diff(wall_cx) <= 1;
                 if !height_ok
                     || near_wall
+                    || on_site(cx, cz)
                     || in_zone(x, z)
                     || terrain.curb_m(cx, cz) > 0.0
                     || terrain.is_water(cx, cz)
@@ -613,10 +660,11 @@ impl World {
         // On the rugged map some nodes end up on mesas or behind water: seen
         // from afar, out of reach. Every kind keeps two a wheel can get to, so
         // a quest has a way to succeed (a decoy on a mesa is the hard part).
+        let site_blocked: HashSet<Cell> = crate::fixture::blocked(&fixtures).collect();
         if layout.is_some() {
             let wheel = noto_core::BaseKind::Wheel.spec();
             let start = terrain.cell_of(base_pos.0, base_pos.1).unwrap_or((0, 0));
-            let taken: HashSet<Cell> = occupied.clone();
+            let taken: HashSet<Cell> = occupied.union(&site_blocked).copied().collect();
             let times = nav::travel_times(&wheel, &terrain, &|x, z| taken.contains(&(x, z)), start, f32::INFINITY);
             let reachable = |cx: usize, cz: usize| -> bool {
                 (-1i32..=1).any(|dz| (-1i32..=1).any(|dx| {
@@ -632,7 +680,7 @@ impl World {
                     let (cx, cz) = (rng.below(cells as u32) as usize, rng.below(cells as u32) as usize);
                     let (x, z) = cell_center(cx, cz);
                     let i = terrain.idx(cx, cz);
-                    if !times[i].is_finite() || occupied.contains(&(cx, cz)) || in_zone(x, z) || cx.abs_diff(wall_cx) <= 1 || terrain.curb_m(cx, cz) > 0.0 {
+                    if !times[i].is_finite() || occupied.contains(&(cx, cz)) || in_zone(x, z) || cx.abs_diff(wall_cx) <= 1 || terrain.curb_m(cx, cz) > 0.0 || on_site(cx, cz) {
                         continue;
                     }
                     if kind == NodeKind::Tree && terrain.height_cm(cx, cz) >= 70 {
@@ -665,6 +713,22 @@ impl World {
             strike_acc: 0.0,
         };
 
+        // Which porches a walking and a wheeled robot get onto from the base camp.
+        if let Some(s) = site.as_mut() {
+            let taken: HashSet<Cell> = occupied.union(&site_blocked).copied().collect();
+            let start = terrain.cell_of(base_pos.0, base_pos.1).unwrap_or((0, 0));
+            let legs = nav::travel_times(&noto_core::BaseKind::HumanFoot.spec(), &terrain, &|x, z| taken.contains(&(x, z)), start, f32::INFINITY);
+            let wheels = nav::travel_times(&noto_core::BaseKind::Wheel.spec(), &terrain, &|x, z| taken.contains(&(x, z)), start, f32::INFINITY);
+            let on = |times: &[f32], cells: &[Cell]| cells.iter().any(|c| times[terrain.idx(c.0, c.1)].is_finite());
+            for h in s.houses.iter_mut() {
+                h.reachable_legs = on(&legs, &h.porch);
+                h.reachable_wheels = on(&wheels, &h.porch);
+            }
+            // A porch no robot gets onto keeps no parcel.
+            let lost: Vec<u32> = s.houses.iter().filter(|h| !h.reachable_legs).map(|h| h.id).collect();
+            s.slots.retain(|sl| !matches!(sl.owner, crate::fixture::Owner::House(id) if lost.contains(&id)));
+        }
+
         // Parcels: light boxes lying about, found by looking (no node yields them).
         // Their own random stream, so the nodes and the game's draws stay as they were.
         let mut drops = Vec::new();
@@ -677,9 +741,16 @@ impl World {
             let (px, pz) = (base_pos.0 + CAMP_PARCEL_AHEAD_M * c - CAMP_PARCEL_RIGHT_M * s, base_pos.1 + CAMP_PARCEL_AHEAD_M * s + CAMP_PARCEL_RIGHT_M * c);
             drops.push(DropItem::whole(next_drop, ItemKind::Parcel, px, pz));
             next_drop += 1;
+            // With a site, the others lie where parcels are left: a porch, a shelf, a table.
+            if let Some(s) = &site {
+                for sl in site::choose_slots(s, n_parcels - drops.len(), &mut prng) {
+                    drops.push(DropItem::on(next_drop, ItemKind::Parcel, sl.x, sl.z, sl.support, sl.y_m));
+                    next_drop += 1;
+                }
+            }
             let wheel = noto_core::BaseKind::Wheel.spec();
             let start = terrain.cell_of(base_pos.0, base_pos.1).unwrap_or((0, 0));
-            let taken: HashSet<Cell> = occupied.clone();
+            let taken: HashSet<Cell> = occupied.union(&site_blocked).copied().collect();
             let times = nav::travel_times(&wheel, &terrain, &|x, z| taken.contains(&(x, z)), start, f32::INFINITY);
             let mut tries = 0;
             while drops.len() < n_parcels && tries < 4000 {
@@ -687,7 +758,7 @@ impl World {
                 let (cx, cz) = (prng.below(cells as u32) as usize, prng.below(cells as u32) as usize);
                 let (x, z) = cell_center(cx, cz);
                 // On land a wheel can get to, off the waypoints' pads and the curb wall, one per cell.
-                if !times[terrain.idx(cx, cz)].is_finite() || occupied.contains(&(cx, cz)) || in_zone(x, z) || cx.abs_diff(wall_cx) <= 1 || terrain.curb_m(cx, cz) > 0.0 {
+                if !times[terrain.idx(cx, cz)].is_finite() || occupied.contains(&(cx, cz)) || in_zone(x, z) || cx.abs_diff(wall_cx) <= 1 || terrain.curb_m(cx, cz) > 0.0 || on_site(cx, cz) {
                     continue;
                 }
                 occupied.insert((cx, cz));
@@ -736,6 +807,8 @@ impl World {
             odom_over: 0.0,
             eye: EyeState::default(),
             side_cache: Mutex::new(std::collections::HashMap::new()),
+            site,
+            fixtures,
         })
     }
 
@@ -933,10 +1006,10 @@ impl World {
             max_slope_deg: l.max_slope_deg,
             max_step_m: l.max_step_m,
             power_w: self.hand.base.power_w * l.power_scale,
-            drive_accel_mps2: (!self.body.legged).then(|| self.body.chassis.drive_force_n / mass),
+            drive_accel_mps2: (!self.body.legged()).then(|| self.body.chassis.drive_force_n / mass),
             mass_kg: Some(mass),
-            walk_com_z_m: self.body.legged.then(|| noto_core::act::gait::walking_com_z(&self.body)),
-            walk_foot_m: self.body.legged.then_some(self.body.leg.foot_len_m),
+            walk_com_z_m: self.body.legged().then(|| noto_core::act::gait::walking_com_z(&self.body)),
+            walk_foot_m: self.body.legged().then_some(self.body.leg.foot_len_m),
             ..self.hand.base
         }
     }
@@ -1024,9 +1097,36 @@ impl World {
         self.terrain.cell_of(self.agent.x, self.agent.z).unwrap_or((0, 0))
     }
 
-    /// Cells that hold a resource node (the base cannot drive through them).
+    /// Cells that hold a resource node, or a site's wall, shelf or table
+    /// (the base cannot drive through them).
     pub fn blocked_cells(&self) -> HashSet<Cell> {
-        self.nodes.iter().filter_map(|n| self.terrain.cell_of(n.x, n.z)).collect()
+        let mut b: HashSet<Cell> = self.nodes.iter().filter_map(|n| self.terrain.cell_of(n.x, n.z)).collect();
+        b.extend(crate::fixture::blocked(&self.fixtures));
+        b
+    }
+
+    /// Height of the surface an item rests on, metres (world y): its cell's
+    /// top on the ground, else its porch, shelf deck or table top.
+    pub fn drop_base_m(&self, d: &DropItem) -> f32 {
+        if d.support.is_ground() {
+            self.surface_m(d.x, d.z)
+        } else {
+            d.y_m
+        }
+    }
+
+    /// Height of the surface a site's support offers, metres (world y):
+    /// a porch or stair tread, a shelf deck, a table top (`Site::support_top_m`);
+    /// `None` for the ground and without a site.
+    pub fn support_top_m(&self, s: Support) -> Option<f32> {
+        self.site.as_ref()?.support_top_m(&self.fixtures, s)
+    }
+
+    /// The search prior per cell (`crate::explore::next_viewpoint_with`):
+    /// where the robot is told parcels are kept (porches, the logistics
+    /// centre); `None` without a site.
+    pub fn search_prior(&self) -> Option<Vec<f32>> {
+        self.site.as_ref().map(|s| s.prior(&self.terrain))
     }
 
     /// Ground height under the robot, curb included.
@@ -1093,6 +1193,7 @@ impl World {
                     (d.x, d.z, d.kind, d.amount)
                 };
                 self.check_reach(dx, dz, PICKUP_REACH_M)?;
+                self.check_support(*drop)?;
                 let info = self.grasp_for(kind, amount);
                 self.agent.grip_margin = Some(info.margin);
                 // From above, the fingers' friction alone carries it: one hand, or both sharing it.
@@ -1179,6 +1280,22 @@ impl World {
                 vec![self.stamp(WorldEvent::ActionDone { action: a.label(), ok: false, reason: Some("cancelled".into()) })]
             }
             None => vec![],
+        }
+    }
+
+    /// The grasp model takes items from the floor the robot stands on. An item
+    /// on a porch is in reach once the robot stands on that porch; one on a
+    /// shelf deck or a table top is not (the reach to a raised support is
+    /// not modelled yet), and the pick is refused instead of played wrong.
+    fn check_support(&self, drop: u32) -> Result<(), ActionError> {
+        let Some(d) = self.drop_item(drop) else { return Err(ActionError::UnknownTarget) };
+        let here = self.agent_ground_m();
+        let at = self.drop_base_m(d);
+        match d.support {
+            Support::Ground => Ok(()),
+            Support::Step { .. } if (at - here).abs() <= 0.03 => Ok(()),
+            Support::Step { .. } => Err(ActionError::CannotReach { lowest_m: here, need_m: at, reason: format!("{}에 있어 같은 높이에 올라서야 집을 수 있음", d.support.label_ko()) }),
+            Support::Shelf { .. } | Support::Table { .. } => Err(ActionError::CannotReach { lowest_m: here, need_m: at, reason: format!("{}의 물체를 집는 손 뻗기는 아직 모델에 없음", d.support.label_ko()) }),
         }
     }
 
@@ -1324,7 +1441,7 @@ impl World {
         }
 
         // A slipping wheel or track counts distance it did not travel (the drive model's cruise slip on this ground).
-        if !self.body.legged {
+        if !self.body.legged() {
             let props = self.ground_at(e.to).surface().props();
             self.odom_over = noto_core::act::cruise_slip(&self.drive_spec(), props, e.slope_deg).map_or(0.0, |s| s / (1.0 - s).max(0.05));
         }
@@ -1574,7 +1691,7 @@ impl World {
                     .filter(|&(x, z)| on_land(self, x, z))
                     .unwrap_or((bx + sx * off, bz + sz * off));
                 piece_index += 1;
-                let d = DropItem { id: self.next_drop, kind: k, x: lx, z: lz, amount: *p };
+                let d = DropItem { id: self.next_drop, kind: k, x: lx, z: lz, amount: *p, support: Support::Ground, y_m: 0.0 };
                 self.next_drop += 1;
                 ids.push(drop_id(d.id));
                 self.drops.push(d);
@@ -1587,11 +1704,11 @@ impl World {
         let Some(d) = self.drops.iter_mut().find(|d| d.id == id) else { return };
         let piece = d.amount * portion;
         d.amount -= piece;
-        let (kind, left, x, z) = (d.kind, d.amount, d.x, d.z);
-        // The broken-off piece lands beside the rest, toward the robot.
+        let (kind, left, x, z, support, y_m) = (d.kind, d.amount, d.x, d.z, d.support, d.y_m);
+        // The broken-off piece lands beside the rest, toward the robot, on what the rest lies on.
         let (ax, az) = (self.agent.x - x, self.agent.z - z);
         let n = ax.hypot(az).max(1e-3);
-        let new = DropItem { id: self.next_drop, kind, x: x + 0.12 * ax / n, z: z + 0.12 * az / n, amount: piece };
+        let new = DropItem { id: self.next_drop, kind, x: x + 0.12 * ax / n, z: z + 0.12 * az / n, amount: piece, support, y_m };
         self.next_drop += 1;
         events.push(self.stamp(WorldEvent::ItemSplit { drop: drop_id(id), piece: drop_id(new.id), item: kind, amount: piece, left }));
         self.drops.push(new);
@@ -1611,7 +1728,7 @@ impl World {
                 ground.push(t.ground_at(cx, cz).code());
             }
         }
-        TerrainGrid { cells_w: t.w, cells_d: t.d, cell_m: CELL_M, heights_cm: heights, curb_cm: curbs, ground, kind: self.cfg.terrain }
+        TerrainGrid { cells_w: t.w, cells_d: t.d, cell_m: CELL_M, heights_cm: heights, curb_cm: curbs, ground, kind: self.cfg.terrain, curb_kind: t.curb_kind_codes().to_vec() }
     }
 
     fn carry_views(list: &[(ItemKind, f32)]) -> Vec<CarryView> {
@@ -1671,9 +1788,10 @@ impl World {
             drops: self
                 .drops
                 .iter()
-                .map(|dr| DropView { id: drop_id(dr.id), item: dr.kind, label_ko: dr.kind.spec().label_ko.into(), pos: at(dr.x, dr.z), amount: dr.amount })
+                .map(|dr| DropView { id: drop_id(dr.id), item: dr.kind, label_ko: dr.kind.spec().label_ko.into(), pos: Pos3 { x: dr.x, y: self.drop_base_m(dr), z: dr.z }, amount: dr.amount, support: dr.support })
                 .collect(),
             terrain: self.cfg.terrain,
+            site: self.site.as_ref().map(|s| s.view(&self.fixtures, &self.terrain)),
         }
     }
 
@@ -1697,7 +1815,7 @@ impl World {
         match &self.active {
             Some((_, Active::Move(m))) => {
                 let Some(e) = m.edges.get(m.idx) else { return (Posture::quiet(cargo), "flat|move".into()) };
-                let rise = self.terrain.height_m(e.to.0, e.to.1) - self.terrain.height_m(e.from.0, e.from.1);
+                let rise = self.terrain.height_m(e.to.0, e.to.1) - self.terrain.height_m(e.from.0, e.from.1) + self.terrain.ramp_rise_m(e.from, e.to).unwrap_or(0.0);
                 let slope = if rise >= 0.0 { e.slope_deg } else { -e.slope_deg };
                 let ground = self.ground_here();
                 let mut p = Posture { slope_deg: slope, moving: true, ..Posture::quiet(cargo) };
@@ -1706,7 +1824,7 @@ impl World {
                 if m.pause_left > 0.0 {
                     p.source = Source::StepUp;
                     p.step_m = e.step_m;
-                    p.single_support = self.body.legged;
+                    p.single_support = self.body.legged();
                 } else if m.elapsed_s < self.drive_spec().max_speed_mps / self.planned_accel(slope, ground, 1.0) {
                     // The planner starts no harder than the ZMP's room toward the back edge and the ground's friction allow on this slope.
                     p.source = Source::Accel;
@@ -1716,7 +1834,7 @@ impl World {
                     p.source = Source::Accel;
                     p.accel_mps2 = -self.planned_accel(slope, ground, -1.0);
                     b_brake = true;
-                } else if self.body.legged {
+                } else if self.body.legged() {
                     p.source = Source::FootLift;
                     p.single_support = true;
                 } else if slope.abs() >= 3.0 {
@@ -1865,6 +1983,7 @@ impl World {
     pub fn body_inputs(&self, vision_confidence: Option<f32>, frame_ms: Option<f32>) -> BodyInputs {
         BodyInputs {
             base: self.hand.base.kind,
+            morph: self.body.morph,
             fingers: u8::from(self.hand.config.fingers),
             vision_confidence,
             frame_ms,

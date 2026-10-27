@@ -127,7 +127,8 @@ impl LexMatcher {
                 }
             }
         }
-        for w in lex.filler.exact_match.iter().chain(&lex.filler.surface) {
+        // "있는", "놓인": filler to the matcher; the role stage reads them after a place.
+        for w in lex.filler.exact_match.iter().chain(&lex.filler.surface).chain(&lex.located_words) {
             add(&mut words, w, Category::Filler, "");
         }
         for w in lex.negation.exact_match.iter().chain(&lex.negation.surface) {

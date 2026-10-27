@@ -106,6 +106,191 @@ G1 관절 토크 한계(MuJoCo Menagerie [27]): 고관절 피치·요 88, 고관
 - **좋은 혼합**: 보급형 팔·머리 + 바퀴 베이스(SO-101 형 물류 로봇), 중급 다리 + 고급 어깨(가반은 늘지만 발목도 한 등급 올려야 함).
 - **피할 조합**: 7 kg 넘는 로봇에 버스 서보 다리, 하중을 받는 Dynamixel 관절(피크:연속 ~5:1), 발목의 보급형 서보(흔들림 관성), 무거운 집기에 다관절 손.
 
+## 7. 형태 (v1.0): 하체 × 몸통 × 머리·목 × 조작기 × 적재
+
+조사일 2026-10-27. `crates/noto-core/src/morph.rs`와 `parts.rs`의 형태 숫자는 이 절에서 왔다. 표기: **[직접]** 출처에 인쇄된 값, **[유도]** 계산, **[추정]** 출처를 찾지 못해 정한 값, **[대입]** 다른 로봇의 값을 빌림. 연구 팩은 `robot-morphologies` (엔진 입력 = Group A, 벤치마크 = Group B).
+
+### 7.1 요청과 반영
+
+| 요청 (R6) | 반영 |
+|---|---|
+| 바퀴 하체에 걷는 사람의 카메라가 붙어 있음 | 카메라 위치를 형태가 정한다 (`HeadMount`): 목 위 머리, 몸통에 고정된 머리(목 없음), 마스트 카메라(팬·틸트 있음/없음), 차체 앞 카메라, 없음. `kin::camera`가 이것을 따르고, `kin::head_camera`는 같은 함수를 부르는 이름으로 남겼다. 세계·화면의 카메라 흔들림은 다음 묶음(카메라)이 이 위치를 쓴다 |
+| 상체에 목이 있거나 없음 | `HeadMount::Fixed { tilt_deg }`: 목 관절, 목 서보 두 개의 질량, 시선 안정화가 없다. 카메라는 몸통과 고정 틸트로만 기운다 |
+| 바퀴 + 몸통 없음 + 집게만 | `deck_gripper`(갑판 위 집게 팔, 차체 카메라, 토트), `mast_gripper`(마스트 리프트에 탄 집게 팔, 마스트 카메라, 토트) |
+| 집게가 없는 운반 트럭 (휴머노이드가 짐을 실어 줌) | `truck`: 조작기 없음, 차체 카메라, 짐칸(`Cargo::Bed`). 집기·내려놓기·들기는 `no_manipulator`로 바로 거절한다. 다른 로봇이 짐칸에 실어 주는 흐름은 다음 묶음(여러 로봇)이 한다 |
+| 여러 층의 조합 | `Morphology { lower, torso, head, manip, cargo }` 다섯 층. 하체는 구동(`NotoConfig.base`)을 따른다. 만들 수 없는 조합과 범위 밖 크기(고정 머리 틸트, 마스트·차체 카메라 높이, 짐칸 크기)는 `Morphology::validate`가 한국어로 이유를 말하고, `Morphology::fit`이 가장 가까운 조합으로 고친다 (`Body::new`는 고친 형태로 만들고, `Body.plan`도 그 형태라서 `plan.id()`가 실제로 만든 로봇을 가리킨다). `BodyPlan::validate`는 여기에 더해, 팔이 자기 토트·짐칸 위로 손을 가져가지 못하는 계획을 거절한다 |
+
+기본값은 오늘의 휴머노이드다. 그래서 `morph`가 없는 계획(예전 JSON 포함)은 예전과 같은 로봇을 마지막 자리까지 같게 만든다. `BodyPlan::id()`도 `mid` 그대로이고, 다른 형태만 `mid+truck`처럼 뒤에 붙는다 (SDS 열쇠 유지).
+
+### 7.2 층과 이름 붙은 형태
+
+| 층 | 선택 |
+|---|---|
+| 하체 `Lower` | 다리 · 바퀴 · 메카넘 바퀴 · 트랙 (`BaseKind`와 1:1, `Lower::from_base`) |
+| 몸통 `Torso` | 휴머노이드(골반·허리·가슴, 오늘) · 마스트 기둥(어깨와 머리를 실은 캐리지, 몸통 리프트로 내려감; Fetch·TIAGo 형) · 없음(갑판) |
+| 머리 `HeadMount` | 목(팬·틸트, 오늘) · 고정(`tilt_deg`) · 마스트 카메라(`height_mm`, `pan_tilt`) · 차체 앞(`height_mm`) · 없음 |
+| 조작기 `Manip` | 두 팔(손, 오늘) · 한 팔(손) · 집게 팔 하나 · 없음 |
+| 적재 `Cargo` | 배 앞 적재함(오늘) · 짐칸(`len/width/height_mm`, `payload_kg`) · 갑판 토트 · 없음 |
+
+크기는 정수 mm·kg라서 `BodyPlan`이 `Copy + Eq`를 그대로 유지한다.
+
+| 형태 | 하체 | 몸통 | 카메라 | 조작기 | 적재 | 실제 원형 |
+|---|---|---|---|---|---|---|
+| `legs_humanoid` 두 다리 휴머노이드 | 다리 | 휴머노이드 | 목 | 두 팔 | 적재함 | 오늘의 다리형 (§2의 G1·K-Bot 급) |
+| `wheel_humanoid` 바퀴 휴머노이드 | 바퀴 | 휴머노이드 | 목 | 두 팔 | 적재함 | 오늘의 기본 로봇 |
+| `track_humanoid` 트랙 휴머노이드 | 트랙 | 휴머노이드 | 목 | 두 팔 | 적재함 | 오늘의 트랙 로봇 |
+| `wheel_noneck` 목 없는 바퀴 휴머노이드 | 바퀴 | 휴머노이드 | 고정, 15° 아래 | 두 팔 | 적재함 | 목 자유도 없는 머리 (Unitree H1 형; 연구 팩도 미확인으로 표시) |
+| `mast_gripper` Stretch 형 | 바퀴 | 없음 | 마스트 1.31 m, 팬·틸트 | 집게 팔 하나 (마스트 리프트) | 토트 | Hello Robot Stretch RE1 [49] |
+| `deck_gripper` LeKiwi 형 | 바퀴 | 없음 | 차체 앞 0.20 m | 집게 팔 하나 (갑판) | 토트 | LeKiwi 베이스 + SO-101 팔 [29][30] |
+| `truck` 운반 트럭 | 바퀴 (트랙도 됨) | 없음 | 차체 앞 0.25 m | 없음 | 짐칸 0.50 × 0.40 m, 0.25 m 높이, 100 kg | AMR·카트 운반 로봇: MiR250 [51], AgileX Tracer [33] (Amazon Proteus는 공개 수치가 없음) |
+
+### 7.3 Group A 엔진 입력
+
+| 상수 (`morph.rs`·`parts.rs`) | 값 | 구분 | 출처 |
+|---|---|---|---|
+| `STRETCH_CAMERA_H_MM` 마스트 카메라 높이 | 1310 mm | [직접] Stretch RE1 머리 컬러 카메라 바닥 위 131 cm | Kemp 외 2022 [49] §II |
+| `MAST_LIFT_TOP_M` 마스트 캐리지 꼭대기 | 1.10 m | [직접] Stretch RE1 리프트 0–110 cm | [49] §II |
+| `MAST_LIFT` 행정 | 꼭대기에서 갑판 팔 어깨 높이(0.26 m)까지 = 0.84 m | [유도] | — |
+| `MAST_LIFT` 속도·힘 | 0.10 m/s · 450 N | [대입] `TORSO_LIFT`(Fetch 몸통 리프트) | §5 `TORSO_LIFT` |
+| `MAST_LIFT` 질량·가격 | `lift_mass_kg(행정)` = 1.0 + 1.4·행정 + 0.9 kg (0.84 m에서 3.08 kg) · $600 | [추정] 벨트 축 1.0 kg + 100 mm당 0.14 kg + 모터·브레이크 0.9 kg (`TORSO_LIFT` 2.5 kg과 같은 추정; 행정이 짧은 마스트는 그만큼 가벼움) | — |
+| `MAST_TILT_MAX_DEG` 마스트 팬·틸트의 아래 한계 | 83° | [직접] Fetch `head_tilt_joint` 상한 1.45 rad | fetch_description URDF [50] |
+| 마스트 팬 범위 | ± 90° | [직접] Fetch `head_pan_joint` ± 1.57 rad (목과 같은 값) | [50] |
+| `AMR_CAMERA_H_MM` 트럭 카메라 | 250 mm | [추정] MiR250 몸체 높이 300 mm, 3D 카메라는 앞쪽 아래 | MiR250 사양 [51] |
+| `DECK_CAMERA_H_MM` 갑판 카메라 | 200 mm | [추정] 0.16 m 갑판의 앞 가장자리 위 0.04 m | — |
+| `FIXED_HEAD_TILT_DEG` 고정 머리 틸트 | 15° | [추정] 목으로 내려다볼 수 없으니, 1.14 m 눈에서 바닥이 약 0.9 m 앞부터 보이게 (렌더 카메라: 세로 시야 50°, 자체 12° 아래 피치 → 수평 머리는 1.5 m 앞부터; 기하 계산) | — |
+| `TRUCK_BED` 정격 | 100 kg | [직접] AgileX Tracer 가반 | [33] |
+| `TRUCK_BED` 크기·높이 | 0.50 × 0.40 m, 0.25 m | [추정] MiR250 몸체 높이 300 mm 아래 | [51] |
+| `BED_KG_PER_M2` 짐칸 판 | 8.1 kg/m² | [유도] 알루미늄 3 mm × 2.70 g/cm³ (§4), 기둥·난간은 뺌 | §4 |
+| `EXTRUSION_KG_PER_M` 카메라 기둥·마스트 기둥 | 0.50 kg/m | [직접] 2020 알루미늄 압출재 | [46] |
+| `POLE_MOUNT_KG` 기둥 클램프·카메라판 | 0.20 kg | [추정] | — |
+| `CHASSIS_CAMERA_KG` 차체 카메라 | 0.10 kg | [추정] D435i 약 72 g [43] + 브래킷 | [43] |
+| 고정 머리 질량 (`mounted_head`) | 머리 프리셋 − 목 서보 2개 | [유도] §5 머리 프리셋 = 서보 2개 + 카메라 | §5 |
+| 몸통 없는 로봇의 컴퓨터 `computer_kg` | 보급 Raspberry Pi 5 0.054 kg (45–62 g의 가운데), 중급 Jetson Orin Nano Super 0.175 kg, 고급 "Orin 급"도 0.175 kg | [직접] / 고급은 [대입] | [41][42] |
+| 전자 상자 `DECK_BOX_KG`, 위치 `ELECTRONICS_Z_M` | 0.30 kg, 차체 안 (중심 0.11 m, 차체 상자의 가운데) | [추정] AMR·모바일 매니퓰레이터는 배터리와 컴퓨터를 베이스 안에 둔다. 갑판 위에 두면 토트·팔 받침·기둥 자리와 겹친다 | — |
+| 갑판 팔 받침 `DECK_ARM_BASE_HALF_M` | 0.06 m 폭, 갑판에서 어깨까지 (그리기만; 질량은 팔 프리셋) | [추정] SO-101 급 팔의 받침 | — |
+| 범위 `FIXED_TILT_RANGE_DEG` | 고정 머리 틸트 −45…60° | [추정] 위로 45°면 렌더 카메라(세로 50°, 자체 12° 아래)에 바닥이 없고, 아래 60°면 자기 앞만 보임 | — |
+| 범위 `MAST_CAMERA_MAX_MM` | 마스트 카메라 2000 mm 이하 | [추정] Fetch 머리 최고 1.447 m [50] 위 | [50] |
+| 범위 `CHASSIS_CAMERA_RANGE_MM` | 차체 카메라 50–600 mm | [추정] 지면 위 ~ MiR250 몸체 높이 300 mm의 두 배 | [51] |
+| 범위 `BED_MAX_MM` | 짐칸 1000 × 800 mm, 높이 800 mm 이하 | [추정] 0.25–0.36 m 차체에 그 이상은 트레일러 | — |
+| 집게 `GripperPreset` | 보급 SO-101 집게 0.13 kg, ~21 / ~7 N; 중급 XM430 2지 집게 0.35 kg; 고급 Robotiq 2F-85 0.9 kg, 20–235 N | [직접]·[추정] (§2 손·그리퍼) | [29][37] |
+| 집게 조임 (`grasp::capacity_for`) | 양쪽 턱이 같은 힘 F로 누르므로 법선력 합 2·F (손가락의 관절 피크 힘과 같이 피크 값): SO-101 42 N, Robotiq 2F-85 470 N. 힘이 없는 중급 XM430 집게는 2지 손 모델(`FingerCount::Two`)의 접촉 | [유도] 평행 집게의 두 접촉면 마찰 | [29][37] |
+| 갑판 높이 `DECK_Z_M` | 0.16 m (차체 상자 윗면) | [유도] `kin`의 차체 상자 | — |
+| 갑판 팔 어깨 `DECK_ARM_X_M`, `DECK_ARM_BASE_H_M` | 갑판 가운데 뒤 0.06 m, 갑판 위 0.10 m | [추정] SO-101 급 팔의 어깨 피치 축이 장착판 위 약 0.1 m | — |
+| 갑판 팔 쉬는 자세 `DECK_REST_DEG` | 어깨 120°, 팔꿈치 120° (갑판 위로 접음) | [추정] | — |
+| 마스트 팔 어깨 `MAST_ARM_X_M` | 마스트 앞 0.05 m | [추정] 캐리지 브래킷 | — |
+| `MAST_CAMERA_CLEAR_M` | 캐리지 꼭대기와 렌즈 사이 0.15 m | [추정] 팬·틸트 머리 | — |
+| 마스트 기둥 `COLUMN_TOP_M` | 1.07 m (어깨 1.00 m + 목 0.07 m) | [유도] §5 기준 기하 | §5 |
+| 마스트 기둥 꼭대기 `column_top_m` | 기둥 위에 마스트 카메라가 있으면 그 팬·틸트 피벗까지 (질량은 압출재 0.50 kg/m로 셈) | [유도] | [46] |
+| 토트 `TOTE_SIZE_M`, `TOTE_KG` | 0.16 × 0.24 × 0.12 m, 0.4 kg | [추정] | — |
+| 적재물 무게중심 `CARGO_ABOVE_FLOOR_M` | 짐칸·토트 바닥 위 0.10 m | [추정] 0.2 m 상자의 절반 | — |
+| 짐칸·토트 위에서 놓는 높이 `RIM_RELEASE_M` | 테두리 위 0.20 m | [추정] | — |
+
+### 7.4 Group B 벤치마크 출처
+
+연구 팩의 benchmark_refs 가운데 형태에 쓸 수 있는 것이다. 엔진 파일은 이 이름을 쓰지 않는다 (`tests/morph_forms.rs`의 출처 검사). 이번 묶음은 형태별 점수 칸([MX])을 만들지 않았다. 형태 행렬 칸은 v1.0 벤치 묶음이 만든다. 아래 비교는 손으로 한 것이다.
+
+| 출처 | 값 | 비교한 것 |
+|---|---|---|
+| Hello Robot, Stretch 3 Hardware Guide [31] (연구 팩 Group B) | 머리 팬 346°·틸트 115° (−25…+90°), 정격 가반 2 kg, 팔 이동 0.52 m | `mast_gripper`의 팬·틸트 범위 |
+| Hello Robot, Stretch 3 전체 높이·질량 (§2 표 [31]) | 141 cm, 24.5 kg | `mast_gripper`의 카메라 높이·질량. 엔진은 Stretch 3 값을 쓰지 않는다 (엔진은 RE1 [49]) |
+| Wevolver, Fetch Mobile Manipulator 사양 [52] | 높이 1096–1491 mm, 113.3 kg, 팔 가반 6 kg | (마스트 기둥 몸통 `Torso::Mast`; 이름 붙은 형태가 없어 비교하지 않음) |
+| Ackerman, IEEE Spectrum 2015 (Starship) [53] | 적재 포함 20 kg 미만, 약 10 kg 적재 | `truck`의 적재 비율 |
+| Konica Minolta MiR250 목록 [54] (검색 결과로만 봄) | 가반 250 kg, 2.0 m/s | `truck`의 적재 비율 (MiR250 질량 97 kg은 [51]) |
+
+같은 141 cm·24.5 kg을 적은 업계 보도 [55]는 연구 팩에서 엔진 입력(Group A)으로 분류되어 있어 점수 출처로 쓰지 않는다 (엔진도 쓰지 않음; 맥락으로만 적음).
+
+| 비교 | 엔진 | 벤치마크 | 차이 |
+|---|---|---|---|
+| 마스트 카메라 높이 vs 로봇 전체 높이 | 1.31 m (Stretch RE1 [49]) | Stretch 3 전체 141 cm [31] | 카메라가 꼭대기보다 0.10 m 아래 (Fetch URDF에서도 머리 꼭대기는 카메라 위 35–45 mm) — 맞음 |
+| `mast_gripper` 질량 (중급) | 17.2 kg | Stretch 3 24.5 kg [31] | −30% (Group A인 Stretch RE1 23 kg 대비 −25%) |
+| 마스트 팬·틸트 범위 | 팬 180° (± 90°), 틸트 166° (± 83°) | Stretch 3 팬 346°, 틸트 115° [31] | 팬 −48%, 틸트 +44%. 엔진은 Fetch URDF [50]의 아래 한계 83°를 위쪽에도 대칭으로 둔다 (Fetch의 위쪽 한계는 43.5°) |
+| `truck` 적재 비율 = 적재 / (자중 + 적재) | 보급 54% · 중급 69% · 고급 73% | Starship ≥ 50% [53] · MiR250 72% [54][51] | 보급은 Starship과, 고급은 MiR250과 비슷 |
+
+### 7.5 모델
+
+- **조립**: `Body::new`는 계획의 형태를 구동에 맞춘 뒤(`Morphology::fit`) 있는 부위만 만든다. 몸통이 없으면 골반(배 프리셋)의 질량·피치 관절·기울기가 0이다. 가슴 프리셋에서는 몸통 구조(척추·외피)를 빼고 컴퓨터와 그 상자(`computer_kg` + `DECK_BOX_KG`)와 배터리만 차체 안(중심 높이 0.11 m)에 싣는다. 목이 없으면 머리 질량에서 목 서보 두 개를 빼고 시선 안정화가 0이다. 차체 카메라는 카메라만(0.10 kg)이다. 팔은 `arm_count()`만큼이고, 손끝 질량은 손(손가락 수) 또는 집게다. 짐칸·토트는 구조 질량과 함께 차체에 붙는다. 적재물은 배 앞 적재함(골반과 함께 움직임) 또는 짐칸·토트(차체에 고정)에 실린다.
+- **세 모델이 같은 질량**: `balance`(준정적), `kin`(전신 기구학), `dynamics`(관절 동역학)는 같은 `Body` 메서드(`shoulder_mount`, `head_com`, `column`, `mount_masses`, `cargo_point`)로 질량을 놓는다. 그래서 세 모델의 질량과 무게중심이 형태마다 맞는다 (§7.6, 층 조합 전부에서 검사). 마스트 카메라의 질량은 팬·틸트 피벗(렌즈 아래 `CAMERA_UP_M`) 위 `head.com_up_m`에 놓인다. 지금 머리 프리셋은 둘 다 0.07 m라 숫자는 같지만, 머리 프리셋이 바뀌어도 세 모델이 갈라지지 않는다 (무게중심을 0.15 m로 바꾼 머리로 검사). 그리는 상자도 공유한다: 갑판 팔 받침·토트·짐칸·차체 카메라는 `Body::deck_boxes` 하나를 `kin`과 `dynamics`가 그린다.
+- **관절은 있는 것만**: 목이 없으면 `neck`이, 몸통이 없으면 `waist_yaw`·`waist_pitch`가, 팔이 하나면 `_l` 관절이, 조작기가 없으면 어깨·팔꿈치·쥠이 어느 보고서에도 없다. 이름으로 찾으면 `None`이 나온다. 동역학의 목표값은 자유도 순서가 아니라 관절 이름으로 고른다 (`Robot::dof_index`).
+- **카메라** (`kin::camera`): 목은 오늘의 고관절 → 골반 → 허리 → 몸통 → 목 사슬이다. 고정 머리는 같은 사슬에 몸통 피치와 고정 틸트만 더한다 (목 각도는 무시). 마스트 카메라는 정한 높이에서 팬·틸트 피벗(있으면)으로 돈다. 차체 카메라는 갑판 앞 가장자리에서 수평이다. 바퀴·트랙의 차체 피치는 모두에 들어간다.
+- **마스트 리프트 (Stretch 형)**: 몸통이 없고 마스트 카메라와 팔이 있으면, 팔은 마스트의 캐리지에 탄다. 어깨는 꼭대기(1.10 m)에서 `KinPose::lift_m`만큼 내려간다. 리프트는 기존 몸통 리프트와 같은 `torso_lift` 관절(선형, 힘 = 캐리지에 실린 팔·손·짐의 무게)로 보고된다. 계획기(`reach::plan`)는 몸통 리프트와 같이 리프트 높이를 찾는다. 내려가고 올라가는 시간은 리프트 속도로 가는 최소 저크 이동보다 짧지 않다. 집은 물건은 토트에 놓을 캐리지 높이에서 든다 (`grasp::hold_pose_for`): 캐리지가 마스트 꼭대기까지 올라갔다가 다시 내려오지 않는다.
+- **조작기 능력**: 조작기가 없으면 `reach`·`grasp`·`release`·`Body::lift`가 바로 `no_manipulator`로 거절한다. 팔이 하나면 두 손 들기를 `one_arm`으로 거절한다 (한 팔로 몰래 들지 않음). 없는 팔에 걸린 하중도 조용히 버리지 않는다: `kin`은 "왼팔 없음: 손 하중 … N"을 관절 범위 밖으로, `balance`는 불가능으로 보고한다. 집은 물건은 형태의 적재 위치로 간다. 적재함은 오늘과 같다. 토트·짐칸은, 손이 놓는 점(테두리 위 0.20 m) 위로 팔 역기구학이 닿는 가장 높은 리프트 위치를 찾아 거기서 놓는다. 적재 공간이 없으면 손에 든 채 운반한다. 적재 공간이 있는데 손이 닿지 않으면(리프트 없는 몸통·기둥의 팔과 낮은 토트·짐칸) 손에 든 채 운반하면서 `stow_unreachable` 사건으로 알리고, `BodyPlan::validate`가 그 계획을 거절한다. 평행 집게(`Gripper1`)는 설정 손(5지)이 아니라 두 턱으로 쥔다: 조임은 2·F(턱 힘 F가 있는 등급), 닫는 속도·접촉은 2지 손 모델, 초점 화면에도 턱 두 개를 그린다.
+- **주행·밀기 표본의 자세**: `act::drive`(`state`, `drive`)와 `act::push`는 오늘의 휴머노이드 선 자세(`KinPose::stand`) 대신 형태의 쉬는 자세(`Body::stand`)로 각 표본을 푼다. 휴머노이드는 같은 자세(비트 단위)이고, 갑판 팔은 갑판 위로 접힌다 (예전에는 손이 땅 아래 −0.22 m였고 축 하중·여유도 그 팔로 셈).
+- **너무 높은 목표의 이유**: `reach::plan`이 목표(테이블·선반)가 팔의 가장 높은 어깨에서도 닿지 않는 높이일 때 "선 자세의 팔로는 손바닥이 X m까지만 올라감"이라고 말한다 (예전: "손은 닿지만 굽힌 자세를 버티지 못함…"). 오늘의 휴머노이드에도 해당하는 문구 변경이다. 성공·실패와 벤치마크 줄은 바뀌지 않는다.
+- **운반 한도**: 짐칸은 자기 정격(Tracer 100 kg)과 섀시 구조 한도(섀시 정격 − 섀시 위 질량) 가운데 작은 것이다. 적재함·토트는 베이스 한도를 쓰고, 적재 공간이 없으면 0이다.
+- **상태 화면**: 하체 이름(발·바퀴·메카넘 바퀴·트랙), 카메라 이름(머리·마스트 카메라·전방 카메라), 적재 영역(`stomach` 적재함, `bed` 짐칸, `tote` 토트)을 형태에서 정한다. 조작기가 없으면 손 영역 두 개가 없다. 오늘의 휴머노이드는 일곱 영역의 id와 순서가 그대로다 (바퀴·트랙 로봇은 아래 두 영역의 이름만 "발" 대신 "바퀴"·"트랙"). `BodyStatus`에 `morph`, `form`, `form_ko`가 붙는다.
+- **검산: 좁은 베이스의 전도 하중**: Kemp 외 2022 [49]의 모멘트 균형(m_payload = m_r·d_ra/d_p)을, 갑판 팔을 수평으로 뻗은 자세에 그대로 놓는다. 그리고 `kin`의 ZMP가 바로 그 하중에서 앞바퀴를 넘는지 본다 (엔진 정역학의 일관성 검사이고 벤치마크가 아님).
+
+### 7.6 검사 결과
+
+`cargo test -p noto-core --test morph_forms` (`[MORPH]` 줄). 엔진 입력과의 일관성 검사이고 점수 칸은 아니다.
+
+**기본 형태는 오늘의 숫자 그대로다.** 세 휴머노이드 형태(`legs_humanoid`·`wheel_humanoid`·`track_humanoid`)는 기본 계획과 질량·CoM·카메라·균형 보고서 전체가 비트 단위로 같고 (`the_default_forms_are_todays_robots`), 기존 테스트는 하나도 바꾸지 않고 모두 통과했으며, 벤치마크 줄 1029개([AX-SUM]·[FX]·[FX-SUM]·[NN]·[NN-SUM]·[VX]·[VX-SUM]·[CAM]·[CAM-SUM])가 v1.0 이전 기준선과 글자 그대로 같다.
+
+**이름 붙은 형태 × 등급** (서 있는 자세; 여유 = ZMP 여유, 경사·속도·적재 = `drive_limits`):
+
+| 형태 | 등급 | 질량 kg | CoM m | 카메라 m | 여유 | 경사 ° | 속도 m/s | 적재 kg | 관절 |
+|---|---|---|---|---|---|---|---|---|---|
+| `legs_humanoid` | 보급 | 8.7 | 0.61 | 1.14 | 0.60 | 20.0 | 0.02 | 0.0 | waist_pitch, neck, shoulder_r, elbow_r, shoulder_l, elbow_l, hip_pitch_r, hip_roll_r, knee_r, ankle_r, hip_pitch_l, hip_roll_l, knee_l, ankle_l |
+| `legs_humanoid` | 중급 | 20.5 | 0.62 | 1.14 | 0.55 | 20.0 | 0.92 | 3.4 | waist_pitch, neck, shoulder_r, elbow_r, shoulder_l, elbow_l, hip_pitch_r, hip_roll_r, knee_r, ankle_r, hip_pitch_l, hip_roll_l, knee_l, ankle_l |
+| `legs_humanoid` | 고급 | 28.9 | 0.61 | 1.14 | 0.55 | 20.0 | 1.20 | 19.0 | waist_pitch, neck, shoulder_r, elbow_r, shoulder_l, elbow_l, hip_pitch_r, hip_roll_r, knee_r, ankle_r, hip_pitch_l, hip_roll_l, knee_l, ankle_l |
+| `wheel_humanoid` | 보급 | 8.2 | 0.57 | 1.14 | 0.95 | 12.0 | 0.24 | 1.4 | waist_pitch, neck, shoulder_r, elbow_r, shoulder_l, elbow_l, drive_front, drive_rear |
+| `wheel_humanoid` | 중급 | 19.3 | 0.50 | 1.14 | 0.98 | 13.5 | 1.50 | 18.7 | waist_pitch, neck, shoulder_r, elbow_r, shoulder_l, elbow_l, drive_front, drive_rear |
+| `wheel_humanoid` | 고급 | 44.5 | 0.34 | 1.14 | 0.99 | 15.0 | 1.50 | 20.0 | waist_pitch, neck, shoulder_r, elbow_r, shoulder_l, elbow_l, drive_front, drive_rear |
+| `track_humanoid` | 보급 | 8.2 | 0.57 | 1.14 | 0.96 | 14.5 | 0.24 | 1.4 | waist_pitch, neck, shoulder_r, elbow_r, shoulder_l, elbow_l, drive |
+| `track_humanoid` | 중급 | 19.3 | 0.50 | 1.14 | 0.98 | 16.5 | 0.80 | 18.7 | waist_pitch, neck, shoulder_r, elbow_r, shoulder_l, elbow_l, drive |
+| `track_humanoid` | 고급 | 44.5 | 0.34 | 1.14 | 0.99 | 20.6 | 0.80 | 30.0 | waist_pitch, neck, shoulder_r, elbow_r, shoulder_l, elbow_l, drive |
+| `wheel_noneck` | 보급 | 8.1 | 0.57 | 1.12 | 0.95 | 12.5 | 0.24 | 1.6 | waist_pitch, shoulder_r, elbow_r, shoulder_l, elbow_l, drive_front, drive_rear |
+| `wheel_noneck` | 중급 | 19.2 | 0.49 | 1.12 | 0.97 | 14.0 | 1.50 | 18.8 | waist_pitch, shoulder_r, elbow_r, shoulder_l, elbow_l, drive_front, drive_rear |
+| `wheel_noneck` | 고급 | 44.4 | 0.34 | 1.12 | 0.99 | 15.0 | 1.50 | 20.0 | waist_pitch, shoulder_r, elbow_r, shoulder_l, elbow_l, drive_front, drive_rear |
+| `mast_gripper` | 보급 | 8.2 | 0.53 | 1.31 | 0.52 | 5.0 | 0.24 | 1.5 | neck, torso_lift, shoulder_r, elbow_r, drive_front, drive_rear |
+| `mast_gripper` | 중급 | 17.2 | 0.40 | 1.31 | 0.73 | 11.0 | 1.40 | 20.0 | neck, torso_lift, shoulder_r, elbow_r, drive_front, drive_rear |
+| `mast_gripper` | 고급 | 41.6 | 0.27 | 1.31 | 0.87 | 15.0 | 1.50 | 20.0 | neck, torso_lift, shoulder_r, elbow_r, drive_front, drive_rear |
+| `deck_gripper` | 보급 | 4.0 | 0.15 | 0.20 | 0.91 | 15.0 | 0.24 | 5.7 | shoulder_r, elbow_r, drive_front, drive_rear |
+| `deck_gripper` | 중급 | 13.0 | 0.15 | 0.20 | 1.00 | 15.0 | 1.50 | 20.0 | shoulder_r, elbow_r, drive_front, drive_rear |
+| `deck_gripper` | 고급 | 37.4 | 0.14 | 0.20 | 0.98 | 15.0 | 1.50 | 20.0 | shoulder_r, elbow_r, drive_front, drive_rear |
+| `truck` | 보급 | 4.5 | 0.14 | 0.25 | 0.98 | 15.0 | 0.24 | 5.2 | drive_front, drive_rear |
+| `truck` | 중급 | 11.8 | 0.12 | 0.25 | 0.99 | 15.0 | 1.50 | 26.2 | drive_front, drive_rear |
+| `truck` | 고급 | 34.7 | 0.13 | 0.25 | 1.00 | 15.0 | 1.50 | 95.3 | drive_front, drive_rear |
+
+**원형과 비교 (엔진 입력)**:
+
+| 형태 | 엔진 | 원형 | 차이 |
+|---|---|---|---|
+| `mast_gripper` 중급 | 17.2 kg | Stretch RE1 23 kg [49] | −25% |
+| `deck_gripper` 보급 | 4.0 kg | LeKiwi 1.7 kg + SO-101 0.8 kg = 2.5 kg [29][30] | +62% |
+| `truck` 고급 | 34.7 kg | AgileX Tracer 30 kg [33] | +16% |
+| `mast_gripper` 카메라 | 1.31 m | Stretch RE1 1.31 m [49], Fetch 1.061–1.447 m [50] | 범위 안 |
+| `deck_gripper`·`truck` 카메라 | 0.20 · 0.25 m | MiR250 몸체 꼭대기 0.30 m [51] | 꼭대기 아래 |
+
+**동작**:
+
+- 8° 경사에서 카메라 기울기: 목 3.60° · 목 없음 8.00° · 마스트 팬·틸트 3.60° · 차체 카메라 8.00°. 목 없는 카메라는 차체의 기울기를 전부 받는다.
+- `truck`: 집기·내려놓기·들기 모두 `no_manipulator`. 짐칸 적재 한도 중급 26.2 kg (같은 등급 휴머노이드의 배 적재 18.7 kg), 고급 95.3 kg (휴머노이드 20.0 kg). 만재해도 CoM 0.28 m (중급; 고급 0.29 m), 여유 1.00.
+- `deck_gripper`: 바닥의 물건을 서 있는 채로 집어 토트에 넣는다 (6.5 s, 토트 낙하 0.15 m, 내려놓기 낙하 0.000 m; 예전 4.5 s는 집게를 설정 손(5지)으로 쥐던 값이고, 이제는 2지 손 모델의 접촉·닫는 속도로 쥔다). 주행·밀기 표본에서 손의 최저 높이 0.49 m (휴머노이드 선 자세였다면 −0.22 m). 두 손 들기는 `one_arm`. 팔을 수평으로 뻗었을 때 앞바퀴 위로 넘어지는 하중은 중급 6.2 kg, 고급 18.9 kg (손 0.27 m 앞). 그 하중에서 어깨는 피크의 194% · 160%라서 어깨가 먼저 포화한다.
+- `mast_gripper`: 리프트 행정 0.84 m. 바닥 물건은 리프트를 0.74 m 내리고 팬·틸트 73°(한계 83°)로 손을 보며 13.8 s에 내려간다. 0.75 m 테이블 위 물건은 리프트를 0.42 m 내려 집는다. 같은 테이블은 갑판 팔로는 불가 (손바닥이 0.55 m까지만 올라감). 바닥에서 집어 토트에 넣기 26.9 s (캐리지는 토트 높이 리프트 0.17 m까지만 올라옴, 토트 낙하 0.20 m), 토트에서 꺼내 바닥에 내려놓기 28.8 s.
+- 층 조합 전부: 1152개 (하체 4 × 몸통 3 × 카메라 6 × 조작기 4 × 적재 4) 가운데 만들 수 없는 576개는 `fit`이 가까운 형태로 고친다. 서로 다른 형태 624개 × 리프트 유무 = 1248개 모두 세 모델의 질량·CoM이 맞고, 서 있고, 관절 목록이 맞으며, 상태·초점·집기·내려놓기 코드가 멈추지 않는다. 조작기가 있는 936개 중 바닥의 1 kg 물건을 집은 것은 216개다 (나머지는 reach 실패로 이유를 대고 거절). 손이 자기 토트·짐칸 위로 가지 못하는 198개는 `BodyPlan::validate`가 거절하고, 집기는 `stow_unreachable`을 내며 손에 든 채 끝난다 (계획 검사와 집기 결과가 1248개 모두에서 일치).
+- 집게 조임 (양쪽 턱 2·F): SO-101 42 N, XM430 2지(손 모델) 48 N, Robotiq 2F-85 470 N; 설정 손(5지)은 같은 6 cm 상자에 99 N.
+- 휴머노이드 몸통 + 토트 (리프트 없음)는 "팔이 갑판 토트에 닿지 않음 (내려놓을 점 0.48 m)"으로 거절되고, 몸통 리프트를 달면 통과한다.
+
+### 7.7 남은 차이
+
+- **세계·화면은 아직 형태를 모른다**: 이번 묶음은 noto-core만 바꿨다 (world-sim·noto-runtime은 `legged` → `legged()` 치환과 `BodyInputs.morph` 한 줄뿐). `World`는 아직 휴머노이드의 서 있는 자세(`KinPose::stand`, `Posture::quiet`)와 손을 가정한다. 트럭의 집기 거절(`ActionError::NoManipulator`), 다른 로봇이 짐칸에 싣는 흐름, 형태별 카메라 흔들림·UI 실루엣은 다음 묶음(형태-세계·카메라·여러 로봇·UI)이 한다. 형태 쪽에서 준비한 것: `Body::stand/quiet/lift_posture`, `kin::camera`, `Body::cargo_geom`, `Body::camera_mount`, `BodyStatus.morph/form/form_ko`, `BodyPlan::validate`.
+- **Stretch와 다른 팔**: Stretch는 옆으로 늘어나는 망원 팔로 베이스 가장자리 밖 0.71 m까지 닿는다 [49]. 여기서는 마스트 캐리지에 단 두 링크 팔(0.48 m)이 앞으로만 뻗어, 범퍼 앞 약 0.25 m까지 닿는다. 마스트 리프트의 속도·힘은 출처가 없어 Fetch 몸통 리프트 값을 빌렸고, 질량은 추정이다.
+- **마스트 팔이 느림**: 바닥에서 집어 토트에 넣는 데 26.9 s 걸린다. 0.10 m/s 리프트(Fetch 몸통 리프트 값)로 0.74 m를 내려갔다가 토트 높이까지 올라오기 때문이다. Stretch 리프트의 속도 출처가 없다 (연구 팩에도 없음).
+- **갑판 로봇의 질량**: 원형보다 무겁다 (보급 `deck_gripper` +62%). 가슴 프리셋의 배터리를 그대로 싣고, 전자 상자(차체 안)·토트·차체 카메라 질량이 추정이라서다. 원형에 맞추려고 고치지 않았다. 반대로 `mast_gripper`는 Stretch보다 가볍다 (−25%): 마스트·리프트·캐리지를 압출재와 벨트 축으로 셌고, Stretch의 망원 팔과 베이스 구조는 이 프로젝트의 부품이 아니다.
+- **균형 모델은 리프트를 모른다**: `balance`의 자세(`Posture`)에는 리프트 높이가 없어, 마스트 팔은 캐리지 꼭대기에 있는 것으로 계산한다 (몸통 리프트와 같은 한계). `kin`은 리프트를 안다. 동역학(`dynamics`)도 리프트 이동을 시뮬레이션하지 않는다.
+- **몸통 리프트 내려놓기 시간**: 기존 `wheel_lift`의 내려놓기 경로는 리프트 이동 시간을 넣지 않는다. 마스트 리프트에만 넣었다 (기존 [AX] 줄을 바꾸지 않으려고). 다음 묶음에서 둘을 맞출 것.
+- **형태 벤치마크 [MX] 없음**: §7.4의 비교는 손으로 한 것이다. 지금 점수 칸으로 만들 수 있는 것은 Stretch 3 질량·높이, Starship·MiR250 적재 비율 정도다. 벤치 묶음에 넘긴다.
+- **팬·틸트 범위**: 마스트 카메라의 틸트는 Fetch URDF [50]의 아래 한계 83°를 위쪽에도 대칭으로 쓴다 (Fetch는 위로 43.5°까지). 오늘의 목(± 45°)과 같은 대칭 단순화다. 팬은 ± 90°로 Stretch 3의 346° [31]보다 좁다.
+- **카메라 틸트**: 차체 카메라는 수평이다. 바닥의 택배를 낮은 카메라로 볼 때의 아래 틸트(MiR250의 3D 카메라는 바닥을 앞 250 mm부터 봄 [51])는 카메라 묶음이 정할 것.
+- **메카넘**: 형태에서는 바퀴와 같게 본다 (`form()`이 `wheel_humanoid`로 부름).
+- **토트 부피**: 토트는 크기로 적재를 막지 않고 베이스 한도만 쓴다.
+- **마스트 기둥 몸통**(`Torso::Mast`, Fetch·TIAGo 형)은 층으로만 있고 이름 붙은 형태가 없다. Fetch 벤치마크(Wevolver [52])와 비교하려면 Fetch 급 형태와 그 부품이 필요하다.
+- **집게의 벌림 폭**: 평행 집게는 조임 힘만 모델링한다. 턱이 벌어지는 폭(Robotiq 2F-85의 85 mm 등)은 없어서, 2지 손 모델이 감쌀 수 있는 크기면 집는다. 손목 카메라·집게 속도도 2지 손 모델 값이다.
+- **차체 카메라와 갑판 위 물건**: 차체 카메라 상자는 갑판 앞 가장자리에 그린다. `deck_gripper`에서는 토트 앞벽에, `truck`에서는 짐칸 앞 가장자리 높이에 걸친다 (그림만; 질량·카메라 위치는 맞음). 휴머노이드 몸통·마스트 기둥에 토트를 단 사용자 형태는 기둥과 토트가 겹쳐 그려진다 (이런 형태는 리프트 없이는 `BodyPlan::validate`가 거절함).
+- **런타임 열쇠**: `Body.plan`은 이제 만든 형태라서 `body.plan.id()`가 실제 로봇을 가리킨다. 그러나 noto-runtime·world-sim은 여전히 설정 값 `cfg.body.id()`(요청한 계획)로 SDS·기록 열쇠를 만든다 (actsds·mlsds·chase·testrun·world). 다음 묶음(형태-세계)에서 `world.body.plan.id()`로 바꾸거나 설정을 읽을 때 `BodyPlan::validate`로 거절할 것.
+- **`stow_unreachable` 사건 이름**: UI의 `EVENT_KO`와 runtime의 `KEY_KINDS`에 아직 없다 (화면에는 사건 이름이 그대로 나옴). UI 묶음에서 붙일 것.
+
 ## 출처
 
 [1] https://evelta.com/sts3215-c018-12v-30kg-cm-dual-shaft-ttl-serial-servo-metal-gears-magnetic-encoder/ ; https://www.robotshop.com/products/feetech-12v-30kgcm-magnetic-encoding-servo-sts3215
@@ -151,5 +336,12 @@ G1 관절 토크 한계(MuJoCo Menagerie [27]): 고관절 피치·요 88, 고관
 [46] https://fab.academany.org/2021/labs/agrilab/students/antonio-anaya/files/week10/profile_alum_2020_datasheet.pdf
 [47] https://compositeenvisions.com/?p=3296
 [48] https://soft.siat.ac.cn/papers/XIA(2008)_Robotica_THBIP2Design.pdf ; https://patents.google.com/patent/US12283704
+[49] Kemp C.C., Edsinger A., Clever H.M., Matulevich B., "The Design of Stretch: A Compact, Lightweight Mobile Manipulator for Indoor Human Environments", ICRA 2022 — https://arxiv.org/abs/2109.10892
+[50] fetch_description URDF, ZebraDevs/fetch_ros (melodic-devel), 2019 — https://raw.githubusercontent.com/ZebraDevs/fetch_ros/melodic-devel/fetch_description/robots/fetch.urdf
+[51] Mobile Industrial Robots A/S, "MiR250 Specifications" (2023-06-28) — https://www.hartfiel.com/wp-content/uploads/2024/04/MiR250-Specs.pdf
+[52] (Group B) Wevolver, "Fetch Mobile Manipulator" tech specs — https://www.wevolver.com/specs/fetch.mobile.manipulator
+[53] (Group B) Ackerman E., "Starship Technologies autonomous ground delivery robots", IEEE Spectrum, 2015 — https://spectrum.ieee.org/starship-technologies-autonomous-ground-delivery-robots
+[54] (Group B, 검색 결과로만 봄) Konica Minolta Australia, MiR250 product listing — https://www.konicaminolta.com.au/?p=898
+[55] (연구 팩 Group A; 엔진·점수에 쓰지 않고 맥락으로만 적음) Automated Warehouse (업계 보도), Hello Robot Stretch 3 출시 사양, 2024 — https://www.automatedwarehouseonline.com/?p=447
 
 **찾지 못한 값**: D435i·OAK-D Lite·Pi 5·Robotiq 2F-85·Stretch 3 가격, G1 배터리·BHL 액추에이터·Robstride 00 질량, STS3215-C018 감속비, 버스 서보 열 시정수. 표에 이 값이 있으면 추정이다.

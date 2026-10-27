@@ -119,6 +119,12 @@ fn a_legged_pick_is_recorded_moment_by_moment_with_its_focus_views_and_the_act_s
     let feet = Scope::new(Track::Act, "nn:grasp", "foot");
     assert!(sds.exact_reference(&feet, "margin").is_some() || sds.exact_baseline(&feet, "margin").is_some(), "the feet while the hands lift");
     assert!(rt.sds_status().ledgers.iter().any(|l| l.ledger == "act" && (l.observations > 0 || l.run_observations > 0)), "the act ledger");
+    // The walks to the log and back are moves with layers of their own, by
+    // robot form; the walks that ended on their feet count as `no_fall`.
+    let all = sds.status(100_000);
+    assert!(all.axes.iter().any(|a| a.scope.starts_with("act|walk|") && a.scope.ends_with(":humanfoot:f5") && a.axis == "ok"), "the walks by form");
+    assert!(all.axes.iter().any(|a| a.scope.starts_with("act|walk:ts|") && a.axis == "step_m"), "the gait on each ground");
+    assert!(all.axes.iter().any(|a| a.scope.starts_with("act|walk|") && a.axis == "no_fall" && a.n > 0 && a.mean > 0.0), "walks that ended standing");
     // The arm lift is an N:N cell with its reference.
     let stats = rt.api_test_stats().unwrap();
     assert!(stats["nn"].as_array().unwrap().iter().any(|c| c["source"] == "arm_lift" && !c["reference"].is_null()), "the arm lift against its reference");

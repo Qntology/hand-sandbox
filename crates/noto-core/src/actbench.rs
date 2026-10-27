@@ -310,31 +310,12 @@ pub fn holdout(seed: u64, count: usize) -> Vec<AxScenario> {
 
 // ----- scoring -----
 
+/// The shared judge (`crate::bench::judge`); the gate is worded as this benchmark prints it.
 fn judge(c: &mut AxCell) {
-    let Some(v) = c.value else {
-        if !matches!(c.rule, Rule::Raw) {
-            c.score = Some(0.0);
-        }
-        return;
-    };
-    match c.rule {
-        Rule::Like { reference, tolerance } => {
-            let z = (v - reference) / tolerance.max(1e-6);
-            c.z = Some(z);
-            c.score = Some((100.0 - 10.0 * z.abs()).max(0.0));
-        }
-        Rule::AtLeast { reference, tolerance } => {
-            let z = ((v - reference) / tolerance.max(1e-6)).min(0.0);
-            c.z = Some(z);
-            c.score = Some((100.0 - 10.0 * z.abs()).max(0.0));
-        }
-        Rule::AtMost { limit } => {
-            if v > limit {
-                c.gate = Some(format!("{} {v:.2} > {limit:.2}", c.axis));
-            }
-        }
-        Rule::Raw => {}
-    }
+    let v = crate::bench::judge(c.value, c.rule.into());
+    c.z = v.z;
+    c.score = v.score;
+    c.gate = v.broken.map(|(x, limit)| format!("{} {x:.2} > {limit:.2}", c.axis));
 }
 
 fn cell(layer: Layer, axis: &'static str, part: Option<&'static str>, value: Option<f32>, rule: Rule, cite: &'static str) -> AxCell {
@@ -395,6 +376,11 @@ pub fn hand_of(body: &Body) -> Hand {
     cfg.build().expect("preset hands build")
 }
 
+/// Why a pick from above is refused: two hands do not hold even the object's weight (`grasp::top_hands`).
+pub fn refused_ko(th: &g::TopHands) -> String {
+    format!("두 손으로도 무게를 못 버팀 (한 손 {:.0} N × 2 < 무게 {:.0} N, 손가락 {}개 닿음): 집지 않음", th.hold_n, th.weight_n, th.touching)
+}
+
 /// The aim error the benchmark's robot has: a stereo head 1.05 m from an object at its feet (D435 law) and a 5 mm arm.
 fn aim_sigma(body: &Body) -> f32 {
     let depth = crate::act::material::stereo_depth_sigma(1.09, 424.0, 0.05, 0.08);
@@ -416,9 +402,14 @@ fn eval_grasp(body: &Body, s: &AxScenario) -> AxResult {
     let o = s.obj.expect("a grasp scenario has an object");
     let hand = hand_of(body);
     let cargo = s.cargo_frac * body.mass_kg();
-    // One hand when it holds the object with its safety factor, else both (as the world decides).
-    let (_, one) = g::top_grasp_ok(&hand, [o.size_m; 3], o.mass_kg, crate::act::material::pad_on(o.material).mean);
-    let two = !one;
+    // One hand when it holds the object with its safety factor, else both, and none when two hands do not
+    // hold even its weight: the contacts the rollout holds with (`top_hands`; the world's grasp table still
+    // reads the v0.9 `grasp::capacity`).
+    let th = g::top_hands(&hand, [o.size_m; 3], o.mass_kg, crate::act::material::pad_on(o.material).mean);
+    if th.hands == 0 {
+        return finish(s, vec![], 0.0, vec![], Some(refused_ko(&th)));
+    }
+    let two = th.hands == 2;
     let mut runs = Vec::new();
     for seed in 0..s.trials as u64 {
         runs.push(g::grasp(&GraspInput::front(body, &hand, o.material, o.mass_kg, [o.size_m; 3], s.ground, two, cargo, aim_sigma(body), seed)));
@@ -473,7 +464,7 @@ fn part_cells(body: &Body, plan: &reach::ReachPlan, cells: &mut Vec<AxCell>) {
     let r = &plan.loaded;
     let trunk = ok.then(|| r.pose.trunk_deg());
     cells.push(cell(Layer::Part, "trunk_deg", Some("waist"), trunk, like(LIFT_TRUNK_DEG), CITE_FLOOR_LIFT));
-    if body.legged {
+    if body.legged() {
         let hip = if ok { r.joint("hip_pitch_r").and_then(|j| j.angle_deg) } else { None };
         let knee = if ok { r.joint("knee_r").and_then(|j| j.angle_deg) } else { None };
         cells.push(cell(Layer::Part, "hip_flex_deg", Some("foot_joints"), hip, like(LIFT_HIP_DEG), CITE_FLOOR_LIFT));
@@ -481,7 +472,7 @@ fn part_cells(body: &Body, plan: &reach::ReachPlan, cells: &mut Vec<AxCell>) {
     }
     let worst = if ok { r.worst().map(|j| j.ratio) } else { None };
     cells.push(cell(Layer::Part, "peak_ratio_bottom", None, worst, Rule::Raw, ""));
-    let moment = if ok { r.joint(if body.legged { "hip_pitch_r" } else { "waist_pitch" }).map(|j| j.torque.abs() * if body.legged { 2.0 } else { 1.0 } / body.mass_kg()) } else { None };
+    let moment = if ok { r.joint(if body.legged() { "hip_pitch_r" } else { "waist_pitch" }).map(|j| j.torque.abs() * if body.legged() { 2.0 } else { 1.0 } / body.mass_kg()) } else { None };
     cells.push(cell(Layer::Part, "trunk_moment_nm_per_kg", Some("waist"), moment, Rule::Raw, ""));
 }
 
@@ -489,8 +480,12 @@ fn eval_bend(body: &Body, s: &AxScenario) -> AxResult {
     let o = s.obj.expect("a bend scenario has an object");
     let hand = hand_of(body);
     let cargo = s.cargo_frac * body.mass_kg();
-    let (_, one) = g::top_grasp_ok(&hand, [o.size_m; 3], o.mass_kg, crate::act::material::pad_on(o.material).mean);
-    let plan = reach::plan_or_straddle(body, &ReachGoal::ground_object(o.size_m, o.mass_kg, !one, cargo), 0.5 * o.size_m);
+    let th = g::top_hands(&hand, [o.size_m; 3], o.mass_kg, crate::act::material::pad_on(o.material).mean);
+    if th.hands == 0 {
+        return finish(s, vec![], 0.0, vec![], Some(refused_ko(&th)));
+    }
+    let two = th.hands == 2;
+    let plan = reach::plan_or_straddle(body, &ReachGoal::ground_object(o.size_m, o.mass_kg, two, cargo), 0.5 * o.size_m);
     let mut cells = Vec::new();
     if !plan.ok {
         cells.push(cell(Layer::Outcome, "reach_ground", Some("waist"), Some(1.0), Rule::AtMost { limit: 0.0 }, "바닥의 물체에 손이 닿아야 굽혀 집을 수 있음"));
@@ -498,13 +493,13 @@ fn eval_bend(body: &Body, s: &AxScenario) -> AxResult {
     cells.push(cell(Layer::Outcome, "lowest_palm_m", Some("hand"), Some(plan.lowest_palm_z), Rule::Raw, ""));
     part_cells(body, &plan, &mut cells);
     // When the bend's peak moment comes: the rise's samples of one grasp.
-    let r = g::grasp(&GraspInput::front(body, &hand, o.material, o.mass_kg, [o.size_m; 3], s.ground, !one, cargo, 0.0, 1));
+    let r = g::grasp(&GraspInput::front(body, &hand, o.material, o.mass_kg, [o.size_m; 3], s.ground, two, cargo, 0.0, 1));
     let peak_t = (|| {
         let lift: Vec<&crate::act::ActSample> = r.samples.iter().filter(|x| x.phase == "lift").collect();
         let t0 = lift.first()?.t;
         let torque = |x: &crate::act::ActSample| {
             let k = crate::kin::solve_fast(body, &x.pose, &x.loads);
-            k.joint(if body.legged { "hip_pitch_r" } else { "waist_pitch" }).map_or(0.0, |j| j.torque.abs())
+            k.joint(if body.legged() { "hip_pitch_r" } else { "waist_pitch" }).map_or(0.0, |j| j.torque.abs())
         };
         let best = lift.iter().max_by(|a, b| torque(a).total_cmp(&torque(b)))?;
         Some(best.t - t0)
@@ -527,7 +522,7 @@ fn eval_bend(body: &Body, s: &AxScenario) -> AxResult {
 fn eval_push(body: &Body, s: &AxScenario) -> AxResult {
     let o = s.obj.expect("a push scenario has an object");
     let cargo = s.cargo_frac * body.mass_kg();
-    if body.legged {
+    if body.legged() {
         return finish(s, vec![], 0.0, vec![], Some("다리형은 범퍼로 밀지 않음 (들어서 옮김)".into()));
     }
     let r_plan = p::planned_radius_m(body, o.material, o.size_m);
@@ -636,7 +631,7 @@ fn human(r: (f32, f32), f: fn(f32, f32) -> f32) -> Rule {
 }
 
 fn eval_walk(body: &Body, s: &AxScenario) -> AxResult {
-    if !body.legged {
+    if !body.legged() {
         return eval_drive(body, s);
     }
     let props = SurfaceProps { mu_foot: s.mu_actual.unwrap_or(s.ground.props().mu_foot), ..*s.ground.props() };

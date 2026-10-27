@@ -20,7 +20,7 @@ use base64::Engine;
 use noto_core::{BaseKind, NotoConfig};
 use noto_search::{Category, ParsedCommand, Plan, Via};
 use serde_json::{json, Value};
-use world_sim::snapshot::{CarryView, Pos3};
+use world_sim::snapshot::{CarryView, Pos3, SiteView};
 use world_sim::WorldSnapshot;
 
 use noto_sds::LogLine;
@@ -33,7 +33,7 @@ pub const MIN_CELLS: usize = 32;
 pub const MAX_CELLS: usize = 160;
 
 /// Names of the commands [`Runtime::api_call`] answers.
-pub const COMMANDS: [&str; 32] = [
+pub const COMMANDS: [&str; 33] = [
     "act_status",
     "inventory_drop",
     "world_reset",
@@ -66,6 +66,7 @@ pub const COMMANDS: [&str; 32] = [
     "devices",
     "nn_status",
     "physics_status",
+    "world_light",
 ];
 
 /// How many steps ahead the time-series tab forecasts.
@@ -115,6 +116,46 @@ fn pos(p: &Pos3, depth_m: f32) -> Value {
     json!([r3(p.x), r3(depth_m - p.z), r3(p.y)])
 }
 
+/// A ground point `[x, z]` for the UI: `[x, depth - z]`.
+fn at2(p: [f32; 2], depth_m: f32) -> Value {
+    json!([r3(p[0]), r3(depth_m - p[1])])
+}
+
+/// A ground point with its height `[x, z, h]`: `[x, depth - z, h]`.
+fn at3(p: [f32; 3], depth_m: f32) -> Value {
+    json!([r3(p[0]), r3(depth_m - p[1]), r3(p[2])])
+}
+
+/// A rectangle `[x0, z0, x1, z1]` for the UI, still min before max: `[x0, depth - z1, x1, depth - z0]`.
+fn rect(r: [f32; 4], depth_m: f32) -> Value {
+    json!([r3(r[0]), r3(depth_m - r[3]), r3(r[2]), r3(depth_m - r[1])])
+}
+
+/// Houses, the logistics centre and their fixtures, through the same flip as every position.
+fn site_json(s: &SiteView, d: f32) -> Value {
+    json!({
+        "houses": s.houses.iter().map(|h| json!({
+            "id": h.id, "label_ko": h.label_ko, "rect": rect(h.rect_m, d), "front_deg": r3(wrap_deg(-h.front_deg)),
+            "floor_m": r3(h.floor_m), "door": at2(h.door, d), "porch": rect(h.porch_m, d),
+            "stairs": {"risers": h.stairs.risers, "riser_m": r3(h.stairs.riser_m), "tread_m": r3(h.stairs.tread_m), "width_m": r3(h.stairs.width_m),
+                       "treads": h.stairs.treads.iter().map(|t| at3(*t, d)).collect::<Vec<_>>()},
+            "ramp": h.ramp.as_ref().map(|r| json!({"cells": r.cells.iter().map(|c| at3(*c, d)).collect::<Vec<_>>(), "rise_m": r3(r.rise_m), "run_m": r3(r.run_m), "run_per_rise": r3(r.run_per_rise)})),
+            "reachable_legs": h.reachable_legs, "reachable_wheels": h.reachable_wheels,
+        })).collect::<Vec<_>>(),
+        "warehouse": s.warehouse.as_ref().map(|w| json!({
+            "label_ko": w.label_ko, "rect": rect(w.rect_m, d), "door": at2(w.door, d), "door_width_m": r3(w.door_width_m),
+            "door_front_deg": r3(wrap_deg(-w.door_front_deg)), "aisle_m": r3(w.aisle_m), "shelves": w.shelves, "tables": w.tables,
+            "zones": w.zones.iter().map(|z| json!({"kind": z.kind, "label_ko": z.label_ko, "rect": rect(z.rect_m, d), "em_lx": r3(z.em_lx)})).collect::<Vec<_>>(),
+        })),
+        "fixtures": s.fixtures.iter().map(|f| json!({
+            "id": f.id, "kind": f.kind, "label_ko": f.label_ko, "cells": f.cells.iter().map(|c| at2(*c, d)).collect::<Vec<_>>(),
+            "yaw_deg": r3(wrap_deg(-f.yaw_deg)), "base_m": r3(f.base_m), "top_m": r3(f.top_m),
+            "levels_m": f.levels_m.iter().map(|l| r3(*l)).collect::<Vec<_>>(), "blocks": f.blocks,
+        })).collect::<Vec<_>>(),
+        "slots": s.slots,
+    })
+}
+
 /// `mass_kg` in a carry entry is the mass of one item, as the UI reads it;
 /// `amount` counts broken pieces (half a stone is 0.5), `total_kg` is the stack.
 fn carry(c: &CarryView) -> Value {
@@ -123,7 +164,7 @@ fn carry(c: &CarryView) -> Value {
 
 pub fn snapshot_json(s: &WorldSnapshot) -> Value {
     let d = s.bounds.depth_m;
-    json!({
+    let mut v = json!({
         "tick": s.tick,
         "time_s": r3(s.time_s as f32),
         "seed": s.seed,
@@ -153,10 +194,21 @@ pub fn snapshot_json(s: &WorldSnapshot) -> Value {
         "nodes": s.nodes.iter().map(|n| json!({
             "id": n.id, "kind": n.kind.id(), "label_ko": n.label_ko, "pos": pos(&n.pos, d), "hp": r3(n.hp),
         })).collect::<Vec<_>>(),
-        "drops": s.drops.iter().map(|x| json!({
-            "id": x.id, "item_id": x.item.id(), "label_ko": x.label_ko, "pos": pos(&x.pos, d), "amount": r3(x.amount),
-        })).collect::<Vec<_>>(),
-    })
+        "drops": s.drops.iter().map(|x| {
+            let mut v = json!({"id": x.id, "item_id": x.item.id(), "label_ko": x.label_ko, "pos": pos(&x.pos, d), "amount": r3(x.amount)});
+            // On a porch, a shelf deck or a table: `pos[2]` is that surface's height.
+            if !x.support.is_ground() {
+                let mut on = json!(x.support);
+                on["label_ko"] = json!(x.support.label_ko());
+                v["support"] = on;
+            }
+            v
+        }).collect::<Vec<_>>(),
+    });
+    if let Some(site) = &s.site {
+        v["site"] = site_json(site, d);
+    }
+    v
 }
 
 pub fn log_json(l: &LogLine) -> Value {
@@ -194,12 +246,27 @@ fn parsed_json(rt: &Runtime, p: &ParsedCommand) -> Value {
     let place = |id: &str| json!({"kind": "waypoint", "id": id, "label_ko": label_ko(w, id)});
     let mean = |v: &[f32]| if v.is_empty() { 0.0 } else { v.iter().sum::<f32>() / v.len() as f32 };
     let targets_json = |targets: &[noto_search::Target]| {
-        targets.iter().map(|t| json!({"item_id": t.resource, "label_ko": label_ko(w, &t.resource), "count": t.quantity, "score": r3(t.score)})).collect::<Vec<_>>()
+        targets
+            .iter()
+            .map(|t| {
+                let mut v = json!({"item_id": t.resource, "label_ko": label_ko(w, &t.resource), "count": t.quantity, "score": r3(t.score)});
+                // Where the command says it lies: a search hint ("창고 선반에서").
+                if !t.origin.is_empty() {
+                    v["origin"] = json!(t.origin.iter().map(|o| json!({"id": o.place, "text": o.text})).collect::<Vec<_>>());
+                }
+                v
+            })
+            .collect::<Vec<_>>()
     };
     let (action, item_id, item_ko, count, dest, conf, targets) = match &p.plan {
         Some(Plan::Fetch { targets, destination }) => {
             let scores: Vec<f32> = targets.iter().map(|t| t.score).chain(std::iter::once(destination.score)).collect();
-            summary_of(targets, "mine_and_deliver", Some(place(&destination.place)), mean(&scores), w, targets_json(targets))
+            let mut dest = place(&destination.place);
+            // Not said: parcels go back to the base camp.
+            if destination.implied() {
+                dest["implied"] = json!(true);
+            }
+            summary_of(targets, "mine_and_deliver", Some(dest), mean(&scores), w, targets_json(targets))
         }
         Some(Plan::Collect { targets }) => {
             let scores: Vec<f32> = targets.iter().map(|t| t.score).collect();
@@ -481,12 +548,17 @@ impl Runtime {
     /// (`y = depth`); see the module comment on the flip.
     pub fn api_world_terrain(&self) -> Result<Value, String> {
         let g = self.world().terrain_grid();
-        Ok(json!({
+        let mut v = json!({
             "kind": g.kind.id(), "cells_w": g.cells_w, "cells_d": g.cells_d, "cell_m": g.cell_m,
             "heights_cm": g.heights_cm, "curb_cm": g.curb_cm, "ground": g.ground,
             "ground_kinds": world_sim::Ground::ALL.iter().map(|k| json!({"code": k.code(), "id": k.id(), "label_ko": k.label_ko(), "color": k.color()})).collect::<Vec<_>>(),
             "layout": self.world().layout,
-        }))
+        });
+        // With a site: what each curb is (0 kerb, 1 stair tread, 2 raised floor, 3 ramp), row by row like the heights.
+        if !g.curb_kind.is_empty() {
+            v["curb_kind"] = json!(g.curb_kind);
+        }
+        Ok(v)
     }
 
     /// `physics_status()`: the ground under the robot and what it does to the
@@ -555,17 +627,13 @@ impl Runtime {
     }
 
     /// `world_frame({width, height, quality, view})`: a WebP screenshot and the
-    /// boxes of the last scan. `view` is `agent`, `top`, `chase:<orbit°>` or
-    /// `focus:<hand|side|low>`; a focus view also returns the focus views of
-    /// the instant (`focus`, as a keyframe's).
+    /// boxes of the last scan. `view` is `agent`, `top`, `chase:<orbit°>`,
+    /// `focus:<hand|side|low>` or `iso:<direction 0-3>:<zoom>[:30]`
+    /// (`views::parse_view`; an unknown id is an error); a focus view also
+    /// returns the focus views of the instant (`focus`, as a keyframe's).
     pub fn api_world_frame(&mut self, width: u32, height: u32, quality: f32, view: &str) -> Result<Value, String> {
-        let view_id = if view.starts_with("chase") || view.starts_with("focus") || view == "top" { "other" } else { "agent" };
-        let view = match view {
-            "top" => FrameView::Top,
-            v if v.starts_with("chase") => FrameView::Chase { orbit_deg: v.split_once(':').and_then(|(_, o)| o.parse::<f32>().ok()).unwrap_or(0.0).clamp(-180.0, 180.0) as i16 },
-            v if v.starts_with("focus") => FrameView::Focus(v.split_once(':').and_then(|(_, c)| world_sim::render::FocusCam::from_id(c)).unwrap_or(world_sim::render::FocusCam::Hand)),
-            _ => FrameView::Agent,
-        };
+        let view = crate::views::parse_view(view)?;
+        let view_id = if view == FrameView::Agent { "agent" } else { "other" };
         let focus = matches!(view, FrameView::Focus(_)).then(|| serde_json::to_value(self.world.focus_frame()).unwrap_or(Value::Null));
         let f = self.frame_sized(view, width, height, quality).map_err(|e| e.to_string())?;
         let dets: Vec<Value> = f
@@ -588,6 +656,7 @@ impl Runtime {
             "overlay": f.overlay,
             "focus": focus,
             "camera": camera,
+            "light": crate::views::light_json(self.world()),
         }))
     }
 
@@ -597,7 +666,7 @@ impl Runtime {
     pub fn head_view_json(&self) -> Value {
         let w = self.world();
         let hv = w.head_view(&self.cam);
-        let t = world_sim::world::sensor_timing(w.body.head.sensor);
+        let t = world_sim::world::sensor_timing_at(w.body.head.sensor, w.scene_lux());
         let deg = |r: f32| r3(r.to_degrees());
         json!({
             "eye_m": r3(hv.eye_m), "standing_eye_m": r3(w.standing_eye_m()),
@@ -608,7 +677,8 @@ impl Runtime {
             "est_err_deg": {"pitch": deg(hv.view.pitch - hv.est.pitch), "roll": deg(hv.view.roll - hv.est.roll)},
             "blur_px": r3(hv.blur_px),
             "terrain_tilt_deg": [r3(hv.tilt_deg[0]), r3(hv.tilt_deg[1])],
-            "sensor": {"name": w.body.head.sensor, "rgb": t.rgb, "exposure_ms": r3(t.exposure_s * 1000.0), "readout_ms": r3(t.readout_s * 1000.0), "gyro_arw_deg": r3(t.gyro_arw_deg), "scene_lux": world_sim::world::SCENE_LUX},
+            "sensor": {"name": w.body.head.sensor, "rgb": t.rgb, "exposure_ms": r3(t.exposure_s * 1000.0), "readout_ms": r3(t.readout_s * 1000.0), "gyro_arw_deg": r3(t.gyro_arw_deg), "scene_lux": r3(w.scene_lux())},
+            "light": crate::views::light_json(w),
             "ground": w.ground_here().surface().props().id,
         })
     }
@@ -854,6 +924,7 @@ impl Runtime {
             "nn_status" => Ok(json!({"scenarios": self.nn_live.summary(), "phases": self.nn_live.phases().collect::<Vec<_>>()})),
             "physics_status" => Ok(self.api_physics_status()),
             "act_status" => Ok(self.api_act_status()),
+            "world_light" => self.api_world_light(args),
             "log_tail" => self.api_log_tail(num(args, "afterSeq").unwrap_or(0.0).max(0.0) as u64, num(args, "limit").unwrap_or(200.0) as usize, text(args, "category")),
             other => Err(format!("unknown command {other}")),
         }
@@ -907,6 +978,56 @@ mod tests {
             let y = n["pos"][1].as_f64().unwrap();
             assert!((0.0..=depth).contains(&y), "node inside the map after the flip: {y}");
         }
+    }
+
+    #[test]
+    fn a_site_goes_out_through_the_same_flip_and_a_bare_world_sends_none() {
+        let mut rt = rt();
+        let v = snapshot_json(&rt.snapshot());
+        assert!(v.get("site").is_none(), "no site, no key");
+        assert!(v["drops"].as_array().unwrap().iter().all(|x| x.get("support").is_none()));
+        assert!(rt.api_world_terrain().unwrap().get("curb_kind").is_none());
+        let cfg = world_sim::WorldConfig { seed: 4, site: Some(world_sim::SiteCfg::default()), ..world_sim::WorldConfig::default() };
+        *rt.world_mut() = world_sim::World::new(cfg).unwrap();
+        let s = rt.snapshot();
+        let v = snapshot_json(&s);
+        let d = s.bounds.depth_m;
+        let site = s.site.as_ref().unwrap();
+        let h = &site.houses[0];
+        let j = &v["site"]["houses"][0];
+        assert_eq!(j["rect"][0].as_f64().unwrap(), r3(h.rect_m[0]));
+        assert_eq!(j["rect"][1].as_f64().unwrap(), r3(d - h.rect_m[3]), "the far edge becomes the low y");
+        assert!(j["rect"][1].as_f64().unwrap() < j["rect"][3].as_f64().unwrap());
+        assert_eq!(j["door"][1].as_f64().unwrap(), r3(d - h.door[1]));
+        assert_eq!(j["front_deg"].as_f64().unwrap(), r3(wrap_deg(-h.front_deg)));
+        assert_eq!(j["stairs"]["risers"], h.stairs.risers);
+        assert!(v["site"]["warehouse"]["shelves"].as_u64().unwrap() > 0);
+        assert!(v["site"]["fixtures"].as_array().unwrap().iter().any(|f| f["kind"] == "shelf" && f["levels_m"].as_array().unwrap().len() == 3));
+        // A parcel on a shelf or a porch says so, and its height is that surface's.
+        let raised: Vec<&Value> = v["drops"].as_array().unwrap().iter().filter(|x| x.get("support").is_some()).collect();
+        assert!(!raised.is_empty());
+        for x in raised {
+            let id = x["id"].as_str().unwrap();
+            let dv = s.drops.iter().find(|q| q.id == id).unwrap();
+            assert_eq!(x["pos"][2].as_f64().unwrap(), r3(dv.pos.y));
+            assert!(x["support"]["label_ko"].is_string() && x["support"]["on"].is_string());
+        }
+        let t = rt.api_world_terrain().unwrap();
+        assert_eq!(t["curb_kind"].as_array().unwrap().len(), t["heights_cm"].as_array().unwrap().len());
+    }
+
+    #[test]
+    fn a_parcel_fetch_says_where_to_look_and_that_the_base_camp_was_implied() {
+        let mut rt = rt();
+        let v = rt.api_command_submit("창고 선반에서 택배 가져와").unwrap();
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["parsed"]["destination"]["id"], "base_camp");
+        assert_eq!(v["parsed"]["destination"]["implied"], true);
+        let origin: Vec<&str> = v["parsed"]["targets"][0]["origin"].as_array().unwrap().iter().map(|o| o["id"].as_str().unwrap()).collect();
+        assert_eq!(origin, vec!["warehouse", "shelf"]);
+        let v = rt.api_command_submit("택배를 창고로 가져와").unwrap();
+        assert!(v["parsed"]["destination"].get("implied").is_none());
+        assert!(v["parsed"]["targets"][0].get("origin").is_none());
     }
 
     #[test]

@@ -1,10 +1,17 @@
 //! Robot status shown like a body-part health display (head, thorax, stomach,
 //! arms, legs).
 //!
-//! Every value is computed from simulation variables. The robot has ONE hand
-//! and one locomotion base, so the two "arms" are two metrics of that hand
-//! (grip and joints) and the two "legs" are two metrics of the base (drive and
-//! terrain margin). They are not anatomical left and right.
+//! Every value is computed from simulation variables. The two "arms" are two
+//! metrics of the working (right) hand or gripper (grip and joints) and the
+//! two "legs" are two metrics of the base (drive and terrain margin). They are
+//! not anatomical left and right.
+//!
+//! The zones follow the form (`morph`): the drive and terrain zones are named
+//! after the lower body (발, 바퀴, 메카넘 바퀴, 트랙), the vision zone after the
+//! camera (a head, a mast camera, a chassis camera, none without one), the
+//! cargo zone after the cargo (the bay `stomach`, a bed `bed`, a tote `tote`,
+//! none without one), and the grip and arm zones exist only with a
+//! manipulator. Today's humanoid keeps its seven zones in their order.
 //!
 //! Modelling assumptions (not measured values) are named constants here and
 //! listed in `data/README.md`:
@@ -18,6 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::balance::{Coupling, JointLoad};
 use crate::base::{BaseKind, BaseSpec};
+use crate::morph::{Cargo, HeadMount, Lower, Manip, Morphology, Torso};
 use crate::surface::{slip_probability, Contact};
 
 /// Battery energy equals cruise power times this many seconds (assumption).
@@ -162,12 +170,22 @@ pub struct BodyStatus {
     pub foot: FootSummary,
     #[serde(default)]
     pub balance: Option<BalanceSummary>,
+    /// The robot's form, for the silhouette (`morph`).
+    #[serde(default)]
+    pub morph: Morphology,
+    /// The named form's id (`truck`, ...) or `custom`, and its Korean name.
+    #[serde(default)]
+    pub form: String,
+    #[serde(default)]
+    pub form_ko: String,
 }
 
 /// Simulation variables the status is computed from.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BodyInputs {
     pub base: BaseKind,
+    /// The robot's form (its lower body follows `base`).
+    pub morph: Morphology,
     pub fingers: u8,
     /// Recent perception confidence 0..1. `None` when nothing was perceived yet.
     pub vision_confidence: Option<f32>,
@@ -222,8 +240,49 @@ pub fn slip_level(margin: f32) -> BodyLevel {
     }
 }
 
-/// Computes the seven zones and the active effects from `inp`.
+/// The zone names the form gives: vision, battery, cargo (id and name), grip,
+/// arm joints and the lower body's word (`None` where the form has no such zone).
+struct ZoneNames {
+    head: Option<&'static str>,
+    thorax: &'static str,
+    cargo: Option<(&'static str, &'static str)>,
+    arms: Option<(&'static str, &'static str)>,
+    lower: &'static str,
+}
+
+fn zone_names(m: &Morphology) -> ZoneNames {
+    ZoneNames {
+        head: match m.head {
+            HeadMount::Neck | HeadMount::Fixed { .. } => Some("머리 · 비전"),
+            HeadMount::MastCamera { .. } => Some("마스트 카메라 · 비전"),
+            HeadMount::ChassisFront { .. } => Some("전방 카메라 · 비전"),
+            HeadMount::None => None,
+        },
+        thorax: if m.torso == Torso::Humanoid { "가슴 · 배터리" } else { "본체 · 배터리" },
+        cargo: match m.cargo {
+            Cargo::Bay => Some(("stomach", "배 · 적재")),
+            Cargo::Bed { .. } => Some(("bed", "적재함 · 짐칸")),
+            Cargo::Tote => Some(("tote", "토트 · 적재")),
+            Cargo::None => None,
+        },
+        arms: match m.manip {
+            Manip::Arms2 | Manip::Arm1 => Some(("손 · 파지", "손 · 관절")),
+            Manip::Gripper1 => Some(("집게 · 파지", "팔 · 관절")),
+            Manip::None => None,
+        },
+        lower: match m.lower {
+            Lower::Legs => "발",
+            Lower::Wheels => "바퀴",
+            Lower::Mecanum => "메카넘 바퀴",
+            Lower::Track => "트랙",
+        },
+    }
+}
+
+/// Computes the zones of the form (today's humanoid: seven) and the active effects from `inp`.
 pub fn compute(inp: &BodyInputs) -> BodyStatus {
+    let morph = inp.morph.fit(inp.base);
+    let names = zone_names(&morph);
     let mut spec = inp.base.spec();
     let (cap_j, cap_kg, runtime_note) = match &inp.limits {
         Some(l) => {
@@ -235,8 +294,8 @@ pub fn compute(inp: &BodyInputs) -> BodyStatus {
         None => (battery_capacity_j(&spec), inp.base.carry_capacity_kg(), format!("순항 전력 × {:.0}분 가정", BATTERY_RUNTIME_S / 60.0)),
     };
 
-    // head: vision
-    let head = match inp.vision_confidence {
+    // head: vision (the camera wherever the form has it)
+    let head = names.head.map(|label| match inp.vision_confidence {
         Some(c) => {
             let ms = inp
                 .frame_ms
@@ -244,22 +303,22 @@ pub fn compute(inp: &BodyInputs) -> BodyStatus {
                 .unwrap_or_default();
             part(
                 "head",
-                "머리 · 비전",
+                label,
                 c * 100.0,
                 100.0,
                 c,
                 format!("최근 인식 신뢰도 {:.0}%{ms}", c * 100.0),
             )
         }
-        None => part("head", "머리 · 비전", 100.0, 100.0, 1.0, "인식 기록 없음".into()),
-    };
+        None => part("head", label, 100.0, 100.0, 1.0, "인식 기록 없음".into()),
+    });
 
     // thorax: battery
     let used = inp.energy_used_j.max(0.0).min(cap_j);
     let battery = (1.0 - used / cap_j) as f32;
     let thorax = part(
         "thorax",
-        "가슴 · 배터리",
+        names.thorax,
         battery * 100.0,
         100.0,
         battery,
@@ -272,41 +331,45 @@ pub fn compute(inp: &BodyInputs) -> BodyStatus {
     let room = here.map_or(cap_kg, |(kg, _)| *kg);
     let load_ratio = 1.0 - carried / room.max(1e-3);
     let frac = inp.body_mass_kg.filter(|m| *m > 0.0).map(|m| format!(" · 몸무게의 {:.0}%", 100.0 * carried / m)).unwrap_or_default();
-    let stomach = part(
-        "stomach",
-        "배 · 적재",
-        carried,
-        cap_kg,
-        load_ratio,
-        match here {
-            Some((kg, ground)) => format!("적재 {carried:.1} / {cap_kg:.0} kg{frac} · {ground}에서는 구동력이 {kg:.1} kg까지"),
-            None => format!("적재 {carried:.1} / {cap_kg:.0} kg{frac}"),
-        },
-    );
+    let stomach = names.cargo.map(|(id, label)| {
+        part(
+            id,
+            label,
+            carried,
+            cap_kg,
+            load_ratio,
+            match here {
+                Some((kg, ground)) => format!("적재 {carried:.1} / {cap_kg:.0} kg{frac} · {ground}에서는 구동력이 {kg:.1} kg까지"),
+                None => format!("적재 {carried:.1} / {cap_kg:.0} kg{frac}"),
+            },
+        )
+    });
 
     // arm_l: grip margin (2.0 or more counts as full)
-    let arm_l = match inp.grip_margin {
+    let arm_l = names.arms.map(|(grip, _)| match inp.grip_margin {
         Some(m) => part(
             "arm_l",
-            "손 · 파지",
+            grip,
             m,
             2.0,
             m / 2.0,
             format!("마찰 용량 / 필요 힘 = {m:.2} (안전계수 포함, 1 이상이면 안정)"),
         ),
-        None => part("arm_l", "손 · 파지", 2.0, 2.0, 1.0, "파지 대기".into()),
-    };
+        None => part("arm_l", grip, 2.0, 2.0, 1.0, "파지 대기".into()),
+    });
 
     // arm_r: the working arm's wear (reducer life used).
     let wear = inp.arm_wear.clamp(0.0, 1.0);
-    let arm_r = part(
-        "arm_r",
-        "손 · 관절",
-        (1.0 - wear) * 100.0,
-        100.0,
-        1.0 - wear,
-        format!("작업 팔 감속기 수명 {:.2}% 사용 · 채취 타격 {}회", inp.arm_wear * 100.0, inp.joint_strikes),
-    );
+    let arm_r = names.arms.map(|(_, joints)| {
+        part(
+            "arm_r",
+            joints,
+            (1.0 - wear) * 100.0,
+            100.0,
+            1.0 - wear,
+            format!("작업 팔 감속기 수명 {:.2}% 사용 · 채취 타격 {}회", inp.arm_wear * 100.0, inp.joint_strikes),
+        )
+    });
 
     // leg_l: drive. This is a speed gauge, not a health bar: a robot standing
     // still is not hurt, so the level stays "ok" unless the battery is empty and
@@ -316,7 +379,7 @@ pub fn compute(inp: &BodyInputs) -> BodyStatus {
     let depleted = used >= cap_j;
     let mut leg_l = part(
         "leg_l",
-        "발 · 구동",
+        &format!("{} · 구동", names.lower),
         speed,
         spec.max_speed_mps,
         sf,
@@ -332,10 +395,11 @@ pub fn compute(inp: &BodyInputs) -> BodyStatus {
 
     // leg_r: terrain margin (the route's slope and step limits, the ground's friction and drive limits included)
     let ground = inp.balance.as_ref().map(|b| b.ground.as_str()).filter(|g| !g.is_empty());
+    let terrain_label = format!("{} · 지형", names.lower);
     let leg_r = match inp.terrain_margin {
         Some(m) => part(
             "leg_r",
-            "발 · 지형",
+            &terrain_label,
             m * 100.0,
             100.0,
             m,
@@ -347,15 +411,12 @@ pub fn compute(inp: &BodyInputs) -> BodyStatus {
                 ground.map(|g| format!(" · {g}의 마찰·구동력 한계 포함")).unwrap_or_default()
             ),
         ),
-        None => part("leg_r", "발 · 지형", 100.0, 100.0, 1.0, "경로 없음".into()),
+        None => part("leg_r", &terrain_label, 100.0, 100.0, 1.0, "경로 없음".into()),
     };
 
-    let parts = vec![head, thorax, stomach, arm_l, arm_r, leg_l, leg_r];
+    let parts: Vec<BodyPart> = [head, Some(thorax), stomach, arm_l, arm_r, Some(leg_l), Some(leg_r)].into_iter().flatten().collect();
 
-    let level_of = |id: &str| -> (BodyLevel, f32) {
-        let p = parts.iter().find(|p| p.id == id).expect("known part id");
-        (p.level, p.ratio)
-    };
+    let level_of = |id: &str| -> Option<(BodyLevel, f32)> { parts.iter().find(|p| p.id == id).map(|p| (p.level, p.ratio)) };
     let mut effects = Vec::new();
     // Fatigue: short term the hottest joint's heat (above 1 it is derated),
     // long term the most worn reducer.
@@ -372,17 +433,19 @@ pub fn compute(inp: &BodyInputs) -> BodyStatus {
             inp.wear_joint.as_ref().map(|j| format!(" ({j})")).unwrap_or_default()
         ),
     });
-    let (load_level, load_left) = level_of("stomach");
-    effects.push(BodyEffect {
-        id: "load".into(),
-        label_ko: "하중".into(),
-        level: load_level,
-        detail: format!(
-            "적재 여유 {:.0}%{}",
-            load_left * 100.0,
-            inp.body_mass_kg.filter(|m| *m > 0.0).map(|m| format!(" · 몸무게의 {:.0}%", 100.0 * carried / m)).unwrap_or_default()
-        ),
-    });
+    // Load: what is left of the cargo place (a form without one has no load effect).
+    if let Some((load_level, load_left)) = names.cargo.and_then(|(id, _)| level_of(id)) {
+        effects.push(BodyEffect {
+            id: "load".into(),
+            label_ko: "하중".into(),
+            level: load_level,
+            detail: format!(
+                "적재 여유 {:.0}%{}",
+                load_left * 100.0,
+                inp.body_mass_kg.filter(|m| *m > 0.0).map(|m| format!(" · 몸무게의 {:.0}%", 100.0 * carried / m)).unwrap_or_default()
+            ),
+        });
+    }
     // Slip: the friction picture of the ground under the robot when the
     // balance model has one, else the route's margin to the slope limit.
     match inp.balance.as_ref().and_then(|b| b.contact.map(|c| (b, c))) {
@@ -400,7 +463,7 @@ pub fn compute(inp: &BodyInputs) -> BodyStatus {
             ),
         }),
         None => {
-            let (slip_level, slip_ratio) = level_of("leg_r");
+            let (slip_level, slip_ratio) = level_of("leg_r").unwrap_or((BodyLevel::Ok, 1.0));
             effects.push(BodyEffect {
                 id: "slip".into(),
                 label_ko: "미끄러짐".into(),
@@ -452,6 +515,9 @@ pub fn compute(inp: &BodyInputs) -> BodyStatus {
             speed_factor: sf,
             terrain_margin: inp.terrain_margin,
         },
+        morph,
+        form: morph.form().map_or("custom", |f| f.id).to_string(),
+        form_ko: morph.label_ko(),
     }
 }
 
@@ -462,6 +528,7 @@ mod tests {
     fn idle(base: BaseKind) -> BodyInputs {
         BodyInputs {
             base,
+            morph: Morphology::humanoid(base),
             fingers: 5,
             vision_confidence: None,
             frame_ms: None,

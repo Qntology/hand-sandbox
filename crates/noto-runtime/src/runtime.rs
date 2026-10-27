@@ -210,6 +210,10 @@ pub enum FrameView {
     /// A close-up on the part an action works with: the hand, the body from
     /// the side (waist, neck, legs), or low by the feet, wheels or tracks.
     Focus(world_sim::render::FocusCam),
+    /// Third person, isometric (`views`): orthographic from the world-fixed
+    /// diagonal `az_step` (0..3), zoomed by `zoom_pct`/100, true isometric or
+    /// 2:1 dimetric, centred on the robot through a follow in simulated time.
+    Iso { az_step: u8, zoom_pct: u16, dimetric: bool },
 }
 
 struct WorldLabels<'a>(&'a World);
@@ -281,7 +285,7 @@ impl PoseFix {
 }
 
 fn new_world(cfg: &RuntimeConfig) -> Result<World> {
-    World::new(WorldConfig { seed: cfg.seed, cells: cfg.cells, noto: cfg.noto, body: cfg.body, terrain: cfg.terrain, odometry: cfg.odometry, parcels: cfg.parcels }).map_err(|e| anyhow!("월드를 만들 수 없습니다: {e}"))
+    World::new(WorldConfig { seed: cfg.seed, cells: cfg.cells, noto: cfg.noto, body: cfg.body, terrain: cfg.terrain, odometry: cfg.odometry, parcels: cfg.parcels, lighting: cfg.lighting, site: cfg.site }).map_err(|e| anyhow!("월드를 만들 수 없습니다: {e}"))
 }
 
 pub struct Runtime {
@@ -323,6 +327,8 @@ pub struct Runtime {
     pub(crate) live_queue: std::collections::VecDeque<String>,
     /// What the vision schedule did (`vision`).
     pub(crate) vstats: VisionStats,
+    /// The isometric view's follow of the robot (`views`).
+    pub(crate) iso: crate::views::IsoFollow,
 }
 
 impl Runtime {
@@ -331,12 +337,15 @@ impl Runtime {
     pub fn new(cfg: RuntimeConfig, lexicon_json: &str, data_dir: Option<&Path>) -> Result<Runtime> {
         let lex = Lexicon::from_json(lexicon_json)?;
         let recognizer: Box<dyn Recognizer> = Box::new(OraclePerception::new(&lex, cfg.noise.clone(), cfg.min_pixels));
-        let ml = crate::ml::MlPipeline::stand_in(&lex, cfg.seed);
+        let mut ml = crate::ml::MlPipeline::stand_in(&lex, cfg.seed);
+        // The v1.0 path for real models, with the lexicon's prompt templates and background set.
+        ml.prompting = noto_search::VisionPrompting::from_lexicon_json(lexicon_json)?;
+        ml.fix = crate::ml::MlFixCfg::v1(&ml.prompting);
         let parser = Parser::new(lex);
         let world = new_world(&cfg)?;
         let ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
         let (sds, audit, db) = match data_dir {
-            Some(dir) => (SdsStore::open(&dir.join("sds")), AuditLog::open(&dir.join("logs"), &format!("session_{ms}"), 4000)?, noto_sds::TestDb::open(&dir.join("db"))),
+            Some(dir) => (SdsStore::open_with(&dir.join("sds"), noto_sds::OpenOptions::stamped(noto_core::bench::ENGINE_REV)), AuditLog::open(&dir.join("logs"), &format!("session_{ms}"), 4000)?, noto_sds::TestDb::open(&dir.join("db"))),
             None => (SdsStore::memory(), AuditLog::memory(4000), noto_sds::TestDb::memory()),
         };
         let cam = cfg.camera.camera();
@@ -373,6 +382,7 @@ impl Runtime {
             test_cfg: crate::testrun::TestCfg::default(),
             live_queue: std::collections::VecDeque::new(),
             vstats: VisionStats::default(),
+            iso: crate::views::IsoFollow::default(),
         };
         let msg = format!(
             "월드 시작: seed {} · {}×{}칸 · 베이스 {:?} · 손가락 {} · 인식기 {}",
@@ -534,6 +544,11 @@ impl Runtime {
         &self.ml
     }
 
+    /// The ML pipeline, to switch its models or the v1.0 fixes (`MlPipeline::fix`).
+    pub fn ml_pipeline_mut(&mut self) -> &mut crate::ml::MlPipeline {
+        &mut self.ml
+    }
+
     pub fn test_db(&self) -> &noto_sds::TestDb {
         &self.db
     }
@@ -598,9 +613,11 @@ impl Runtime {
     /// Replaces the recogniser (for example with SigLIP2).
     pub fn set_recognizer(&mut self, r: Box<dyn Recognizer>) {
         let mode = r.mode().to_string();
+        let scope = r.scope();
         self.recognizer = r;
         self.eval = EvalCounters::default();
         self.gates.clear();
+        self.gates.set_recognizer_mode(&scope);
         self.log("vision", Level::Info, format!("인식기 교체: {mode}"), None);
     }
 
@@ -610,8 +627,12 @@ impl Runtime {
     pub fn use_siglip(&mut self, model: Arc<noto_ml::Siglip2>, bank_dir: Option<&Path>) -> Result<()> {
         let t0 = Instant::now();
         let phrases = Arc::new(crate::embedding::BankedPhrases::new(Arc::clone(&model), bank_dir));
-        self.ml.locate = crate::ml::LocateEngine::Model(Box::new(noto_vision::SiglipLocator::new(Arc::clone(&model))));
-        let rec = crate::embedding::EmbeddingPerception::siglip(model, self.parser.lexicon(), bank_dir, Default::default())?;
+        self.ml.locate = crate::ml::LocateEngine::Model(Box::new(noto_vision::SiglipLocator::with_cfg(Arc::clone(&model), self.ml.fix.locate.clone())));
+        let prompting = self.ml.fix.scan_prompting.then(|| self.ml.prompting.clone());
+        let mut rec = crate::embedding::EmbeddingPerception::siglip_with(model, self.parser.lexicon(), bank_dir, Default::default(), prompting.as_ref())?;
+        if self.ml.fix.scan_calibrated {
+            rec.set_calibration(self.ml.calib.iter().find(|t| t.mode == crate::embedding::SCAN_CALIB_MODE).cloned());
+        }
         self.attach_embedder(phrases)?;
         self.set_recognizer(Box::new(rec));
         let ms = t0.elapsed().as_secs_f32() * 1000.0;
@@ -649,6 +670,21 @@ impl Runtime {
     pub fn use_oracle(&mut self) {
         let r = OraclePerception::new(self.parser.lexicon(), self.cfg.noise.clone(), self.cfg.min_pixels);
         self.set_recognizer(Box::new(r));
+    }
+
+    /// Every stand-in spoiled the way its real model was measured to be wrong
+    /// on this renderer (v1.0, `docs/research/ml-ab.md`): the tile recogniser
+    /// ([`crate::perception::ScanErrModel::SIGLIP_MEASURED`]), the depth and the
+    /// semantic location of the ML pass (`MlPipeline::use_honest_stand_ins`).
+    /// Real models already attached stay; their SDS statistics stay apart.
+    pub fn use_honest_stand_ins(&mut self) {
+        let seed = self.cfg.seed;
+        self.ml.use_honest_stand_ins(seed);
+        if self.recognizer.mode() == "oracle" {
+            let mut r = OraclePerception::new(self.parser.lexicon(), self.cfg.noise.clone(), self.cfg.min_pixels);
+            r.set_honest(Some(crate::perception::ScanErrModel::SIGLIP_MEASURED));
+            self.set_recognizer(Box::new(r));
+        }
     }
 
     /// Lets the command parser use embeddings for words the dictionary misses.
@@ -756,6 +792,7 @@ impl Runtime {
         self.record_tick();
         self.record_act_keyframes(&events);
         self.record_act_sds(&events);
+        self.record_bench_sds(&events);
         if self.world.tick.saturating_sub(self.last_flush_tick) >= 600 {
             self.flush_sds();
         }
@@ -909,7 +946,7 @@ impl Runtime {
 
     /// How fast the robot's memories spread per metre: what the SDS learned, else its odometry's specification.
     pub(crate) fn drift_rate(&self) -> DriftRate {
-        DriftRate::learned(&self.sds, &self.base_id(), self.world.body.legged)
+        DriftRate::learned(&self.sds, &self.base_id(), self.world.body.legged())
     }
 
     /// 1σ of the robot's own position against the map: its odometry's drift
@@ -1222,6 +1259,12 @@ impl Runtime {
             FrameView::Focus(which) => {
                 let cam = Camera { width: width.clamp(32, 2048) as usize, height: height.clamp(32, 2048) as usize, fov_deg: 50.0, max_dist_m: 12.0, ..self.cam };
                 (world_sim::render::render_focus(&self.world, &cam, which), Vec::new())
+            }
+            FrameView::Iso { az_step, zoom_pct, dimetric } => {
+                let cam = Camera { width: width.clamp(32, 2048) as usize, height: height.clamp(32, 2048) as usize, max_dist_m: 60.0, ..self.cam };
+                let (f, o) = crate::views::render_iso(&self.world, &cam, &mut self.iso, az_step, zoom_pct as f32 / 100.0, dimetric);
+                overlay = o;
+                (f, Vec::new())
             }
         };
         let enc = encode_webp(&frame.rgb, frame.width as u32, frame.height as u32, quality).map_err(|e| anyhow!("WebP 인코딩 실패: {e}"))?;

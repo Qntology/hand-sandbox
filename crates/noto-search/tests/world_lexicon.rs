@@ -46,6 +46,14 @@ fn the_shipped_lexicon_is_valid_and_complete() {
         assert!(l.vision.iter().any(|e| e.id == id), "vision entity {id}");
     }
     assert!(l.all_phrases().len() > 100);
+    // A site's places and what the camera sees of them (never a target).
+    for id in ["house", "doorstep", "shelf", "table"] {
+        assert!(l.place(id).is_some(), "place {id}");
+        assert!(l.structures.iter().any(|e| e.id == id && e.link == id), "structure {id}");
+        assert!(!l.vision.iter().any(|e| e.id == id), "{id} stays out of the recognisers' label set");
+    }
+    assert!(l.is_placed("parcel") && !l.is_placed("log"));
+    assert_eq!(l.home().map(|n| n.id.as_str()), Some("base_camp"));
 }
 
 #[test]
@@ -165,6 +173,83 @@ fn an_origin_is_ignored_with_a_warning_when_a_destination_exists() {
     let p = parse("창고에서 석탄 베이스캠프로 가져와");
     assert_eq!(fetch(&p), (vec![("coal".to_string(), 1)], "base_camp".to_string()));
     assert!(p.warnings.iter().any(|w| w.contains("출발 지점")));
+    // Since v1.0 the origin is kept as a search hint, never a destination.
+    assert_eq!(origin(&p), vec!["warehouse".to_string()]);
+}
+
+/// The search hint of the first target.
+fn origin(p: &ParsedCommand) -> Vec<String> {
+    match p.plan.as_ref().unwrap_or_else(|| panic!("no plan for {:?}: {:?}", p.text, p.problem)) {
+        Plan::Fetch { targets, .. } | Plan::Collect { targets } => targets[0].origin.iter().map(|o| o.place.clone()).collect(),
+        other => panic!("expected Fetch or Collect for {:?}, got {other:?}", p.text),
+    }
+}
+
+fn implied_destination(p: &ParsedCommand) -> bool {
+    match p.plan.as_ref() {
+        Some(Plan::Fetch { destination, .. }) => destination.implied(),
+        other => panic!("expected Fetch for {:?}, got {other:?}", p.text),
+    }
+}
+
+#[test]
+fn a_parcel_without_a_destination_goes_back_to_the_base_camp() {
+    let p = parse("택배 가져와");
+    assert_eq!(fetch(&p), (vec![("parcel".to_string(), 1)], "base_camp".to_string()));
+    assert!(implied_destination(&p));
+    assert!(p.warnings.iter().any(|w| w.contains("베이스캠프로")), "{:?}", p.warnings);
+    assert!(p.trace.iter().any(|t| t.detail.contains("home place")));
+    let p = parse("택배 상자 2개 갖다줘");
+    assert_eq!(fetch(&p), (vec![("parcel".to_string(), 2)], "base_camp".to_string()));
+    // Said out loud, it is an ordinary destination; a mined item still needs one.
+    let p = parse("택배를 창고로 가져와");
+    assert_eq!(fetch(&p).1, "warehouse");
+    assert!(!implied_destination(&p));
+    assert_eq!(parse("철광석 가져와").problem.unwrap().code, "missing_destination");
+    assert_eq!(parse("택배랑 나무 가져와").problem.unwrap().code, "missing_destination", "only placed items have a home");
+    // Picking it up without bringing it keeps it in hand.
+    match parse("택배 주워").plan.unwrap() {
+        Plan::Collect { targets } => assert_eq!(targets[0].resource, "parcel"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn where_a_parcel_lies_becomes_a_search_hint() {
+    let p = parse("집 앞에서 택배 가져와");
+    assert_eq!(fetch(&p), (vec![("parcel".to_string(), 1)], "base_camp".to_string()));
+    assert_eq!(origin(&p), vec!["doorstep".to_string()]);
+    let p = parse("물류센터 선반에서 택배 가져와");
+    assert_eq!(fetch(&p).1, "base_camp");
+    assert_eq!(origin(&p), vec!["warehouse".to_string(), "shelf".to_string()], "outermost first");
+    assert!(p.trace.iter().any(|t| t.detail.contains("joins the origin")));
+    let p = parse("창고 선반에서 택배 1개 가져와");
+    assert_eq!(origin(&p), vec!["warehouse".to_string(), "shelf".to_string()]);
+    let p = parse("선반에 있는 택배 가져와");
+    assert_eq!(fetch(&p).1, "base_camp", "선반에 is where it lies, not where it goes");
+    assert_eq!(origin(&p), vec!["shelf".to_string()]);
+    assert!(p.unmatched.is_empty(), "{:?}", p.unmatched);
+    let p = parse("테이블 위에서 택배 두 개 가져와");
+    assert_eq!(fetch(&p), (vec![("parcel".to_string(), 2)], "base_camp".to_string()));
+    assert_eq!(origin(&p), vec!["table".to_string()]);
+    let p = parse("현관 앞 택배를 창고로 옮겨줘");
+    assert_eq!(fetch(&p).1, "warehouse");
+    // An origin alone is still not a command.
+    assert_eq!(parse("집 앞에서").problem.unwrap().code, "unsupported_origin");
+}
+
+#[test]
+fn the_new_place_words_leave_the_verbs_alone() {
+    // 집어 (pick) is a verb form, not the place 집 (house) with a tail.
+    for text in ["택배 집어와", "돌 하나 집어", "택배 집어서 창고로 가져와"] {
+        let p = parse(text);
+        assert!(p.hits.iter().all(|h| h.category != Category::Place || h.node == "warehouse"), "{text}: {:?}", p.hits);
+        assert!(p.plan.is_some(), "{text}: {:?}", p.problem);
+    }
+    match parse("집으로 가").plan.unwrap() {
+        Plan::Goto { place } => assert_eq!(place.place, "house"),
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]

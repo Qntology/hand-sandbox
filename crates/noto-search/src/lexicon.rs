@@ -10,8 +10,16 @@
 //!
 //! This crate adds one optional field, `surface`: complete word forms that
 //! must match whole (used for short irregular verb forms where stripping an
-//! ending would be unsafe). The code holds no vocabulary: every word the
-//! search knows comes from the lexicon file.
+//! ending would be unsafe), and one optional resource flag, `placed`: the item
+//! lies where it was put (a parcel at a door or on a shelf) instead of being
+//! mined out of a node, and one optional place flag, `home`: where such items
+//! are brought when a command names no destination ("택배 가져와"). The code
+//! holds no vocabulary: every word the search knows comes from the lexicon file.
+//!
+//! Vision entities of kind `structure` (a house, a doorstep, a shelf, a table)
+//! are kept apart in [`Lexicon::structures`]: recognisers built from
+//! [`Lexicon::vision`] keep their label sets, and one that wants to tell a
+//! parcel from the shelf it lies on opts in to them as never-a-target classes.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -114,6 +122,10 @@ pub struct Node {
     pub surface: Vec<String>,
     /// The resource a source/drop yields, or the place a waypoint stands for.
     pub link: Option<String>,
+    /// A resource that lies where it was put (a parcel) rather than being mined.
+    pub placed: bool,
+    /// The place placed items are brought to when no destination is said.
+    pub home: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -124,6 +136,18 @@ pub enum EntityKind {
     Drop,
     /// A named waypoint (base camp, warehouse).
     Waypoint,
+}
+
+/// A building part or a piece of furniture the camera may see (kind
+/// `structure` in the lexicon): never a target, only where targets lie.
+#[derive(Clone, Debug)]
+pub struct StructureEntity {
+    pub id: String,
+    /// The place it stands for (`house`, `doorstep`, `shelf`, `table`).
+    pub link: String,
+    pub semantic: String,
+    pub bias: Vec<Phrase>,
+    pub prejudice: Vec<Phrase>,
 }
 
 /// What the camera should be able to recognise, with English prompts.
@@ -158,8 +182,12 @@ pub struct Lexicon {
     pub negation: Node,
     pub direction_words: Vec<String>,
     pub source_words: Vec<String>,
+    /// Words after "X에" that make X where an item lies ("선반에 있는 택배"), not where it goes.
+    pub located_words: Vec<String>,
     pub quantity: QuantityTable,
     pub vision: Vec<VisionEntity>,
+    /// Vision entities of kind `structure`, apart from [`Lexicon::vision`].
+    pub structures: Vec<StructureEntity>,
 }
 
 #[derive(Deserialize)]
@@ -176,6 +204,10 @@ struct RawNode {
     surface: Vec<String>,
     #[serde(default)]
     source: Option<String>,
+    #[serde(default)]
+    placed: bool,
+    #[serde(default)]
+    home: bool,
 }
 
 #[derive(Deserialize)]
@@ -212,6 +244,8 @@ struct RawPreposition {
     direction: Vec<String>,
     #[serde(default)]
     source: Vec<String>,
+    #[serde(default)]
+    located: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -250,6 +284,8 @@ fn node_of(id: &str, raw: RawNode) -> Node {
         exact_match: norm_list(&raw.exact_match),
         surface: norm_list(&raw.surface),
         link: raw.source,
+        placed: raw.placed,
+        home: raw.home,
     }
 }
 
@@ -274,15 +310,22 @@ impl Lexicon {
                 exact_match: Vec::new(),
                 surface: Vec::new(),
                 source: None,
+                placed: false,
+                home: false,
             }),
         );
         let mut vision = Vec::new();
+        let mut structures = Vec::new();
         for (id, e) in r.vision {
             let kind = match e.kind.as_str() {
                 "source" => EntityKind::Source,
                 "drop" => EntityKind::Drop,
                 "waypoint" => EntityKind::Waypoint,
-                other => bail!("vision entity {id}: unknown kind {other:?} (source, drop or waypoint)"),
+                "structure" => {
+                    structures.push(StructureEntity { id, link: e.link, semantic: e.semantic, bias: weighted_phrases(&e.bias), prejudice: weighted_phrases(&e.prejudice) });
+                    continue;
+                }
+                other => bail!("vision entity {id}: unknown kind {other:?} (source, drop, waypoint or structure)"),
             };
             vision.push(VisionEntity {
                 id,
@@ -311,8 +354,10 @@ impl Lexicon {
             negation,
             direction_words: norm_list(&r.preposition.direction),
             source_words: norm_list(&r.preposition.source),
+            located_words: norm_list(&r.preposition.located),
             quantity,
             vision,
+            structures,
         };
         lex.validate()?;
         Ok(lex)
@@ -364,6 +409,22 @@ impl Lexicon {
                 bail!("vision entity {:?} has no bias phrases", e.id);
             }
         }
+        for e in &self.structures {
+            if !self.places.iter().any(|p| p.id == e.link) {
+                return Err(anyhow!("structure entity {:?} links to {:?}, which is not a place", e.id, e.link));
+            }
+            if e.bias.is_empty() {
+                bail!("structure entity {:?} has no bias phrases", e.id);
+            }
+        }
+        if self.places.iter().filter(|p| p.home).count() > 1 {
+            bail!("more than one place is marked home");
+        }
+        for r in self.resources.iter().filter(|r| r.placed) {
+            if !self.vision.iter().any(|e| e.kind == EntityKind::Drop && e.link == r.id) {
+                bail!("placed resource {:?} has no drop vision entity", r.id);
+            }
+        }
         Ok(())
     }
 
@@ -377,6 +438,16 @@ impl Lexicon {
 
     pub fn verb(&self, id: &str) -> Option<&Node> {
         self.verbs.iter().find(|n| n.id == id)
+    }
+
+    /// Whether a resource lies where it was put (a parcel) rather than being mined.
+    pub fn is_placed(&self, resource: &str) -> bool {
+        self.resource(resource).is_some_and(|n| n.placed)
+    }
+
+    /// The place placed items are brought to when a command names none.
+    pub fn home(&self) -> Option<&Node> {
+        self.places.iter().find(|p| p.home)
     }
 
     /// Every phrase that would be embedded: node bias and prejudice phrases
@@ -458,6 +529,31 @@ mod tests {
         let bad = MIN.replace(r#""link": "log""#, r#""link": "gold""#);
         let err = Lexicon::from_json(&bad).unwrap_err().to_string();
         assert!(err.contains("not defined"), "{err}");
+    }
+
+    #[test]
+    fn structures_are_kept_apart_from_the_vision_entities_and_need_a_place() {
+        let with = MIN.replace(
+            r#""warehouse": {"kind": "waypoint", "link": "warehouse", "bias": "a warehouse"}"#,
+            r#""warehouse": {"kind": "waypoint", "link": "warehouse", "bias": "a warehouse"},
+               "shelf": {"kind": "structure", "link": "warehouse", "bias": "a steel shelf"}"#,
+        );
+        let l = Lexicon::from_json(&with).unwrap();
+        assert_eq!(l.vision.len(), 2, "the recognisers' label set stays as it was");
+        assert_eq!(l.structures.len(), 1);
+        assert!(!l.all_phrases().contains(&"a steel shelf".to_string()));
+        let bad = with.replace(r#""kind": "structure", "link": "warehouse""#, r#""kind": "structure", "link": "log""#);
+        assert!(Lexicon::from_json(&bad).unwrap_err().to_string().contains("not a place"));
+    }
+
+    #[test]
+    fn a_placed_resource_needs_a_drop_entity() {
+        let placed = MIN.replace(r#""exact_match": ["돌"]}"#, r#""exact_match": ["돌"], "placed": true}"#);
+        let err = Lexicon::from_json(&placed).unwrap_err().to_string();
+        assert!(err.contains("no drop vision entity"), "{err}");
+        let ok = placed.replace(r#""tree": {"kind": "source""#, r#""stone": {"kind": "drop", "link": "stone", "bias": "a stone"}, "tree": {"kind": "source""#);
+        let l = Lexicon::from_json(&ok).unwrap();
+        assert!(l.is_placed("stone") && !l.is_placed("log") && !l.is_placed("gold"));
     }
 
     #[test]

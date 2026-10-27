@@ -17,9 +17,17 @@
 //!    buffer, and overlapping candidates of one label are merged (NMS).
 //!
 //! Everything from step 3 on is plain code and is tested with stand-in
-//! embedders. Nothing here has been run against real SigLIP2 weights: the
-//! thresholds are starting points, and the tile boxes are coarse (a tile is
-//! bigger than most objects), which is why the robot scans again as it nears.
+//! embedders. The thresholds are starting points, and the tile boxes are
+//! coarse (a tile is bigger than most objects), which is why the robot scans
+//! again as it nears.
+//!
+//! v1.0 measured the scan with real SigLIP2 weights on rendered frames
+//! (`tests/ml_ab.rs`, `docs/research/ml-ab.md`): with the raw score most
+//! candidates that pass the gates are wrong. With a calibration table
+//! ([`EmbeddingPerception::set_calibration`]) every entity's tile score is
+//! mapped through that label's Platt fit to the probability that a candidate
+//! of that score is right, so the gates' floor (`GateCfg::min_score`) means a
+//! precision for this recogniser as it does for any other.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -37,6 +45,9 @@ use world_sim::render::View;
 use world_sim::{decode_webp, encode_webp, Camera, Frame};
 
 use crate::perception::{centre_from_surface, centre_offset_m, Candidate, EntityTable, Recognizer, ScanInput, ScanOutput};
+
+/// The calibration table of the tile scan in `data/ml_calib.json`.
+pub const SCAN_CALIB_MODE: &str = "embedding";
 
 /// Settings of the tile scan. Starting points, not tuned values.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -105,6 +116,8 @@ pub struct EmbeddingPerception {
     calibrate: Arc<dyn Fn(f32) -> f32 + Send + Sync>,
     cfg: EmbeddingCfg,
     device: String,
+    /// Per-label Platt maps of the tile score (v1.0); `None` keeps the raw score.
+    calib: Option<noto_vision::CalibTable>,
 }
 
 impl EmbeddingPerception {
@@ -119,16 +132,57 @@ impl EmbeddingPerception {
         device: &str,
         cfg: EmbeddingCfg,
     ) -> Result<EmbeddingPerception> {
-        let bank = VisionBank::build(lex, text)?;
-        Ok(EmbeddingPerception { image, bank, table: EntityTable::from_lexicon(lex), calibrate, cfg, device: device.to_string() })
+        EmbeddingPerception::new_with(lex, text, image, calibrate, device, cfg, None)
+    }
+
+    /// [`EmbeddingPerception::new`] with the lexicon's prompt templates and
+    /// background set (`VisionBank::build_with`).
+    pub fn new_with(
+        lex: &Lexicon,
+        text: &dyn PhraseEmbedder,
+        image: Arc<dyn ImageEmbedder + Send + Sync>,
+        calibrate: Arc<dyn Fn(f32) -> f32 + Send + Sync>,
+        device: &str,
+        cfg: EmbeddingCfg,
+        prompting: Option<&noto_search::VisionPrompting>,
+    ) -> Result<EmbeddingPerception> {
+        let bank = VisionBank::build_with(lex, text, prompting)?;
+        Ok(EmbeddingPerception { image, bank, table: EntityTable::from_lexicon(lex), calibrate, cfg, device: device.to_string(), calib: None })
+    }
+
+    /// Maps tile scores through a calibration table (labels it lacks fall
+    /// back to its `*` entry, else keep the raw score); `None` turns it off.
+    pub fn set_calibration(&mut self, table: Option<noto_vision::CalibTable>) {
+        self.calib = table;
+    }
+
+    pub fn calibration(&self) -> Option<&noto_vision::CalibTable> {
+        self.calib.as_ref()
+    }
+
+    /// The probability a tile score of `label` stands for, under the
+    /// calibration. Places (waypoints) were never part of the fit and keep
+    /// their raw score; other labels without a fit of their own use the
+    /// pooled `*` entry.
+    fn calibrated(&self, label: &str, kind: &noto_search::EntityKind, score: f32) -> f32 {
+        let Some(t) = &self.calib else { return score };
+        if *kind == noto_search::EntityKind::Waypoint {
+            return score;
+        }
+        t.labels.get(label).or_else(|| t.labels.get("*")).and_then(|c| c.probability(score)).unwrap_or(score)
     }
 
     /// SigLIP2 for both sides. Phrase vectors are cached under `bank_dir` when given.
     pub fn siglip(model: Arc<Siglip2>, lex: &Lexicon, bank_dir: Option<&Path>, cfg: EmbeddingCfg) -> Result<EmbeddingPerception> {
+        EmbeddingPerception::siglip_with(model, lex, bank_dir, cfg, None)
+    }
+
+    /// [`EmbeddingPerception::siglip`] with prompting.
+    pub fn siglip_with(model: Arc<Siglip2>, lex: &Lexicon, bank_dir: Option<&Path>, cfg: EmbeddingCfg, prompting: Option<&noto_search::VisionPrompting>) -> Result<EmbeddingPerception> {
         let phrases = BankedPhrases::new(Arc::clone(&model), bank_dir);
         let device = noto_ml::device_label(model.device());
         let m = Arc::clone(&model);
-        EmbeddingPerception::new(lex, &phrases, model, Arc::new(move |c| m.pair_probability(c)), &device, cfg)
+        EmbeddingPerception::new_with(lex, &phrases, model, Arc::new(move |c| m.pair_probability(c)), &device, cfg, prompting)
     }
 
     pub fn cfg(&self) -> &EmbeddingCfg {
@@ -139,6 +193,14 @@ impl EmbeddingPerception {
 impl Recognizer for EmbeddingPerception {
     fn mode(&self) -> &str {
         "embedding"
+    }
+
+    fn scope(&self) -> String {
+        if self.calib.is_some() {
+            "embedding+cal".into()
+        } else {
+            "embedding".into()
+        }
     }
 
     fn scan(&mut self, input: ScanInput<'_>) -> Result<ScanOutput> {
@@ -156,7 +218,15 @@ impl Recognizer for EmbeddingPerception {
         if vecs.len() != tiles.len() {
             return Err(anyhow!("타일 {}개에 벡터 {}개가 돌아왔습니다", tiles.len(), vecs.len()));
         }
-        let scores: Vec<Vec<EntityScore>> = vecs.iter().map(|v| self.bank.score(v, &*self.calibrate, self.cfg.prejudice_weight)).collect();
+        let mut scores: Vec<Vec<EntityScore>> = vecs.iter().map(|v| self.bank.score(v, &*self.calibrate, self.cfg.prejudice_weight)).collect();
+        if self.calib.is_some() {
+            for sc in scores.iter_mut() {
+                for e in sc.iter_mut() {
+                    e.score = self.calibrated(&e.id, &e.kind, e.score);
+                }
+                sc.sort_by(|a, b| b.score.total_cmp(&a.score));
+            }
+        }
 
         let scene = scores.first().map(|s| s.iter().map(|e| (e.id.clone(), e.score)).collect()).unwrap_or_default();
         let view = input.world.head_view(input.camera).est;
@@ -432,6 +502,27 @@ mod tests {
         // deterministic
         let again = p.scan(ScanInput { world: &w, frame: &f, camera: &cam }).unwrap();
         assert_eq!(again.candidates, out.candidates);
+    }
+
+    #[test]
+    fn a_calibration_maps_entity_scores_but_leaves_places_raw() {
+        let (w, cam) = world_with_tree_ahead();
+        let f = w.render(&cam);
+        let mut p = perception();
+        let raw = p.scan(ScanInput { world: &w, frame: &f, camera: &cam }).unwrap();
+        assert_eq!(Recognizer::scope(&p), "embedding");
+        // Every tree score of s becomes σ(10·s − 10): the raw ones here are below 1, so all fall under 0.5.
+        let mut t = noto_vision::CalibTable { mode: SCAN_CALIB_MODE.into(), statistic: "tile_score".into(), ..Default::default() };
+        t.labels.insert("tree".into(), noto_vision::LabelCalib { threshold: 1.0, platt: Some((10.0, -10.0)), positives: 5, negatives: 5, precision: None, recall: None });
+        p.set_calibration(Some(t));
+        assert_eq!(Recognizer::scope(&p), "embedding+cal", "calibrated statistics stay apart");
+        let cal = p.scan(ScanInput { world: &w, frame: &f, camera: &cam }).unwrap();
+        let top = |o: &ScanOutput, id: &str| o.scene.iter().find(|(l, _)| l == id).map(|x| x.1).unwrap();
+        let (r, c) = (top(&raw, "tree"), top(&cal, "tree"));
+        assert!((c - 1.0 / (1.0 + (-(10.0 * r - 10.0)).exp())).abs() < 1e-5, "{r} -> {c}");
+        // A place keeps its raw score; a label without a fit and no `*` entry too.
+        assert_eq!(top(&raw, "warehouse"), top(&cal, "warehouse"));
+        assert_eq!(top(&raw, "boulder"), top(&cal, "boulder"));
     }
 
     #[test]

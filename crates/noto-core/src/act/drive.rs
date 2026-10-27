@@ -179,7 +179,7 @@ pub fn state(body: &Body, ground: &SurfaceProps, slope_deg: f32, accel: f32, car
     let limit = mu * normal;
     let gs = Surface::from_id(ground.id).unwrap_or_default();
     let slip = slip_on(gs, need / limit.max(1e-3), contact_len_m(body, gs)).unwrap_or(1.0);
-    let pose = KinPose { base_pitch_deg: slope_deg, ..KinPose::stand(cargo_kg) };
+    let pose = KinPose { base_pitch_deg: slope_deg, ..body.stand(cargo_kg) };
     let r = kin::solve_fast(body, &pose, &KinLoads { accel: [accel, 0.0, 0.0], bumper_force: [-push_n, 0.0, 0.0], ..KinLoads::default() });
     let (front, rear, pressure) = match (r.contact("axle_front"), r.contact("axle_rear"), r.contact("track")) {
         (Some(f), Some(b), _) => (f.normal_n, b.normal_n, None),
@@ -230,7 +230,7 @@ pub fn drive(body: &Body, ground: Surface, slope_deg: f32, cargo_kg: f32, speed:
         if a < 0.0 && v <= 1e-3 {
             v = 0.02;
         }
-        let pose = KinPose { base_pitch_deg: slope_deg, ..KinPose::stand(cargo_kg) };
+        let pose = KinPose { base_pitch_deg: slope_deg, ..body.stand(cargo_kg) };
         samples.push(ActSample { t, phase: if a > 0.0 { "start" } else if a < 0.0 { "stop" } else { "cruise" }, pose, loads: KinLoads { accel: [a, 0.0, 0.0], bumper_force: [-push_n, 0.0, 0.0], ..KinLoads::default() }, margin: st.margin, zmp: [0.0, 0.0], com: [x, 0.0, 0.0], peak_ratio: st.need_n / (2.0 * body.chassis.drive_force_n).max(1e-3), grip: None, object: None });
         t += dt;
     }

@@ -40,6 +40,8 @@
 use serde::Serialize;
 
 use crate::balance::{step_knee_lever, Body, FeedForward, Posture, Source, CARGO_X_M, CARGO_Z_M, G, HIP_HALF_WIDTH_M, KNEE_LEVER_STAND_M, KNEE_LEVER_WALK_M, REACTION_DELAY_S};
+use crate::kin::CAMERA_UP_M;
+use crate::morph::{column_top_m, HeadMount, Torso, COLUMN_TOP_M};
 use crate::parts::*;
 
 type V = [f64; 3];
@@ -150,6 +152,42 @@ pub struct Robot {
     dof_joints: Vec<(usize, Actuator, f64, f64)>,
     /// The report's joint list: simulated, structural, then statics.
     pub joints: Vec<DynJoint>,
+    /// Height of the root's frame above the ground at rest, metres: the waist
+    /// joint for a humanoid torso, the ground for a column or a deck (`morph`).
+    root_z: f64,
+    /// The head (or a mast camera on its pan-tilt) is a link of the tree; a
+    /// camera fixed to the chassis is one of `lower_masses` instead.
+    head_in_tree: bool,
+}
+
+fn sim_joint(name: &str, seg: Segment, a: &Actuator, lo: f64, hi: f64) -> DynJoint {
+    DynJoint { name: name.into(), segment: seg, actuator: a.name.into(), peak_nm: a.peak_nm, cont_nm: a.cont_nm, speed_rad_s: a.speed_rad_s, backdrivable: a.backdrivable, kind: "sim", q_min_deg: lo as f32, q_max_deg: hi as f32 }
+}
+
+/// Adds the head to the tree on the last link (the trunk, or the root of a
+/// column or a deck) at `origin` in its frame: on its pan-tilt's tilt joint
+/// (`neck`, within `lim_deg`) for a neck or a mast's pan-tilt, welded and
+/// pitched by its tilt for a head fixed on the trunk or the column. A camera
+/// on the chassis front or a fixed mast camera is not added (it stays with
+/// the chassis). Whether the head is in the tree.
+fn head_link(body: &Body, links: &mut Vec<Link>, dof_joints: &mut Vec<(usize, Actuator, f64, f64)>, joints: &mut Vec<DynJoint>, origin: V, lim_deg: f64, half: V) -> bool {
+    let parent = links.len() - 1;
+    let m = body.head.mass_kg as f64;
+    let c = body.head.com_up_m as f64;
+    let (dof, com) = match body.camera_mount() {
+        HeadMount::Neck | HeadMount::MastCamera { pan_tilt: true, .. } => {
+            dof_joints.push((links.len(), body.head.neck, (-lim_deg).to_radians(), lim_deg.to_radians()));
+            joints.push(sim_joint("neck", Segment::Head, &body.head.neck, -lim_deg, lim_deg));
+            (Some(dof_joints.len() - 1), [0.0, 0.0, c])
+        }
+        HeadMount::Fixed { tilt_deg } if body.head_on_trunk() => {
+            let t = (tilt_deg as f64).to_radians();
+            (None, [c * t.sin(), 0.0, c * t.cos()])
+        }
+        _ => return false,
+    };
+    links.push(Link { name: "head", segment: Segment::Head, parent: Some(parent), origin, axis: PITCH_AXIS, dof, locked: None, mass: m, com, inertia: box_inertia(m, half), shape: ([0.0, 0.0, half[2]], half) });
+    true
 }
 
 /// Where the base puts the pelvis at one instant.
@@ -184,54 +222,73 @@ impl Robot {
             q_min_deg: lo as f32,
             q_max_deg: hi as f32,
         };
-        // Pelvis (root): belly, the battery when it sits low, and the cargo bay.
-        let pelvis_half = [0.09, 0.14, 0.07];
-        let mut pm = body.belly.mass_kg as f64;
-        let mut pc = scale([0.0, 0.0, -(body.belly.com_down_m as f64)], pm);
-        if body.plan.battery_low {
-            pm += body.chest.battery_kg as f64;
-            pc = add(pc, scale([0.0, 0.0, -(body.belly.com_down_m as f64)], body.chest.battery_kg as f64));
-        }
-        if post.cargo_kg > 0.0 {
-            pm += post.cargo_kg as f64;
-            pc = add(pc, scale([CARGO_X_M as f64, 0.0, (CARGO_Z_M - WAIST_M) as f64], post.cargo_kg as f64));
-        }
-        links.push(Link { name: "pelvis", segment: Segment::Belly, parent: None, origin: [0.0; 3], axis: YAW_AXIS, dof: None, locked: None, mass: pm, com: scale(pc, 1.0 / pm.max(1e-6)), inertia: box_inertia(pm, pelvis_half), shape: ([0.0, 0.0, -0.06], pelvis_half) });
-        // Waist yaw: carries the whole upper body about the vertical.
-        dof_joints.push((1, body.belly.waist, -90f64.to_radians(), 90f64.to_radians()));
-        joints.push(sim("waist_yaw", Segment::Belly, &body.belly.waist, -90.0, 90.0));
-        links.push(Link { name: "waist", segment: Segment::Belly, parent: Some(0), origin: [0.0; 3], axis: YAW_AXIS, dof: Some(0), locked: None, mass: 0.0, com: [0.0; 3], inertia: [[0.0; 3]; 3], shape: ([0.0; 3], [0.0; 3]) });
-        // Trunk: chest structure and computer, the battery when it sits high.
-        let trunk_half = [0.10, 0.16, 0.16];
-        let mut tm = body.chest.mass_kg as f64;
-        if !body.plan.battery_low {
-            tm += body.chest.battery_kg as f64;
-        }
-        let (dof, locked) = match &body.belly.pitch {
-            Some(a) => {
-                let lim = (body.belly.max_lean_deg as f64).max(1.0);
-                dof_joints.push((2, *a, -lim.to_radians(), lim.to_radians()));
-                joints.push(sim("waist_pitch", Segment::Belly, a, -lim, lim));
-                (Some(dof_joints.len() - 1), None)
-            }
-            None => (None, Some(0)),
-        };
-        links.push(Link { name: "trunk", segment: Segment::Chest, parent: Some(1), origin: [0.0; 3], axis: PITCH_AXIS, dof, locked, mass: tm, com: [0.0, 0.0, body.chest.com_up_m as f64], inertia: box_inertia(tm, trunk_half), shape: ([0.0, 0.0, 0.16], trunk_half) });
-        let neck_h = (SHOULDER_M + 0.07 - WAIST_M) as f64;
-        dof_joints.push((3, body.head.neck, -45f64.to_radians(), 45f64.to_radians()));
-        joints.push(sim("neck", Segment::Head, &body.head.neck, -45.0, 45.0));
         let head_half = [0.07, 0.08, 0.07];
-        links.push(Link { name: "head", segment: Segment::Head, parent: Some(2), origin: [0.0, 0.0, neck_h], axis: PITCH_AXIS, dof: Some(dof_joints.len() - 1), locked: None, mass: body.head.mass_kg as f64, com: [0.0, 0.0, body.head.com_up_m as f64], inertia: box_inertia(body.head.mass_kg as f64, head_half), shape: ([0.0, 0.0, 0.07], head_half) });
+        let neck_lim = body.head_range_deg().0 as f64;
+        // Where the arms hang from: the trunk link with its origin at the waist, or the root at the ground.
+        let (arm_parent, root_z, head_in_tree): (usize, f32, bool);
+        if body.has_torso() {
+            // Pelvis (root): belly, the battery when it sits low, and the cargo bay.
+            let pelvis_half = [0.09, 0.14, 0.07];
+            let mut pm = body.belly.mass_kg as f64;
+            let mut pc = scale([0.0, 0.0, -(body.belly.com_down_m as f64)], pm);
+            if body.plan.battery_low {
+                pm += body.chest.battery_kg as f64;
+                pc = add(pc, scale([0.0, 0.0, -(body.belly.com_down_m as f64)], body.chest.battery_kg as f64));
+            }
+            if post.cargo_kg > 0.0 && body.cargo_point().1 {
+                pm += post.cargo_kg as f64;
+                pc = add(pc, scale([CARGO_X_M as f64, 0.0, (CARGO_Z_M - WAIST_M) as f64], post.cargo_kg as f64));
+            }
+            links.push(Link { name: "pelvis", segment: Segment::Belly, parent: None, origin: [0.0; 3], axis: YAW_AXIS, dof: None, locked: None, mass: pm, com: scale(pc, 1.0 / pm.max(1e-6)), inertia: box_inertia(pm, pelvis_half), shape: ([0.0, 0.0, -0.06], pelvis_half) });
+            // Waist yaw: carries the whole upper body about the vertical.
+            dof_joints.push((1, body.belly.waist, -90f64.to_radians(), 90f64.to_radians()));
+            joints.push(sim("waist_yaw", Segment::Belly, &body.belly.waist, -90.0, 90.0));
+            links.push(Link { name: "waist", segment: Segment::Belly, parent: Some(0), origin: [0.0; 3], axis: YAW_AXIS, dof: Some(0), locked: None, mass: 0.0, com: [0.0; 3], inertia: [[0.0; 3]; 3], shape: ([0.0; 3], [0.0; 3]) });
+            // Trunk: chest structure and computer, the battery when it sits high.
+            let trunk_half = [0.10, 0.16, 0.16];
+            let mut tm = body.chest.mass_kg as f64;
+            if !body.plan.battery_low {
+                tm += body.chest.battery_kg as f64;
+            }
+            let (dof, locked) = match &body.belly.pitch {
+                Some(a) => {
+                    let lim = (body.belly.max_lean_deg as f64).max(1.0);
+                    dof_joints.push((2, *a, -lim.to_radians(), lim.to_radians()));
+                    joints.push(sim("waist_pitch", Segment::Belly, a, -lim, lim));
+                    (Some(dof_joints.len() - 1), None)
+                }
+                None => (None, Some(0)),
+            };
+            links.push(Link { name: "trunk", segment: Segment::Chest, parent: Some(1), origin: [0.0; 3], axis: PITCH_AXIS, dof, locked, mass: tm, com: [0.0, 0.0, body.chest.com_up_m as f64], inertia: box_inertia(tm, trunk_half), shape: ([0.0, 0.0, 0.16], trunk_half) });
+            let neck_h = (SHOULDER_M + 0.07 - WAIST_M) as f64;
+            head_in_tree = head_link(body, &mut links, &mut dof_joints, &mut joints, [0.0, 0.0, neck_h], neck_lim, head_half);
+            arm_parent = 2;
+            root_z = WAIST_M;
+        } else {
+            // A column or a deck: the root is the chassis frame at the ground; what
+            // sits on the chassis (electronics, column, cargo) is in `lower_masses`.
+            links.push(Link { name: "deck", segment: Segment::Foot, parent: None, origin: [0.0; 3], axis: YAW_AXIS, dof: None, locked: None, mass: 0.0, com: [0.0; 3], inertia: [[0.0; 3]; 3], shape: ([0.0; 3], [0.0; 3]) });
+            let pivot = match body.camera_mount() {
+                HeadMount::MastCamera { height_mm, .. } => Some([body.mast_camera_x() as f64, 0.0, (height_mm as f32 / 1000.0 - CAMERA_UP_M) as f64]),
+                HeadMount::Neck | HeadMount::Fixed { .. } => Some([0.0, 0.0, COLUMN_TOP_M as f64]),
+                _ => None,
+            };
+            head_in_tree = pivot.is_some_and(|p| head_link(body, &mut links, &mut dof_joints, &mut joints, p, neck_lim, [0.04, 0.07, 0.04]));
+            arm_parent = 0;
+            root_z = 0.0;
+        }
         let (m_up, r_up, m_fore) = body.arm_split();
         let (m_up, r_up, m_fore) = (m_up as f64, r_up as f64, m_fore as f64);
         let (up_l, fo_l) = (UPPER_ARM_M as f64, FOREARM_M as f64);
-        for (side, tag) in [(0usize, "r"), (1, "l")] {
-            let y = if side == 0 { -SHOULDER_HALF_WIDTH_M } else { SHOULDER_HALF_WIDTH_M } as f64;
+        for (side, tag) in [(0usize, "r"), (1, "l")].into_iter().take(body.arm_count()) {
+            // The shoulder in the parent's frame (the trunk's origin is the waist joint, the root's the ground).
+            let mount = body.shoulder_mount(side);
+            let origin = [mount[0] as f64, mount[1] as f64, (mount[2] - root_z) as f64];
             let sh = links.len();
             dof_joints.push((sh, body.arm.shoulder, -60f64.to_radians(), 180f64.to_radians()));
             joints.push(sim(&format!("shoulder_{tag}"), Segment::Arm, &body.arm.shoulder, -60.0, 180.0));
             let uh = [0.035, 0.035, up_l / 2.0];
-            links.push(Link { name: if side == 0 { "upper_arm_r" } else { "upper_arm_l" }, segment: Segment::Arm, parent: Some(2), origin: [0.0, y, (SHOULDER_M - WAIST_M) as f64], axis: ARM_AXIS, dof: Some(dof_joints.len() - 1), locked: None, mass: m_up, com: [0.0, 0.0, -r_up], inertia: box_inertia(m_up, uh), shape: ([0.0, 0.0, -up_l / 2.0], uh) });
+            links.push(Link { name: if side == 0 { "upper_arm_r" } else { "upper_arm_l" }, segment: Segment::Arm, parent: Some(arm_parent), origin, axis: ARM_AXIS, dof: Some(dof_joints.len() - 1), locked: None, mass: m_up, com: [0.0, 0.0, -r_up], inertia: box_inertia(m_up, uh), shape: ([0.0, 0.0, -up_l / 2.0], uh) });
             let el = links.len();
             dof_joints.push((el, body.arm.elbow, 0.0, 150f64.to_radians()));
             joints.push(sim(&format!("elbow_{tag}"), Segment::Arm, &body.arm.elbow, 0.0, 150.0));
@@ -241,12 +298,12 @@ impl Robot {
             let hh = [0.04, 0.05, 0.04];
             links.push(Link { name: if side == 0 { "hand_r" } else { "hand_l" }, segment: Segment::Hand, parent: Some(el), origin: [0.0, 0.0, -fo_l], axis: ARM_AXIS, dof: None, locked: None, mass: hm, com: [0.0, 0.0, -0.06], inertia: box_inertia(hm, hh), shape: ([0.0, 0.0, -0.05], hh) });
         }
-        if body.belly.pitch.is_none() {
+        if body.has_torso() && body.belly.pitch.is_none() {
             let w = body.belly.waist;
             joints.push(DynJoint { name: "waist_pitch".into(), segment: Segment::Belly, actuator: "구조 (피치 관절 없음)".into(), peak_nm: 0.0, cont_nm: 0.0, speed_rad_s: w.speed_rad_s, backdrivable: false, kind: "structure", q_min_deg: 0.0, q_max_deg: 0.0 });
         }
         let stat = |name: &str, seg: Segment, a: &Actuator| DynJoint { kind: "statics", ..sim(name, seg, a, 0.0, 0.0) };
-        if body.legged {
+        if body.legged() {
             for tag in ["r", "l"] {
                 joints.push(stat(&format!("hip_pitch_{tag}"), Segment::Leg, &body.leg.knee));
                 joints.push(stat(&format!("hip_roll_{tag}"), Segment::Leg, &body.leg.knee));
@@ -257,7 +314,7 @@ impl Robot {
             let f = body.chassis.drive_force_n;
             joints.push(DynJoint { name: "drive".into(), segment: Segment::Foot, actuator: body.chassis.name.into(), peak_nm: 2.0 * f, cont_nm: f, speed_rad_s: 0.0, backdrivable: true, kind: "statics", q_min_deg: 0.0, q_max_deg: 0.0 });
         }
-        Robot { links, dof_joints, joints }
+        Robot { links, dof_joints, joints, root_z: root_z as f64, head_in_tree }
     }
 
     pub fn dofs(&self) -> usize {
@@ -269,10 +326,15 @@ impl Robot {
         self.joints.iter().position(|j| j.name == name)
     }
 
-    /// Root pose: rotation and position of the pelvis frame.
+    /// Index of a simulated joint (its degree of freedom) by name.
+    pub fn dof_index(&self, name: &str) -> Option<usize> {
+        self.joint_index(name).filter(|k| *k < self.dofs())
+    }
+
+    /// Root pose: rotation and position of the pelvis frame (the chassis frame of a column or a deck).
     fn root_pose(&self, root: &RootState) -> (M, V) {
         let r = rot(PITCH_AXIS, -(root.pitch as f64));
-        let p = mv(&r, [0.0, root.shift_y as f64, WAIST_M as f64 + root.rise_m as f64]);
+        let p = mv(&r, [0.0, root.shift_y as f64, self.root_z + root.rise_m as f64]);
         (r, p)
     }
 
@@ -506,22 +568,25 @@ pub struct Rollout {
     lift_at: f32,
 }
 
-/// Simulated joint targets of a posture: waist yaw, waist pitch (if any),
-/// neck, shoulders and elbows, radians, in degree-of-freedom order.
+/// Simulated joint targets of a posture: waist yaw, waist pitch, neck,
+/// shoulders and elbows, radians, for the joints the form has, in
+/// degree-of-freedom order (by the joints' names, so an absent neck or waist
+/// shifts nothing).
 fn targets(body: &Body, post: &Posture, lean_rad: f64, pitch: f64, robot: &Robot) -> Vec<f64> {
-    let mut v = Vec::with_capacity(robot.dofs());
-    v.push(0.0);
-    if body.belly.pitch.is_some() {
-        v.push(lean_rad);
-    }
     // The neck cancels its share of the body's tilt to keep the camera level.
     let tilt = if body.belly.pitch.is_some() { lean_rad } else { 0.0 } - pitch;
-    v.push(-tilt * body.head.gaze_stabilization as f64);
-    for s in 0..2 {
-        v.push((post.arm_elev_deg[s] as f64).to_radians());
-        v.push((post.elbow_deg[s] as f64).to_radians());
-    }
-    v
+    (0..robot.dofs())
+        .map(|k| match robot.joints[k].name.as_str() {
+            "waist_pitch" => lean_rad,
+            "neck" => -tilt * body.head.gaze_stabilization as f64,
+            "shoulder_r" => (post.arm_elev_deg[0] as f64).to_radians(),
+            "elbow_r" => (post.elbow_deg[0] as f64).to_radians(),
+            "shoulder_l" => (post.arm_elev_deg[1] as f64).to_radians(),
+            "elbow_l" => (post.elbow_deg[1] as f64).to_radians(),
+            // The waist yaw stays straight ahead.
+            _ => 0.0,
+        })
+        .collect()
 }
 
 /// Simulates the move from posture `from` to posture `to` (the motion of
@@ -557,7 +622,8 @@ pub fn simulate(body: &Body, from: &Posture, to: &Posture, ff: &FeedForward, gri
         let (b, bd, bdd) = min_jerk((t - delay) / dur);
         (anticipated * a + (1.0 - anticipated) * b, (anticipated * ad + (1.0 - anticipated) * bd) / dur, (anticipated * add + (1.0 - anticipated) * bdd) / (dur * dur))
     };
-    let comp_dof = if body.belly.pitch.is_some() { Some(1usize) } else { None };
+    let comp_dof = robot.dof_index("waist_pitch");
+    let neck_dof = robot.dof_index("neck");
     let (shift0, shift1) = (start.lateral_shift_m as f64, goal.lateral_shift_m as f64);
     let step = to.step_m as f64;
     let support = body.support_rect(to, pitch1 as f32);
@@ -671,7 +737,7 @@ pub fn simulate(body: &Body, from: &Posture, to: &Posture, ff: &FeedForward, gri
             all_stall[k] = stalled[k];
         }
         let mut idx = n;
-        if body.belly.pitch.is_none() {
+        if body.has_torso() && body.belly.pitch.is_none() {
             all_tau[idx] = full.locked[0].abs() as f32;
             idx += 1;
         }
@@ -701,8 +767,9 @@ pub fn simulate(body: &Body, from: &Posture, to: &Posture, ff: &FeedForward, gri
         }
         if t + 1e-9 >= next_sample {
             next_sample += cfg.sample_s as f64;
-            let tilt = if body.belly.pitch.is_some() { q[1] } else { 0.0 } - root.pitch as f64;
-            let neck = q[if body.belly.pitch.is_some() { 2 } else { 1 }];
+            // The camera's pitch: the trunk's lean and the base's pitch, less what the neck (if any) takes back.
+            let tilt = comp_dof.map_or(0.0, |k| q[k]) - root.pitch as f64;
+            let neck = neck_dof.map_or(0.0, |k| q[k]);
             head_max = head_max.max(((tilt + neck).to_degrees() as f32).abs());
             samples.push(DynSample {
                 t: t as f32,
@@ -789,7 +856,7 @@ fn whole_body(body: &Body, post: &Posture, single: bool, robot: &Robot, r: &Rnea
         mass_sum += l.mass;
         mc = add(mc, scale(r.com[i], l.mass));
     }
-    for (m, p) in lower_masses(body, post, single, root) {
+    for (m, p) in lower_masses(body, post, single, root, robot.head_in_tree) {
         let fi = scale(a, m);
         f = add(f, fi);
         m_o = add(m_o, cross(p, fi));
@@ -801,10 +868,14 @@ fn whole_body(body: &Body, post: &Posture, single: bool, robot: &Robot, r: &Rnea
     (f3(f), zmp, f3(scale(mc, 1.0 / mass_sum.max(1e-6))))
 }
 
-/// Point masses of the lower body in the base frame (as `balance` places them).
-fn lower_masses(body: &Body, post: &Posture, single: bool, root: &RootState) -> Vec<(f64, V)> {
+/// Point masses of the lower body in the base frame (as `balance` places them),
+/// and what the form fixes to the chassis outside the tree: the column or the
+/// camera pole, a deck's electronics, a camera off the trunk (unless the tree
+/// holds it, `head_in_tree`), the cargo structure, and cargo that sits on the
+/// chassis instead of the pelvis.
+fn lower_masses(body: &Body, post: &Posture, single: bool, root: &RootState, head_in_tree: bool) -> Vec<(f64, V)> {
     let mut v = Vec::new();
-    if body.legged {
+    if body.legged() {
         for (i, y) in [-STANCE_WIDTH_M / 2.0, STANCE_WIDTH_M / 2.0].into_iter().enumerate() {
             let swing = single && i == 1;
             let lift = if swing { post.step_m.max(0.05) } else { 0.0 } as f64;
@@ -814,8 +885,23 @@ fn lower_masses(body: &Body, post: &Posture, single: bool, root: &RootState) -> 
         }
     } else {
         let r = rot(PITCH_AXIS, -(root.pitch as f64));
-        v.push((body.mast_kg() as f64, mv(&r, [0.0, 0.0, 0.35])));
+        if body.has_torso() {
+            // The mast under a humanoid torso (`Body::column`), at its centre 0.35 m up.
+            v.push((body.mast_kg() as f64, mv(&r, [0.0, 0.0, 0.35])));
+        } else if let Some((m, p)) = body.column() {
+            v.push((m as f64, mv(&r, d3(p))));
+        }
         v.push((body.chassis.mass_kg as f64, mv(&r, [0.0, 0.0, body.chassis.com_m as f64])));
+        for mm in body.mount_masses() {
+            if mm.segment == Segment::Head && head_in_tree {
+                continue;
+            }
+            v.push((mm.kg as f64, mv(&r, d3(mm.at))));
+        }
+        let (at, on_pelvis) = body.cargo_point();
+        if post.cargo_kg > 0.0 && !(on_pelvis && body.has_torso()) {
+            v.push((post.cargo_kg as f64, mv(&r, d3(at))));
+        }
     }
     v
 }
@@ -824,7 +910,7 @@ fn lower_masses(body: &Body, post: &Posture, single: bool, root: &RootState) -> 
 /// statics of the ground reaction on the stance feet.
 fn lower_torques(body: &Body, post: &Posture, single: bool, grf: [f32; 3], zmp: [f32; 2], root: &RootState) -> Vec<f32> {
     let f = d3(grf);
-    if !body.legged {
+    if !body.legged() {
         let slope = (post.slope_deg as f64).to_radians();
         let m = f[2] / G as f64;
         let crr = if post.propelling() { crate::surface::rolling_resistance(body.base, post.ground.props()) as f64 } else { 0.0 };
@@ -984,7 +1070,7 @@ impl Rollout {
             joints.push(jp("waist_pitch", k.pos[2], None, j));
         }
         let pelvis = k.pos[0];
-        if body.legged {
+        if body.legged() {
             let half = STANCE_WIDTH_M / 2.0;
             for (side, tag) in [(0usize, "r"), (1, "l")] {
                 let y = if side == 0 { -half } else { half };
@@ -1010,7 +1096,24 @@ impl Rollout {
             let r = rot(PITCH_AXIS, -(s.root.pitch as f64));
             let len = body.support_len_m;
             boxes.push(LinkBox { name: "chassis", segment: Segment::Foot, center: f3(mv(&r, [0.0, 0.0, 0.08])), axes: axes_of(&r), half: [len / 2.0, CHASSIS_WIDTH_M / 2.0, 0.06] });
-            boxes.push(LinkBox { name: "mast", segment: Segment::Leg, center: f3(mv(&r, [0.0, 0.0, (0.14 + WAIST_M as f64 - 0.13) / 2.0])), axes: axes_of(&r), half: [0.03, 0.03, (WAIST_M - 0.27) / 2.0] });
+            match body.morph.torso {
+                Torso::Humanoid => boxes.push(LinkBox { name: "mast", segment: Segment::Leg, center: f3(mv(&r, [0.0, 0.0, (0.14 + WAIST_M as f64 - 0.13) / 2.0])), axes: axes_of(&r), half: [0.03, 0.03, (WAIST_M - 0.27) / 2.0] }),
+                Torso::Mast => {
+                    let top = column_top_m(body.camera_mount());
+                    boxes.push(LinkBox { name: "column", segment: Segment::Leg, center: f3(mv(&r, [0.0, 0.0, (0.14 + top as f64) / 2.0])), axes: axes_of(&r), half: [0.04, 0.04, (top - 0.14) / 2.0] });
+                }
+                Torso::None => {
+                    // A camera's pole or mast.
+                    if let HeadMount::MastCamera { height_mm, .. } = body.camera_mount() {
+                        let top = height_mm as f32 / 1000.0 - CAMERA_UP_M;
+                        boxes.push(LinkBox { name: "pole", segment: Segment::Leg, center: f3(mv(&r, [body.mast_camera_x() as f64, 0.0, (0.14 + top as f64) / 2.0])), axes: axes_of(&r), half: [0.01, 0.01, ((top - 0.14) / 2.0).max(0.0)] });
+                    }
+                }
+            }
+            // A deck arm's base, a tote or a bed, a chassis camera: the boxes `kin` draws.
+            for b in body.deck_boxes() {
+                boxes.push(LinkBox { center: f3(mv(&r, d3(b.center))), axes: axes_of(&r), ..b });
+            }
             if let Some(j) = self.robot.joint_index("drive") {
                 joints.push(jp("drive", mv(&r, [0.0, 0.0, 0.08]), None, j));
             }

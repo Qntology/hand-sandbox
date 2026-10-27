@@ -67,6 +67,8 @@ pub struct WalkState {
     pub slips: u32,
     /// The gait of the edge being walked, with its ground and slope.
     pub plan: Option<(gait::GaitPlan, Ground, i32)>,
+    /// The friction drawn for the last step that came down (the foot views show it).
+    pub last_mu: Option<f32>,
 }
 
 /// A push along a route.
@@ -317,6 +319,13 @@ impl World {
             d.x += r * dir.cos();
             d.z += r * dir.sin();
         }
+        // Bounced off a porch's edge: it now lies on the ground below.
+        if let Some(i) = self.drops.iter().position(|d| d.id == drop) {
+            let d = &self.drops[i];
+            if !d.support.is_ground() && (self.surface_m(d.x, d.z) - d.y_m).abs() > 0.03 {
+                self.drops[i].support = crate::site::Support::Ground;
+            }
+        }
     }
 
     /// Where a dropped piece lands from a release (the rollout's own landing point, rotated into the world).
@@ -334,7 +343,7 @@ impl World {
     /// that comes down draws the ground's friction and a slip; a slip the robot
     /// cannot catch ends the move with a fall.
     pub(super) fn walk_steps(&mut self, walked_m: f32, e: &nav::EdgePlan, events: &mut Vec<TimedEvent>) -> Option<String> {
-        if !self.body.legged || walked_m <= 0.0 {
+        if !self.body.legged() || walked_m <= 0.0 {
             return None;
         }
         let ground = self.ground_at(e.to);
@@ -353,6 +362,7 @@ impl World {
             self.walk.steps += 1;
             self.walk.stance = 1 - self.walk.stance;
             let mu = draw_lognormal(&mut self.act_rng, noto_core::surface::available_mu(self.body.base, &props), gait::GROUND_MU_COV);
+            self.walk.last_mu = Some(mu);
             let margin = mu - g.rcof;
             let p = noto_core::surface::slip_probability(margin);
             if self.act_rng.next_f32() >= p {
@@ -386,7 +396,7 @@ impl World {
             };
             return Some((s.pose, s.loads, src));
         }
-        if self.body.legged && matches!(&self.active, Some((_, Active::Move(_)))) && self.agent.speed_mps > 0.0 {
+        if self.body.legged() && matches!(&self.active, Some((_, Active::Move(_)))) && self.agent.speed_mps > 0.0 {
             let (g, _, _) = self.walk.plan.clone()?;
             let u = (self.walk.since_step_m / g.step_m.max(1e-3)).clamp(0.0, 1.0);
             let (pose, loads, _) = gait::pose_at(&self.body, &g, self.walk.stance, u, self.carried_kg());
@@ -405,6 +415,7 @@ impl World {
     /// Every focus view of this instant: the playing action's sample (or the
     /// last one's end), the walking step, or the robot standing as it is.
     pub fn focus_frame(&self) -> FocusFrame {
+        let walking = self.act.is_none() && self.body.legged && matches!(&self.active, Some((_, Active::Move(_)))) && self.agent.speed_mps > 0.0;
         let (pose, loads, kind, sample, event, object) = match (&self.act, &self.last_act) {
             (Some(p), _) => {
                 let t = p.t();
@@ -423,19 +434,19 @@ impl World {
                 Some((pose, loads, _)) => (pose, loads, Some(ActKind::Walk), None, None, None),
                 None => {
                     let moving = matches!(&self.active, Some((_, Active::Move(_)))) && self.agent.speed_mps > 0.0;
-                    let pose = KinPose { base_pitch_deg: if self.body.legged { 0.0 } else { self.posture_now().0.slope_deg }, ..KinPose::stand(self.carried_kg()) };
+                    let pose = KinPose { base_pitch_deg: if self.body.legged() { 0.0 } else { self.posture_now().0.slope_deg }, ..KinPose::stand(self.carried_kg()) };
                     (pose, KinLoads::default(), moving.then_some(ActKind::Drive), None, None, None)
                 }
             },
         };
         let r = hkin::solve_fast(&self.body, &pose, &loads);
         let props = self.ground_here().surface().props();
-        let drive = (!self.body.legged).then(|| noto_core::act::drive::state(&self.body, props, self.posture_now().0.slope_deg, 0.0, self.carried_kg(), 0.0));
+        let drive = (!self.body.legged()).then(|| noto_core::act::drive::state(&self.body, props, self.posture_now().0.slope_deg, 0.0, self.carried_kg(), 0.0));
         let obj = object.map(|(k, a)| {
             let s = k.spec().piece_size_m(a);
             ([0.5 * s[0], 0.5 * s[1], 0.5 * s[2]], k.spec().mass_kg * a)
         });
-        focus::frame(&FocusCtx { body: &self.body, hand: &self.hand, report: &r, sample: sample.as_ref(), action: kind, event: event.as_ref(), ground_mu: noto_core::surface::available_mu(self.body.base, props), drive, object: obj })
+        focus::frame(&FocusCtx { body: &self.body, hand: &self.hand, report: &r, sample: sample.as_ref(), action: kind, event: event.as_ref(), ground_mu: noto_core::surface::available_mu(self.body.base, props), drive, object: obj, step_mu: if walking { self.walk.last_mu } else { None } })
     }
 
     /// Whether this body brings its palm down to a piece of `amount` items
@@ -497,10 +508,13 @@ impl World {
     /// (no water, no node, no curb), and where the robot lines up behind it
     /// (x, z, heading).
     pub fn push_route(&self, drop: u32, x: f32, z: f32) -> Result<(nav::Plan, (f32, f32, f32)), ActionError> {
-        if self.body.legged {
+        if self.body.legged() {
             return Err(ActionError::CannotPush { reason: "다리형은 범퍼가 없어 바닥의 물체를 밀지 않음 (들어서 옮김)".into() });
         }
         let d = self.drop_item(drop).ok_or(ActionError::UnknownTarget)?;
+        if !d.support.is_ground() {
+            return Err(ActionError::CannotPush { reason: format!("{}의 물체는 범퍼로 밀 수 없음", d.support.label_ko()) });
+        }
         let start = self.terrain.cell_of(d.x, d.z).ok_or(ActionError::UnknownTarget)?;
         let nodes = self.blocked_cells();
         let t = &self.terrain;

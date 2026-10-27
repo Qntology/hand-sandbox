@@ -82,8 +82,10 @@ pub fn edge_with(spec: &BaseSpec, t: &Terrain, a: Cell, b: Cell, load: Option<Pu
     let (ax, az) = cell_center(a.0, a.1);
     let (bx, bz) = cell_center(b.0, b.1);
     let horizontal = ((ax - bx).powi(2) + (az - bz).powi(2)).sqrt();
-    let rise = t.height_m(b.0, b.1) - t.height_m(a.0, a.1);
-    let step = (t.curb_m(b.0, b.1) - t.curb_m(a.0, a.1)).abs();
+    // A ramp (`terrain::CurbKind::Ramp`) joins its cells' curbs as a slope; any other curb difference is a step.
+    let ramp = t.ramp_rise_m(a, b);
+    let rise = t.height_m(b.0, b.1) - t.height_m(a.0, a.1) + ramp.unwrap_or(0.0);
+    let step = if ramp.is_some() { 0.0 } else { (t.curb_m(b.0, b.1) - t.curb_m(a.0, a.1)).abs() };
 
     let ground = if rise.abs() < 1e-6 {
         Segment::Flat { length_m: horizontal }

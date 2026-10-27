@@ -119,10 +119,17 @@ fn the_engine_never_names_a_benchmark_source() {
         ("dynamics.rs", include_str!("../src/dynamics.rs")),
         ("body.rs", include_str!("../src/body.rs")),
         ("parts.rs", include_str!("../src/parts.rs")),
+        ("morph.rs", include_str!("../src/morph.rs")),
         ("surface.rs", include_str!("../src/surface.rs")),
+        ("contact.rs", include_str!("../src/contact.rs")),
+        ("act/collide.rs", include_str!("../src/act/collide.rs")),
+        ("act/fall.rs", include_str!("../src/act/fall.rs")),
+        ("act/cocarry.rs", include_str!("../src/act/cocarry.rs")),
         ("world-sim world.rs", include_str!("../../world-sim/src/world.rs")),
         ("world-sim nav.rs", include_str!("../../world-sim/src/nav.rs")),
         ("world-sim terrain.rs", include_str!("../../world-sim/src/terrain.rs")),
+        ("world-sim site.rs", include_str!("../../world-sim/src/site.rs")),
+        ("world-sim fixture.rs", include_str!("../../world-sim/src/fixture.rs")),
     ];
     let sources = ["Hanson", "Beschorner", "Rodríguez-Martínez", "Lejeune", "Knapik", "Middleton", "Frey Law", "Frey-Law", "maxon", "effects::"];
     for (name, src) in files {

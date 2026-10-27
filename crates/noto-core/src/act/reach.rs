@@ -11,7 +11,11 @@
 //!   when the belly preset has a pitch joint, within that joint's range, and
 //!   slide it down the mast when it has a torso lift (`parts::TORSO_LIFT`);
 //! * legs add hip flexion (the pelvis pitches over the thighs) and the squat
-//!   (knees and ankles), each within its range (`kin::Rom`).
+//!   (knees and ankles), each within its range (`kin::Rom`);
+//! * an arm on a column hangs from its carriage (the lift lowers it), an arm
+//!   on a camera's mast rides that mast's lift (Stretch-like), an arm on a
+//!   deck reaches from its low shoulder on the deck (`morph`), and a form
+//!   without a manipulator fails at once (`no_manipulator`).
 //!
 //! The planner searches those joints (coarse grid, then a finer one around the
 //! best) and the stand-off distance, solves the arm by two-link inverse
@@ -30,6 +34,7 @@ use serde::Serialize;
 
 use crate::balance::{Body, G};
 use crate::kin::{self, KinLoads, KinPose, KinReport, Rom, ANKLE_H_M, PALM_OFFSET_M, SHANK_M, THIGH_M, WHEEL_R_M, BUMPER_GAP_M};
+use crate::morph::{HeadMount, Torso};
 use crate::parts::*;
 
 use super::MIN_JERK_PEAK;
@@ -104,6 +109,29 @@ pub struct ReachPlan {
     pub rise_margin: Option<f32>,
     /// Candidates the search evaluated.
     pub evaluated: u32,
+    /// A failure the form decides before any search: `no_manipulator` (no arm
+    /// at all) or `one_arm` (both hands asked of a single arm).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<&'static str>,
+}
+
+/// A plan that fails before any search because the form cannot do it.
+fn refused(body: &Body, goal: &ReachGoal, approach: &'static str, code: &'static str, why: &str) -> ReachPlan {
+    let stand = body.stand(goal.cargo_kg);
+    let empty = kin::solve(body, &stand, &KinLoads::default());
+    ReachPlan { ok: false, strategy: "none", strategy_ko: "불가", approach, pose: stand, loaded: empty.clone(), empty, object_x: min_object_x(body, goal.half_len_m), object_y: 0.0, lowest_palm_z: f32::NAN, reason_ko: Some(why.to_string()), descend_s: 0.0, rise_s: 0.0, rise_margin: None, evaluated: 0, code: Some(code) }
+}
+
+/// The form's own reason a reach cannot even be tried: no manipulator, or a
+/// two-handed reach with one arm.
+fn form_refusal(body: &Body, goal: &ReachGoal, approach: &'static str) -> Option<ReachPlan> {
+    if !body.has_manipulator() {
+        return Some(refused(body, goal, approach, "no_manipulator", "조작기(팔·집게)가 없어 물건을 집을 수 없음"));
+    }
+    if goal.two_arms && body.arm_count() < 2 {
+        return Some(refused(body, goal, approach, "one_arm", "팔이 하나뿐이라 두 손으로 들 수 없음"));
+    }
+    None
 }
 
 /// The palm in the sagittal plane from the shoulder by two-link inverse
@@ -145,16 +173,26 @@ pub fn hip_at(shank_deg: f32, thigh_deg: f32) -> [f32; 2] {
 pub fn blend(body: &Body, a: &KinPose, b: &KinPose, u: f32) -> KinPose {
     let mut p = KinPose::lerp(a, b, u);
     let planted = |q: &KinPose| q.feet.iter().all(|f| f[0].abs() < 1e-4 && f[1].abs() < 1e-4);
-    if body.legged && planted(a) && planted(b) {
+    if body.legged() && planted(a) && planted(b) {
         let ((sa, ta), (sb, tb)) = (leg_angles(a), leg_angles(b));
         p.hip = hip_at(sa + (sb - sa) * u, ta + (tb - ta) * u);
     }
     p
 }
 
-/// The shoulder joint in the sagittal plane (x forward, z up) for a pose.
+/// The shoulder joint in the sagittal plane (x forward, z up) for a pose: at
+/// the top of the trunk, on the column carriage, on the carriage of a
+/// camera's mast, or on the deck (`morph`); the carriages ride the lift.
 pub fn shoulder_point(body: &Body, pose: &KinPose) -> [f32; 2] {
-    let hip = if body.legged { pose.hip } else { [0.0, HIP_M - pose.lift_m] };
+    match body.morph.torso {
+        Torso::Humanoid => {}
+        Torso::Mast => return [0.0, SHOULDER_M - pose.lift_m],
+        Torso::None => {
+            let s = body.shoulder_at(0, pose.lift_m);
+            return [s[0], s[2]];
+        }
+    }
+    let hip = if body.legged() { pose.hip } else { [0.0, HIP_M - pose.lift_m] };
     let p = pose.pelvis_deg.to_radians();
     let t = pose.trunk_deg().to_radians();
     let waist = [hip[0] + kin::PELVIS_M * p.sin(), hip[1] + kin::PELVIS_M * p.cos()];
@@ -163,7 +201,7 @@ pub fn shoulder_point(body: &Body, pose: &KinPose) -> [f32; 2] {
 
 /// Nearest the object's centre can be to the base origin along x: in front of the toes or the bumper.
 pub fn min_object_x(body: &Body, half_len_m: f32) -> f32 {
-    let front = if body.legged { 0.75 * body.leg.foot_len_m } else { 0.5 * body.support_len_m + WHEEL_R_M + BUMPER_GAP_M };
+    let front = if body.legged() { 0.75 * body.leg.foot_len_m } else { 0.5 * body.support_len_m + WHEEL_R_M + BUMPER_GAP_M };
     front + half_len_m + STANDOFF_GAP_M
 }
 
@@ -179,10 +217,10 @@ struct Cand {
 
 /// Classifies a bottom pose by the joints it bends.
 fn strategy_of(body: &Body, pose: &KinPose) -> &'static str {
-    let squat = body.legged && pose.hip[1] < HIP_M - 0.05;
-    let hinge = body.legged && pose.pelvis_deg > 10.0;
+    let squat = body.legged() && pose.hip[1] < HIP_M - 0.05;
+    let hinge = body.legged() && pose.pelvis_deg > 10.0;
     let stoop = pose.waist_deg > 10.0;
-    if !body.legged && pose.lift_m > 0.05 {
+    if !body.legged() && pose.lift_m > 0.05 {
         return if stoop { "lower_stoop" } else { "lower" };
     }
     match (squat, hinge, stoop) {
@@ -224,9 +262,20 @@ fn violation(r: &KinReport) -> f32 {
     r.worst().map_or(0.0, |j| (j.ratio - 1.0).max(0.0)) + (-r.margin).max(0.0) + 0.5 * r.out_of_range.len() as f32
 }
 
+/// Where the robot looks from and how far its camera can tilt down: the eye
+/// over the shoulder for a neck (as before), a mast camera's lens; `None`
+/// without a pan-tilt (the camera looks wherever the body points it).
+fn look_from(body: &Body, sh: [f32; 2]) -> Option<([f32; 2], f32)> {
+    match body.camera_mount() {
+        HeadMount::Neck => Some(([sh[0], sh[1] + kin::NECK_UP_M + 0.07], kin::NECK_PITCH_MAX_DEG)),
+        HeadMount::MastCamera { height_mm, pan_tilt: true } => Some(([body.mast_camera_x() + kin::CAMERA_FWD_M, height_mm as f32 / 1000.0], body.head_range_deg().0)),
+        _ => None,
+    }
+}
+
 fn candidate_or_miss(body: &Body, goal: &ReachGoal, x_obj: f32, shank_deg: f32, thigh_deg: f32, pelvis_deg: f32, waist_deg: f32, lift_m: f32) -> Result<Cand, Option<Miss>> {
-    let mut pose = KinPose::stand(goal.cargo_kg);
-    if body.legged {
+    let mut pose = body.stand(goal.cargo_kg);
+    if body.legged() {
         // Feet flat at x = 0; the shank leans forward by the dorsiflexion, the thigh back from the knee.
         let (s, t) = (shank_deg.to_radians(), thigh_deg.to_radians());
         let knee = [SHANK_M * s.sin(), ANKLE_H_M + SHANK_M * s.cos()];
@@ -238,12 +287,16 @@ fn candidate_or_miss(body: &Body, goal: &ReachGoal, x_obj: f32, shank_deg: f32, 
     pose.waist_deg = waist_deg;
     let sh = shoulder_point(body, &pose);
     let (sd, ed) = arm_ik(sh, [x_obj, goal.palm_z], pose.trunk_deg()).ok_or(None)?;
-    pose.shoulder_deg = [sd, if goal.two_arms { sd } else { 0.0 }];
-    pose.elbow_deg = [ed, if goal.two_arms { ed } else { 10.0 }];
-    // Look at the hand: the neck tilts the camera down toward the object, within its range.
-    let eye = [sh[0], sh[1] + kin::NECK_UP_M + 0.07];
-    let look = (eye[1] - goal.palm_z).atan2(x_obj - eye[0]).to_degrees();
-    pose.neck_deg = (look - pose.trunk_deg()).clamp(-kin::NECK_PITCH_MAX_DEG, kin::NECK_PITCH_MAX_DEG);
+    // The other arm stays at rest (or does not exist).
+    let rest = body.stand(goal.cargo_kg);
+    pose.shoulder_deg = [sd, if goal.two_arms { sd } else { rest.shoulder_deg[1] }];
+    pose.elbow_deg = [ed, if goal.two_arms { ed } else { rest.elbow_deg[1] }];
+    // Look at the hand: the neck (or a mast's pan-tilt) tilts the camera down
+    // toward the object, within its range; a fixed camera cannot.
+    if let Some((eye, max)) = look_from(body, sh) {
+        let look = (eye[1] - goal.palm_z).atan2(x_obj - eye[0]).to_degrees();
+        pose.neck_deg = (look - pose.trunk_deg()).clamp(-max, max);
+    }
     pose.closure = 0.0;
     let loaded = kin::solve_fast(body, &pose, &KinLoads::holding(goal.load_kg, goal.two_arms, 0.0));
     if !loaded.feasible {
@@ -262,15 +315,15 @@ fn candidate_or_miss(body: &Body, goal: &ReachGoal, x_obj: f32, shank_deg: f32, 
 fn lowest_palm(body: &Body, rom: &Rom, x_obj: f32) -> f32 {
     let mut best = f32::INFINITY;
     let steps = |max: f32, n: usize| (0..=n).map(move |i| max * i as f32 / n as f32);
-    let shank_max = if body.legged { rom.ankle_dorsi_max } else { 0.0 };
-    let thigh_max = if body.legged { (rom.knee_max - shank_max).max(0.0).min(110.0) } else { 0.0 };
-    let pelvis_max = if body.legged { rom.hip_flex_max } else { 0.0 };
+    let shank_max = if body.legged() { rom.ankle_dorsi_max } else { 0.0 };
+    let thigh_max = if body.legged() { (rom.knee_max - shank_max).max(0.0).min(110.0) } else { 0.0 };
+    let pelvis_max = if body.legged() { rom.hip_flex_max } else { 0.0 };
     for s in steps(shank_max, 3) {
         for t in steps(thigh_max, 11) {
             for p in steps(pelvis_max, 12) {
                 for w in steps(rom.waist_max, 9) {
                     let mut pose = KinPose::stand(0.0);
-                    if body.legged {
+                    if body.legged() {
                         let (sr, tr) = (s.to_radians(), t.to_radians());
                         let knee = [SHANK_M * sr.sin(), ANKLE_H_M + SHANK_M * sr.cos()];
                         pose.hip = [knee[0] - THIGH_M * tr.sin(), knee[1] + THIGH_M * tr.cos()];
@@ -293,8 +346,21 @@ fn lowest_palm(body: &Body, rom: &Rom, x_obj: f32) -> f32 {
     best
 }
 
+/// The highest palm height at a stand-off: standing upright with the lift at
+/// its top, the arm reaching up to the object's x (`None` out of reach). For
+/// the reason text when a goal is too high (a table top, a shelf).
+fn highest_palm(body: &Body, x_obj: f32) -> Option<f32> {
+    let sh = shoulder_point(body, &body.stand(0.0));
+    let reach = UPPER_ARM_M + FOREARM_M + PALM_OFFSET_M;
+    let dx = x_obj - sh[0];
+    (dx.abs() <= reach).then(|| sh[1] + (reach * reach - dx * dx).sqrt())
+}
+
 /// Plans the bend that brings the palm to `goal` with the least effort.
 pub fn plan(body: &Body, goal: &ReachGoal) -> ReachPlan {
+    if let Some(no) = form_refusal(body, goal, "front") {
+        return no;
+    }
     let rom = Rom::of(body);
     let x0 = min_object_x(body, goal.half_len_m);
     let xs = [x0, x0 + 0.06, x0 + 0.12, x0 + 0.20];
@@ -310,10 +376,10 @@ pub fn plan(body: &Body, goal: &ReachGoal) -> ReachPlan {
     };
     // Standing reach first: nothing to bend when the palm already gets there.
     let grid = |max: f32, n: usize| -> Vec<f32> { (0..=n).map(|i| max * i as f32 / n.max(1) as f32).collect() };
-    let shank_max = if body.legged { rom.ankle_dorsi_max } else { 0.0 };
-    let thigh_max = if body.legged { (rom.knee_max - shank_max).max(0.0).min(110.0) } else { 0.0 };
-    let pelvis_max = if body.legged { rom.hip_flex_max } else { 0.0 };
-    let (ss, ts, ps, ws) = (grid(shank_max, if body.legged { 3 } else { 0 }), grid(thigh_max, if body.legged { 11 } else { 0 }), grid(pelvis_max, if body.legged { 12 } else { 0 }), grid(rom.waist_max, if rom.waist_max > 0.0 { 9 } else { 0 }));
+    let shank_max = if body.legged() { rom.ankle_dorsi_max } else { 0.0 };
+    let thigh_max = if body.legged() { (rom.knee_max - shank_max).max(0.0).min(110.0) } else { 0.0 };
+    let pelvis_max = if body.legged() { rom.hip_flex_max } else { 0.0 };
+    let (ss, ts, ps, ws) = (grid(shank_max, if body.legged() { 3 } else { 0 }), grid(thigh_max, if body.legged() { 11 } else { 0 }), grid(pelvis_max, if body.legged() { 12 } else { 0 }), grid(rom.waist_max, if rom.waist_max > 0.0 { 9 } else { 0 }));
     let ls = grid(rom.lift_max_m, if rom.lift_max_m > 0.0 { 8 } else { 0 });
     for &x in &xs {
         for &s in &ss {
@@ -339,7 +405,7 @@ pub fn plan(body: &Body, goal: &ReachGoal) -> ReachPlan {
     }
     // Refine around the best on half the grid steps.
     if let Some((b, x)) = best.as_ref().map(|(c, x)| (c.pose, *x)) {
-        let (s0, t0) = if body.legged {
+        let (s0, t0) = if body.legged() {
             let knee = kin::knee_ik(b.hip, [0.0, ANKLE_H_M]).map(|k| k.0).unwrap_or([0.0, ANKLE_H_M + SHANK_M]);
             ((knee[0]).atan2(knee[1] - ANKLE_H_M).to_degrees(), (knee[0] - b.hip[0]).atan2(b.hip[1] - knee[1]).to_degrees())
         } else {
@@ -365,7 +431,7 @@ pub fn plan(body: &Body, goal: &ReachGoal) -> ReachPlan {
             }
         }
     }
-    let stand = KinPose::stand(goal.cargo_kg);
+    let stand = body.stand(goal.cargo_kg);
     match best {
         Some((c, x)) => {
             let empty = kin::solve(body, &c.pose, &KinLoads::default());
@@ -376,13 +442,17 @@ pub fn plan(body: &Body, goal: &ReachGoal) -> ReachPlan {
             let descend_s = move_time(&up, &empty).max(lift_s);
             let rise_s = move_time(&loaded, &kin::solve_fast(body, &KinPose { cargo_kg: goal.cargo_kg, ..stand }, &KinLoads::holding(goal.load_kg, goal.two_arms, 0.0))).max(lift_s);
             let _ = c.loaded;
-            ReachPlan { ok: true, strategy: c.strategy, strategy_ko: strategy_ko(c.strategy), approach: "front", pose: c.pose, empty, loaded, object_x: x, object_y: 0.0, lowest_palm_z: goal.palm_z, reason_ko: None, descend_s, rise_s, rise_margin: None, evaluated }
+            ReachPlan { ok: true, strategy: c.strategy, strategy_ko: strategy_ko(c.strategy), approach: "front", pose: c.pose, empty, loaded, object_x: x, object_y: 0.0, lowest_palm_z: goal.palm_z, reason_ko: None, descend_s, rise_s, rise_margin: None, evaluated, code: None }
         }
         None => {
             let low = lowest_palm(body, &rom, x0).max(0.0);
             let why = if low > goal.palm_z + 1e-3 {
-                if body.legged {
+                if body.legged() {
                     format!("다리를 굽혀도 손바닥이 {:.2} m 아래로 내려가지 않음 (필요 {:.2} m)", low, goal.palm_z)
+                } else if body.mast_arms() {
+                    format!("마스트 리프트를 {:.2} m 내려도 팔이 손바닥을 {:.2} m 아래로 가져가지 못함 (필요 {:.2} m)", rom.lift_max_m, low, goal.palm_z)
+                } else if !body.has_torso() && rom.lift_max_m <= 0.0 {
+                    format!("{}의 팔이 손바닥을 {:.2} m 아래로 가져가지 못함 (필요 {:.2} m)", if body.deck_arms() { "갑판" } else { "기둥" }, low, goal.palm_z)
                 } else if rom.waist_max <= 0.0 {
                     let lift = if rom.lift_max_m > 0.0 { format!("몸통을 {:.2} m 내려도 ", rom.lift_max_m) } else { String::new() };
                     format!("허리 피치 관절이 없어 {lift}손바닥이 {:.2} m 아래로 내려가지 않음 (필요 {:.2} m) — 바닥의 물건을 집을 수 없음", low, goal.palm_z)
@@ -391,12 +461,16 @@ pub fn plan(body: &Body, goal: &ReachGoal) -> ReachPlan {
                 } else {
                     format!("허리를 {:.0}°까지 굽혀도 손바닥이 {:.2} m 아래로 내려가지 않음 (필요 {:.2} m)", rom.waist_max, low, goal.palm_z)
                 }
+            } else if let Some(high) = highest_palm(body, x0).filter(|h| *h < goal.palm_z - 1e-3) {
+                // Too high (a table top, a shelf) for the arm's highest shoulder.
+                let place = if body.deck_arms() { "갑판의 팔" } else if body.mast_arms() { "마스트 캐리지 꼭대기의 팔" } else { "선 자세의 팔" };
+                format!("{place}로는 손바닥이 {:.2} m까지만 올라감 (필요 {:.2} m)", high, goal.palm_z)
             } else {
                 // Low enough in geometry, but no candidate held: the nearest one's limit (torque, balance or range).
                 format!("손은 닿지만 굽힌 자세를 버티지 못함{}", nearest.as_ref().map(|m| format!(": {}", m.reason)).unwrap_or_default())
             };
             let empty = kin::solve(body, &stand, &KinLoads::default());
-            ReachPlan { ok: false, strategy: "none", strategy_ko: "불가", approach: "front", pose: stand, loaded: empty.clone(), empty, object_x: x0, object_y: 0.0, lowest_palm_z: low, reason_ko: Some(why), descend_s: 0.0, rise_s: 0.0, rise_margin: None, evaluated }
+            ReachPlan { ok: false, strategy: "none", strategy_ko: "불가", approach: "front", pose: stand, loaded: empty.clone(), empty, object_x: x0, object_y: 0.0, lowest_palm_z: low, reason_ko: Some(why), descend_s: 0.0, rise_s: 0.0, rise_margin: None, evaluated, code: None }
         }
     }
 }
@@ -512,8 +586,8 @@ pub const RISE_ZMP_SAFETY: f32 = crate::balance::GRIP_SAFETY;
 
 fn candidate3(body: &Body, goal: &ReachGoal, hands: Hands, out_m: f32, legs: [f32; 4], top: &KinReport) -> Result<Cand, Option<Miss>> {
     let [shank_deg, thigh_deg, pelvis_deg, waist_deg] = legs;
-    let mut pose = KinPose::stand(goal.cargo_kg);
-    if body.legged {
+    let mut pose = body.stand(goal.cargo_kg);
+    if body.legged() {
         pose.hip = hip_splayed(shank_deg, thigh_deg, out_m).ok_or(None)?;
         pose.pelvis_deg = pelvis_deg;
         pose.stance_out_m = out_m;
@@ -521,31 +595,34 @@ fn candidate3(body: &Body, goal: &ReachGoal, hands: Hands, out_m: f32, legs: [f3
     pose.waist_deg = waist_deg;
     let sh = shoulder_point(body, &pose);
     let trunk = pose.trunk_deg();
+    let pan_max = Rom::of(body).pan_max;
     let two = match hands {
         Hands::Side { x, y } => {
-            let (fd, ed, ad) = arm_ik3([sh[0], -SHOULDER_HALF_WIDTH_M, sh[1]], [x, y, goal.palm_z], trunk, 0).ok_or(None)?;
-            pose.shoulder_deg = [fd, 0.0];
-            pose.elbow_deg = [ed, 10.0];
+            let (fd, ed, ad) = arm_ik3([sh[0], body.shoulder_mount(0)[1], sh[1]], [x, y, goal.palm_z], trunk, 0).ok_or(None)?;
+            pose.shoulder_deg[0] = fd;
+            pose.elbow_deg[0] = ed;
             pose.shoulder_abd_deg = [ad, 0.0];
             // The head turns to the hand beside the foot: the neck pans toward it and pitches down, each within its range.
-            let eye = [sh[0], sh[1] + kin::NECK_UP_M + 0.07];
-            let ground = (x - eye[0]).hypot(y);
-            pose.neck_pan_deg = y.atan2(x - eye[0]).to_degrees().clamp(-kin::NECK_PAN_MAX_DEG, kin::NECK_PAN_MAX_DEG);
-            let look = (eye[1] - goal.palm_z).atan2(ground).to_degrees();
-            pose.neck_deg = (look - trunk).clamp(-kin::NECK_PITCH_MAX_DEG, kin::NECK_PITCH_MAX_DEG);
+            if let Some((eye, max)) = look_from(body, sh) {
+                let ground = (x - eye[0]).hypot(y);
+                pose.neck_pan_deg = y.atan2(x - eye[0]).to_degrees().clamp(-pan_max, pan_max);
+                let look = (eye[1] - goal.palm_z).atan2(ground).to_degrees();
+                pose.neck_deg = (look - trunk).clamp(-max, max);
+            }
             false
         }
         Hands::Between { x, y } => {
             for s in 0..2 {
-                let (sy, ty) = if s == 0 { (-SHOULDER_HALF_WIDTH_M, -y) } else { (SHOULDER_HALF_WIDTH_M, y) };
+                let (sy, ty) = (body.shoulder_mount(s)[1], if s == 0 { -y } else { y });
                 let (fd, ed, ad) = arm_ik3([sh[0], sy, sh[1]], [x, ty, goal.palm_z], trunk, s).ok_or(None)?;
                 pose.shoulder_deg[s] = fd;
                 pose.elbow_deg[s] = ed;
                 pose.shoulder_abd_deg[s] = ad;
             }
-            let eye = [sh[0], sh[1] + kin::NECK_UP_M + 0.07];
-            let look = (eye[1] - goal.palm_z).atan2(x - eye[0]).to_degrees();
-            pose.neck_deg = (look - trunk).clamp(-kin::NECK_PITCH_MAX_DEG, kin::NECK_PITCH_MAX_DEG);
+            if let Some((eye, max)) = look_from(body, sh) {
+                let look = (eye[1] - goal.palm_z).atan2(x - eye[0]).to_degrees();
+                pose.neck_deg = (look - trunk).clamp(-max, max);
+            }
             true
         }
     };
@@ -568,9 +645,9 @@ fn candidate3(body: &Body, goal: &ReachGoal, hands: Hands, out_m: f32, legs: [f3
 }
 
 /// The pose the rise of a three-dimensional plan ends in, solved with the
-/// load: standing, the object held in front of the chest (`grasp::hold_pose`).
+/// load: standing, the object held in front of the chest (`grasp::hold_pose_for`).
 fn top_report(body: &Body, goal: &ReachGoal, two: bool) -> KinReport {
-    kin::solve_fast(body, &super::grasp::hold_pose(two, goal.cargo_kg), &KinLoads::holding(goal.load_kg, two, 0.0))
+    kin::solve_fast(body, &super::grasp::hold_pose_for(body, two, goal.cargo_kg), &KinLoads::holding(goal.load_kg, two, 0.0))
 }
 
 /// The coarse grid of the legs and the trunk, then a finer one around the
@@ -580,11 +657,11 @@ fn search3(body: &Body, goal: &ReachGoal, options: &[(Hands, f32)]) -> (Option<C
     let rom = Rom::of(body);
     let top = top_report(body, goal, options.first().is_some_and(|o| matches!(o.0, Hands::Between { .. })));
     let grid = |max: f32, n: usize| -> Vec<f32> { (0..=n).map(|i| max * i as f32 / n.max(1) as f32).collect() };
-    let shank_max = if body.legged { rom.ankle_dorsi_max } else { 0.0 };
-    let thigh_max = if body.legged { (rom.knee_max - shank_max).max(0.0).min(110.0) } else { 0.0 };
-    let pelvis_max = if body.legged { rom.hip_flex_max } else { 0.0 };
+    let shank_max = if body.legged() { rom.ankle_dorsi_max } else { 0.0 };
+    let thigh_max = if body.legged() { (rom.knee_max - shank_max).max(0.0).min(110.0) } else { 0.0 };
+    let pelvis_max = if body.legged() { rom.hip_flex_max } else { 0.0 };
     let n = |legged: bool, k: usize| if legged { k } else { 0 };
-    let (ss, ts, ps, ws) = (grid(shank_max, n(body.legged, 3)), grid(thigh_max, n(body.legged, 11)), grid(pelvis_max, n(body.legged, 12)), grid(rom.waist_max, if rom.waist_max > 0.0 { 9 } else { 0 }));
+    let (ss, ts, ps, ws) = (grid(shank_max, n(body.legged(), 3)), grid(thigh_max, n(body.legged(), 11)), grid(pelvis_max, n(body.legged(), 12)), grid(rom.waist_max, if rom.waist_max > 0.0 { 9 } else { 0 }));
     let mut evaluated = 0u32;
     let mut best: Option<Cand3> = None;
     let mut nearest: Option<Miss> = None;
@@ -641,25 +718,25 @@ fn finish3(body: &Body, goal: &ReachGoal, b: Cand3, approach: &'static str, eval
     };
     let empty = kin::solve(body, &b.cand.pose, &KinLoads::default());
     let loaded = kin::solve(body, &b.cand.pose, &KinLoads::holding(goal.load_kg, two, 0.0));
-    let stand = KinPose::stand(goal.cargo_kg);
+    let stand = body.stand(goal.cargo_kg);
     let up = kin::solve_fast(body, &stand, &KinLoads::default());
     let descend_s = move_time(&up, &empty);
     // The rise the search planned: as fast as the actuators allow, slowed to keep the balance.
     let rise_s = b.cand.rise_s.unwrap_or_else(|| move_time(&loaded, &kin::solve_fast(body, &stand, &KinLoads::holding(goal.load_kg, two, 0.0))));
     let strategy = b.cand.strategy;
-    ReachPlan { ok: true, strategy, strategy_ko: strategy_ko(strategy), approach, pose: b.cand.pose, empty, loaded, object_x: x, object_y: y, lowest_palm_z: goal.palm_z, reason_ko: None, descend_s, rise_s, rise_margin: b.cand.rise_margin, evaluated }
+    ReachPlan { ok: true, strategy, strategy_ko: strategy_ko(strategy), approach, pose: b.cand.pose, empty, loaded, object_x: x, object_y: y, lowest_palm_z: goal.palm_z, reason_ko: None, descend_s, rise_s, rise_margin: b.cand.rise_margin, evaluated, code: None }
 }
 
 fn failed3(body: &Body, goal: &ReachGoal, approach: &'static str, why: String, x: f32, y: f32, evaluated: u32) -> ReachPlan {
-    let stand = KinPose::stand(goal.cargo_kg);
+    let stand = body.stand(goal.cargo_kg);
     let empty = kin::solve(body, &stand, &KinLoads::default());
-    ReachPlan { ok: false, strategy: "none", strategy_ko: "불가", approach, pose: stand, loaded: empty.clone(), empty, object_x: x, object_y: y, lowest_palm_z: f32::NAN, reason_ko: Some(why), descend_s: 0.0, rise_s: 0.0, rise_margin: None, evaluated }
+    ReachPlan { ok: false, strategy: "none", strategy_ko: "불가", approach, pose: stand, loaded: empty.clone(), empty, object_x: x, object_y: y, lowest_palm_z: f32::NAN, reason_ko: Some(why), descend_s: 0.0, rise_s: 0.0, rise_margin: None, evaluated, code: None }
 }
 
 /// Nearest the centre of an object `half_w_m` half wide can lie beside the
 /// right foot (or the bumper's right corner), metres (negative: to the right).
 pub fn side_object_y(body: &Body, half_w_m: f32) -> f32 {
-    let edge = if body.legged { 0.5 * STANCE_WIDTH_M + 0.5 * body.leg.foot_width_m } else { 0.5 * body.support_width_m };
+    let edge = if body.legged() { 0.5 * STANCE_WIDTH_M + 0.5 * body.leg.foot_width_m } else { 0.5 * body.support_width_m };
     -(edge + half_w_m + STANDOFF_GAP_M)
 }
 
@@ -670,8 +747,11 @@ pub fn side_object_y(body: &Body, half_w_m: f32) -> f32 {
 /// with the pose. The statics carry the load out to the side: the ZMP moves
 /// across, the abduction joint holds the arm.
 pub fn plan_side(body: &Body, goal: &ReachGoal, half_w_m: f32) -> ReachPlan {
+    if let Some(no) = form_refusal(body, &ReachGoal { two_arms: false, ..*goal }, "side") {
+        return no;
+    }
     let y0 = side_object_y(body, half_w_m);
-    let x0 = if body.legged { 0.25 * body.leg.foot_len_m } else { 0.0 };
+    let x0 = if body.legged() { 0.25 * body.leg.foot_len_m } else { 0.0 };
     let mut options = Vec::new();
     for dy in [0.0f32, -0.06, -0.12] {
         for dx in [-0.06f32, 0.0, 0.08, 0.16] {
@@ -698,7 +778,11 @@ pub fn plan_side(body: &Body, goal: &ReachGoal, half_w_m: f32) -> ReachPlan {
 /// wheeled base cannot straddle); `half_w_m` is the load's half width across.
 pub fn plan_straddle(body: &Body, goal: &ReachGoal, half_w_m: f32) -> ReachPlan {
     let rom = Rom::of(body);
-    if !body.legged {
+    // Both hands take the load's sides.
+    if let Some(no) = form_refusal(body, &ReachGoal { two_arms: true, ..*goal }, "straddle") {
+        return no;
+    }
+    if !body.legged() {
         return failed3(body, goal, "straddle", "바퀴·트랙은 물건을 발 사이에 두고 설 수 없음".into(), 0.0, 0.0, 0);
     }
     // Each foot out far enough that its inside edge clears the load and the fingers on its sides.
@@ -734,7 +818,7 @@ pub fn plan_straddle(body: &Body, goal: &ReachGoal, half_w_m: f32) -> ReachPlan 
 /// whenever it holds, so a load the body lifts from in front keeps that pose.
 pub fn plan_or_straddle(body: &Body, goal: &ReachGoal, half_w_m: f32) -> ReachPlan {
     let front = plan(body, goal);
-    if front.ok || !body.legged || front.lowest_palm_z > goal.palm_z + 1e-3 {
+    if front.ok || !body.legged() || front.lowest_palm_z > goal.palm_z + 1e-3 {
         return front;
     }
     let wide = plan_straddle(body, goal, half_w_m);

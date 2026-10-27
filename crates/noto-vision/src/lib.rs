@@ -16,7 +16,12 @@
 //!    move, predict what the next keyframe should show).
 //!
 //! [`fusion`] mixes the tracks into per-keyframe features for the SDS.
+//! [`align`] puts a monocular depth map on the metric scale of the ground the
+//! camera stands on, and [`calib`] holds the per-label score calibration
+//! fitted offline on rendered frames.
 
+pub mod align;
+pub mod calib;
 pub mod camera;
 pub mod decide;
 pub mod depth;
@@ -29,12 +34,14 @@ pub mod tips;
 pub mod track;
 pub mod triangulate;
 
+pub use align::{contact_range, fit_ground, ground_align, ground_depth, AlignCfg, AlignFit, AlignSpace};
+pub use calib::{CalibTable, LabelCalib};
 pub use camera::{Intrinsics, Pose};
 pub use decide::{centroid_sigma, scale_usable, DecideCfg, Decider, Decision, DecisionReport, Estimate, Prediction, Sighting};
 pub use fusion::{features, flags, FlagCfg, Features, FusionInput};
 pub use depth::{depth_metrics, DepthMetrics, DepthModel};
 pub use frame::{DepthKind, DepthMap, Mask, Rgb};
-pub use locate::{Heat, LabelPrompt, SemanticLocator, SemanticPoint, SiglipLocator};
+pub use locate::{label_heats, Heat, LabelPrompt, LabelTexts, LocateCfg, LocateScoring, SemanticLocator, SemanticPoint, SiglipLocator};
 pub use tips::{InputGrid, TipsConfig, TipsDepth};
 pub use sam::{SamCfg, SamModel, SamTracker, SamVariant};
 pub use track::{MaskTracker, PointPrompt, RegionCfg, RegionTracker, TrackedMask};

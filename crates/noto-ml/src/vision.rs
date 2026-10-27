@@ -1,5 +1,13 @@
 //! SigLIP2 vision tower with NaFlex patches and a multihead attention-pooling
 //! (MAP) head that turns the patch tokens into one image embedding.
+//!
+//! The learned position table is a 16x16 grid; a NaFlex image of another
+//! grid gets it resized. Hugging Face's `Siglip2VisionEmbeddings.
+//! resize_positional_embeddings` does that with `F.interpolate(mode=
+//! "bilinear", align_corners=False, antialias=True)`, so a 13-row grid (a
+//! 384x256 keyframe) averages the 16 table rows instead of sampling them.
+//! [`VisionTower::set_position_antialias`] chooses between that reference
+//! filter (the default) and the plain bilinear resize this port used before.
 
 use candle_core::{Device, Result, Tensor};
 use candle_nn::{layer_norm, linear, LayerNorm, Linear, Module, VarBuilder};
@@ -122,6 +130,34 @@ pub struct VisionTower {
     side: usize,
     hidden: usize,
     device: Device,
+    /// Resize the position table with the antialiased filter of the reference.
+    pos_antialias: bool,
+}
+
+/// Weights of PyTorch's antialiased bilinear resize along one axis
+/// (`_compute_indices_min_size_weights_aa` with `align_corners=False`), as a
+/// row-major `dst x src` matrix. Upsampling reduces to ordinary bilinear with
+/// half-pixel centres; downsampling widens the triangle to the scale factor so
+/// every input sample contributes.
+pub fn antialias_bilinear_weights(src: usize, dst: usize) -> Vec<f32> {
+    let scale = src as f64 / dst as f64;
+    let (support, inv_scale) = if scale >= 1.0 { (scale, 1.0 / scale) } else { (1.0, 1.0) };
+    let triangle = |x: f64| (1.0 - x.abs()).max(0.0);
+    let mut weights = vec![0f32; dst * src];
+    for o in 0..dst {
+        let center = scale * (o as f64 + 0.5);
+        // `as i64` truncates toward zero like the C++ `static_cast<int64_t>`.
+        let lo = ((center - support + 0.5) as i64).max(0) as usize;
+        let hi = ((center + support + 0.5) as i64).min(src as i64).max(lo as i64) as usize;
+        let taps: Vec<f64> = (lo..hi).map(|j| triangle((j as f64 - center + 0.5) * inv_scale)).collect();
+        let total: f64 = taps.iter().sum();
+        if total > 0.0 {
+            for (k, t) in taps.iter().enumerate() {
+                weights[o * src + lo + k] = (t / total) as f32;
+            }
+        }
+    }
+    weights
 }
 
 impl VisionTower {
@@ -151,16 +187,35 @@ impl VisionTower {
             side: cfg.position_side(),
             hidden: d,
             device: vb.device().clone(),
+            pos_antialias: true,
         })
     }
 
+    /// `true` (default): the reference's antialiased resize of the position
+    /// table; `false`: plain bilinear (this port before v1.0).
+    pub fn set_position_antialias(&mut self, on: bool) {
+        self.pos_antialias = on;
+    }
+
+    pub fn position_antialias(&self) -> bool {
+        self.pos_antialias
+    }
+
     /// Positions for a `grid_h x grid_w` patch grid. The square table is
-    /// bilinearly resized when the grid is not square-shaped like the table.
+    /// resized when the grid is not square-shaped like the table.
     fn positions(&self, grid_h: usize, grid_w: usize) -> Result<Tensor> {
         let d = self.hidden;
         let table = self.position.reshape((self.side, self.side, d))?;
         if grid_h == self.side && grid_w == self.side {
             return table.reshape((1, grid_h * grid_w, d));
+        }
+        if self.pos_antialias {
+            // Separable: rows, then columns, as two small matrix products.
+            let side = self.side;
+            let wy = Tensor::from_vec(antialias_bilinear_weights(side, grid_h), (grid_h, side), &self.device)?;
+            let wx = Tensor::from_vec(antialias_bilinear_weights(side, grid_w), (grid_w, side), &self.device)?;
+            let by_rows = wy.matmul(&table.reshape((side, side * d))?)?.reshape((grid_h, side, d))?;
+            return wx.broadcast_matmul(&by_rows)?.reshape((1, grid_h * grid_w, d));
         }
         table
             .permute((2, 0, 1))?

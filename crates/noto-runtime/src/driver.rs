@@ -972,7 +972,7 @@ impl Runtime {
         match self.touch_piece((l.x, l.z), item) {
             Some(piece) => {
                 t.side = t.side.map(|(_, h)| (piece, h));
-                let vscope = Scope::new(Track::Vision, &l.label, "");
+                let vscope = self.gates.vision_scope(&l.label);
                 self.sds.record_agreement(&vscope, "touch", true);
                 self.sds.record_baseline(&vscope, "score", l.score as f64);
                 t.touch_ok += 1;
@@ -994,7 +994,7 @@ impl Runtime {
                     self.goto_phase(t, Phase::Approach, "위치 재확인");
                     return Flow::Continue;
                 }
-                let vscope = Scope::new(Track::Vision, &l.label, "");
+                let vscope = self.gates.vision_scope(&l.label);
                 self.sds.record_agreement(&vscope, "touch", false);
                 self.gates.reject(id);
                 t.touch_miss += 1;
@@ -1038,7 +1038,7 @@ impl Runtime {
                 }
                 if let Some(id) = id {
                     if let Some(l) = self.gates.landmark(id).cloned() {
-                        let vscope = Scope::new(Track::Vision, &l.label, "");
+                        let vscope = self.gates.vision_scope(&l.label);
                         self.sds.record_agreement(&vscope, "touch", false);
                         self.sds.record_confusion(&vscope, &l.label, "background", l.margin as f64);
                         self.log(
@@ -1146,7 +1146,7 @@ impl Runtime {
                 if t.destination.is_none() {
                     return fail("reach_ground", format!("{name}{} 집을 수 없습니다: {why}", eul_reul(&name)));
                 }
-                if self.world.body.legged {
+                if self.world.body.legged() {
                     return fail("reach_ground", format!("{name}{} 집을 수 없습니다: {why}", eul_reul(&name)));
                 }
                 self.log("quest", Level::Info, format!("{name}: 바닥에 손이 닿지 않아 범퍼로 밀어 옮김 — {why}"), Some(json!({"drop": id})));
@@ -1790,6 +1790,9 @@ impl Runtime {
                 _ => fail(&why, format!("동작이 실패했습니다: {why}")),
             };
         }
+        if matches!(act, Act::Move(_)) && self.world.body.base == noto_core::BaseKind::HumanFoot {
+            self.sds.record_agreement(&Scope::new(Track::Act, "walk", self.world.ground_here().id()), "no_fall", true);
+        }
         match act {
             Act::Turn => {
                 t.scan_cooldown = 0;
@@ -1895,7 +1898,7 @@ impl Runtime {
         let hit = kind.spec().drop == wanted;
         let lm = t.target_lm.take().and_then(|id| self.gates.landmark(id).cloned());
         if let Some(l) = &lm {
-            let vscope = Scope::new(Track::Vision, &l.label, "");
+            let vscope = self.gates.vision_scope(&l.label);
             self.sds.record_agreement(&vscope, "touch", hit);
             if hit {
                 self.sds.record_baseline(&vscope, "score", l.score as f64);

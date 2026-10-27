@@ -10,7 +10,11 @@
 //! * a ledger whose recipe string differs from [`SDS_RECIPE`] is discarded;
 //! * ledgers are written to a temporary file and renamed (logis-center
 //!   `write_atomic`), which endmill-sandbox did not do;
-//! * a ledger over the size cap drops its least observed scopes first.
+//! * a ledger over the size cap drops its least observed scopes first;
+//! * run files and ledgers carry the engine revision their observations came
+//!   from ([`OpenOptions`]); a reader may set aside ledgers of another one;
+//! * a track may forbid backing off across secondaries or primaries
+//!   ([`ScopePolicy`]), so model modes or robot forms never pool.
 //!
 //! The store never decides anything on its own. Callers ask for a learned
 //! value and fall back to their fixed default when the answer is `None`
@@ -63,6 +67,70 @@ pub struct SdsFile {
     pub updated_at: i64,
     #[serde(default)]
     pub scopes: HashMap<String, ScopeStat>,
+    /// Every engine revision whose observations are in the ledger
+    /// ([`UNSTAMPED`] for runs that set none), sorted.
+    #[serde(default)]
+    pub engine_revs: Vec<String>,
+}
+
+/// The revision of observations written without one (ledgers from before the stamp).
+pub const UNSTAMPED: &str = "unstamped";
+
+/// What to do with a ledger that holds observations of another engine revision.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OtherRevs {
+    /// Load it and keep merging (the revisions are listed in the ledger).
+    #[default]
+    Keep,
+    /// Move it aside (`<ledger>.rev-<ms>.json`, nothing is deleted) and start
+    /// that ledger empty, so no read sees another engine's observations.
+    SetAside,
+}
+
+/// How [`SdsStore::open_with`] opens a ledger directory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OpenOptions {
+    /// Stamped into the run files and the ledgers (`""`: unstamped).
+    pub engine_rev: String,
+    pub other_revs: OtherRevs,
+}
+
+impl OpenOptions {
+    /// Stamp the observations with `rev`, keep ledgers of other revisions.
+    pub fn stamped(rev: &str) -> OpenOptions {
+        OpenOptions { engine_rev: rev.into(), other_revs: OtherRevs::Keep }
+    }
+
+    /// Stamp with `rev` and read only observations of that revision.
+    pub fn only(rev: &str) -> OpenOptions {
+        OpenOptions { engine_rev: rev.into(), other_revs: OtherRevs::SetAside }
+    }
+}
+
+/// Whether reads may pool a scope with its siblings when it is thin
+/// (`secondary -> primary -> global`). The default pools both, as the
+/// logis-center store does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopePolicy {
+    /// A named secondary may back off to its primary (pooling every secondary).
+    pub pool_secondaries: bool,
+    /// A named primary may back off to the global scope (pooling every primary).
+    pub pool_primaries: bool,
+}
+
+impl Default for ScopePolicy {
+    fn default() -> Self {
+        ScopePolicy::POOLED
+    }
+}
+
+impl ScopePolicy {
+    pub const POOLED: ScopePolicy = ScopePolicy { pool_secondaries: true, pool_primaries: true };
+    /// A named secondary answers alone (a model mode, a robot form never pools with another).
+    pub const KEEP_SECONDARIES: ScopePolicy = ScopePolicy { pool_secondaries: false, pool_primaries: true };
+    /// The most specific named level answers alone.
+    pub const EXACT: ScopePolicy = ScopePolicy { pool_secondaries: false, pool_primaries: false };
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -74,6 +142,9 @@ struct RunFile {
     updated_at: i64,
     observations: u64,
     scopes: HashMap<String, ScopeStat>,
+    /// The engine revision the run's observations came from (`""`: unstamped).
+    #[serde(default)]
+    engine_rev: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -91,6 +162,9 @@ pub struct LedgerStatus {
     pub scopes: usize,
     pub observations: u64,
     pub run_observations: u64,
+    /// Engine revisions of the observations in the ledger (and the open run).
+    #[serde(default)]
+    pub engine_revs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,6 +218,47 @@ pub struct ReferenceReport {
     pub mean_ref: f64,
     #[serde(default)]
     pub mean_tol: f64,
+    /// Mean |deviation| and root mean square deviation in tolerance units:
+    /// unlike the signed mean, +z and -z do not cancel. `None` for
+    /// observations recorded before these axes existed.
+    #[serde(default)]
+    pub mean_abs_dev: Option<f64>,
+    #[serde(default)]
+    pub rms_dev: Option<f64>,
+}
+
+/// One reference axis in an [`AreaReport`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AreaAxis {
+    /// The primary scope key it was read at (it pools every secondary).
+    pub scope: String,
+    pub axis: String,
+    pub n: u64,
+    /// Signed mean deviation in tolerances.
+    pub mean_dev: f64,
+    pub mean_abs_dev: Option<f64>,
+    pub rms_dev: Option<f64>,
+    pub in_band_rate: Option<f64>,
+}
+
+/// Every reference axis under a track and primary prefix, pooled by
+/// observation count: the live counterpart of the benchmarks' per-area
+/// deviation (`noto_core::bench::Summary`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AreaReport {
+    pub track: String,
+    pub prefix: String,
+    pub axes: Vec<AreaAxis>,
+    /// Observations over every axis.
+    pub n: u64,
+    /// Count-weighted over the axes that have them.
+    pub mean_abs_dev: Option<f64>,
+    pub rms_dev: Option<f64>,
+    pub in_band_rate: Option<f64>,
+    /// Axes recorded before |dev| and dev^2 were (their signed mean only).
+    pub legacy_axes: usize,
+    /// The axis farthest from its reference (by mean |dev|, or |mean dev| for a legacy axis).
+    pub worst: Option<AreaAxis>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,6 +290,8 @@ pub struct SdsStore {
     last_flush: Option<Instant>,
     log: Vec<String>,
     cap_bytes: usize,
+    engine_rev: String,
+    policies: HashMap<Track, ScopePolicy>,
 }
 
 impl SdsStore {
@@ -189,6 +306,8 @@ impl SdsStore {
             last_flush: None,
             log: Vec::new(),
             cap_bytes: DEFAULT_CAP_BYTES,
+            engine_rev: String::new(),
+            policies: HashMap::new(),
         };
         for l in Ledger::ALL {
             s.bases.insert(l, fresh_file());
@@ -200,8 +319,15 @@ impl SdsStore {
     /// Opens (and creates) a ledger directory. A missing, unreadable or
     /// recipe-mismatched ledger starts empty and says why in the log.
     pub fn open(dir: &Path) -> Self {
+        SdsStore::open_with(dir, OpenOptions::default())
+    }
+
+    /// [`open`](Self::open) with an engine revision stamp and what to do with
+    /// ledgers of another revision.
+    pub fn open_with(dir: &Path, opts: OpenOptions) -> Self {
         let mut store = SdsStore::memory();
         store.dir = Some(dir.to_path_buf());
+        store.engine_rev = opts.engine_rev.clone();
         store.log.clear();
         let _ = std::fs::create_dir_all(dir);
         let mut loaded = 0usize;
@@ -213,9 +339,28 @@ impl SdsStore {
                     .map_err(|e| e.to_string())
                     .and_then(|t| serde_json::from_str::<SdsFile>(&t).map_err(|e| e.to_string()))
                 {
-                    Ok(f) if f.recipe == SDS_RECIPE || f.recipe == SDS_RECIPE_LEGACY => {
-                        loaded += 1;
-                        file = f;
+                    Ok(mut f) if f.recipe == SDS_RECIPE || f.recipe == SDS_RECIPE_LEGACY => {
+                        if f.engine_revs.is_empty() && !f.scopes.is_empty() {
+                            f.engine_revs.push(UNSTAMPED.into());
+                        }
+                        // Compared with the stamp this store writes (`unstamped` for no revision).
+                        let own = store.stamp();
+                        let foreign = f.engine_revs.iter().any(|r| *r != own);
+                        if foreign && opts.other_revs == OtherRevs::SetAside {
+                            let aside = dir.join(format!("{}.rev-{}.json", l.as_str(), now_ms()));
+                            match std::fs::rename(&path, &aside) {
+                                Ok(()) => store.log.push(format!(
+                                    "[SDS] [{}] 다른 엔진 개정({})의 관측을 {}로 옮겨 두고 새로 시작합니다",
+                                    l.as_str(),
+                                    f.engine_revs.join(", "),
+                                    aside.display()
+                                )),
+                                Err(e) => store.log.push(format!("[SDS] [{}] 다른 엔진 개정의 원장을 옮기지 못해({e}) 읽지 않고 새로 시작합니다", l.as_str())),
+                            }
+                        } else {
+                            loaded += 1;
+                            file = f;
+                        }
                     }
                     Ok(f) => store.log.push(format!(
                         "[SDS] [{}] 레시피 세대 불일치 ('{}' vs '{}') — 원장을 폐기하고 새로 시작합니다",
@@ -242,6 +387,58 @@ impl SdsStore {
 
     pub fn set_cap_bytes(&mut self, cap: usize) {
         self.cap_bytes = cap;
+    }
+
+    /// The engine revision this store stamps on its observations (`""`: none).
+    pub fn engine_rev(&self) -> &str {
+        &self.engine_rev
+    }
+
+    pub fn set_engine_rev(&mut self, rev: &str) {
+        self.engine_rev = rev.into();
+    }
+
+    /// Engine revisions of a ledger's observations, the open run's included.
+    pub fn engine_revs(&self, l: Ledger) -> Vec<String> {
+        let mut v = self.bases.get(&l).map(|b| b.engine_revs.clone()).unwrap_or_default();
+        if self.runs.get(&l).is_some_and(|r| r.observations > 0) {
+            v.push(self.stamp());
+        }
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    fn stamp(&self) -> String {
+        if self.engine_rev.is_empty() {
+            UNSTAMPED.into()
+        } else {
+            self.engine_rev.clone()
+        }
+    }
+
+    /// Sets how reads of a track back off ([`ScopePolicy`]); the default pools.
+    pub fn set_policy(&mut self, track: Track, policy: ScopePolicy) {
+        self.policies.insert(track, policy);
+    }
+
+    pub fn policy(&self, track: Track) -> ScopePolicy {
+        self.policies.get(&track).copied().unwrap_or_default()
+    }
+
+    /// The scope keys a read may use, most specific first, with the
+    /// observations each needs. The default policy keeps the original order
+    /// exactly (secondary, primary, global, each with its minimum).
+    fn levels(&self, scope: &Scope) -> Vec<(String, u64)> {
+        let (m2, m1, mg) = scope.track.min_obs();
+        let mut v = vec![(scope.key_secondary(), m2), (scope.key_primary(), m1), (scope.key_global(), mg)];
+        let p = self.policy(scope.track);
+        if !p.pool_secondaries && !scope.secondary.is_empty() {
+            v.truncate(1);
+        } else if !p.pool_primaries && !scope.primary.is_empty() {
+            v.truncate(2);
+        }
+        v
     }
 
     pub fn log_lines(&self) -> &[String] {
@@ -366,17 +563,23 @@ impl SdsStore {
     /// physical formula. Three things go into one observation: the value
     /// itself (`axis`), its deviation in tolerance units (`axis:dev`, that is
     /// `(value - reference) / tolerance`) and whether it stayed inside the band
-    /// (`axis:in_band`, an agreement). [`reference_report`](Self::reference_report)
-    /// reads them back.
+    /// (`axis:in_band`, an agreement). The deviation's magnitude and square
+    /// (`axis:absdev`, `axis:dev2`) go in beside it, so a report can say how
+    /// far off the values are and not only on which side.
+    /// [`reference_report`](Self::reference_report) and
+    /// [`area_report`](Self::area_report) read them back.
     pub fn record_reference(&mut self, scope: &Scope, axis: &str, value: f64, reference: f64, tolerance: f64) {
         if !value.is_finite() || !reference.is_finite() || !tolerance.is_finite() || tolerance <= 0.0 {
             return;
         }
         let dev = (value - reference) / tolerance;
         let (a, ad, ab, ar, at) = (axis.to_string(), format!("{axis}:dev"), format!("{axis}:in_band"), format!("{axis}:ref"), format!("{axis}:tol"));
+        let (aa, a2) = (format!("{axis}:absdev"), format!("{axis}:dev2"));
         self.with_scopes(scope, move |s, ring| {
             s.baseline.entry(a.clone()).or_default().push(value, ring);
             s.baseline.entry(ad.clone()).or_default().push(dev, ring);
+            s.baseline.entry(aa.clone()).or_default().push(dev.abs(), ring);
+            s.baseline.entry(a2.clone()).or_default().push(dev * dev, ring);
             // The reference can depend on the situation (a load, a slope); keep its mean too.
             s.baseline.entry(ar.clone()).or_default().push(reference, ring);
             s.baseline.entry(at.clone()).or_default().push(tolerance, ring);
@@ -434,9 +637,8 @@ impl SdsStore {
     /// Backoff: the first of secondary, primary, global whose statistic has at
     /// least the track's minimum observation count. Also names the scope used.
     fn resolve<T, F: Fn(&ScopeStat) -> Option<(T, u64)>>(&self, scope: &Scope, pick: F) -> Option<(T, String)> {
-        let (m2, m1, mg) = scope.track.min_obs();
         let l = scope.track.ledger();
-        for (key, need) in [(scope.key_secondary(), m2), (scope.key_primary(), m1), (scope.key_global(), mg)] {
+        for (key, need) in self.levels(scope) {
             if need == 0 {
                 continue;
             }
@@ -483,9 +685,8 @@ impl SdsStore {
 
     /// Smoothed probability of `to` following `from` (add-one smoothing).
     pub fn transition_prior(&self, scope: &Scope, from: &str, to: &str) -> Option<f64> {
-        let (m2, m1, _) = scope.track.min_obs();
         let l = scope.track.ledger();
-        for (key, need) in [(scope.key_secondary(), m2), (scope.key_primary(), m1)] {
+        for (key, need) in self.levels(scope).into_iter().take(2) {
             let Some(st) = self.merged_scope(l, &key) else { continue };
             let prefix = format!("{}>", from);
             let total: u64 = st.transition.iter().filter(|(k, _)| k.starts_with(&prefix)).map(|(_, v)| *v).sum();
@@ -502,6 +703,11 @@ impl SdsStore {
     /// `(rate, n)` of agreements recorded for an axis.
     pub fn agreement_rate(&self, scope: &Scope, axis: &str) -> Option<(f64, u64)> {
         self.resolve(scope, |st| st.agreement.get(axis).map(|w| ((w.mean, w.n), w.n))).map(|v| v.0)
+    }
+
+    /// Same as [`agreement_rate`](Self::agreement_rate) plus the scope key that answered.
+    pub fn agreement_rate_scoped(&self, scope: &Scope, axis: &str) -> Option<((f64, u64), String)> {
+        self.resolve(scope, |st| st.agreement.get(axis).map(|w| ((w.mean, w.n), w.n)))
     }
 
     /// `(mean margin, sd, n)` of the winner margin of an axis.
@@ -523,16 +729,11 @@ impl SdsStore {
     /// What [`record_reference`](Self::record_reference) collected for an axis,
     /// from the first scope level with enough observations.
     pub fn reference_report(&self, scope: &Scope, axis: &str) -> Option<ReferenceReport> {
-        let (ad, ab, ar) = (format!("{axis}:dev"), format!("{axis}:in_band"), format!("{axis}:ref"));
-        self.resolve(scope, |st| {
-            let v = st.baseline.get(axis)?;
-            let d = st.baseline.get(&ad)?;
-            let b = st.agreement.get(&ab)?;
-            let r = st.baseline.get(&ar).map_or(f64::NAN, |w| w.mean);
-            let t = st.baseline.get(&format!("{axis}:tol")).map_or(f64::NAN, |w| w.mean);
-            Some(((v.mean, v.sd(), d.mean, d.recent_mean(), b.mean, v.n, r, t), v.n))
-        })
-        .map(|((mean, sd, mean_dev, recent_dev, in_band_rate, n, mean_ref, mean_tol), scope_key)| ReferenceReport { scope: scope_key, n, mean, sd, mean_dev, recent_dev, in_band_rate, mean_ref, mean_tol })
+        self.resolve(scope, |st| reference_of(st, axis).map(|r| {
+            let n = r.n;
+            (r, n)
+        }))
+        .map(|(r, scope_key)| ReferenceReport { scope: scope_key, ..r })
     }
 
     /// `(mean, sd, n)` of a baseline axis at exactly one scope (no backoff).
@@ -547,12 +748,73 @@ impl SdsStore {
     pub fn exact_reference(&self, scope: &Scope, axis: &str) -> Option<ReferenceReport> {
         let key = if scope.secondary.is_empty() { scope.key_primary() } else { scope.key_secondary() };
         let st = self.merged_scope(scope.track.ledger(), &key)?;
-        let v = st.baseline.get(axis).filter(|w| w.n > 0)?;
-        let d = st.baseline.get(&format!("{axis}:dev"))?;
-        let b = st.agreement.get(&format!("{axis}:in_band"))?;
-        let mean_ref = st.baseline.get(&format!("{axis}:ref")).map_or(f64::NAN, |w| w.mean);
-        let mean_tol = st.baseline.get(&format!("{axis}:tol")).map_or(f64::NAN, |w| w.mean);
-        Some(ReferenceReport { scope: key, n: v.n, mean: v.mean, sd: v.sd(), mean_dev: d.mean, recent_dev: d.recent_mean(), in_band_rate: b.mean, mean_ref, mean_tol })
+        st.baseline.get(axis).filter(|w| w.n > 0)?;
+        reference_of(&st, axis).map(|r| ReferenceReport { scope: key, ..r })
+    }
+
+    /// Every reference axis of a track whose primary starts with `prefix`
+    /// (`""`: the whole track), read at the primary scopes (each pools its
+    /// secondaries, so nothing is counted twice) and pooled by count.
+    pub fn area_report(&self, track: Track, prefix: &str) -> AreaReport {
+        let l = track.ledger();
+        let head = format!("{}|", track.as_str());
+        let prefix = prefix.trim().to_lowercase();
+        let mut keys: Vec<String> = self.bases.get(&l).map(|b| b.scopes.keys().cloned().collect()).unwrap_or_default();
+        if let Some(r) = self.runs.get(&l) {
+            keys.extend(r.scopes.keys().cloned());
+        }
+        keys.retain(|k| {
+            let Some(rest) = k.strip_prefix(&head) else { return false };
+            // A primary key: `track|primary|` with a named primary.
+            match rest.split_once('|') {
+                Some((p, s)) => !p.is_empty() && s.is_empty() && p.starts_with(&prefix),
+                None => false,
+            }
+        });
+        keys.sort();
+        keys.dedup();
+        let mut axes = Vec::new();
+        for k in &keys {
+            let Some(st) = self.merged_scope(l, k) else { continue };
+            let mut names: Vec<&String> = st.baseline.keys().filter(|a| a.ends_with(":dev")).collect();
+            names.sort();
+            for a in names {
+                let axis = a.trim_end_matches(":dev");
+                let d = &st.baseline[a];
+                if d.n == 0 {
+                    continue;
+                }
+                axes.push(AreaAxis {
+                    scope: k.clone(),
+                    axis: axis.to_string(),
+                    n: d.n,
+                    mean_dev: d.mean,
+                    mean_abs_dev: st.baseline.get(&format!("{axis}:absdev")).filter(|w| w.n > 0).map(|w| w.mean),
+                    rms_dev: st.baseline.get(&format!("{axis}:dev2")).filter(|w| w.n > 0).map(|w| w.mean.max(0.0).sqrt()),
+                    in_band_rate: st.agreement.get(&format!("{axis}:in_band")).filter(|w| w.n > 0).map(|w| w.mean),
+                });
+            }
+        }
+        let weighted = |f: &dyn Fn(&AreaAxis) -> Option<f64>| {
+            let (num, den) = axes.iter().filter_map(|a| f(a).map(|v| (v * a.n as f64, a.n as f64))).fold((0.0, 0.0), |s, x| (s.0 + x.0, s.1 + x.1));
+            (den > 0.0).then(|| num / den)
+        };
+        let mean_abs_dev = weighted(&|a| a.mean_abs_dev);
+        let rms_dev = weighted(&|a| a.rms_dev.map(|r| r * r)).map(f64::sqrt);
+        let in_band_rate = weighted(&|a| a.in_band_rate);
+        let far = |a: &AreaAxis| a.mean_abs_dev.unwrap_or(a.mean_dev.abs());
+        let worst = axes.iter().max_by(|a, b| far(a).total_cmp(&far(b))).cloned();
+        AreaReport {
+            track: track.as_str().into(),
+            prefix,
+            n: axes.iter().map(|a| a.n).sum(),
+            legacy_axes: axes.iter().filter(|a| a.mean_abs_dev.is_none()).count(),
+            mean_abs_dev,
+            rms_dev,
+            in_band_rate,
+            worst,
+            axes,
+        }
     }
 
     /// Past mean squared error of a forecasting method (see `noto-ts` fusion).
@@ -563,7 +825,7 @@ impl SdsStore {
     pub fn gate_rates(&self, scope: &Scope) -> Vec<GateRate> {
         let l = scope.track.ledger();
         let mut out = Vec::new();
-        for key in [scope.key_secondary(), scope.key_primary(), scope.key_global()] {
+        for (key, _) in self.levels(scope) {
             if let Some(st) = self.merged_scope(l, &key) {
                 if st.gates.is_empty() {
                     continue;
@@ -589,7 +851,7 @@ impl SdsStore {
     /// Baseline axes with a name prefix, from the first scope level that has any.
     pub fn axes_of(&self, scope: &Scope, prefix: &str) -> Vec<AxisStatus> {
         let l = scope.track.ledger();
-        for key in [scope.key_secondary(), scope.key_primary(), scope.key_global()] {
+        for (key, _) in self.levels(scope) {
             if let Some(st) = self.merged_scope(l, &key) {
                 let mut v: Vec<AxisStatus> = st
                     .baseline
@@ -627,6 +889,7 @@ impl SdsStore {
                     updated_at: now_ms(),
                     observations: run.observations,
                     scopes: run.scopes.clone(),
+                    engine_rev: self.engine_rev.clone(),
                 };
                 let rdir = dir.join("runs").join(l.as_str());
                 let _ = std::fs::create_dir_all(&rdir);
@@ -639,6 +902,7 @@ impl SdsStore {
             }
             let mut snapshot = self.bases.get(&l).cloned().unwrap_or_default();
             snapshot.recipe = SDS_RECIPE.into();
+            snapshot.engine_revs = self.engine_revs(l);
             if let Some(run) = self.runs.get(&l) {
                 for (k, v) in run.scopes.iter() {
                     snapshot.scopes.entry(k.clone()).or_default().absorb(v.clone(), ring_for_key(k), now_ms());
@@ -678,7 +942,13 @@ impl SdsStore {
     /// Flushes, then folds the open run buffers into the ledgers.
     pub fn close_runs(&mut self) {
         self.flush();
+        let revs: Vec<(Ledger, Vec<String>)> = Ledger::ALL.iter().map(|l| (*l, self.engine_revs(*l))).collect();
         let runs: Vec<(Ledger, RunBuf)> = self.runs.drain().collect();
+        for (l, revs) in revs {
+            if let Some(b) = self.bases.get_mut(&l) {
+                b.engine_revs = revs;
+            }
+        }
         for (l, run) in runs {
             let base = self.bases.entry(l).or_default();
             for (k, v) in run.scopes.into_iter() {
@@ -766,6 +1036,7 @@ impl SdsStore {
                 scopes: keys.len(),
                 observations: obs,
                 run_observations: run.map(|r| r.observations).unwrap_or(0),
+                engine_revs: self.engine_revs(l),
             });
         }
         axes.sort_by(|a, b| b.n.cmp(&a.n).then(a.scope.cmp(&b.scope)).then(a.axis.cmp(&b.axis)));
@@ -798,7 +1069,19 @@ impl SdsStore {
 }
 
 fn fresh_file() -> SdsFile {
-    SdsFile { recipe: SDS_RECIPE.into(), updated_at: now_ms(), scopes: HashMap::new() }
+    SdsFile { recipe: SDS_RECIPE.into(), updated_at: now_ms(), scopes: HashMap::new(), engine_revs: Vec::new() }
+}
+
+/// What [`SdsStore::record_reference`] collected for an axis in one scope (scope key left empty).
+fn reference_of(st: &ScopeStat, axis: &str) -> Option<ReferenceReport> {
+    let v = st.baseline.get(axis)?;
+    let d = st.baseline.get(&format!("{axis}:dev"))?;
+    let b = st.agreement.get(&format!("{axis}:in_band"))?;
+    let mean_ref = st.baseline.get(&format!("{axis}:ref")).map_or(f64::NAN, |w| w.mean);
+    let mean_tol = st.baseline.get(&format!("{axis}:tol")).map_or(f64::NAN, |w| w.mean);
+    let mean_abs_dev = st.baseline.get(&format!("{axis}:absdev")).filter(|w| w.n > 0).map(|w| w.mean);
+    let rms_dev = st.baseline.get(&format!("{axis}:dev2")).filter(|w| w.n > 0).map(|w| w.mean.max(0.0).sqrt());
+    Some(ReferenceReport { scope: String::new(), n: v.n, mean: v.mean, sd: v.sd(), mean_dev: d.mean, recent_dev: d.recent_mean(), in_band_rate: b.mean, mean_ref, mean_tol, mean_abs_dev, rms_dev })
 }
 
 fn axis_status(scope: &str, axis: &str, kind: &str, w: &Welford) -> AxisStatus {
@@ -1131,5 +1414,130 @@ mod tests {
         // The new tracks land in their own ledgers.
         assert!(s.status(10).ledgers.iter().any(|l| l.ledger == "body" && l.observations > 0));
         assert_eq!(Track::Depth.ledger(), Ledger::Ml);
+    }
+
+    #[test]
+    fn reference_reports_say_how_far_and_not_only_which_side() {
+        let mut s = SdsStore::memory();
+        let scope = Scope::new(Track::Act, "grasp:ts", "log");
+        // Reference 1.0 ± 0.5: +2 and −2 tolerances cancel in the signed mean.
+        for _ in 0..4 {
+            s.record_reference(&scope, "preload_s", 2.0, 1.0, 0.5);
+            s.record_reference(&scope, "preload_s", 0.0, 1.0, 0.5);
+        }
+        let r = s.reference_report(&scope, "preload_s").unwrap();
+        assert!(r.mean_dev.abs() < 1e-12, "{r:?}");
+        assert!((r.mean_abs_dev.unwrap() - 2.0).abs() < 1e-12 && (r.rms_dev.unwrap() - 2.0).abs() < 1e-12);
+        assert_eq!(r.in_band_rate, 0.0);
+        let e = s.exact_reference(&scope, "preload_s").unwrap();
+        assert_eq!((e.mean_abs_dev, e.rms_dev, e.scope.as_str()), (r.mean_abs_dev, r.rms_dev, "act|grasp:ts|log"));
+    }
+
+    #[test]
+    fn the_area_report_pools_every_reference_axis_of_a_prefix_once() {
+        let mut s = SdsStore::memory();
+        // Two secondaries under one primary: read at the primary, nothing counted twice.
+        for item in ["log", "stone"] {
+            for v in [1.0, 3.0] {
+                s.record_reference(&Scope::new(Track::Act, "grasp:ts", item), "preload_s", v, 1.0, 1.0);
+            }
+        }
+        // Another primary under the prefix, |dev| 4 three times.
+        for _ in 0..3 {
+            s.record_reference(&Scope::new(Track::Act, "grasp>part", "reach"), "trunk_deg", 5.0, 1.0, 1.0);
+        }
+        // A primary outside the prefix, and an axis recorded before |dev| existed.
+        s.record_reference(&Scope::new(Track::Act, "nn:grasp", "foot"), "margin", 9.0, 0.0, 1.0);
+        for _ in 0..2 {
+            s.record_baseline(&Scope::new(Track::Act, "grasp:old", ""), "x:dev", -0.5);
+        }
+        let r = s.area_report(Track::Act, "grasp");
+        assert_eq!(r.axes.len(), 3, "{:?}", r.axes);
+        assert_eq!(r.n, 4 + 3 + 2);
+        assert_eq!(r.legacy_axes, 1);
+        // |dev|: preload 0,0,2,2 (mean 1, n 4), trunk 4 (n 3) → (4·1 + 3·4) / 7.
+        assert!((r.mean_abs_dev.unwrap() - 16.0 / 7.0).abs() < 1e-9, "{r:?}");
+        // dev²: preload 0,0,4,4 (mean 2), trunk 16 → √((4·2 + 3·16) / 7).
+        assert!((r.rms_dev.unwrap() - (56.0f64 / 7.0).sqrt()).abs() < 1e-9);
+        assert_eq!(r.worst.as_ref().map(|a| a.axis.as_str()), Some("trunk_deg"));
+        assert_eq!(s.area_report(Track::Act, "").axes.len(), 4, "the whole track");
+        assert!(s.area_report(Track::Vision, "").axes.is_empty());
+    }
+
+    #[test]
+    fn a_scope_policy_keeps_model_modes_apart() {
+        let mut s = SdsStore::memory();
+        let real = Scope::new(Track::Locate, "parcel", "siglip2");
+        let stand_in = Scope::new(Track::Locate, "parcel", "stand_in");
+        feed(&mut s, &stand_in, "peak", 30, 0.9);
+        feed(&mut s, &real, "peak", 3, 0.1);
+        // Pooled (the default): the thin real-model scope answers with the stand-in's statistics.
+        let (m, _, _) = s.adaptive_baseline(&real, "peak").unwrap();
+        assert!(m > 0.7, "{m}");
+        s.set_policy(Track::Locate, ScopePolicy::KEEP_SECONDARIES);
+        assert!(s.adaptive_baseline(&real, "peak").is_none(), "the real model waits for its own observations");
+        assert_eq!(s.adaptive_baseline_scoped(&stand_in, "peak").unwrap().1, "locate|parcel|stand_in");
+        // A scope without a secondary may still use its primary.
+        assert!(s.adaptive_baseline(&Scope::new(Track::Locate, "parcel", ""), "peak").is_some());
+        // Exact: a thin primary does not back off to the global scope either.
+        let tips = Scope::new(Track::Depth, "tips", "");
+        feed(&mut s, &Scope::new(Track::Depth, "stand_in", ""), "scale", 25, 1.25);
+        feed(&mut s, &tips, "scale", 2, 0.9);
+        assert!(s.adaptive_baseline(&tips, "scale").is_some(), "pooled through the global scope");
+        s.set_policy(Track::Depth, ScopePolicy::EXACT);
+        assert!(s.adaptive_baseline(&tips, "scale").is_none());
+        assert_eq!(s.policy(Track::Vision), ScopePolicy::POOLED);
+    }
+
+    #[test]
+    fn runs_and_ledgers_carry_the_engine_revision() {
+        let dir = tmpdir("rev");
+        {
+            let mut s = SdsStore::open_with(&dir, OpenOptions::stamped("r1"));
+            for i in 0..5 {
+                s.record_baseline(&Scope::new(Track::Forecast, "x", ""), "a", i as f64);
+            }
+            s.close_runs();
+        }
+        let ledger: SdsFile = serde_json::from_str(&std::fs::read_to_string(dir.join("task.json")).unwrap()).unwrap();
+        assert_eq!(ledger.engine_revs, vec!["r1".to_string()]);
+        let run = std::fs::read_dir(dir.join("runs").join("task")).unwrap().next().unwrap().unwrap().path();
+        assert!(std::fs::read_to_string(run).unwrap().contains("\"engine_rev\": \"r1\""));
+        // Another revision keeps the old observations by default and lists both.
+        {
+            let mut s = SdsStore::open_with(&dir, OpenOptions::stamped("r2"));
+            assert!(s.adaptive_baseline(&Scope::new(Track::Forecast, "x", ""), "a").is_some());
+            s.record_baseline(&Scope::new(Track::Forecast, "x", ""), "a", 9.0);
+            assert_eq!(s.engine_revs(Ledger::Task), vec!["r1".to_string(), "r2".to_string()]);
+            assert!(s.status(1).ledgers.iter().any(|l| l.ledger == "task" && l.engine_revs.len() == 2));
+            s.close_runs();
+        }
+        // Reading only r2: the mixed ledger is set aside (kept on disk), the store starts empty.
+        let s = SdsStore::open_with(&dir, OpenOptions::only("r2"));
+        assert!(s.adaptive_baseline(&Scope::new(Track::Forecast, "x", ""), "a").is_none());
+        assert!(s.log_lines().iter().any(|l| l.contains("다른 엔진 개정")), "{:?}", s.log_lines());
+        let aside: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().starts_with("task.rev-")).collect();
+        assert_eq!(aside.len(), 1);
+        drop(s);
+        // A ledger written before the stamp counts as unstamped.
+        let legacy = tmpdir("rev_legacy");
+        std::fs::create_dir_all(&legacy).unwrap();
+        let mut old = fresh_file();
+        let mut st = ScopeStat::default();
+        st.baseline.entry("a".into()).or_default().push(1.0, 4);
+        old.scopes.insert("forecast||".into(), st);
+        let txt = serde_json::to_string(&old).unwrap().replace(",\"engine_revs\":[]", "");
+        std::fs::write(legacy.join("task.json"), txt).unwrap();
+        let s = SdsStore::open_with(&legacy, OpenOptions::stamped("r2"));
+        assert_eq!(s.engine_revs(Ledger::Task), vec![UNSTAMPED.to_string()]);
+        drop(s);
+        // An unstamped reader that keeps only its own revision keeps the unstamped ledger.
+        let s = SdsStore::open_with(&legacy, OpenOptions::only(""));
+        assert!(s.adaptive_baseline(&Scope::new(Track::Forecast, "", ""), "a").is_none(), "one observation is below the minimum");
+        assert_eq!(s.engine_revs(Ledger::Task), vec![UNSTAMPED.to_string()]);
+        assert!(!s.log_lines().iter().any(|l| l.contains("다른 엔진 개정")), "{:?}", s.log_lines());
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&legacy);
     }
 }
