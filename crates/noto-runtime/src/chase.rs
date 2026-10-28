@@ -69,9 +69,12 @@ pub fn overlay(
             None => Value::Null,
         }
     };
+    // A wheeled or tracked base is drawn as a lift truck: only its drive joints are on it to mark.
+    let truck = noto_core::act::fork::applies(&world.body);
     let joints: Vec<Value> = pose
         .joints
         .iter()
+        .filter(|j| !truck || j.name.starts_with("drive"))
         .map(|j| {
             json!({
                 "name": j.name, "kind": j.kind, "at": px(j.pos), "q_deg": j.q_deg.map(r3),
@@ -125,7 +128,9 @@ mod tests {
 
     #[test]
     fn the_chase_view_shows_the_robot_and_its_joints() {
-        let w = World::new(WorldConfig { cells: 40, ..WorldConfig::default() }).unwrap();
+        let mut noto = noto_core::NotoConfig::preset(noto_core::FingerCount::Five);
+        noto.base = noto_core::BaseKind::HumanFoot;
+        let w = World::new(WorldConfig { cells: 40, noto, ..WorldConfig::default() }).unwrap();
         let cam = Camera { width: 192, height: 128, fov_deg: 64.0, max_dist_m: 30.0, ..Camera::default() };
         let (f, o) = render(&w, &cam, 0.0);
         let o = o.expect("an overlay");
@@ -136,6 +141,10 @@ mod tests {
         let vis = joints.iter().filter(|j| j["at"]["visible"] == true).count();
         assert!(vis >= 3, "{vis} joints visible");
         assert!(o["zmp"].is_object() && o["support"].as_array().unwrap().len() == 4);
+        let truck = World::new(WorldConfig { cells: 40, ..WorldConfig::default() }).unwrap();
+        let (f, _) = render(&truck, &cam, 0.0);
+        let robot_px = (0..f.width * f.height).filter(|&i| f.ids[i] == 0 && f.depth[i] < CHASE_DIST_M + 1.0).count();
+        assert!(robot_px > 200, "the wheeled base is drawn as a lift truck: {robot_px} robot pixels");
     }
 
     #[test]

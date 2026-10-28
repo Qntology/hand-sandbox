@@ -118,7 +118,7 @@
 @media (prefers-reduced-motion: reduce) { .zone[data-level="crit"] .z-base { animation: none; } }
 
 /* 3인칭 관절 물리: 관절 점·CoM·ZMP 오버레이와 관절 표 */
-.joint-layer { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.frame-box .joint-layer { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; background: transparent; }
 .joint-panel { position: absolute; right: 10px; bottom: 58px; z-index: 7; width: 280px; max-height: 62%; overflow: auto; padding: 8px 10px; font-size: 0.66rem; color: var(--text); }
 .joint-panel .jp-head { display: flex; justify-content: space-between; gap: 6px; margin-bottom: 4px; }
 .joint-panel .jp-head span { color: var(--text-dim); text-align: right; }
@@ -171,4 +171,8 @@
 .gaze-reticle.ok { border-color: var(--success); color: var(--success); }
 .gaze-reticle.fail { border-color: var(--danger); color: var(--danger); }
 .viewport-canvas-wrap[data-h="short"] .pick-hud .ph-pose { display: none; }
+.ph-forkcam { margin: 6px 0 0; position: relative; }
+.ph-forkcam canvas { display: block; width: 100%; aspect-ratio: 4 / 3; border-radius: 4px; border: 1px solid var(--border-strong); background: #000; }
+.ph-forkcam figcaption { position: absolute; left: 5px; top: 4px; font-size: 0.56rem; color: #fff; text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8); }
+.viewport-canvas-wrap[data-h="short"] .pick-hud .ph-forkcam { display: none; }
 @media (prefers-reduced-motion: reduce) { .ph-stage.active .ph-dot { animation: none; } }

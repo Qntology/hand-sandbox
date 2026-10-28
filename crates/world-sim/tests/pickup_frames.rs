@@ -66,6 +66,8 @@ fn a_looked_down_pixel_lands_back_on_the_log() {
         while w.busy() {
             w.tick();
         }
+        // Legs bend the head down to it; on wheels the rider keeps looking ahead and the fork carriage camera sees it.
+        w.fork_cam = base != BaseKind::HumanFoot;
         let cam = Camera::default();
         let f = w.render(&cam);
         let hv = w.head_view(&cam);
@@ -82,7 +84,7 @@ fn a_looked_down_pixel_lands_back_on_the_log() {
                 n += 1;
             }
         }
-        assert!(n > 50, "{base:?}: the log is in view while the head is down ({n} px)");
+        assert!(n > 50, "{base:?}: the log is in view while the head (or the fork camera) is down ({n} px)");
         let (cx, cz) = (sx / n as f32, sz / n as f32);
         let err = (cx - dx).hypot(cz - dz);
         println!("[RECON] {base:?} pitch {:.1}° eye {:.2} m · log px {n} · centroid off {:.3} m", hv.view.pitch.to_degrees(), hv.eye_m, err);

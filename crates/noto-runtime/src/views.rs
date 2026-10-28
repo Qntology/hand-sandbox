@@ -64,6 +64,7 @@ pub fn parse_view(view: &str) -> Result<FrameView, String> {
     match (id, args.as_slice()) {
         ("agent", []) => Ok(FrameView::Agent),
         ("top", []) => Ok(FrameView::Top),
+        ("fork", []) => Ok(FrameView::Fork),
         ("chase", []) => Ok(FrameView::Chase { orbit_deg: 0 }),
         ("chase", [o]) => Ok(FrameView::Chase { orbit_deg: num(o, "궤도 각")?.clamp(-180.0, 180.0) as i16 }),
         ("focus", []) => Ok(FrameView::Focus(FocusCam::Hand)),
@@ -266,7 +267,9 @@ mod tests {
         let (f, o) = render_iso(&rt.world, &cam, &mut rt.iso, 0, 1.0, false);
         let o = o.expect("an overlay");
         assert_eq!(o["camera"]["kind"], "iso");
-        assert!(o["joints"].as_array().unwrap().iter().filter(|j| j["at"]["visible"] == true).count() >= 3);
+        // The wheeled robot is drawn as a lift truck: its overlay marks only the drive joints (inside the truck body).
+        let joints = o["joints"].as_array().unwrap();
+        assert!(!joints.is_empty() && joints.iter().all(|j| j["name"].as_str().unwrap_or("").starts_with("drive") && j["at"].is_object()), "{joints:?}");
         let (x0, y0) = robot_centre(&f);
         assert!((x0 - 96.0).abs() < 15.0 && (y0 - 64.0).abs() < 18.0, "({x0}, {y0})");
         let (ax, az) = (rt.world.agent.x, rt.world.agent.z);

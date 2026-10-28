@@ -147,7 +147,9 @@ export function setTeamMode({ teamSize = 2, activeRobot = 1 } = {}) {
 export function snapshot() {
   const w = need();
   const teamSize = w.teamSize ?? 2;
-  const activeRobot = w.active?.rt?.coPhase ?? w.agent.activeRobot ?? 1;
+  const activeRt = w.rt.get(w.quests.find((q) => q.state === 'active')?.id);
+  const coPhase = activeRt?.coPhase ?? null;
+  const activeRobot = coPhase ?? w.agent.activeRobot ?? 1;
   const partnerPos = w.partnerPos ?? [w.agent.pos[0] - 0.85, w.agent.pos[1] + 0.45];
   const partnerYawDeg = ((w.partnerYaw ?? w.agent.yaw) * 180) / Math.PI;
   return {
@@ -163,12 +165,12 @@ export function snapshot() {
       speed_mps: w.agent.speed,
       base: w.base,
       active_robot: activeRobot,
-      co_phase: w.active?.rt?.coPhase ?? null,
+      co_phase: coPhase,
       partner: teamSize === 2 ? {
         robot_index: activeRobot === 1 ? 2 : 1,
         pos: partnerPos,
         yaw_deg: partnerYawDeg,
-        holding: w.active?.rt?.coPhase === 2,
+        holding: coPhase === 2,
       } : null,
       carrying: stack(w.agent.carrying),
       motion: w.agent.maneuver
@@ -568,7 +570,93 @@ function startPick(rt, drop) {
   rt.pick = { drop, stage: 'approach', t: 0, check: null };
 }
 
+// ── 지게차: 바퀴·메카넘·트랙 몸은 탑승자가 정면을 보고, 포크를 내려 포크 카메라로 확인한 뒤 끼워 들어올린다 ──
+// (Rust noto_core::act::fork 와 같은 순서·값의 모의판)
+export const FORK_STAGES = [
+  ['approach', '다가가기'],
+  ['align', '정렬 (정면 응시)'],
+  ['lower', '포크 내림'],
+  ['check', '포크 카메라 확인'],
+  ['insert', '포크 끼우기'],
+  ['raise', '들어올림'],
+];
+const FORK_REST_M = 0.05;
+const FORK_CARRY_M = 0.10;
+const FORK_MPS = 0.10;
+const FORK_STANDOFF_M = 0.58;
+const FORK_LOAD_X_M = 0.34;
+export const usesForks = () => !!W && ['wheel', 'mecanum', 'track'].includes(W.base);
+
+function forkStep(q, rt, needsCoCarry = false, coPhase = 1) {
+  const a = W.agent;
+  const p = rt.pick;
+  const drop = p.drop;
+  a.fork_m = a.fork_m ?? FORK_REST_M;
+  a.neck_deg = 0;
+  a.trunk_deg = 0;
+  applyCameraPose(a, 0, 0);
+  if (p.stage !== 'raise' && !W.drops.includes(drop)) {
+    rt.pick = null;
+    return 'lost';
+  }
+  switch (p.stage) {
+    case 'approach': {
+      const left = moveToward(drop.pos, FORK_STANDOFF_M);
+      if (left <= 0) Object.assign(p, { stage: 'align', t: 0 });
+      break;
+    }
+    case 'align': {
+      const rem = turnToward(drop.pos);
+      if (Math.abs(rem) < 0.06) Object.assign(p, { stage: 'lower', t: 0 });
+      break;
+    }
+    case 'lower': {
+      a.fork_m = Math.max(0, a.fork_m - FORK_MPS * DT);
+      if (a.fork_m <= 0) {
+        Object.assign(p, { stage: 'check', t: 0 });
+        log('vision', 'info', `[로봇 ${coPhase}] 포크를 바닥까지 내림: ${rt.it.ko} — 탑승자는 정면, 포크 카메라로 확인`, { robot_index: coPhase, fork_m: 0 });
+      }
+      break;
+    }
+    case 'check': {
+      p.t += 1;
+      if (p.t === 1) {
+        const range = dist2(a.pos, drop.pos);
+        const bearing = Math.abs(wrapAngle(Math.atan2(drop.pos[1] - a.pos[1], drop.pos[0] - a.pos[0]) - a.yaw));
+        const seen = range < 1.5 && bearing < 0.5;
+        p.check = seen ? { ok: true, label_ko: rt.it.ko, score: Number((0.86 + W.rng() * 0.1).toFixed(2)), range_m: Number(range.toFixed(2)), depth_m: Number((range * (1 + (W.rng() - 0.5) * 0.04)).toFixed(2)) } : { ok: false, reason: '포크 카메라 화면 안에 대상이 없음' };
+        log('vision', p.check.ok ? 'info' : 'warn', p.check.ok ? `[로봇 ${coPhase}] 비전 확인 ✓ ${rt.it.ko} ${p.check.range_m} m (깊이 ${p.check.depth_m} m) · 포크 카메라` : `[로봇 ${coPhase}] 비전 확인 실패: ${p.check.reason}`, { robot_index: coPhase, check: p.check });
+      }
+      if (p.t >= 2) Object.assign(p, p.check?.ok ? { stage: 'insert', t: 0 } : { stage: 'approach', t: 0, check: null });
+      break;
+    }
+    case 'insert': {
+      const left = moveToward(drop.pos, FORK_LOAD_X_M);
+      if (left <= 0) {
+        if (needsCoCarry && coPhase === 1) return 'phase1_ready';
+        W.drops.splice(W.drops.indexOf(drop), 1);
+        Object.assign(p, { stage: 'raise', t: 0 });
+      }
+      break;
+    }
+    case 'raise': {
+      a.fork_m = Math.min(FORK_CARRY_M, a.fork_m + FORK_MPS * DT);
+      W.energy += (needsCoCarry ? 6 : 12) * DT;
+      if (a.fork_m >= FORK_CARRY_M) {
+        a.carrying.push({ item_id: rt.key, label_ko: rt.it.ko, mass_kg: rt.it.mass });
+        rt.pick = null;
+        return 'picked';
+      }
+      break;
+    }
+    default:
+      break;
+  }
+  return 'busy';
+}
+
 function pickStep(q, rt, needsCoCarry = false, coPhase = 1) {
+  if (usesForks()) return forkStep(q, rt, needsCoCarry, coPhase);
   const a = W.agent;
   const p = rt.pick;
   const drop = p.drop;
@@ -666,6 +754,25 @@ export function procedureView() {
   const p = rt?.pick;
   if (!p) return null;
   const a = W.agent;
+  if (usesForks()) {
+    const at = FORK_STAGES.findIndex(([id]) => id === p.stage);
+    return {
+      act: ['align', 'lower', 'check'].includes(p.stage) ? 'look' : 'pick',
+      mechanism: 'fork',
+      camera: ['lower', 'check', 'insert'].includes(p.stage) ? 'fork' : 'head',
+      target: p.drop.id,
+      label_ko: (W.teamSize ?? 2) >= 2 ? `${rt.it.ko} [로봇 ${rt.coPhase ?? 1}/2]` : rt.it.ko,
+      stage: p.stage,
+      stages: FORK_STAGES.map(([id, label_ko], i) => ({ id, label_ko, state: i < at ? 'done' : i === at ? 'active' : 'pending' })),
+      fork_m: a.fork_m ?? FORK_REST_M,
+      neck_deg: 0,
+      trunk_deg: 0,
+      eye_m: a.eye_m,
+      standing_eye_m: a.standing_eye_m,
+      pitch_deg: a.pitch_deg,
+      check: p.check,
+    };
+  }
   const at = PICK_STAGES.findIndex(([id]) => id === p.stage);
   const teamCoop = (W.teamSize ?? 2) >= 2;
   const phaseLabel = teamCoop ? ` [로봇 ${rt.coPhase ?? 1}/2]` : '';
@@ -708,7 +815,7 @@ function runStep(q, rt) {
     case 'approach': {
       const total = rt.total ?? (rt.total = Math.max(1, dist2(a.pos, rt.node.pos)));
       const left = moveToward(rt.node.pos, 1.0);
-      if (q.steps.some((x) => x.kind === 'look_down') && dist2(a.pos, rt.node.pos) <= 1.6) {
+      if (q.steps.some((x) => x.kind === 'look_down') && dist2(a.pos, rt.node.pos) <= 1.6 && !usesForks()) {
         lookDownAt(a, rt.node.pos);
       } else {
         applyCameraPose(a, 0, 0);
@@ -726,9 +833,10 @@ function runStep(q, rt) {
       if (!drop) return failQuest(q, rt, `확인할 ${rt.it.ko} 드롭이 없습니다`);
       if (!rt.pick) startPick(rt, drop);
       if (pickStep(q, rt) === 'lost') break;
-      const at = PICK_STAGES.findIndex(([id]) => id === rt.pick?.stage);
-      s.progress = Math.min(1, at / 3);
-      if (rt.pick?.stage === 'bend') nextStep(q, rt);
+      const forks = usesForks();
+      const at = (forks ? FORK_STAGES : PICK_STAGES).findIndex(([id]) => id === rt.pick?.stage);
+      s.progress = Math.min(1, at / (forks ? 4 : 3));
+      if (rt.pick?.stage === (forks ? 'insert' : 'bend')) nextStep(q, rt);
       break;
     }
     case 'mine': {
@@ -756,7 +864,8 @@ function runStep(q, rt) {
     }
     case 'collect': {
       const teamCoop = (W.teamSize ?? 2) >= 2;
-      const soloGripFail = W.config?.fingers <= 2 && rt.it.mass >= 3;
+      // 지게차(바퀴·메카넘·트랙)는 손가락으로 쥐지 않으므로 파지 불안정이 없다.
+      const soloGripFail = !usesForks() && W.config?.fingers <= 2 && rt.it.mass >= 3;
       const soloLoadFail = loadKg() + rt.it.mass > LOAD_LIMIT;
       const needsCoCarry = teamCoop || soloGripFail || soloLoadFail;
       const effectiveMass = needsCoCarry ? rt.it.mass * 0.5 : rt.it.mass;
@@ -811,10 +920,11 @@ function runStep(q, rt) {
         log('world', 'info', `${rt.it.ko} ${needsCoCarry ? '순차 협동 ' : ''}줍기 완료 (${rt.collected}/${rt.count}), 분담 적재 ${loadKg().toFixed(1)} kg`, { grasp_margin: needsCoCarry ? 0.85 : 0.8 });
       }
 
-      const at = rt.pick ? PICK_STAGES.findIndex(([id]) => id === rt.pick.stage) : 0;
+      const stagesNow = usesForks() ? FORK_STAGES : PICK_STAGES;
+      const at = rt.pick ? stagesNow.findIndex(([id]) => id === rt.pick.stage) : 0;
       const phaseFrac = needsCoCarry
-        ? ((rt.coPhase - 1) * 0.5 + (at / PICK_STAGES.length) * 0.5)
-        : (at / PICK_STAGES.length);
+        ? ((rt.coPhase - 1) * 0.5 + (at / stagesNow.length) * 0.5)
+        : (at / stagesNow.length);
       s.progress = (rt.collected + phaseFrac) / rt.count;
 
       if (rt.collected >= rt.count) {
@@ -836,7 +946,13 @@ function runStep(q, rt) {
       break;
     }
     case 'deliver': {
-      applyCameraPose(a, 10, 0.05);
+      if (usesForks()) {
+        // 지게차: 탑승자는 정면, 포크를 내려 짐을 놓고 물러난 뒤 포크를 다시 올린다.
+        applyCameraPose(a, 0, 0);
+        a.fork_m = rt.work < 4 ? Math.max(0, (a.fork_m ?? FORK_CARRY_M) - FORK_MPS * DT * 1.25) : Math.min(FORK_REST_M, (a.fork_m ?? 0) + FORK_MPS * DT);
+      } else {
+        applyCameraPose(a, 10, 0.05);
+      }
       rt.work += 1;
       s.progress = rt.work / 8;
       if (rt.work >= 8) {

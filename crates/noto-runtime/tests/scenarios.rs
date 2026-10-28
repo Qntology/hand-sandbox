@@ -104,35 +104,22 @@ fn collecting_without_a_destination_keeps_the_items_in_hand() {
 }
 
 #[test]
-fn a_wheeled_body_pushes_what_it_cannot_reach() {
+fn a_wheeled_body_lifts_the_log_on_its_forks_and_keeps_it_there_without_a_destination() {
     let wheeled = || Runtime::new(RuntimeConfig { seed: 7, noise: NoiseCfg::none(), ..RuntimeConfig::default() }, LEXICON, None).expect("runtime");
     let mut rt = wheeled();
     assert_eq!(rt.world().hand.base.kind, BaseKind::Wheel);
     let q = run_command(&mut rt, "원목 1개를 창고로 가져와", 40_000);
     assert_done(&rt, &q);
     assert_eq!(stock(&rt, "warehouse", ItemKind::Log), 1);
-    assert!(quest_log(&rt).contains("범퍼로 밀어"), "{}", quest_log(&rt));
-    assert_eq!(rt.world().carried_count(ItemKind::Log), 0, "it never held the log");
-    let mut rt = wheeled();
-    let q = run_command(&mut rt, "원목 1개 캐줘", 30_000);
-    assert_eq!(q.state, State::Failed, "{}", quest_log(&rt));
-    let f = q.failure.as_ref().unwrap();
-    assert_eq!(f.code, "reach_ground", "{f:?}");
-    assert!(f.message_ko.contains("손바닥"), "{}", f.message_ko);
-}
-
-#[test]
-fn a_wheeled_body_with_a_torso_lift_picks_the_log_up_from_the_floor() {
-    let cfg = RuntimeConfig { seed: 7, noise: NoiseCfg::none(), body: noto_core::BodyPlan::named("wheel_lift").unwrap(), ..RuntimeConfig::default() };
-    let mut rt = Runtime::new(cfg, LEXICON, None).expect("runtime");
-    assert_eq!(rt.world().hand.base.kind, BaseKind::Wheel);
-    let q = run_command(&mut rt, "원목 1개 캐줘", 40_000);
-    assert_done(&rt, &q);
-    assert_eq!(rt.world().carried_count(ItemKind::Log), 1, "the log is in the bay");
     let log = quest_log(&rt);
     assert!(!log.contains("범퍼로 밀어"), "{log}");
-    let world_log = rt.log_tail(0, 5000, None).0.iter().filter(|l| l.cat == "world").map(|l| l.msg.clone()).collect::<Vec<_>>().join("\n");
-    assert!(world_log.contains("몸통을 내리"), "{world_log}");
+    let world_log = rt.log_tail(0, 5000, None).0.iter().filter(|l| l.cat == "world").map(|l| l.msg.clone()).collect::<Vec<_>>().join("
+");
+    assert!(world_log.contains("포크") && world_log.contains("들어올림"), "{world_log}");
+    let mut rt = wheeled();
+    let q = run_command(&mut rt, "원목 1개 캐줘", 30_000);
+    assert_done(&rt, &q);
+    assert_eq!(rt.world().carried_count(ItemKind::Log), 1, "the log stays on the tines");
 }
 
 #[test]
@@ -391,4 +378,73 @@ fn a_parcel_seen_faintly_from_afar_is_walked_to_and_looked_down_at() {
     assert!(log.contains("가까이 가서 내려다보며 확인"), "no walk-up look:\n{log}");
     assert!(log.contains("내려다보고 확인"), "the close look did not confirm it:\n{log}");
     assert_done(&rt, &q);
+}
+
+fn vision_lines(rt: &Runtime) -> String {
+    rt.log_tail(0, 5000, Some("vision")).0.iter().map(|l| l.msg.clone()).collect::<Vec<_>>().join("\n")
+}
+
+/// What a log pick-up showed on the way: the deepest the neck bent, the deepest the head camera dipped below where it
+/// looks standing still, the lowest the fork tines went, and the vision and quest logs.
+struct PickLook {
+    neck_deg: f32,
+    dip_deg: f32,
+    fork_low_m: f32,
+    carried: bool,
+    log: String,
+}
+
+fn pick_with_look(base: BaseKind, body: noto_core::BodyPlan) -> PickLook {
+    let cfg = RuntimeConfig { seed: 7, noise: NoiseCfg::none(), noto: NotoConfig { base, ..RuntimeConfig::default().noto }, body, ..RuntimeConfig::default() };
+    let mut rt = Runtime::new(cfg, LEXICON, None).expect("runtime");
+    let rest = rt.head_view_json()["pitch_deg"].as_f64().unwrap_or(0.0) as f32;
+    let s = rt.submit("원목 1개를 캐서 창고로 가져와");
+    assert!(s.ok, "{:?}", s.error);
+    let (mut neck_deg, mut dip_deg, mut fork_low_m, mut carried) = (0.0f32, 0.0f32, f32::INFINITY, false);
+    let mut n = 0;
+    while n < 30_000 && rt.busy() {
+        rt.tick();
+        neck_deg = neck_deg.max(rt.world().current_kin_pose().neck_deg);
+        let v = rt.head_view_json();
+        dip_deg = dip_deg.max(rest - v["pitch_deg"].as_f64().unwrap_or(0.0) as f32);
+        fork_low_m = fork_low_m.min(rt.world().fork_m_now());
+        carried |= rt.world().carried_count(ItemKind::Log) > 0;
+        n += 1;
+    }
+    let log = format!("{}
+-- quest --
+{}", vision_lines(&rt), quest_log(&rt));
+    PickLook { neck_deg, dip_deg, fork_low_m, carried, log }
+}
+
+#[test]
+fn a_walker_bends_its_neck_to_look_at_the_item_before_the_hand_and_the_vision_check_runs() {
+    let p = pick_with_look(BaseKind::HumanFoot, noto_core::BodyPlan::default());
+    assert!(p.neck_deg > 20.0, "the neck bent only {:.0}°
+{}", p.neck_deg, p.log);
+    assert!(p.dip_deg > 20.0, "the camera dipped only {:.0}°
+{}", p.dip_deg, p.log);
+    assert!(p.log.contains("비전 확인 ✓") && p.log.contains("고개"), "no head-down vision check:
+{}", p.log);
+}
+
+#[test]
+fn wheels_and_tracks_lift_with_forks_while_the_rider_looks_ahead_and_the_fork_camera_checks() {
+    let lift = noto_core::BodyPlan::named("wheel_lift").unwrap();
+    let noneck = noto_core::BodyPlan { morph: noto_core::morph::Morphology::named("wheel_noneck").unwrap(), ..noto_core::BodyPlan::default() };
+    for (base, body, tag) in [(BaseKind::Wheel, noto_core::BodyPlan::default(), "wheel"), (BaseKind::Track, noto_core::BodyPlan::default(), "track"), (BaseKind::Mecanum, noto_core::BodyPlan::default(), "mecanum"), (BaseKind::Wheel, lift, "wheel+lift"), (BaseKind::Wheel, noneck, "wheel, no neck")] {
+        let p = pick_with_look(base, body);
+        assert!(p.neck_deg < 1.0, "{tag}: the rider does not bend to the floor ({:.0}°)
+{}", p.neck_deg, p.log);
+        assert!(p.dip_deg < 8.0, "{tag}: the rider keeps looking ahead (head camera {:.0}° below its mount)
+{}", p.dip_deg, p.log);
+        assert!(p.fork_low_m < 0.01, "{tag}: the tines went down to the floor ({:.3} m)
+{}", p.fork_low_m, p.log);
+        assert!(p.carried, "{tag}: the log rode on the tines
+{}", p.log);
+        assert!(p.log.contains("비전 확인 ✓") && p.log.contains("포크 카메라"), "{tag}: no fork-camera vision check:
+{}", p.log);
+        assert!(!p.log.contains("범퍼로 밀어"), "{tag}: it lifted rather than pushed
+{}", p.log);
+    }
 }

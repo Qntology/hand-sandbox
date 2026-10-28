@@ -6,7 +6,7 @@ import { bus, state } from './state.js';
 import { $, clear, el, fmt, observeResize } from './util.js';
 import { drawJointOverlay, renderJointPanel } from './joint-view.js';
 import { DRAWN_PARTS, PART_KO, drawFocus, partAvailable, resolvePart } from './focus-view.js';
-import { renderPickHud } from './pick-hud.js';
+import { renderPickHud, wantsForkCam } from './pick-hud.js';
 
 const POLL_MS = 160;
 const RETRY_MS = 2500;
@@ -169,6 +169,19 @@ function renderDetections() {
   }
 }
 
+// ── 지게차: 줍기 HUD 안의 포크 카메라 작은 화면 ──────────────────────
+async function drawForkCam(quality) {
+  const f = await call('world_frame', { width: 240, height: 180, quality, view: 'fork' }, { quiet: true });
+  const img = await decode(f.webp_base64);
+  const canvas = $('ph-forkcam');
+  if (canvas.width !== f.width || canvas.height !== f.height) {
+    canvas.width = f.width;
+    canvas.height = f.height;
+  }
+  canvas.getContext('2d').drawImage(img, 0, 0, f.width, f.height);
+  img.close?.();
+}
+
 // ── 폴링 ────────────────────────────────────────────────────────
 async function poll(force = false) {
   if (pending || state.centerTab !== 'world' || document.hidden || !state.snapshot) return;
@@ -183,6 +196,7 @@ async function poll(force = false) {
     const f = await call('world_frame', { ...p, view }, { quiet: true });
     lastKey = key;
     await drawFrame(f);
+    if (view === 'agent' && wantsForkCam(state.procedure)) await drawForkCam(p.quality);
   } catch (e) {
     retryAt = Date.now() + RETRY_MS;
     $('frame-info').textContent = `프레임 오류: ${e.message}`;

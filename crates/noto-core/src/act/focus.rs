@@ -151,7 +151,7 @@ pub fn parts_of(kind: ActKind, morph: &Morphology) -> Vec<Part> {
         ActKind::Grasp | ActKind::Release => vec![Part::Hand, Part::HandJoints, Part::Waist, Part::Neck],
         ActKind::Bend => vec![Part::Waist, Part::Neck, Part::Hand],
         ActKind::Look => vec![Part::Neck, Part::Waist],
-        ActKind::Push => vec![Part::Wheel, Part::Track],
+        ActKind::Push | ActKind::Fork => vec![Part::Wheel, Part::Track],
         ActKind::Walk => vec![Part::Foot, Part::FootJoints, Part::Waist, Part::Neck],
         ActKind::Drive => vec![Part::Wheel, Part::Track, Part::Neck],
     };

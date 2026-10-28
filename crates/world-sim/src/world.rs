@@ -348,6 +348,8 @@ pub struct World {
     pub site: Option<Site>,
     pub fixtures: Vec<Fixture>,
     pub gaze: Option<GazeHold>,
+    /// The eye is the fork carriage camera instead of the rider's head (a wheeled base checking an item at the floor).
+    pub fork_cam: bool,
 }
 
 impl Clone for World {
@@ -390,6 +392,7 @@ impl Clone for World {
             site: self.site.clone(),
             fixtures: self.fixtures.clone(),
             gaze: self.gaze,
+            fork_cam: self.fork_cam,
         }
     }
 }
@@ -683,6 +686,7 @@ impl World {
             site,
             fixtures,
             gaze: None,
+            fork_cam: false,
         })
     }
 
@@ -1003,6 +1007,20 @@ impl World {
                 self.check_reach(n.x, n.z, MINE_REACH_M)?;
                 Active::Work(WorkState { kind: WorkKind::Mine { node: *node }, remaining_s: n.hp })
             }
+            Action::PickUp { drop, .. } if noto_core::act::fork::applies(&self.body) => {
+                let (dx, dz, kind, amount) = {
+                    let d = self.drop_item(*drop).ok_or(ActionError::UnknownTarget)?;
+                    (d.x, d.z, d.kind, d.amount)
+                };
+                self.check_reach(dx, dz, PICKUP_REACH_M)?;
+                self.check_support(*drop)?;
+                let item_kg = kind.spec().mass_kg * amount;
+                if self.carried_kg() + item_kg > self.capacity_kg() + 1e-4 {
+                    return Err(ActionError::CapacityExceeded { carried_kg: self.carried_kg(), item_kg, capacity_kg: self.capacity_kg() });
+                }
+                let t = self.start_fork_pick(*drop)?;
+                Active::Work(WorkState { kind: WorkKind::Pick { drop: *drop, two_arms: false, face: Some((dx, dz)) }, remaining_s: t })
+            }
             Action::PickUp { drop, aim, side, memory_sigma_m } => {
                 let (dx, dz, kind, amount) = {
                     let d = self.drop_item(*drop).ok_or(ActionError::UnknownTarget)?;
@@ -1255,7 +1273,10 @@ impl World {
         };
         let heading = (tz - self.agent.z).atan2(tx - self.agent.x);
         let err = wrap_angle(heading - self.agent.yaw).abs();
-        if err > FACE_DONE_RAD {
+        // A fork act turns and drives the base itself: once it runs (or when it is a pick, which aligns first), the
+        // base no longer turns to face the target on its own.
+        let fork_steers = self.act.as_ref().is_some_and(|p| p.drive.is_some() && (p.elapsed_s > 0.0 || matches!(w.kind, WorkKind::Pick { .. })));
+        if err > FACE_DONE_RAD && !fork_steers {
             let t = self.rotate_toward(heading, remaining);
             self.add_energy(MANIPULATION_POWER_W * t as f64);
             return t;
@@ -2127,10 +2148,10 @@ mod tests {
         run(&mut iron, 20.0);
         assert!((iron.time_s - t0) as f32 >= PICKUP_TIME_S * TWO_ARM_LIFT_FACTOR - 0.15);
         let mut track = world_with(BodyPlan::default(), BaseKind::Track);
-        match place(&mut track, ItemKind::Log) {
-            Err(ActionError::CannotReach { lowest_m, need_m, .. }) => assert!(lowest_m > need_m + 0.3, "{lowest_m} {need_m}"),
-            other => panic!("{other:?}"),
-        }
+        assert!(place(&mut track, ItemKind::Log).is_ok(), "a track lifts the log on its forks instead of reaching for it");
+        let ev = run(&mut track, 20.0);
+        assert!(ev.iter().any(|e| matches!(e.event, WorldEvent::ItemPicked { .. })), "{ev:?}");
+        assert!(track.current_kin_pose().neck_deg.abs() < 1e-3, "the rider never bends to the floor");
     }
 
     #[test]
@@ -2263,7 +2284,7 @@ mod tests {
         assert!(w.agent.carried.is_empty() && w.carried_kg() == 0.0);
         let d = w.drops.last().unwrap();
         assert!((d.x - w.agent.x).abs() < DROP_AHEAD_M + 0.3 && d.x > w.agent.x, "ahead of the robot: {} vs {}", d.x, w.agent.x);
-        assert!(ev.iter().any(|e| matches!(&e.event, WorldEvent::Act { kind, .. } if kind == "impact")));
+        assert!(ev.iter().any(|e| matches!(&e.event, WorldEvent::Act { kind, .. } if kind == "fork_out")), "a track sets the load down with its forks and backs out");
     }
 
     #[test]
