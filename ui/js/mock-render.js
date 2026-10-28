@@ -12,7 +12,7 @@ const hash = (s) => {
   for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 16777619);
   return (h >>> 0) / 4294967296;
 };
-const DROP_COLOR = { wood: '#b98a4e', iron_ore: '#c4764a', coal: '#1c1c20', stone: '#9a9ca2' };
+const DROP_COLOR = { parcel: '#d49b54', wood: '#b98a4e', iron_ore: '#c4764a', coal: '#1c1c20', stone: '#9a9ca2' };
 
 function detection(o, bbox, w, h, tick) {
   const [id, ko] = o.drop ? [`${o.item_id}_drop`, `${o.label_ko} (드롭)`] : DETECT_LABEL[o.kind];
@@ -62,25 +62,32 @@ function drawObject(ctx, o, sx, gy, s) {
 }
 
 function drawAgentView(ctx, w, h, W, dets) {
-  const horizon = Math.round(h * 0.42);
   const f = w * 0.9;
-  const camH = 1.0;
+  const camH = W.agent.eye_m ?? 1.0;
+  const pitchRad = ((W.agent.pitch_deg ?? -12.0) * Math.PI) / 180;
+  const horizon = Math.round(h * 0.5 + Math.tan(pitchRad) * f);
+  const skyBottom = Math.max(0, Math.min(h, horizon));
   const [ax, ay] = W.agent.pos;
-  const yaw = W.agent.yaw;
+  const yaw = W.agent.yaw - ((W.agent.pan_deg ?? 0) * Math.PI) / 180;
   const cy = Math.cos(yaw);
   const sy = Math.sin(yaw);
-  const sky = ctx.createLinearGradient(0, 0, 0, horizon);
-  sky.addColorStop(0, '#27456b'); sky.addColorStop(1, '#a5bed8');
-  ctx.fillStyle = sky; ctx.fillRect(0, 0, w, horizon);
-  ctx.fillStyle = '#40604d';
-  for (let x = 0; x < w; x += 4) {
-    const ang = yaw + (x - w / 2) / f;
-    const hh = 12 + 12 * Math.sin(ang * 3 + W.seed) + 7 * Math.sin(ang * 7.3);
-    ctx.fillRect(x, horizon - hh, 4, hh);
+  if (skyBottom > 0) {
+    const sky = ctx.createLinearGradient(0, 0, 0, skyBottom);
+    sky.addColorStop(0, '#27456b');
+    sky.addColorStop(1, '#a5bed8');
+    ctx.fillStyle = sky;
+    ctx.fillRect(0, 0, w, skyBottom);
+    ctx.fillStyle = '#40604d';
+    for (let x = 0; x < w; x += 4) {
+      const ang = yaw + (x - w / 2) / f;
+      const hh = 12 + 12 * Math.sin(ang * 3 + W.seed) + 7 * Math.sin(ang * 7.3);
+      ctx.fillRect(x, horizon - hh, 4, hh);
+    }
   }
   const colors = [[['#42733c', '#3a6836'], ['#6b5a45', '#62523f']], [['#3b6a37', '#34602f'], ['#5f503d', '#584a38']]];
-  for (let y = horizon + 1; y < h; y += 2) {
-    const d = (camH * f) / (y - horizon);
+  const startY = Math.max(0, horizon + 1);
+  for (let y = startY; y < h; y += 2) {
+    const d = (camH * f) / Math.max(1, y - horizon);
     const fog = Math.min(1, d / 40);
     for (let x = 0; x < w; x += 8) {
       const ro = ((x + 4 - w / 2) / f) * d;
@@ -92,29 +99,40 @@ function drawAgentView(ctx, w, h, W, dets) {
       ctx.fillRect(x, y, 8, 2);
     }
   }
-  const haze = ctx.createLinearGradient(0, horizon, 0, horizon + h * 0.12);
-  haze.addColorStop(0, 'rgba(165,190,216,0.75)'); haze.addColorStop(1, 'rgba(165,190,216,0)');
-  ctx.fillStyle = haze; ctx.fillRect(0, horizon, w, h * 0.12);
-
+  if (horizon > -h * 0.12 && horizon < h) {
+    const haze = ctx.createLinearGradient(0, horizon, 0, horizon + h * 0.12);
+    haze.addColorStop(0, 'rgba(165,190,216,0.75)');
+    haze.addColorStop(1, 'rgba(165,190,216,0)');
+    ctx.fillStyle = haze;
+    ctx.fillRect(0, Math.max(0, horizon), w, h * 0.12);
+  }
   const objs = visibleObjects(28);
   for (const o of objs) {
-    if (o.forward < 0.7) continue;
+    if (o.forward < 0.25) continue;
     const s = f / o.forward;
     const sx = w / 2 + (o.right / o.forward) * f;
-    const gy = horizon + camH * s;
-    if (sx < -3 * s || sx > w + 3 * s) continue;
+    const objZ = o.pos[2] ?? 0;
+    const gy = horizon + (camH - objZ) * s;
+    if (sx < -3 * s || sx > w + 3 * s || gy < -2 * s || gy - 3 * s > h) continue;
     ctx.globalAlpha = Math.max(0.4, 1 - o.forward / 36);
     if (o.kind === 'waypoint') {
-      ctx.fillStyle = '#e8e8ea'; ctx.fillRect(sx - 0.04 * s, gy - 3 * s, 0.08 * s, 3 * s);
-      ctx.fillStyle = '#4aa3df'; ctx.beginPath(); ctx.moveTo(sx, gy - 3 * s); ctx.lineTo(sx + 0.9 * s, gy - 2.7 * s); ctx.lineTo(sx, gy - 2.4 * s); ctx.fill();
+      ctx.fillStyle = '#e8e8ea';
+      ctx.fillRect(sx - 0.04 * s, gy - 3 * s, 0.08 * s, 3 * s);
+      ctx.fillStyle = '#4aa3df';
+      ctx.beginPath();
+      ctx.moveTo(sx, gy - 3 * s);
+      ctx.lineTo(sx + 0.9 * s, gy - 2.7 * s);
+      ctx.lineTo(sx, gy - 2.4 * s);
+      ctx.fill();
       ctx.globalAlpha = 1;
       continue;
     }
     const bbox = drawObject(ctx, o, sx, gy, s);
     ctx.globalAlpha = 1;
-    if (bbox && o.forward < 20 && bbox[2] - bbox[0] >= 5 && bbox[2] > 0 && bbox[0] < w) dets.push({ o, bbox });
+    if (bbox && o.forward < 20 && bbox[2] - bbox[0] >= 5 && bbox[2] > 0 && bbox[0] < w && bbox[3] > 0 && bbox[1] < h) {
+      dets.push({ o, bbox });
+    }
   }
-  // 손(그리퍼) 힌트
   ctx.fillStyle = 'rgba(30,30,34,0.85)';
   ctx.fillRect(w / 2 - w * 0.05, h - h * 0.07, w * 0.1, h * 0.07);
 }
@@ -177,5 +195,24 @@ export function renderFrame({ width, height, quality, view }) {
   const detections = hits
     .sort((a, b) => a.o.dist - b.o.dist).slice(0, 12)
     .map(({ o, bbox }) => detection(o, bbox, w, h, W.tick));
-  return { webp_base64: b64, width: w, height: h, bytes: Math.floor((b64.length * 3) / 4) - pad, encode_ms, tick: W.tick, detections };
+  const a = W.agent;
+  const moving = (a.speed ?? 0) > 0.05;
+  const shakePitch = moving ? Math.sin(W.tick * 0.9) * 0.35 : 0;
+  const camera = view === 'top' ? null : {
+    eye_m: a.eye_m ?? 1.0,
+    standing_eye_m: a.standing_eye_m ?? 1.0,
+    mount_deg: a.mount_deg ?? -12.0,
+    head_pitch_deg: a.head_pitch_deg ?? 0.0,
+    pitch_deg: (a.pitch_deg ?? -12.0) + shakePitch,
+    pan_deg: a.pan_deg ?? 0.0,
+    roll_deg: a.roll_deg ?? 0.0,
+    blur_px: moving ? 0.4 : 0.0,
+    shake: {
+      source: moving ? (W.base === 'biped' || W.base === 'quadruped' ? 'sway' : 'rolling') : 'still',
+      pitch_deg: shakePitch,
+      dz_mm: moving ? 1.2 : 0.0,
+      rate_dps: moving ? [2, 4, 1] : [0, 0, 0],
+    },
+  };
+  return { webp_base64: b64, width: w, height: h, bytes: Math.floor((b64.length * 3) / 4) - pad, encode_ms, tick: W.tick, detections, camera };
 }

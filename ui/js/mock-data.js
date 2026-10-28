@@ -41,6 +41,13 @@ export const BASES = {
   human_foot: { kind: 'human_foot', max_speed_mps: 1.2, max_slope_deg: 20.0, max_step_m: 0.18, holonomic: false, power_w: 180.0, footprint_m: 0.25 },
 };
 
+export const BASE_TURN_SPECS = {
+  wheel: { turn_rate_rad_s: 1.4, turn_move_rad: 0.45 },
+  mecanum: { turn_rate_rad_s: 1.8, turn_move_rad: 0.85 },
+  track: { turn_rate_rad_s: 0.75, turn_move_rad: 0.25 },
+  human_foot: { turn_rate_rad_s: 1.0, turn_move_rad: 0.35 },
+};
+
 export const BASE_LABELS = {
   wheel: '바퀴 (4륜 차동)',
   mecanum: '메카넘 바퀴 (전방향)',

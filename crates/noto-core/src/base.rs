@@ -19,6 +19,15 @@ impl BaseKind {
         BaseKind::HumanFoot,
     ];
 
+    pub fn turn_rate_rad_s(self) -> f32 {
+        match self {
+            BaseKind::Wheel => 1.4,
+            BaseKind::Mecanum => 1.8,
+            BaseKind::Track => 0.75,
+            BaseKind::HumanFoot => 1.0,
+        }
+    }
+
     pub fn spec(self) -> BaseSpec {
         match self {
             BaseKind::Wheel => BaseSpec {

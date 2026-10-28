@@ -1,7 +1,7 @@
 // 모의 월드: 아주 작은 상태 기계. 실제 Rust 백엔드(world-sim, noto-quest)가 아니다.
 // 명령 "철광석 3개 캐서 베이스캠프로 가져와" → 퀘스트(탐색→접근→채취→줍기→운반→인도)가 틱마다 진행되고,
 // 에이전트가 움직이며 배터리·하중·피로 같은 신체 상태가 변한다.
-import { BASES } from './mock-data.js';
+import { BASES, BASE_TURN_SPECS } from './mock-data.js';
 import { levelOf } from './util.js';
 
 const DT = 0.2; // 틱당 초
@@ -9,6 +9,7 @@ const CAP_J = 30000; // 배터리 용량(가정)
 const LOAD_LIMIT = 20; // 적재 한계 kg(가정)
 
 const ITEMS = {
+  parcel: { ko: '택배', node: null, mass: 1.5, names: ['택배', '소포', '상자', '박스'], aliases: ['짐', '배달물'] },
   iron_ore: { ko: '철광석', node: 'iron_ore', mass: 2.5, names: ['철광석', '철광', '철광물'], aliases: ['쇠돌', '철석'] },
   coal: { ko: '석탄', node: 'coal_ore', mass: 1.2, names: ['석탄'], aliases: ['숯'] },
   wood: { ko: '목재', node: 'tree', mass: 3.0, names: ['목재', '나무', '원목'], aliases: ['통나무'] },
@@ -86,11 +87,25 @@ export function worldNew({ seed, size, config, base }) {
   const waypoints = WAYPOINTS.map((w) => ({ id: w.id, label_ko: w.label_ko, pos: at(w.fx, w.fy) }));
   const drops = [];
   for (let i = 0; i < 3; i++) drops.push({ id: `d${i}`, item_id: 'wood', label_ko: '목재', pos: [waypoints[2].pos[0] + (r() - 0.5) * 4, waypoints[2].pos[1] + (r() - 0.5) * 4, 0] });
+  for (let i = 0; i < 3; i++) drops.push({ id: `d${i + 3}`, item_id: 'parcel', label_ko: '택배', pos: [waypoints[0].pos[0] + 2.2 + (r() - 0.5) * 3, waypoints[0].pos[1] + (r() - 0.5) * 3, 0] });
+  const standingEye = base === 'biped' || base === 'quadruped' ? 1.14 : 1.0;
   W = {
-    seed, size, bounds: [half, half], tick: 0, time_s: 0, base: BASES[base] ? base : 'wheel', config, rng: r,
-    nextSeq: 1, logs: [], fresh: [], quests: [], rt: new Map(), nextQuest: 1, nextDrop: 100,
+    seed, size, bounds: [half, half], tick: 0, time_s: 0, base: BASES[base] ? base : 'wheel', config,
+    rng: r, nextSeq: 1, logs: [], fresh: [], quests: [], rt: new Map(), nextQuest: 1, nextDrop: 100,
     nodes, drops, waypoints,
-    agent: { pos: [waypoints[0].pos[0] + 1.5, waypoints[0].pos[1], 0], yaw: 0, speed: 0, carrying: [] },
+    agent: {
+      pos: [waypoints[0].pos[0] + 1.5, waypoints[0].pos[1], 0],
+      yaw: 0,
+      speed: 0,
+      carrying: [],
+      standing_eye_m: standingEye,
+      eye_m: standingEye,
+      mount_deg: -12.0,
+      head_pitch_deg: 0.0,
+      pitch_deg: -12.0,
+      pan_deg: 0.0,
+      roll_deg: 0.0,
+    },
     energy: 0, fatigue: 0, heat: 0, visionMargin: 0.72, slipMargin: 0.8, lastMoved: 0, idleTicks: 0,
   };
   log('world', 'info', `월드 생성: 시드 ${seed}, ${half} × ${half} m, 노드 ${nodes.length}개`, { seed, size, base: W.base, nodes: nodes.length });
@@ -125,8 +140,12 @@ export function snapshot() {
 export function visibleObjects(maxDist = 24) {
   const w = need();
   const [ax, ay] = w.agent.pos;
-  const cy = Math.cos(w.agent.yaw);
-  const sy = Math.sin(w.agent.yaw);
+  const yaw = w.agent.yaw - ((w.agent.pan_deg ?? 0) * Math.PI) / 180;
+  const cy = Math.cos(yaw);
+  const sy = Math.sin(yaw);
+  const eyeM = w.agent.eye_m ?? 1.0;
+  const pitchRad = ((w.agent.pitch_deg ?? -12.0) * Math.PI) / 180;
+  const halfVfov = (25.0 * Math.PI) / 180;
   const out = [];
   const add = (o) => {
     const dx = o.pos[0] - ax;
@@ -134,7 +153,11 @@ export function visibleObjects(maxDist = 24) {
     const forward = dx * cy + dy * sy;
     const right = dx * sy - dy * cy;
     const dist = Math.hypot(dx, dy);
-    if (dist <= maxDist) out.push({ ...o, dx, dy, forward, right, dist });
+    if (dist > maxDist) return;
+    const objH = o.drop ? (o.pos[2] ?? 0) + 0.12 : 0.8;
+    const targetPitch = -Math.atan2(Math.max(0, eyeM - objH), Math.max(0.1, forward));
+    const inPitch = forward > 0.15 && targetPitch >= pitchRad - halfVfov && targetPitch <= pitchRad + halfVfov;
+    out.push({ ...o, dx, dy, forward, right, dist, target_pitch_deg: (targetPitch * 180) / Math.PI, in_pitch: inPitch });
   };
   for (const n of w.nodes) if (n.hp > 0) add({ ...n, drop: false });
   for (const d of w.drops) add({ ...d, kind: 'drop', drop: true });
@@ -252,17 +275,21 @@ function waypointRef(id) {
 
 function createQuest(p) {
   const it = ITEMS[p.item_id];
+  const isDropOnly = !it.node || p.action === 'collect';
   const steps = [
     { kind: 'locate', label_ko: `${it.ko} 탐색` },
-    { kind: 'approach', label_ko: `${it.ko} 노드로 접근` },
+    { kind: 'approach', label_ko: `${it.ko} 가까이 접근` },
+    isDropOnly
+      ? { kind: 'look_down', label_ko: `${it.ko} 내려다보며 확인` }
+      : { kind: 'mine', label_ko: `${it.ko} 채취 ${p.count}개` },
+    { kind: 'collect', label_ko: `${it.ko} 줍기 ${p.count}개` },
   ];
-  if (p.action !== 'collect') steps.push({ kind: 'mine', label_ko: `${it.ko} 채취 ${p.count}개` });
-  steps.push({ kind: 'collect', label_ko: `${it.ko} 줍기 ${p.count}개` });
   if (p.destination) steps.push({ kind: 'carry', label_ko: `${p.destination.label_ko} 운반` }, { kind: 'deliver', label_ko: `${p.destination.label_ko} 인도` });
   const q = {
     id: `q${W.nextQuest++}`,
-    title: `${it.ko} ${p.count}개 ${p.action === 'collect' ? '줍기' : '채취'}${p.destination ? ` → ${p.destination.label_ko} 운반` : ''}`,
-    state: 'pending', created_tick: W.tick,
+    title: `${it.ko} ${p.count}개 ${ isDropOnly ? '줍기' : '채취' }${p.destination ? ` → ${p.destination.label_ko} 운반` : ''}`,
+    state: 'pending',
+    created_tick: W.tick,
     steps: steps.map((s) => ({ ...s, state: 'pending', progress: 0 })),
   };
   W.quests.push(q);
@@ -278,13 +305,45 @@ const structuredCloneSafe = (o) => JSON.parse(JSON.stringify(o));
 const dist2 = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
 const loadKg = () => W.agent.carrying.reduce((a, c) => a + c.mass_kg, 0);
 
+function wrapAngle(rad) {
+  let r = rad % (Math.PI * 2);
+  if (r > Math.PI) r -= Math.PI * 2;
+  else if (r < -Math.PI) r += Math.PI * 2;
+  return r;
+}
+
+function turnToward(targetPos) {
+  const a = W.agent;
+  const desired = Math.atan2(targetPos[1] - a.pos[1], targetPos[0] - a.pos[0]);
+  const diff = wrapAngle(desired - a.yaw);
+  const spec = BASE_TURN_SPECS[W.base] ?? BASE_TURN_SPECS.wheel;
+  const loadPenalty = 1 - 0.25 * Math.min(1, loadKg() / LOAD_LIMIT);
+  const maxTurn = spec.turn_rate_rad_s * loadPenalty * DT;
+  if (Math.abs(diff) <= maxTurn) {
+    a.yaw = desired;
+    return 0;
+  }
+  a.yaw = wrapAngle(a.yaw + Math.sign(diff) * maxTurn);
+  return wrapAngle(desired - a.yaw);
+}
+
 function moveToward(target, reach) {
   const a = W.agent;
   const d = dist2(a.pos, target);
-  if (d <= reach) return 0;
-  const speed = BASES[W.base].max_speed_mps * (1 - 0.35 * Math.min(1, loadKg() / LOAD_LIMIT));
+  if (d <= reach) {
+    turnToward(target);
+    return 0;
+  }
+  const remYaw = turnToward(target);
+  const absErr = Math.abs(remYaw);
+  const spec = BASE_TURN_SPECS[W.base] ?? BASE_TURN_SPECS.wheel;
+  if (absErr > spec.turn_move_rad) {
+    W.lastMoved = 0;
+    return d;
+  }
+  const alignFactor = Math.max(0.2, Math.cos(absErr));
+  const speed = BASES[W.base].max_speed_mps * (1 - 0.35 * Math.min(1, loadKg() / LOAD_LIMIT)) * alignFactor;
   const step = Math.min(speed * DT, d - reach * 0.9);
-  a.yaw = Math.atan2(target[1] - a.pos[1], target[0] - a.pos[0]);
   a.pos[0] += Math.cos(a.yaw) * step;
   a.pos[1] += Math.sin(a.yaw) * step;
   W.lastMoved = step;
@@ -333,17 +392,37 @@ function nextStep(q, rt) {
   }
 }
 
+function applyCameraPose(a, headPitchDeg = 0, crouchM = 0) {
+  a.standing_eye_m = a.standing_eye_m ?? 1.0;
+  a.mount_deg = a.mount_deg ?? -12.0;
+  a.head_pitch_deg = headPitchDeg;
+  a.eye_m = Math.max(0.35, a.standing_eye_m - crouchM);
+  a.pitch_deg = Math.max(-65.0, Math.min(15.0, a.mount_deg - a.head_pitch_deg));
+}
+
+function lookDownAt(a, targetPos) {
+  const d = Math.max(0.2, dist2(a.pos, targetPos));
+  const targetZ = (targetPos[2] ?? 0) + 0.05;
+  const dz = Math.max(0.1, (a.standing_eye_m ?? 1.0) - targetZ);
+  const directDeg = -(Math.atan2(dz, d) * 180) / Math.PI;
+  const desiredPitch = d <= 1.6 ? Math.max(-60.0, Math.min(-12.0, directDeg)) : -12.0;
+  const headPitch = Math.max(0, (a.mount_deg ?? -12.0) - desiredPitch);
+  const crouch = headPitch > 35 ? Math.min(0.22, (headPitch - 35) * 0.008) : 0;
+  applyCameraPose(a, headPitch, crouch);
+}
+
 function runStep(q, rt) {
   const s = q.steps[rt.i];
   const a = W.agent;
   switch (s.kind) {
     case 'locate': {
+      applyCameraPose(a, 0, 0);
       rt.work += 1;
       s.progress = rt.work / 12;
       if (rt.work >= 12) {
-        rt.node = nearest(W.nodes, ITEMS[rt.key].node);
+        rt.node = ITEMS[rt.key].node ? nearest(W.nodes, ITEMS[rt.key].node) : null;
         if (!rt.node && q.steps.every((x) => x.kind !== 'mine')) rt.node = nearest(W.drops, rt.key);
-        if (!rt.node) return failQuest(q, rt, `${rt.it.ko} 노드를 찾지 못했습니다 (탐색 시간 초과)`);
+        if (!rt.node) return failQuest(q, rt, `${rt.it.ko} 대상을 찾지 못했습니다 (탐색 시간 초과)`);
         log('vision', 'info', `대상 탐지: ${rt.it.ko} @ (${rt.node.pos[0].toFixed(1)}, ${rt.node.pos[1].toFixed(1)})`, { label: rt.key, score: Number((0.62 + W.rng() * 0.3).toFixed(2)), decision: 'accept' });
         nextStep(q, rt);
       }
@@ -352,11 +431,36 @@ function runStep(q, rt) {
     case 'approach': {
       const total = rt.total ?? (rt.total = Math.max(1, dist2(a.pos, rt.node.pos)));
       const left = moveToward(rt.node.pos, 1.0);
+      if (q.steps.some((x) => x.kind === 'look_down') && dist2(a.pos, rt.node.pos) <= 1.6) {
+        lookDownAt(a, rt.node.pos);
+      } else {
+        applyCameraPose(a, 0, 0);
+      }
       s.progress = 1 - left / total;
-      if (left <= 0) { rt.total = null; nextStep(q, rt); }
+      if (left <= 0) {
+        rt.total = null;
+        nextStep(q, rt);
+      }
+      break;
+    }
+    case 'look_down': {
+      const drop = nearest(W.drops, rt.key) ?? rt.node;
+      if (!drop) return failQuest(q, rt, `확인할 ${rt.it.ko} 드롭이 없습니다`);
+      const remYaw = turnToward(drop.pos);
+      lookDownAt(a, drop.pos);
+      if (Math.abs(remYaw) > 0.08) break;
+      rt.work += 1;
+      s.progress = rt.work / 5;
+      if (rt.work === 1) {
+        log('vision', 'info', `근거리(${dist2(a.pos, drop.pos).toFixed(2)} m) 바닥 확인: 카메라 피치 ${a.pitch_deg.toFixed(1)}° (목·허리 ${a.head_pitch_deg.toFixed(1)}° 숙임)`, { pitch_deg: Number(a.pitch_deg.toFixed(1)), eye_m: Number(a.eye_m.toFixed(2)) });
+      }
+      if (rt.work >= 5) {
+        nextStep(q, rt);
+      }
       break;
     }
     case 'mine': {
+      applyCameraPose(a, 8, 0);
       if (!rt.node || rt.node.hp <= 0) {
         rt.node = nearest(W.nodes, ITEMS[rt.key].node);
         if (!rt.node) return failQuest(q, rt, `채취할 ${rt.it.ko} 노드가 부족합니다 (${rt.mined}/${rt.count})`);
@@ -383,7 +487,11 @@ function runStep(q, rt) {
       if (loadKg() + rt.it.mass > LOAD_LIMIT) return failQuest(q, rt, `적재 한계 초과 (${(loadKg() + rt.it.mass).toFixed(1)} > ${LOAD_LIMIT} kg)`);
       const drop = nearest(W.drops, rt.key);
       if (!drop) return failQuest(q, rt, `줍을 ${rt.it.ko} 드롭이 없습니다`);
-      if (moveToward(drop.pos, 0.8) > 0) break;
+      if (moveToward(drop.pos, 0.8) > 0) {
+        lookDownAt(a, drop.pos);
+        break;
+      }
+      lookDownAt(a, drop.pos);
       rt.work += 1;
       W.energy += 20 * DT;
       if (rt.work >= 4) {
@@ -395,24 +503,33 @@ function runStep(q, rt) {
         log('world', 'info', `${rt.it.ko} 줍기 (${rt.collected}/${rt.count}), 적재 ${loadKg().toFixed(1)} kg`, { grasp_margin: 0.8 });
       }
       s.progress = (rt.collected + rt.work / 4) / rt.count;
-      if (rt.collected >= rt.count) nextStep(q, rt);
+      if (rt.collected >= rt.count) {
+        applyCameraPose(a, 0, 0);
+        nextStep(q, rt);
+      }
       break;
     }
     case 'carry': {
+      applyCameraPose(a, 0, 0);
       const target = W.waypoints.find((p) => p.id === rt.dest.id).pos;
       const total = rt.total ?? (rt.total = Math.max(1, dist2(a.pos, target)));
       const left = moveToward(target, 1.5);
       s.progress = 1 - left / total;
-      if (left <= 0) { rt.total = null; nextStep(q, rt); }
+      if (left <= 0) {
+        rt.total = null;
+        nextStep(q, rt);
+      }
       break;
     }
     case 'deliver': {
+      applyCameraPose(a, 10, 0.05);
       rt.work += 1;
       s.progress = rt.work / 8;
       if (rt.work >= 8) {
         const wp = rt.dest ? W.waypoints.find((p) => p.id === rt.dest.id) : null;
         if (wp) (wp.pile ??= []).push(...a.carrying.filter((c) => c.item_id === rt.key));
         a.carrying = a.carrying.filter((c) => c.item_id !== rt.key);
+        applyCameraPose(a, 0, 0);
         nextStep(q, rt);
       }
       break;
@@ -502,7 +619,7 @@ export function bodyStatus() {
 // ── 인식 ────────────────────────────────────────────────────────
 export function perceptionScan({ topK }) {
   const w = need();
-  const seen = visibleObjects(22).filter((o) => o.forward > 0.5 && o.kind !== 'waypoint');
+  const seen = visibleObjects(22).filter((o) => o.forward > 0.25 && o.in_pitch && o.kind !== 'waypoint');
   const best = new Map();
   for (const o of seen) {
     const [id, ko] = o.drop ? [`${o.item_id}_drop`, `${o.label_ko} (드롭)`] : DETECT_LABEL[o.kind];
