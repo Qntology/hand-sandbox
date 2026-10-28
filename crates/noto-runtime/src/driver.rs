@@ -560,7 +560,7 @@ impl Runtime {
         self.viewpoint_with(cov, avoid, 0.0, world_sim::explore::SEARCH_RANGE_M)
     }
 
-    fn viewpoint_with(&self, cov: &Coverage, avoid: &[(f32, f32)], tilt: f32, range: f32) -> Option<Viewpoint> {
+    pub(crate) fn viewpoint_with(&self, cov: &Coverage, avoid: &[(f32, f32)], tilt: f32, range: f32) -> Option<Viewpoint> {
         let blocked = self.world.blocked_cells();
         let start = self.world.terrain.cell_of(self.world.agent.x, self.world.agent.z)?;
         world_sim::explore::next_viewpoint(&self.world.terrain, &self.world.drive_spec(), &|x, z| blocked.contains(&(x, z)), start, cov, self.world.standing_eye_m(), self.cam.pitch_deg - 0.5 * tilt, self.cam.vfov_deg() + tilt, range, avoid)
@@ -681,9 +681,10 @@ impl Runtime {
         let base_tilt = (depression + self.cam.pitch_deg).clamp(0.0, noto_core::kin::NECK_PITCH_MAX_DEG);
         t.inspected.push(id);
         let need = self.cfg.gates.confirm_sightings.max(1);
+        let mut tilt = base_tilt;
         for i in 0..need {
             let seen_before = self.gates.landmark(id).map_or(0, |l| l.seen);
-            let tilt = if i > 0 && !self.gates.landmark(id).is_some_and(|l| l.confirmed) {
+            tilt = if i > 0 && !self.gates.landmark(id).is_some_and(|l| l.confirmed) {
                 (base_tilt + 12.0).clamp(0.0, noto_core::kin::NECK_PITCH_MAX_DEG)
             } else {
                 base_tilt
