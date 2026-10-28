@@ -139,8 +139,27 @@ pub fn centre_from_surface(view: &View, p: [f32; 3], r: f32) -> (f32, f32) {
     let (dx, dz) = (p[0] - view.origin[0], p[2] - view.origin[2]);
     let ground = dx.hypot(dz).max(1e-4);
     let theta = (view.origin[1] - p[1]).atan2(ground).max(0.0);
-    let front = theta.cos() / (theta.cos() + theta.sin());
+    let front = if theta > 0.45 {
+        (theta.cos() / (theta.cos() + 1.5 * theta.sin())).max(0.15)
+    } else {
+        theta.cos() / (theta.cos() + theta.sin())
+    };
     (p[0] + dx / ground * r * front, p[2] + dz / ground * r * front)
+}
+
+pub fn box_iou_and_iomin(a: &[f32; 4], b: &[f32; 4]) -> (f32, f32) {
+    let ix0 = a[0].max(b[0]);
+    let iy0 = a[1].max(b[1]);
+    let ix1 = a[2].min(b[2]);
+    let iy1 = a[3].min(b[3]);
+    let inter = (ix1 - ix0).max(0.0) * (iy1 - iy0).max(0.0);
+    if inter <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let area_a = ((a[2] - a[0]).max(0.0) * (a[3] - a[1]).max(0.0)).max(1e-6);
+    let area_b = ((b[2] - b[0]).max(0.0) * (b[3] - b[1]).max(0.0)).max(1e-6);
+    let union = (area_a + area_b - inter).max(1e-6);
+    (inter / union, inter / area_a.min(area_b))
 }
 
 /// The centroid (x, y, z) of each object's visible pixels in a frame, by

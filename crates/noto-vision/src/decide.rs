@@ -84,17 +84,12 @@ pub struct Sighting {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Decision {
-    /// Nothing tracked: turn and look.
     Search { turn_deg: f32 },
-    /// The mandatory baseline move before a range is trusted.
+    LookDown { pitch_deg: f32, turn_deg: f32 },
     Triangulate(TriStep),
-    /// Drive a hop toward the forecast position and face it.
-    Approach { to: (f32, f32), hop_m: f32, face: (f32, f32) },
-    /// Within reach of the forecast position.
-    Arrive { at: (f32, f32) },
-    /// Look again without moving.
+    Approach { to: (f32, f32), hop_m: f32, face: (f32, f32), look_pitch_deg: f32 },
+    Arrive { at: (f32, f32), look_pitch_deg: f32 },
     Hold { reason: String },
-    /// A full turn showed nothing: look from somewhere else.
     Explore { turned_deg: f32 },
 }
 
@@ -102,21 +97,21 @@ impl Decision {
     pub fn label(&self) -> String {
         match self {
             Decision::Search { turn_deg } => format!("search(turn {turn_deg:+.0}°)"),
+            Decision::LookDown { pitch_deg, turn_deg } => format!("look_down(pitch {pitch_deg:+.0}°, turn {turn_deg:+.0}°)"),
             Decision::Triangulate(t) => format!("tri_step({}, {:.2} m)", t.kind, t.step_m),
-            Decision::Approach { hop_m, .. } => format!("move({hop_m:.1} m)"),
-            Decision::Arrive { .. } => "arrive".into(),
+            Decision::Approach { hop_m, look_pitch_deg, .. } => format!("move({hop_m:.1} m, pitch {look_pitch_deg:+.0}°)"),
+            Decision::Arrive { look_pitch_deg, .. } => format!("arrive(pitch {look_pitch_deg:+.0}°)"),
             Decision::Hold { reason } => format!("hold({reason})"),
             Decision::Explore { turned_deg } => format!("explore(after {turned_deg:.0}°)"),
         }
     }
 }
 
-/// What the next keyframe should show if the move goes as planned.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Prediction {
-    /// Target bearing relative to the robot's heading after the move, degrees.
     pub bearing_rel_deg: f32,
     pub range_m: f32,
+    pub pitch_deg: f32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -225,20 +220,36 @@ impl Decider {
             note: String::new(),
         };
         let predicted = self.prediction.take();
+        let calc_pitch = |eye_m: f32, dist_m: f32| -> f32 {
+            let dz = (eye_m - 0.05).max(0.1);
+            let direct = -dz.atan2(dist_m.max(0.2)).to_degrees();
+            if dist_m <= 1.6 {
+                direct.clamp(-60.0, -12.0)
+            } else {
+                -12.0
+            }
+        };
+
         let Some(s) = sighting else {
             self.lost += 1;
-            // Keep turning toward where the forecast says the target is, else search.
             if let Some((x, z, band, method)) = self.forecast_position(extra) {
+                let dist = (x - pose.x).hypot(z - pose.z);
                 let rel = wrap_angle((z - pose.z).atan2(x - pose.x) - pose.yaw).to_degrees();
                 rep.forecast_method = method;
                 rep.band = Some(band);
+                if self.lost == 1 && dist <= 1.8 {
+                    let pitch_deg = calc_pitch(pose.eye_m, dist);
+                    let turn_deg = if rel.abs() > 5.0 { rel } else { 0.0 };
+                    rep.decision = Decision::LookDown { pitch_deg, turn_deg };
+                    rep.note = format!("근거리({dist:.2} m) 대상 시야 이탈: 고개를 {pitch_deg:+.0}° 숙여 바닥 확인");
+                    return rep;
+                }
                 if self.lost <= 2 && rel.abs() > 8.0 {
                     rep.decision = Decision::Search { turn_deg: rel };
                     rep.note = "추적을 놓쳐 예측 위치 쪽으로 회전".into();
                     return rep;
                 }
             }
-            // A whole turn without the target: another viewpoint, not another turn.
             if self.turned_deg + self.cfg.search_turn_deg * 0.5 >= 360.0 {
                 rep.decision = Decision::Explore { turned_deg: self.turned_deg };
                 rep.note = format!("{:.0}° 돌아도 대상 없음: 다른 시점으로 이동", self.turned_deg);
@@ -301,25 +312,25 @@ impl Decider {
             let at = (pose.x + r * s.heading.cos(), pose.z + r * s.heading.sin());
             rep.estimate = Some(Estimate { x: at.0, z: at.1, range_m: r, sigma_m: 0.25 * r, source: "depth".into() });
             if r <= self.cfg.reach_m + 0.25 {
-                rep.decision = Decision::Arrive { at };
-                rep.note = format!("가까움: 깊이 거리 {r:.2} m로 도달");
+                let look_pitch_deg = calc_pitch(pose.eye_m, r);
+                rep.decision = Decision::Arrive { at, look_pitch_deg };
+                rep.note = format!("가까움: 깊이 거리 {r:.2} m로 도달 (시선 {look_pitch_deg:+.0}°)");
             } else {
                 let hop = r - self.cfg.reach_m;
+                let next_r = r - hop;
+                let look_pitch_deg = calc_pitch(pose.eye_m, next_r);
                 let to = (pose.x + hop * s.heading.cos(), pose.z + hop * s.heading.sin());
-                self.prediction = Some(Prediction { bearing_rel_deg: 0.0, range_m: r - hop });
+                self.prediction = Some(Prediction { bearing_rel_deg: 0.0, range_m: next_r, pitch_deg: look_pitch_deg });
                 rep.prediction = self.prediction;
-                rep.decision = Decision::Approach { to, hop_m: hop, face: at };
-                rep.note = format!("가까움: 깊이 거리 {r:.2} m, {hop:.2} m 다가감");
+                rep.decision = Decision::Approach { to, hop_m: hop, face: at, look_pitch_deg };
+                rep.note = format!("가까움: 깊이 거리 {r:.2} m, {hop:.2} m 다가감 (시선 {look_pitch_deg:+.0}°)");
             }
             return rep;
         }
 
-        // No usable fix yet: the triangulation step is mandatory.
         let good = self.last_fix.as_ref().filter(|f| f.sigma_m <= (self.cfg.max_sigma_frac * f.range_m).max(0.25));
         if good.is_none() {
             let guess = s.depth_range_m.map(|d| d * depth_scale.unwrap_or(1.0)).unwrap_or(self.cfg.default_range_m);
-            // Keep stepping to the same side so the baseline adds up; the side
-            // only changes when a step could not be made (`move_failed`).
             let step = plan_step(pose, s.heading, guess, holonomic, self.side, &self.cfg.tri);
             if let Some(f) = &self.last_fix {
                 rep.note = format!("측량 오차 {:.2} m / 거리 {:.1} m: 기선 추가", f.sigma_m, f.range_m);
@@ -330,9 +341,8 @@ impl Decider {
                 self.rays.clear();
                 self.rays.push(s);
             }
-            // After the step the robot faces the guessed position, so the target
-            // should appear dead ahead if the guess was right.
-            self.prediction = Some(Prediction { bearing_rel_deg: 0.0, range_m: (step.face.0 - step.to.0).hypot(step.face.1 - step.to.1) });
+            let next_r = (step.face.0 - step.to.0).hypot(step.face.1 - step.to.1);
+            self.prediction = Some(Prediction { bearing_rel_deg: 0.0, range_m: next_r, pitch_deg: calc_pitch(pose.eye_m, next_r) });
             rep.prediction = self.prediction;
             rep.decision = Decision::Triangulate(step);
             return rep;
@@ -345,17 +355,20 @@ impl Decider {
         rep.band = Some(band);
         rep.estimate = Some(Estimate { x, z, range_m: range, sigma_m: sigma, source: if self.est_x.len() > 1 { "forecast".into() } else { "triangulation".into() } });
         if range <= self.cfg.reach_m + 0.25 {
-            rep.decision = Decision::Arrive { at: (x, z) };
-            rep.note = format!("도달: 거리 {range:.2} m");
+            let look_pitch_deg = calc_pitch(pose.eye_m, range);
+            rep.decision = Decision::Arrive { at: (x, z), look_pitch_deg };
+            rep.note = format!("도달: 거리 {range:.2} m (시선 {look_pitch_deg:+.0}°)");
             return rep;
         }
         let hop = (range - self.cfg.reach_m).min(self.cfg.hop_max_m);
+        let next_r = range - hop;
+        let look_pitch_deg = calc_pitch(pose.eye_m, next_r);
         let h = (z - pose.z).atan2(x - pose.x);
         let to = (pose.x + hop * h.cos(), pose.z + hop * h.sin());
-        self.prediction = Some(Prediction { bearing_rel_deg: 0.0, range_m: range - hop });
+        self.prediction = Some(Prediction { bearing_rel_deg: 0.0, range_m: next_r, pitch_deg: look_pitch_deg });
         rep.prediction = self.prediction;
-        rep.decision = Decision::Approach { to, hop_m: hop, face: (x, z) };
-        rep.note = format!("예측 위치 ({x:.1}, {z:.1}) ±{sigma:.2} m 쪽으로 {hop:.1} m");
+        rep.decision = Decision::Approach { to, hop_m: hop, face: (x, z), look_pitch_deg };
+        rep.note = format!("예측 위치 ({x:.1}, {z:.1}) ±{sigma:.2} m 쪽으로 {hop:.1} m (시선 {look_pitch_deg:+.0}°)");
         rep
     }
 }
@@ -389,18 +402,25 @@ impl Decider {
             note: String::new(),
         };
         self.prediction = None;
+        let calc_pitch = |eye_m: f32, dist_m: f32| -> f32 {
+            let dz = (eye_m - 0.05).max(0.1);
+            let direct = -dz.atan2(dist_m.max(0.2)).to_degrees();
+            if dist_m <= 1.6 { direct.clamp(-60.0, -12.0) } else { -12.0 }
+        };
         if range <= self.cfg.reach_m + 0.25 {
-            rep.decision = Decision::Arrive { at: (x, z) };
-            rep.note = format!("눈 감고 예측으로 도달: 거리 {range:.2} m (±{sigma:.2} m)");
+            let look_pitch_deg = calc_pitch(pose.eye_m, range);
+            rep.decision = Decision::Arrive { at: (x, z), look_pitch_deg };
+            rep.note = format!("눈 감고 예측으로 도달: 거리 {range:.2} m (±{sigma:.2} m, 시선 {look_pitch_deg:+.0}°)");
             return Some(rep);
         }
         let hop = (range - self.cfg.reach_m).min(self.cfg.hop_max_m);
+        let next_r = range - hop;
+        let look_pitch_deg = calc_pitch(pose.eye_m, next_r);
         let h = (z - pose.z).atan2(x - pose.x);
         let to = (pose.x + hop * h.cos(), pose.z + hop * h.sin());
-        // The next keyframe should show it dead ahead if the forecast held.
-        self.prediction = Some(Prediction { bearing_rel_deg: 0.0, range_m: range - hop });
+        self.prediction = Some(Prediction { bearing_rel_deg: 0.0, range_m: next_r, pitch_deg: look_pitch_deg });
         rep.prediction = self.prediction;
-        rep.decision = Decision::Approach { to, hop_m: hop, face: (x, z) };
+        rep.decision = Decision::Approach { to, hop_m: hop, face: (x, z), look_pitch_deg };
         rep.note = format!("눈 감고 예측 위치 ({x:.1}, {z:.1}) ±{sigma:.2} m 쪽으로 {hop:.1} m (ML 꺼짐)");
         Some(rep)
     }

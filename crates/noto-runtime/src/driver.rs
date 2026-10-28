@@ -800,11 +800,23 @@ impl Runtime {
         let bearing = b.sin().atan2(b.cos()).to_degrees();
         let pan = (-bearing).clamp(-noto_core::kin::NECK_PAN_MAX_DEG, noto_core::kin::NECK_PAN_MAX_DEG);
         let depression = self.world.standing_eye_m().atan2(d.max(0.1)).to_degrees();
-        let tilt = (depression + self.cam.pitch_deg).clamp(0.0, noto_core::kin::NECK_PITCH_MAX_DEG);
+        let base_tilt = (depression + self.cam.pitch_deg).clamp(0.0, noto_core::kin::NECK_PITCH_MAX_DEG);
         t.inspected.push(id);
-        for _ in 0..self.cfg.gates.confirm_sightings.max(1) {
+        let need = self.cfg.gates.confirm_sightings.max(1);
+        for i in 0..need {
+            let seen_before = self.gates.landmark(id).map_or(0, |l| l.seen);
+            let tilt = if i > 0 && !self.gates.landmark(id).is_some_and(|l| l.confirmed) {
+                (base_tilt + 12.0).clamp(0.0, noto_core::kin::NECK_PITCH_MAX_DEG)
+            } else {
+                base_tilt
+            };
             if self.scan_gaze("inspect", pan, tilt).is_err() {
                 break;
+            }
+            let seen_after = self.gates.landmark(id).map_or(0, |l| l.seen);
+            if seen_after == seen_before && tilt < noto_core::kin::NECK_PITCH_MAX_DEG {
+                let deeper = (tilt + 12.0).clamp(0.0, noto_core::kin::NECK_PITCH_MAX_DEG);
+                let _ = self.scan_gaze("inspect", pan, deeper);
             }
         }
         t.looks += 1;
@@ -988,8 +1000,20 @@ impl Runtime {
             None => {
                 t.approach_tries += 1;
                 if t.approach_tries < 2 {
-                    self.log("quest", Level::Warn, format!("기억한 자리에 {}이 손에 닿지 않음 — 다시 보고 접근 ({}/2)", t.target().label_ko, t.approach_tries), None);
-                    let _ = self.scan_now("retouch");
+                    self.log("quest", Level::Warn, format!("기억한 자리에 {}이 손에 닿지 않음 — 내려다보며 다시 확인 후 접근 ({}/2)", t.target().label_ko, t.approach_tries), None);
+                    let me = self.me();
+                    let eye = self.world.standing_eye_m();
+                    if let Some((pan, tilt)) = gaze_to_see(&self.cam, eye, me, l.x, l.z) {
+                        let _ = self.scan_gaze("retouch", pan, tilt);
+                    } else {
+                        let d = (l.x - me.0).hypot(l.z - me.1).max(0.15);
+                        let dep = eye.atan2(d).to_degrees();
+                        let tilt = (dep + self.cam.pitch_deg).clamp(GROUND_SWEEP_TILT_DEG, noto_core::kin::NECK_PITCH_MAX_DEG);
+                        let _ = self.scan_gaze("retouch", 0.0, tilt);
+                    }
+                    t.looks += 1;
+                    self.vstats.looks += 1;
+                    self.take_fix(t);
                     t.side = None;
                     self.goto_phase(t, Phase::Approach, "위치 재확인");
                     return Flow::Continue;
@@ -1642,26 +1666,26 @@ impl Runtime {
     fn while_running(&mut self, t: &mut Task, act: &Act) {
         match act {
             Act::Move(MoveFor::Approach(_)) => {
-                let (mx, mz, _) = self.me();
-                let target = t.target_lm.and_then(|id| self.gates.landmark(id)).map(|l| (l.x, l.z, l.distance_to(mx, mz)));
+                let me = self.me();
+                let eye = self.world.standing_eye_m();
+                let target = t.target_lm.and_then(|id| self.gates.landmark(id)).map(|l| (l.x, l.z, l.distance_to(me.0, me.1)));
+                let target_gaze = target.and_then(|(x, z, _)| gaze_to_see(&self.cam, eye, me, x, z));
                 if !self.cfg.vision.intermittent {
-                    // As before v0.7: a look every few ticks.
                     if t.approach_scan_cd == 0 {
                         t.approach_scan_cd = self.cfg.approach_scan_every_ticks;
-                        if self.scan_now("approach").is_ok() {
-                            self.mark_coverage(&mut t.coverage);
+                        let (pan, tilt) = target_gaze.unwrap_or((0.0, 0.0));
+                        if self.scan_gaze("approach", pan, tilt).is_ok() {
+                            let (range, _) = self.search_reach(t);
+                            self.mark_coverage_as(&mut t.coverage, tilt, range);
                         }
                     } else {
                         t.approach_scan_cd -= 1;
                     }
                 } else {
                     self.vstats.approach_s += world_sim::TICK_S as f64;
-                    // The pattern: a look per look-ahead horizon, and one about a second before the hand acts.
                     let lead_m = self.world.agent.speed_mps.max(0.1) * EYE_LEAD_S + PICKUP_REACH_M;
-                    // The look before the hand turns the head to the target when the level camera does not reach it (at the feet, to the side).
-                    let eye = self.world.standing_eye_m();
-                    let gaze = if t.pre_looked { None } else { target.filter(|&(_, _, d)| d <= lead_m).and_then(|(x, z, _)| gaze_to_see(&self.cam, eye, self.me(), x, z)) };
-                    let pre = gaze.is_some();
+                    let needs_down = target_gaze.is_some_and(|(_, tilt)| tilt > 0.0);
+                    let pre = !t.pre_looked && target.is_some_and(|(_, _, d)| d <= lead_m) && (needs_down || target.is_some_and(|(_, _, d)| d <= PICKUP_REACH_M + 0.4));
                     let due = t.look_cd == 0;
                     if pre || due {
                         let kind = if pre { "pre_act" } else { "pattern" };
@@ -1669,12 +1693,13 @@ impl Runtime {
                             t.pre_looked = true;
                         }
                         t.look_cd = self.cfg.vision.look_every_ticks;
-                        let (pan, tilt) = gaze.unwrap_or((0.0, 0.0));
+                        let (pan, tilt) = target_gaze.unwrap_or((0.0, 0.0));
                         if self.scan_gaze(kind, pan, tilt).is_ok() {
                             t.looks += 1;
                             self.vstats.looks += 1;
                             self.vstats.approach_looks += 1;
-                            self.mark_coverage(&mut t.coverage);
+                            let (range, _) = self.search_reach(t);
+                            self.mark_coverage_as(&mut t.coverage, tilt, range);
                         }
                     } else {
                         t.look_cd -= 1;

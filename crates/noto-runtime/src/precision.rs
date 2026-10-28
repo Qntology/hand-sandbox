@@ -399,6 +399,41 @@ impl PrecisionGates {
         (floor.min(0.95) as f32, source)
     }
 
+    fn dedup_scan_candidates(&self, mut cands: Vec<Candidate>) -> Vec<Candidate> {
+        cands.sort_by(|a, b| b.score.total_cmp(&a.score));
+        let mut kept: Vec<Candidate> = Vec::with_capacity(cands.len());
+        for c in cands {
+            let mut merged = false;
+            for k in &mut kept {
+                if k.label != c.label || k.kind != c.kind {
+                    continue;
+                }
+                let (iou, iomin) = crate::perception::box_iou_and_iomin(&k.bbox, &c.bbox);
+                let dist_ok = match (k.world, c.world) {
+                    (Some((x1, z1)), Some((x2, z2))) => (x1 - x2).hypot(z1 - z2) <= (0.45 * self.cfg.track_radius_m).max(0.35),
+                    _ => false,
+                };
+                if iou >= 0.4 || iomin >= 0.65 || dist_ok {
+                    let area_k = (k.bbox[2] - k.bbox[0]) * (k.bbox[3] - k.bbox[1]);
+                    let area_c = (c.bbox[2] - c.bbox[0]) * (c.bbox[3] - c.bbox[1]);
+                    if area_c < area_k && c.score >= k.score * 0.85 && c.world.is_some() {
+                        k.bbox = c.bbox;
+                        k.world = c.world;
+                        k.depth_m = c.depth_m;
+                        k.pixels = c.pixels;
+                    }
+                    merged = true;
+                    break;
+                }
+            }
+            if !merged {
+                kept.push(c);
+            }
+        }
+        kept.sort_by(|a, b| a.depth_m.total_cmp(&b.depth_m).then_with(|| a.label.cmp(&b.label)));
+        kept
+    }
+
     fn associate(&mut self, c: &Candidate, x: f32, z: f32, tick: u64) -> u32 {
         let r = self.cfg.track_radius_m;
         let best = self
@@ -454,7 +489,8 @@ impl PrecisionGates {
     /// its memory by their variances (`mem`: how far the robot has moved since).
     pub fn judge_with(&mut self, cands: Vec<Candidate>, tick: u64, sds: &mut SdsStore, mem: &MemCtx) -> Vec<Judged> {
         self.prune(tick);
-        cands.into_iter().map(|c| self.judge_one(c, tick, sds, mem)).collect()
+        let deduped = self.dedup_scan_candidates(cands);
+        deduped.into_iter().map(|c| self.judge_one(c, tick, sds, mem)).collect()
     }
 
     fn judge_one(&mut self, c: Candidate, tick: u64, sds: &mut SdsStore, mem: &MemCtx) -> Judged {
@@ -513,8 +549,13 @@ impl PrecisionGates {
                     }
                     let mut held = v.outcome == TemporalOutcome::Held;
                     let mut detail = format!("{} · {}", v.method, v.reason);
+                    let positive_jump = held && v.expected.is_some_and(|exp| (c.score as f64) > exp && c.score >= floor + 0.05);
                     if let Some(l) = self.landmarks.iter_mut().find(|l| l.id == id) {
-                        if held {
+                        if positive_jump {
+                            l.held_run.clear();
+                            held = false;
+                            detail = format!("{detail} → 근접·하향 확인으로 점수 상승({:.2}) 수락", c.score);
+                        } else if held {
                             l.held_run.push(c.score as f64);
                             let run = &l.held_run;
                             let spread = run.iter().cloned().fold(f64::MIN, f64::max) - run.iter().cloned().fold(f64::MAX, f64::min);
@@ -550,10 +591,12 @@ impl PrecisionGates {
 
         // 4. conflict
         if let Some((x, z)) = c.world {
+            let close_inspection = c.depth_m <= 1.6 && c.margin >= self.cfg.min_margin * 1.5;
             let rival = self
                 .landmarks
                 .iter()
                 .filter(|l| l.state == LmState::Active && l.kind == c.kind && l.label != c.label && l.good >= 1 && l.distance_to(x, z) <= CONFLICT_RADIUS_M)
+                .filter(|l| !(close_inspection && !l.confirmed && l.last_tick < tick))
                 .max_by(|a, b| a.score.total_cmp(&b.score));
             match rival {
                 Some(r) if r.score >= c.score => gates.push(GateResult {

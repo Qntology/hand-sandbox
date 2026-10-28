@@ -269,8 +269,30 @@ fn look_from(body: &Body, sh: [f32; 2]) -> Option<([f32; 2], f32)> {
     match body.camera_mount() {
         HeadMount::Neck => Some(([sh[0], sh[1] + kin::NECK_UP_M + 0.07], kin::NECK_PITCH_MAX_DEG)),
         HeadMount::MastCamera { height_mm, pan_tilt: true } => Some(([body.mast_camera_x() + kin::CAMERA_FWD_M, height_mm as f32 / 1000.0], body.head_range_deg().0)),
+        HeadMount::Fixed { tilt_deg } => Some(([sh[0], sh[1] + kin::NECK_UP_M + 0.07], tilt_deg.abs() as f32)),
         _ => None,
     }
+}
+
+pub fn look_down_pose(body: &Body, dist_m: f32, target_z_m: f32, cargo_kg: f32) -> KinPose {
+    let mut pose = body.stand(cargo_kg);
+    let rom = Rom::of(body);
+    let sh0 = shoulder_point(body, &pose);
+    let eye_z = sh0[1] + kin::NECK_UP_M + 0.07;
+    let needed_deg = (eye_z - target_z_m).max(0.05).atan2(dist_m.max(0.15)).to_degrees();
+    let neck_max = body.head_range_deg().0;
+    if matches!(body.camera_mount(), HeadMount::Neck | HeadMount::MastCamera { pan_tilt: true, .. }) {
+        pose.neck_deg = needed_deg.clamp(-neck_max, neck_max);
+    }
+    let remainder = (needed_deg - pose.neck_deg).max(0.0);
+    if remainder > 1.0 {
+        if rom.waist_max > 0.0 {
+            pose.waist_deg = remainder.min(rom.waist_max);
+        } else if body.legged() && rom.hip_flex_max > 0.0 {
+            pose.pelvis_deg = remainder.min(rom.hip_flex_max * 0.5);
+        }
+    }
+    pose
 }
 
 fn candidate_or_miss(body: &Body, goal: &ReachGoal, x_obj: f32, shank_deg: f32, thigh_deg: f32, pelvis_deg: f32, waist_deg: f32, lift_m: f32) -> Result<Cand, Option<Miss>> {

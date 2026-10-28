@@ -214,7 +214,7 @@ impl Camera {
     /// fraction `f` of the frame width is `f * width`. `None` for a depth that
     /// is not finite and positive.
     pub fn world_point(&self, agent_xz: (f32, f32), yaw_rad: f32, px: f32, py: f32, depth_m: f32) -> Option<(f32, f32)> {
-        let view = View { origin: [agent_xz.0, 0.0, agent_xz.1], yaw: yaw_rad, pitch: self.pitch_deg.to_radians(), roll: 0.0 };
+        let view = View { origin: [agent_xz.0, 0.0, agent_xz.1], yaw: yaw_rad - self.pan_deg.to_radians(), pitch: self.pitch_deg.to_radians(), roll: 0.0 };
         self.world_point_in(&view, px, py, depth_m)
     }
 
@@ -244,7 +244,7 @@ impl Camera {
     /// Pixel and forward depth of a world point, the inverse of
     /// [`Camera::world_point`]. `None` for a point behind the camera.
     pub fn project(&self, origin: [f32; 3], yaw_rad: f32, point: [f32; 3]) -> Option<(f32, f32, f32)> {
-        self.project_in(&View { origin, yaw: yaw_rad, pitch: self.pitch_deg.to_radians(), roll: 0.0 }, point)
+        self.project_in(&View { origin, yaw: yaw_rad - self.pan_deg.to_radians(), pitch: self.pitch_deg.to_radians(), roll: 0.0 }, point)
     }
 
     /// Pixel and forward depth of a world point seen from `view`, the inverse

@@ -500,8 +500,29 @@ impl Runtime {
         if t.decisions > self.test_cfg.max_ml_decisions {
             return fail("ml_budget", format!("[ML] 결정 {}회 안에 끝내지 못했습니다", self.test_cfg.max_ml_decisions));
         }
+        let placed = !t.target().item.from_node();
+        let mut look_cam = self.cam;
+        let mut applied_tilt = 0.0f32;
+        if placed {
+            let eye = self.world.standing_eye_m();
+            let ttm = self.gates.ttm();
+            let tp = ttm.as_deref().map(TtmPredictor);
+            let extra: Vec<&dyn Predictor> = tp.iter().map(|p| p as &dyn Predictor).collect();
+            let odo_pose = crate::record::odometry(&self.world, &self.cam);
+            if let Some(pred) = t.decider.predict(&odo_pose, &extra, 0.0).and_then(|r| r.estimate) {
+                if let Some((_, tilt)) = gaze_to_see(&self.cam, eye, (odo_pose.x, odo_pose.z, odo_pose.yaw), pred.x, pred.z) {
+                    applied_tilt = tilt;
+                } else if pred.range_m <= 1.8 {
+                    let dep = eye.atan2(pred.range_m.max(0.15)).to_degrees();
+                    applied_tilt = (dep + self.cam.pitch_deg).clamp(0.0, noto_core::kin::NECK_PITCH_MAX_DEG);
+                }
+            } else if t.holds > 0 {
+                applied_tilt = crate::driver::GROUND_SWEEP_TILT_DEG;
+            }
+            look_cam.pitch_deg -= applied_tilt;
+        }
         let index = self.recording.as_ref().map_or(0, |r| r.keyframes.len()) as u32;
-        let mut kf = match capture_keyframe(&self.world, &self.cam, self.test_cfg.record.quality, index) {
+        let mut kf = match capture_keyframe(&self.world, &look_cam, self.test_cfg.record.quality, index) {
             Ok(k) => k,
             Err(e) => return fail("capture_failed", e.to_string()),
         };
@@ -511,7 +532,11 @@ impl Runtime {
             Ok(o) => o,
             Err(e) => return fail("perception_failed", format!("ML 파이프라인 실패: {e}")),
         };
-        self.mark_coverage(&mut t.coverage);
+        if placed {
+            self.mark_coverage_as(&mut t.coverage, applied_tilt, crate::driver::SMALL_ITEM_SEE_M);
+        } else {
+            self.mark_coverage(&mut t.coverage);
+        }
         let label = out.frame.target.as_ref().map(|x| x.label.clone()).or_else(|| wanted.first().cloned()).unwrap_or_default();
         let ttm = self.gates.ttm();
         let tp = ttm.as_deref().map(TtmPredictor);
@@ -608,7 +633,13 @@ impl Runtime {
                 t.queue.push_back(Action::MoveTo { x: step.to.0, z: step.to.1, reach_m: 0.0 });
                 t.queue.push_back(Action::Face { x: step.face.0, z: step.face.1 });
             }
-            Decision::Explore { .. } => match self.search_viewpoint_for(&t.coverage, &t.visited) {
+            Decision::Explore { .. } => {
+                let vp = if !t.target().item.from_node() {
+                    self.viewpoint_with(&t.coverage, &t.visited, crate::driver::GROUND_SWEEP_TILT_DEG, crate::driver::SMALL_ITEM_SEE_M)
+                } else {
+                    self.search_viewpoint_for(&t.coverage, &t.visited)
+                };
+                match vp {
                 Some(v) => {
                     t.visited.push((self.world.agent.x, self.world.agent.z));
                     t.visited.push((v.x, v.z));
@@ -624,7 +655,8 @@ impl Runtime {
                     }
                     t.queue.push_back(Action::Turn { yaw_deg: yaw_deg + 50.0 });
                 }
-            },
+            }
+        },
             Decision::Approach { to, face, .. } => {
                 t.queue.push_back(Action::MoveTo { x: to.0, z: to.1, reach_m: 0.3 });
                 t.queue.push_back(Action::Face { x: face.0, z: face.1 });

@@ -81,14 +81,42 @@ impl Intrinsics {
         depth_m * r[0].hypot(r[2])
     }
 
-    /// Forward depth of a point at ground distance `range_m` along a pixel's
-    /// ray, the inverse of [`ground_range`](Self::ground_range).
+    pub fn with_pitch(&self, pitch_deg: f32) -> Intrinsics {
+        Intrinsics { pitch_deg, ..*self }
+    }
+
+    pub fn vfov_deg(&self) -> f32 {
+        let (w, h) = (self.width.max(1) as f32, self.height.max(1) as f32);
+        let half_w = (self.fov_deg.to_radians() * 0.5).tan();
+        2.0 * (half_w * h / w).atan().to_degrees()
+    }
+
+    pub fn look_down_pitch_deg(&self, eye_m: f32, range_m: f32, target_h_m: f32) -> f32 {
+        let dz = (eye_m - target_h_m).max(0.05);
+        let direct_deg = -dz.atan2(range_m.max(0.15)).to_degrees();
+        let half_vfov = self.vfov_deg() * 0.5;
+        let min_needed = direct_deg + half_vfov * 0.65;
+        if self.pitch_deg > min_needed {
+            direct_deg.clamp(-65.0, self.pitch_deg)
+        } else {
+            self.pitch_deg
+        }
+    }
+
+    pub fn is_ground_target_visible(&self, eye_m: f32, range_m: f32, target_h_m: f32) -> bool {
+        let dz = (eye_m - target_h_m).max(0.0);
+        let target_pitch_deg = -dz.atan2(range_m.max(0.05)).to_degrees();
+        let half_vfov = self.vfov_deg() * 0.5;
+        let bottom_edge_deg = self.pitch_deg - half_vfov * 0.85;
+        let top_edge_deg = self.pitch_deg + half_vfov * 0.85;
+        target_pitch_deg >= bottom_edge_deg && target_pitch_deg <= top_edge_deg
+    }
+
     pub fn depth_for_range(&self, yaw: f32, px: f32, py: f32, range_m: f32) -> f32 {
         let r = self.ray(yaw, px, py);
         range_m / r[0].hypot(r[2]).max(1e-6)
     }
 
-    /// Ground position `(x, z)` of the point seen at a pixel at forward depth `depth_m`.
     pub fn ground_point(&self, pose: &Pose, px: f32, py: f32, depth_m: f32) -> Option<(f32, f32)> {
         if !depth_m.is_finite() || depth_m <= 0.0 {
             return None;

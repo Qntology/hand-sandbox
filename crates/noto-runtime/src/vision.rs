@@ -123,51 +123,58 @@ pub fn memory_ok(sigma_m: f32, tolerance_m: f32, cfg: &VisionCfg) -> bool {
     cfg.sigmas * sigma_m <= tolerance_m
 }
 
-/// Whether the camera on the robot at `pose` (x, z, yaw; believed) can see a
-/// point on the ground at `(x, z)`: inside the horizontal field of view, beyond
-/// the near edge of the view of the ground and within the camera's range.
 pub fn in_view(cam: &Camera, eye_m: f32, pose: (f32, f32, f32), x: f32, z: f32) -> bool {
     let (dx, dz) = (x - pose.0, z - pose.1);
     let d = dx.hypot(dz);
     let bearing = wrap(dz.atan2(dx) - pose.2).abs();
     let half_h = 0.5 * cam.fov_deg.to_radians() - 0.05;
-    // The lowest ray of the camera meets the ground this far ahead.
-    let low = (-cam.pitch_deg).to_radians() + 0.5 * cam.vfov_deg().to_radians();
+    let half_v = (0.5 * cam.vfov_deg().to_radians() - 0.05).max(0.05);
+    let center_dep = (-cam.pitch_deg).to_radians();
+    let low = center_dep + half_v;
+    let high = center_dep - half_v;
     let near = if low > 1e-3 { eye_m / low.tan() } else { 0.0 };
-    bearing <= half_h && d >= near && d <= cam.max_dist_m
+    let far = if high > 1e-3 { (eye_m / high.tan()).min(cam.max_dist_m) } else { cam.max_dist_m };
+    bearing <= half_h && d >= near && d <= far
 }
 
-/// Whether the camera sees the point with the head pitched down by the neck
-/// as far as it goes (`noto_core::kin::NECK_PITCH_MAX_DEG`): a glance at the
-/// ground in front of the feet, where the level camera does not reach. The
-/// tilt it takes, degrees, or `None` (beside the robot or behind it no tilt helps).
 pub fn tilt_to_see(cam: &Camera, eye_m: f32, pose: (f32, f32, f32), x: f32, z: f32) -> Option<f32> {
     if in_view(cam, eye_m, pose, x, z) {
         return Some(0.0);
     }
-    let tilt = noto_core::kin::NECK_PITCH_MAX_DEG;
-    let down = Camera { pitch_deg: cam.pitch_deg - tilt, ..*cam };
-    in_view(&down, eye_m, pose, x, z).then_some(tilt)
+    let d = (x - pose.0).hypot(z - pose.1).max(0.1);
+    let dep_deg = eye_m.atan2(d).to_degrees();
+    let ideal_tilt = (dep_deg + cam.pitch_deg).clamp(0.0, noto_core::kin::NECK_PITCH_MAX_DEG);
+    for tilt in [ideal_tilt, noto_core::kin::NECK_PITCH_MAX_DEG] {
+        let down = Camera { pitch_deg: cam.pitch_deg - tilt, ..*cam };
+        if in_view(&down, eye_m, pose, x, z) {
+            return Some(tilt);
+        }
+    }
+    None
 }
 
-/// The head's turn that shows a point the camera does not see now: the neck
-/// pans toward it, as far as it goes (`noto_core::kin::NECK_PAN_MAX_DEG`),
-/// and pitches down when the point lies at the feet. `(pan, tilt)` in
-/// degrees, the pan to the robot's left positive; `None` when no turn of the
-/// head shows it (behind the robot, beyond the pan).
 pub fn gaze_to_see(cam: &Camera, eye_m: f32, pose: (f32, f32, f32), x: f32, z: f32) -> Option<(f32, f32)> {
-    if in_view(cam, eye_m, pose, x, z) {
+    let d = (x - pose.0).hypot(z - pose.1).max(0.1);
+    let dep_deg = eye_m.atan2(d).to_degrees();
+    let comfortable_low = -cam.pitch_deg + 0.30 * cam.vfov_deg();
+    if in_view(cam, eye_m, pose, x, z) && dep_deg <= comfortable_low {
         return Some((0.0, 0.0));
     }
-    let max = noto_core::kin::NECK_PAN_MAX_DEG;
-    // A heading to the right of the robot (toward +z of its heading) is a pan to the right: negative.
+    let max_pan = noto_core::kin::NECK_PAN_MAX_DEG;
     let bearing = wrap((z - pose.1).atan2(x - pose.0) - pose.2).to_degrees();
-    let pan = (-bearing).clamp(-max, max);
+    let pan = (-bearing).clamp(-max_pan, max_pan);
     let turned = (pose.0, pose.1, pose.2 - pan.to_radians());
-    [0.0, noto_core::kin::NECK_PITCH_MAX_DEG].into_iter().find_map(|tilt| {
+    let ideal_tilt = (dep_deg + cam.pitch_deg).clamp(0.0, noto_core::kin::NECK_PITCH_MAX_DEG);
+    for tilt in [0.0, ideal_tilt, noto_core::kin::NECK_PITCH_MAX_DEG] {
         let c = Camera { pitch_deg: cam.pitch_deg - tilt, ..*cam };
-        in_view(&c, eye_m, turned, x, z).then_some((pan, tilt))
-    })
+        if in_view(&c, eye_m, turned, x, z) {
+            if tilt == 0.0 && dep_deg > comfortable_low {
+                continue;
+            }
+            return Some((pan, tilt));
+        }
+    }
+    None
 }
 
 /// A record of when the robot looked and why, for the timeline's vision lane.
