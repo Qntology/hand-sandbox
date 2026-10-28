@@ -22,6 +22,8 @@ pub const GOAL_TOL_M: f32 = 0.06;
 pub const MAX_STOP_TURNS: u32 = 6;
 pub const STALL_S: f32 = 2.5;
 pub const FINAL_APPROACH_M: f32 = 0.45;
+pub const STEER_MAX_RAD: f32 = 0.75;
+pub const STEER_RATE_RAD_S: f32 = 1.0;
 
 #[derive(Clone, Debug)]
 pub(crate) struct SegRun {
@@ -63,6 +65,7 @@ pub(crate) struct Follow {
     pub best_s: f32,
     pub stall_s: f32,
     pub stop_within: Option<((f32, f32), f32)>,
+    pub steer: f32,
 }
 
 impl Follow {
@@ -304,6 +307,7 @@ impl World {
         let stalled = m.follow.stall_s > STALL_S;
         if caps.kind != TurnKind::Holonomic && (alpha.abs() > stop_at || near_end || stalled) && dist > 0.03 {
             m.follow.stall_s = 0.0;
+            m.follow.steer = 0.0;
             if m.follow.turns >= MAX_STOP_TURNS {
                 m.follow.on_rails = true;
                 return 1e-4;
@@ -321,6 +325,15 @@ impl World {
         let mut kappa = 2.0 * alpha.sin() / dist;
         if caps.kind == TurnKind::Skid && caps.min_radius_m > 0.0 {
             kappa = kappa.clamp(-1.0 / caps.min_radius_m, 1.0 / caps.min_radius_m);
+        }
+        if caps.kind == TurnKind::Skid {
+            // The steering lock swings at a finite rate and stops at a limit, as a hydraulic tractor's does, so the
+            // curvature ramps instead of jumping to whatever the pursuit law asks for in one tick.
+            let l = self.body.support_len_m.max(0.1);
+            let want = (kappa * l).atan().clamp(-STEER_MAX_RAD, STEER_MAX_RAD);
+            let step = STEER_RATE_RAD_S * dt;
+            m.follow.steer += (want - m.follow.steer).clamp(-step, step);
+            kappa = m.follow.steer.tan() / l;
         }
         if caps.kind != TurnKind::Holonomic && kappa.abs() > 1e-3 {
             v = v.min(caps.speed_on_radius(1.0 / kappa.abs(), v).max(MIN_CURVE_MPS));
@@ -460,6 +473,25 @@ mod tests {
         assert!(moving.iter().all(|t| t.3 > 0.05), "it never halts mid-route: {:?}", moving.iter().map(|t| t.3).collect::<Vec<_>>());
         let jumps = tr.windows(2).map(|p| wrap_angle(p[1].2 - p[0].2).abs()).fold(0.0f32, f32::max);
         assert!(jumps < 0.35, "the heading turns smoothly, at most {jumps} rad a tick");
+    }
+
+    #[test]
+    fn the_steering_lock_swings_at_a_finite_rate() {
+        let mut w = world(BaseKind::Track);
+        let (x0, z0) = (w.agent.x, w.agent.z);
+        w.command(Action::MoveTo { x: x0 + 3.0, z: z0 + 3.0, reach_m: 0.0 }).unwrap();
+        let mut steer = 0.0f32;
+        for _ in 0..400 {
+            w.tick();
+            if let Some(Active::Move(m)) = w.active.as_ref().map(|a| &a.1) {
+                assert!((m.follow.steer - steer).abs() < STEER_RATE_RAD_S * 0.2, "the lock jumped {} rad", m.follow.steer - steer);
+                steer = m.follow.steer;
+            }
+            if !w.busy() {
+                break;
+            }
+        }
+        assert!(!w.busy());
     }
 
     #[test]
