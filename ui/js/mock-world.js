@@ -705,12 +705,20 @@ function pickStep(q, rt, needsCoCarry = false, coPhase = 1) {
       p.t += 1;
       gazeAt(a, drop.pos, 1, 1);
       if (p.t >= 2) {
-        if (needsCoCarry && coPhase === 1) {
-          return 'phase1_ready';
+        if (!needsCoCarry || coPhase === 2) {
+          const idx = W.drops.indexOf(drop);
+          if (idx >= 0) W.drops.splice(idx, 1);
+          a.carrying.push({ item_id: rt.key, label_ko: rt.it.ko, mass_kg: rt.it.mass });
         }
-        W.drops.splice(W.drops.indexOf(drop), 1);
-        a.carrying.push({ item_id: rt.key, label_ko: rt.it.ko, mass_kg: rt.it.mass });
-        Object.assign(p, { stage: 'lift', t: 0, from: { neck: a.neck_deg, total: a.head_pitch_deg, crouch: (a.standing_eye_m ?? 1) - a.eye_m } });
+        Object.assign(p, {
+          stage: 'lift',
+          t: 0,
+          from: {
+            neck: a.neck_deg ?? 0,
+            total: a.head_pitch_deg ?? 0,
+            crouch: (a.standing_eye_m ?? 1) - (a.eye_m ?? 1),
+          },
+        });
       }
       break;
     }
@@ -722,9 +730,13 @@ function pickStep(q, rt, needsCoCarry = false, coPhase = 1) {
       applyCameraPose(a, p.from.total * (1 - u), p.from.crouch * (1 - u));
       W.energy += (needsCoCarry ? 12.5 : 25) * DT;
       if (u >= 1) {
-        rt.pick = null;
         a.neck_deg = 0;
         a.trunk_deg = 0;
+        applyCameraPose(a, 0, 0);
+        if (needsCoCarry && coPhase === 1) {
+          return 'phase1_ready';
+        }
+        rt.pick = null;
         return 'picked';
       }
       break;
@@ -749,7 +761,7 @@ export function procedureView() {
       mechanism: 'fork',
       camera: ['lower', 'check', 'insert'].includes(p.stage) ? 'fork' : 'head',
       target: p.drop.id,
-      label_ko: rt.it.ko,
+      label_ko: (W.teamSize ?? 2) >= 2 ? `${rt.it.ko} [로봇 ${rt.coPhase ?? 1}/2]` : rt.it.ko,
       stage: p.stage,
       stages: FORK_STAGES.map(([id, label_ko], i) => ({ id, label_ko, state: i < at ? 'done' : i === at ? 'active' : 'pending' })),
       fork_m: a.fork_m ?? FORK_REST_M,
@@ -762,12 +774,18 @@ export function procedureView() {
     };
   }
   const at = PICK_STAGES.findIndex(([id]) => id === p.stage);
+  const teamCoop = (W.teamSize ?? 2) >= 2;
+  const phaseLabel = teamCoop ? ` [로봇 ${rt.coPhase ?? 1}/2]` : '';
   return {
     act: 'pick',
     target: p.drop.id,
-    label_ko: rt.it.ko,
+    label_ko: `${rt.it.ko}${phaseLabel}`,
     stage: p.stage,
-    stages: PICK_STAGES.map(([id, label_ko], i) => ({ id, label_ko, state: i < at ? 'done' : i === at ? 'active' : 'pending' })),
+    stages: PICK_STAGES.map(([id, label_ko], i) => ({
+      id,
+      label_ko,
+      state: i < at ? 'done' : i === at ? 'active' : 'pending',
+    })),
     neck_deg: a.neck_deg ?? 0,
     trunk_deg: a.trunk_deg ?? 0,
     eye_m: a.eye_m,
@@ -845,27 +863,31 @@ function runStep(q, rt) {
       break;
     }
     case 'collect': {
+      const teamCoop = (W.teamSize ?? 2) >= 2;
+      // 지게차(바퀴·메카넘·트랙)는 손가락으로 쥐지 않으므로 파지 불안정이 없다.
       const soloGripFail = !usesForks() && W.config?.fingers <= 2 && rt.it.mass >= 3;
       const soloLoadFail = loadKg() + rt.it.mass > LOAD_LIMIT;
-      const needsCoCarry = soloGripFail || soloLoadFail;
+      const needsCoCarry = teamCoop || soloGripFail || soloLoadFail;
       const effectiveMass = needsCoCarry ? rt.it.mass * 0.5 : rt.it.mass;
       const teamLimit = LOAD_LIMIT * 2 * 0.85;
 
-      if (needsCoCarry && loadKg() + effectiveMass > LOAD_LIMIT) {
-        return failQuest(q, rt, `협동 분담 한계 초과 (분담 후 ${(loadKg() + effectiveMass).toFixed(1)} > ${LOAD_LIMIT} kg, 팀 한계 ${teamLimit.toFixed(1)} kg)`);
+      if (!needsCoCarry && soloGripFail) {
+        return failQuest(q, rt, `손가락 ${W.config.fingers}개로는 ${rt.it.ko}(${rt.it.mass} kg)를 안정적으로 쥘 수 없습니다 (파지 불안정)`);
+      }
+      if (loadKg() + effectiveMass > LOAD_LIMIT) {
+        return failQuest(q, rt, `적재 한계 초과 (${(loadKg() + effectiveMass).toFixed(1)} > ${LOAD_LIMIT} kg, 팀 한계 ${teamLimit.toFixed(1)} kg)`);
       }
 
       if (!rt.coPhase) {
         rt.coPhase = 1;
-        rt.savedPos = [a.pos[0], a.pos[1]];
-        rt.savedYaw = a.yaw;
+        W.agent.activeRobot = 1;
       }
 
       if (!rt.pick) {
         const drop = nearest(W.drops, rt.key);
         if (!drop) return failQuest(q, rt, `줍을 ${rt.it.ko} 드롭이 없습니다`);
         if (needsCoCarry && rt.coPhase === 1) {
-          log('world', 'info', `협동 모드(중첩 물리): 2번 로봇의 반대편 지지를 가정하여 1번 로봇 일차 시뮬레이션 시작 (유효 하중 ${effectiveMass.toFixed(1)} kg)`, { co_phase: 1, effective_mass_kg: effectiveMass });
+          log('world', 'info', `[로봇 1/2] 순차 협동 1차 시뮬레이션 시작: 고개 숙여 응시 → 자세 낮춤 → 1차 지지 들어올림 (분담 하중 ${effectiveMass.toFixed(1)} kg)`, { co_phase: 1, effective_mass_kg: effectiveMass });
         }
         startPick(rt, drop);
       }
@@ -873,11 +895,17 @@ function runStep(q, rt) {
       const r = pickStep(q, rt, needsCoCarry, rt.coPhase);
 
       if (r === 'phase1_ready') {
+        W.partnerPos = [a.pos[0], a.pos[1], 0];
+        W.partnerYaw = a.yaw;
         rt.coPhase = 2;
-        a.pos = [rt. pick.drop.pos[0] - 0.9, rt.pick.drop.pos[1] + 0.4];
+        W.agent.activeRobot = 2;
+        a.pos = [rt.pick.drop.pos[0] - 1.5, rt.pick.drop.pos[1] + 0.8, 0];
         a.yaw = Math.atan2(rt.pick.drop.pos[1] - a.pos[1], rt.pick.drop.pos[0] - a.pos[0]);
+        a.neck_deg = 0;
+        a.trunk_deg = 0;
+        applyCameraPose(a, 0, 0);
         Object.assign(rt.pick, { stage: 'approach', t: 0, check: null });
-        log('world', 'info', `1번 로봇 파지 위치 확보 완료 → 2번 로봇 시점으로 전환하여 이차 시뮬레이션 진행`, { co_phase: 2 });
+        log('world', 'info', `[로봇 1/2] 1차 파지 및 들어올림 대기 완료 → [로봇 2/2] 시점으로 전환하여 고개 숙여 응시 → 자세 낮춤 → 협동 들어올림 진행`, { co_phase: 2 });
         break;
       }
 
