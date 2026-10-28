@@ -163,7 +163,7 @@ pub fn odometry(world: &World, cam: &Camera) -> Pose {
 
 pub fn intrinsics(world: &World, cam: &Camera) -> Intrinsics {
     let est = world.head_view(cam).est;
-    Intrinsics { width: cam.width as u32, height: cam.height as u32, fov_deg: cam.fov_deg, pitch_deg: est.pitch.to_degrees() }
+    Intrinsics { width: cam.width as u32, height: cam.height as u32, fov_deg: cam.fov_deg, pitch_deg: est.pitch.to_degrees(), roll_deg: est.roll.to_degrees() }
 }
 
 pub const FOCUS_W: usize = 192;

@@ -181,6 +181,11 @@ impl World {
         hkin::head_camera(&self.body, &KinPose::stand(0.0)).pos[2]
     }
 
+    /// The body pose the head camera hangs on right now (an act, a step, a held gaze, or standing).
+    pub fn current_kin_pose(&self) -> KinPose {
+        self.camera_pose().0
+    }
+
     fn camera_pose(&self) -> (KinPose, bool) {
         if let Some(p) = &self.act {
             if let Some(s) = p.rollout.sample_at(p.t()) {

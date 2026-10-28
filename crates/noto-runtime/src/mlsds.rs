@@ -112,6 +112,7 @@ impl Runtime {
             pose: kf.pose,
             heading: t.heading,
             sigma: noto_vision::centroid_sigma(kf.intr.width, kf.intr.fov_deg, 2.0),
+            extent: target_track.map_or(0.0, |m| (kf.intr.relative_bearing(&kf.pose, m.bbox[2], m.cy) - kf.intr.relative_bearing(&kf.pose, m.bbox[0], m.cy)).abs()),
             depth_range_m: t.depth_range_m,
             track_id: t.track_id,
             score: t.score,

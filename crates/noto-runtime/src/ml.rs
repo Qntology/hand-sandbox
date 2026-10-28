@@ -34,6 +34,16 @@ pub struct MlFixCfg {
     pub scan_prompting: bool,
     #[serde(default)]
     pub scan_calibrated: bool,
+    #[serde(default)]
+    pub sky_mask: bool,
+    #[serde(default)]
+    pub normals: bool,
+}
+
+/// The depth model's extra heads a configuration asks for: the ADE20K segmentation to take the sky out of the
+/// depth, the surface normals to keep objects out of the ground fit.
+pub fn scene_heads(fix: &MlFixCfg) -> noto_vision::SceneHeads {
+    noto_vision::SceneHeads { normals: fix.normals && fix.align.is_some(), segmentation: fix.sky_mask }
 }
 
 fn default_pitch_sigma() -> f32 {
@@ -55,6 +65,8 @@ impl MlFixCfg {
             locate: LocateCfg::default(),
             scan_prompting: false,
             scan_calibrated: false,
+            sky_mask: false,
+            normals: false,
         }
     }
 
@@ -74,6 +86,8 @@ impl MlFixCfg {
             locate,
             scan_prompting: false,
             scan_calibrated: true,
+            sky_mask: true,
+            normals: false,
         }
     }
 }
@@ -459,7 +473,7 @@ pub const PREFETCH_MAX: usize = 32;
 
 #[derive(Default)]
 struct Prefetched {
-    depth: Option<DepthMap>,
+    depth: Option<noto_vision::DepthScene>,
     points: Option<Vec<SemanticPoint>>,
 }
 
@@ -550,8 +564,9 @@ impl MlPipeline {
             return Ok(0);
         }
         self.tracker.prepare(&sel)?;
+        let heads = scene_heads(&self.fix);
         let depths = match &mut self.depth {
-            DepthEngine::Model(m) => Some(m.infer_batch(&sel)?),
+            DepthEngine::Model(m) => Some(m.infer_scene_batch(&sel, heads)?),
             DepthEngine::StandIn(_) => None,
         };
         let points = match &mut self.locate {
@@ -643,14 +658,17 @@ impl MlPipeline {
         let key = frame_key(rgb);
         let pre = self.pre.remove(&key).unwrap_or_default();
         self.pre_order.retain(|k| *k != key);
-        let mut depth = match (pre.depth, &mut self.depth, truth) {
+        let heads = scene_heads(&self.fix);
+        let scene = match (pre.depth, &mut self.depth, truth) {
             (Some(d), DepthEngine::Model(_), _) => d,
-            (_, DepthEngine::Model(m), _) => m.infer(rgb)?,
-            (_, DepthEngine::StandIn(s), Some(t)) => s.run(t),
+            (_, DepthEngine::Model(m), _) => m.infer_scene(rgb, heads)?,
+            (_, DepthEngine::StandIn(s), Some(t)) => noto_vision::DepthScene::depth_only(s.run(t)),
             (_, DepthEngine::StandIn(_), None) => anyhow::bail!("깊이 대역 모델에는 정답 버퍼가 필요합니다"),
         };
+        let mut depth = scene.depth;
+        let normals = scene.normals.filter(|_| self.fix.normals);
         let align = match (&self.depth, &self.fix.align) {
-            (DepthEngine::Model(m), Some(cfg)) => noto_vision::ground_align(&mut depth, intr, pose, height, m.max_depth_m(), cfg),
+            (DepthEngine::Model(m), Some(cfg)) => noto_vision::ground_align_with(&mut depth, normals.as_ref(), intr, pose, height, m.max_depth_m(), cfg),
             _ => None,
         };
         let points = match (pre.points, &mut self.locate, truth) {
@@ -845,7 +863,7 @@ mod tests {
         let phantom = LocateErrModel { pass_absent: 0.3, score_pass: (0.4, 0.3), score_block: (0.6, 0.3), ..sure };
         let mut s = LocateStandIn { err: Some(phantom), ..LocateStandIn::new(4) };
         let empty = truth_with(Vec::new());
-        let passed = (0..1000).filter(|_| s.run(&empty, &labels)[0].score >= 0.5).count();
+        let passed = (0..1000).filter(|_| s.run(&empty, &labels).first().is_some_and(|p| p.score >= 0.5)).count();
         assert!((250..350).contains(&passed), "{passed} of 1000");
         let half = LocateErrModel { hit_a: 1.0, hit_b: -(400f32).ln(), ..sure };
         let mut s = LocateStandIn { err: Some(half), ..LocateStandIn::new(9) };

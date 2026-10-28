@@ -18,7 +18,9 @@ use crate::terrain::{cell_center, FlatZone, RuggedLayout, Terrain, TerrainKind, 
 
 mod acts;
 mod eye;
-pub use acts::{camera_of, material_of, ActPlay, PushState, WalkState, GET_UP_S, PUSH_START_SLACK_M, SIDE_SHUFFLE_MAX_M};
+mod motion;
+pub use acts::{camera_of, material_of, ActPlay, GazeHold, PushState, WalkState, GET_UP_S, PUSH_START_SLACK_M, SIDE_SHUFFLE_MAX_M};
+use motion::{Follow, SegRun};
 pub use eye::{chassis_accel_rms, exposure_s, profile, roughness_gd, sensor_timing, sensor_timing_at, strike_peak_mps2, strike_scale, EyeState, HeadView, SensorTiming, Shake, EXPOSURE_MAX_S, SCENE_LUX};
 
 pub const TICK_S: f32 = 0.1;
@@ -29,8 +31,6 @@ pub const PICKUP_TIME_S: f32 = 1.0;
 pub const DELIVER_TIME_S: f32 = 1.0;
 pub const MANIPULATION_POWER_W: f64 = 30.0;
 pub const TURN_RATE_RAD_S: f32 = 1.2;
-const TURN_IN_PLACE_RAD: f32 = 0.28;
-const TURN_DONE_RAD: f32 = 0.05;
 const FACE_DONE_RAD: f32 = 0.03;
 pub const TWO_ARM_LIFT_FACTOR: f32 = 1.5;
 pub const ACCEL_TIME_S: f32 = 0.5;
@@ -149,6 +149,7 @@ pub enum Action {
     MoveTo { x: f32, z: f32, reach_m: f32 },
     Turn { yaw_deg: f32 },
     Face { x: f32, z: f32 },
+    Look { x: f32, z: f32 },
     Mine { node: u32 },
     PickUp {
         drop: u32,
@@ -183,6 +184,7 @@ impl Action {
             Action::MoveTo { x, z, reach_m } => format!("move_to({x:.1},{z:.1},reach={reach_m:.1})"),
             Action::Turn { yaw_deg } => format!("turn({yaw_deg:.0})"),
             Action::Face { x, z } => format!("face({x:.1},{z:.1})"),
+            Action::Look { x, z } => format!("look({x:.1},{z:.1})"),
             Action::Mine { node } => format!("mine({})", node_id(*node)),
             Action::PickUp { drop, side, .. } => format!("{}({})", if *side { "pick_up_side" } else { "pick_up" }, drop_id(*drop)),
             Action::Deliver { waypoint, item } => match item {
@@ -281,11 +283,13 @@ struct MoveState {
     progress_s: f32,
     announced_pause: bool,
     elapsed_s: f32,
+    follow: Follow,
 }
 
 #[derive(Clone, Debug)]
 enum WorkKind {
     Mine { node: u32 },
+    Look { at: (f32, f32) },
     Pick { drop: u32, two_arms: bool, face: Option<(f32, f32)> },
     Deliver { waypoint: u32, item: Option<ItemKind> },
     Drop { item: Option<ItemKind>, amount: Option<f32>, waypoint: Option<u32> },
@@ -301,7 +305,7 @@ struct WorkState {
 #[derive(Clone, Debug)]
 enum Active {
     Move(MoveState),
-    Turn { target: f32 },
+    Turn { target: f32, run: SegRun },
     Work(WorkState),
     Push(PushState),
 }
@@ -343,6 +347,7 @@ pub struct World {
     side_cache: Mutex<std::collections::HashMap<(ItemKind, i32, i32), Option<(f32, f32)>>>,
     pub site: Option<Site>,
     pub fixtures: Vec<Fixture>,
+    pub gaze: Option<GazeHold>,
 }
 
 impl Clone for World {
@@ -384,6 +389,7 @@ impl Clone for World {
             side_cache: Mutex::new(self.side_cache.lock().unwrap_or_else(|e| e.into_inner()).clone()),
             site: self.site.clone(),
             fixtures: self.fixtures.clone(),
+            gaze: self.gaze,
         }
     }
 }
@@ -676,6 +682,7 @@ impl World {
             side_cache: Mutex::new(std::collections::HashMap::new()),
             site,
             fixtures,
+            gaze: None,
         })
     }
 
@@ -706,6 +713,7 @@ impl World {
         self.motion = None;
         self.last_posture = Posture::quiet(self.carried_kg());
         self.fallen_until = None;
+        self.gaze = None;
     }
 
     pub fn grasp_info(&self, item: ItemKind) -> &GraspInfo {
@@ -869,9 +877,7 @@ impl World {
     }
 
     fn remaining_m(&self, m: &MoveState) -> f32 {
-        let rest: f32 = m.edges.iter().skip(m.idx).map(|e| e.horizontal_m).sum();
-        let done = m.edges.get(m.idx).map_or(0.0, |e| e.horizontal_m * (m.progress_s / e.move_time_s.max(1e-6)).clamp(0.0, 1.0));
-        rest - done
+        (m.follow.total_m() - m.follow.s).max(0.0)
     }
 
     fn ff_for(&self, s: Source) -> FeedForward {
@@ -976,10 +982,22 @@ impl World {
                 };
                 let plan = self.plan_route(goal).ok_or(ActionError::NoPath)?;
                 self.odom.new_move();
-                Active::Move(MoveState { edges: plan.edges, idx: 0, pause_left: 0.0, progress_s: 0.0, announced_pause: false, elapsed_s: 0.0 })
+                let mut follow = self.start_follow(&plan.edges);
+                follow.stop_within = (*reach_m > 0.0).then_some(((*x, *z), *reach_m));
+                Active::Move(MoveState { edges: plan.edges, idx: 0, pause_left: 0.0, progress_s: 0.0, announced_pause: false, elapsed_s: 0.0, follow })
             }
-            Action::Turn { yaw_deg } => Active::Turn { target: wrap_angle(yaw_deg.to_radians()) },
-            Action::Face { x, z } => Active::Turn { target: (z - self.agent.z).atan2(x - self.agent.x) },
+            Action::Turn { yaw_deg } => {
+                let target = wrap_angle(yaw_deg.to_radians());
+                Active::Turn { target, run: self.turn_run(target) }
+            }
+            Action::Face { x, z } => {
+                let target = (z - self.agent.z).atan2(x - self.agent.x);
+                Active::Turn { target, run: self.turn_run(target) }
+            }
+            Action::Look { x, z } => {
+                let t = self.start_look(*x, *z);
+                Active::Work(WorkState { kind: WorkKind::Look { at: (*x, *z) }, remaining_s: t })
+            }
             Action::Mine { node } => {
                 let n = self.node(*node).ok_or(ActionError::UnknownTarget)?;
                 self.check_reach(n.x, n.z, MINE_REACH_M)?;
@@ -1056,6 +1074,9 @@ impl World {
         let after = (self.agent.x, self.agent.z, self.agent.yaw);
         if after != before {
             self.odom.update(before, after, 0.0, 0.0);
+        }
+        if !matches!(action, Action::PickUp { .. } | Action::Look { .. }) {
+            self.gaze = None;
         }
         let label = action.label();
         self.active = Some((action, state));
@@ -1141,10 +1162,12 @@ impl World {
     }
 
     fn rotate_toward(&mut self, target: f32, max_dt: f32) -> f32 {
+        let caps = self.turn_caps();
+        let rate = if caps.can_pivot() { caps.pivot_rad_s.min(TURN_RATE_RAD_S) } else { motion::CREEP_RAD_S };
         let err = wrap_angle(target - self.agent.yaw);
-        let turn = (TURN_RATE_RAD_S * max_dt).min(err.abs());
+        let turn = (rate * max_dt).min(err.abs());
         self.agent.yaw = wrap_angle(self.agent.yaw + turn * err.signum());
-        turn / TURN_RATE_RAD_S
+        turn / rate
     }
 
     fn advance(&mut self, remaining: f32, events: &mut Vec<TimedEvent>) -> f32 {
@@ -1152,15 +1175,16 @@ impl World {
         let used;
         let mut done: Option<(bool, Option<String>)> = None;
         match &mut state {
-            Active::Turn { target } => {
-                let err = wrap_angle(*target - self.agent.yaw).abs();
-                if err <= FACE_DONE_RAD * 0.5 {
+            Active::Turn { target, run } => {
+                if run.done() && run.wait_left <= 0.0 {
+                    if wrap_angle(*target - self.agent.yaw).abs() <= FACE_DONE_RAD {
+                        self.agent.yaw = *target;
+                    }
+                    self.agent.speed_mps = 0.0;
                     done = Some((true, None));
                     used = 0.0;
                 } else {
-                    let t = self.rotate_toward(*target, remaining);
-                    self.add_energy(self.drive_spec().power_w as f64 * t as f64);
-                    used = t;
+                    used = self.advance_run(run, remaining).max(1e-4);
                 }
             }
             Active::Move(m) => {
@@ -1189,66 +1213,7 @@ impl World {
             *done = Some((true, None));
             return 0.0;
         }
-        let e = m.edges[m.idx];
-        let (fx, fz) = cell_center(e.from.0, e.from.1);
-        let (tx, tz) = cell_center(e.to.0, e.to.1);
-        self.agent.terrain_margin = Some(e.margin);
-        let power = self.drive_spec().power_w as f64;
-
-        if e.pause_s > 0.0 && !m.announced_pause {
-            m.announced_pause = true;
-            m.pause_left = e.pause_s;
-            events.push(self.stamp(WorldEvent::CurbClimbed { height_m: e.step_m }));
-        }
-        if m.pause_left > 0.0 {
-            let t = m.pause_left.min(remaining);
-            m.pause_left -= t;
-            self.agent.speed_mps = 0.0;
-            self.add_energy(power * t as f64);
-            return t;
-        }
-
-        let heading = (tz - fz).atan2(tx - fx);
-        let err = wrap_angle(heading - self.agent.yaw).abs();
-        if !self.hand.base.holonomic && err > TURN_IN_PLACE_RAD {
-            let need = (err - TURN_DONE_RAD) / TURN_RATE_RAD_S;
-            let t = need.min(remaining);
-            self.rotate_toward(heading, t);
-            self.agent.speed_mps = 0.0;
-            self.add_energy(power * t as f64);
-            return t;
-        }
-
-        if !self.body.legged() {
-            let props = self.ground_at(e.to).surface().props();
-            self.odom_over = noto_core::act::cruise_slip(&self.drive_spec(), props, e.slope_deg).map_or(0.0, |s| s / (1.0 - s).max(0.05));
-        }
-        let left = e.move_time_s - m.progress_s;
-        let t = left.min(remaining);
-        m.progress_s += t;
-        m.elapsed_s += t;
-        self.rotate_toward(heading, t);
-        let f = (m.progress_s / e.move_time_s).clamp(0.0, 1.0);
-        let (px, pz) = (self.agent.x, self.agent.z);
-        self.agent.x = fx + (tx - fx) * f;
-        self.agent.z = fz + (tz - fz) * f;
-        self.agent.speed_mps = e.horizontal_m / e.move_time_s;
-        if let Some(why) = self.walk_steps((self.agent.x - px).hypot(self.agent.z - pz), &e, events) {
-            *done = Some((false, Some(format!("fall: {why}"))));
-            return t;
-        }
-        self.add_energy(power * e.energy_factor as f64 * t as f64);
-        if m.progress_s >= e.move_time_s - 1e-6 {
-            self.agent.x = tx;
-            self.agent.z = tz;
-            m.idx += 1;
-            m.progress_s = 0.0;
-            m.announced_pause = false;
-            if m.idx >= m.edges.len() {
-                *done = Some((true, None));
-            }
-        }
-        t
+        self.advance_follow(m, remaining, events, done)
     }
 
     fn advance_work(&mut self, w: &mut WorkState, remaining: f32, events: &mut Vec<TimedEvent>, done: &mut Option<(bool, Option<String>)>) -> f32 {
@@ -1260,6 +1225,7 @@ impl World {
                     return 0.0;
                 }
             },
+            WorkKind::Look { at } => at,
             WorkKind::Pick { drop, face, .. } => match (self.drop_item(drop), face) {
                 (Some(_), Some(p)) => p,
                 (Some(_), None) => (self.agent.x + self.agent.yaw.cos(), self.agent.z + self.agent.yaw.sin()),
@@ -1312,6 +1278,15 @@ impl World {
                 w.remaining_s = n.hp / rate;
                 if n.hp <= 1e-5 {
                     self.break_node(node, events);
+                    *done = Some((true, None));
+                }
+            }
+            WorkKind::Look { at } => {
+                w.remaining_s -= t;
+                if w.remaining_s <= 1e-6 {
+                    self.act_finish(events);
+                    let play = self.end_act();
+                    self.hold_gaze(play.as_ref(), at);
                     *done = Some((true, None));
                 }
             }
@@ -1527,6 +1502,7 @@ impl World {
                 capacity_kg: self.capacity_kg(),
                 battery_ratio: self.battery_ratio(),
                 action: self.current_action(),
+                motion: self.motion_view(),
                 belief: self.odom.cfg.enabled.then(|| {
                     let (x, z, yaw) = self.believed_pose();
                     BeliefView { x, z, yaw_deg: yaw.to_degrees(), error_m: self.belief_error_m(), since_fix_m: self.odom.since_fix_m }
@@ -1604,6 +1580,7 @@ impl World {
             }
             Some((_, Active::Work(w))) => match &w.kind {
                 WorkKind::Mine { .. } => (Posture::arm_raise(cargo), "flat|mine".into()),
+                WorkKind::Look { .. } => (Posture::quiet(cargo), "flat|look".into()),
                 WorkKind::Pick { drop, two_arms, .. } => {
                     let kg = self.drop_item(*drop).map_or(0.0, |d| d.mass_kg());
                     (Posture::arm_lift(kg, *two_arms, cargo), "flat|pick".into())
@@ -1979,7 +1956,7 @@ mod tests {
         let ev = run(&mut w, 120.0);
         assert!(ok_done(&ev));
         assert!((w.agent.x - cell_center(w.terrain.cell_of(goal.0, goal.1).unwrap().0, 0).0).abs() < 0.3);
-        assert!(w.agent.energy_used_j >= plan.energy_j as f64 - 1.0);
+        assert!(w.agent.energy_used_j >= plan.energy_j as f64 * 0.8 - 1.0, "the base drives from where it stands, not from its cell's centre: {} vs {}", w.agent.energy_used_j, plan.energy_j);
         assert!(w.agent.energy_used_j <= plan.energy_j as f64 * 1.15 + 20.0, "{} vs {}", w.agent.energy_used_j, plan.energy_j);
     }
 

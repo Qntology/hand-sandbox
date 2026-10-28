@@ -6,6 +6,7 @@ import { bus, state } from './state.js';
 import { $, clear, el, fmt, observeResize } from './util.js';
 import { drawJointOverlay, renderJointPanel } from './joint-view.js';
 import { DRAWN_PARTS, PART_KO, drawFocus, partAvailable, resolvePart } from './focus-view.js';
+import { renderPickHud } from './pick-hud.js';
 
 const POLL_MS = 160;
 const RETRY_MS = 2500;
@@ -88,6 +89,7 @@ async function drawFrame(f) {
   const cam = c ? ` · 눈 ${fmt.n(c.eye_m, 2)} m · 피치 ${fmt.n(c.pitch_deg, 1)}° · 롤 ${fmt.n(c.roll_deg, 1)}°${Math.abs(c.pan_deg) > 0.5 ? ` · 팬 ${fmt.n(c.pan_deg, 0)}°` : ''} · 흔들림 ${c.shake?.source === 'still' ? '없음' : `${fmt.n(c.shake?.pitch_deg, 2)}°`} · 블러 ${fmt.n(c.blur_px, 1)} px` : '';
   $('frame-info').textContent = `틱 ${f.tick} · ${f.width}×${f.height} · ${fmt.bytes(f.bytes)} · 인코딩 ${fmt.n(f.encode_ms, 1)} ms${cam}`;
   $('sb-frame').textContent = `${fmt.bytes(f.bytes)} · ${fmt.n(f.encode_ms, 1)} ms`;
+  state.procedure = c ? f.procedure ?? null : null;
   renderDetections();
   bus.emit('frame', state.frame);
 }
@@ -149,6 +151,7 @@ function renderDetections() {
       layer.append(box);
     }
   }
+  renderPickHud(state.procedure);
   const list = $('lg-list');
   clear(list);
   const sorted = [...dets].sort((a, b) => b.score - a.score).slice(0, 10);

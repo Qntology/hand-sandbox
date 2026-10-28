@@ -151,6 +151,7 @@ pub fn snapshot_json(s: &WorldSnapshot) -> Value {
             "capacity_kg": r3(s.agent.capacity_kg),
             "battery_ratio": r3(s.agent.battery_ratio),
             "action": s.agent.action,
+            "motion": s.agent.motion.as_ref().map(|m| json!({"kind": m.kind, "label_ko": m.label_ko, "reversing": m.reversing})),
             "belief": s.agent.belief.as_ref().map(|b| json!({"pos": [r3(b.x), r3(d - b.z)], "yaw_deg": r3(wrap_deg(-b.yaw_deg)), "error_m": r3(b.error_m), "since_fix_m": r3(b.since_fix_m)})),
         },
         "waypoints": s.waypoints.iter().map(|w| json!({
@@ -572,6 +573,7 @@ impl Runtime {
             })
             .collect();
         let camera = matches!(view_id, "agent").then(|| self.head_view_json());
+        let procedure = matches!(view_id, "agent").then(|| self.procedure_json()).flatten();
         Ok(json!({
             "webp_base64": STANDARD.encode(&f.webp),
             "width": f.width, "height": f.height, "bytes": f.bytes,
@@ -580,7 +582,61 @@ impl Runtime {
             "overlay": f.overlay,
             "focus": focus,
             "camera": camera,
+            "procedure": procedure,
             "light": crate::views::light_json(self.world()),
+        }))
+    }
+
+    /// The pick-up as a person does it, stage by stage, for the first-person HUD: walk up, bend the head to look,
+    /// check with vision, lower the body, grip, lift. Read from the world's act phase (or held gaze) and the last
+    /// look-down check.
+    pub fn procedure_json(&self) -> Option<Value> {
+        use noto_core::act::ActKind;
+        const STAGES: [(&str, &str); 6] = [("approach", "다가가기"), ("look", "고개 숙여 응시"), ("check", "비전 확인"), ("bend", "자세 낮춤"), ("grip", "쥐기"), ("lift", "들어올림")];
+        let w = self.world();
+        let action = w.current_action().unwrap_or_default();
+        let target = action.split(['(', ')']).nth(1).filter(|s| s.starts_with('d')).and_then(|s| s.get(1..)?.parse::<u32>().ok());
+        let stage = match w.act_phase() {
+            Some((ActKind::Look, "look")) | Some((ActKind::Grasp, "look")) => "look",
+            Some((ActKind::Look, _)) | Some((ActKind::Grasp, "check")) => "check",
+            Some((ActKind::Grasp, "reach")) => "bend",
+            Some((ActKind::Grasp, "close" | "squeeze" | "load")) => "grip",
+            Some((ActKind::Grasp, _)) => "lift",
+            _ => {
+                let next = self.task.as_ref().filter(|t| matches!(t.phase, crate::driver::Phase::Collect)).and_then(|t| t.drops.get(t.drop_idx).copied());
+                let near = next.and_then(|id| w.drop_item(id)).is_some_and(|d| (d.x - w.agent.x).hypot(d.z - w.agent.z) < 3.0);
+                if !(near && action.starts_with("move_to")) {
+                    return None;
+                }
+                "approach"
+            }
+        };
+        let gazed = self.gaze_check.as_ref().map(|g| g.drop);
+        let drop = target.or(gazed).or_else(|| self.task.as_ref().and_then(|t| t.drops.get(t.drop_idx).copied()));
+        let at = STAGES.iter().position(|(id, _)| *id == stage).unwrap_or(0);
+        let stages: Vec<Value> = STAGES
+            .iter()
+            .enumerate()
+            .map(|(i, (id, ko))| json!({"id": id, "label_ko": ko, "state": if i < at { "done" } else if i == at { "active" } else { "pending" }}))
+            .collect();
+        let check = self.gaze_check.as_ref().filter(|g| Some(g.drop) == drop && w.tick.saturating_sub(g.tick) < 600).map(|g| {
+            json!({"ok": g.ok, "label_ko": g.label_ko, "score": g.score.map(r3), "range_m": g.range_m.map(r3), "depth_m": g.depth_m.map(r3), "bbox": g.bbox.map(|b| b.map(r3)), "reason": g.reason})
+        });
+        let hv = w.head_view(&self.cam);
+        let pose = w.current_kin_pose();
+        let label_ko = drop.and_then(|id| w.drop_item(id)).map(|d| d.kind.spec().label_ko.to_string()).or_else(|| self.gaze_check.as_ref().map(|g| g.label_ko.clone()));
+        Some(json!({
+            "act": if matches!(w.act_phase(), Some((ActKind::Look, "look" | "check"))) { "look" } else { "pick" },
+            "target": drop.map(|d| format!("d{d}")),
+            "label_ko": label_ko,
+            "stage": stage,
+            "stages": stages,
+            "neck_deg": r3(pose.neck_deg),
+            "trunk_deg": r3(pose.trunk_deg()),
+            "eye_m": r3(hv.eye_m),
+            "standing_eye_m": r3(w.standing_eye_m()),
+            "pitch_deg": r3(hv.view.pitch.to_degrees()),
+            "check": check,
         }))
     }
 
@@ -611,6 +667,13 @@ impl Runtime {
             "metrics": d.metrics.map(|m| json!({"absrel": r3(m.absrel), "delta1": r3(m.delta1), "rmse_m": r3(m.rmse_m), "median_scale": r3(m.median_scale), "pixels": m.pixels})),
             "scale_m": [r3(d.scale_m.0), r3(d.scale_m.1)], "max_depth_m": d.max_depth_m.map(r3),
             "rgb_webp_base64": STANDARD.encode(&d.rgb_webp), "pred_webp_base64": STANDARD.encode(&d.pred_webp), "truth_webp_base64": STANDARD.encode(&d.truth_webp),
+            "metrics_raw": d.metrics_raw.map(|m| json!({"absrel": r3(m.absrel), "delta1": r3(m.delta1), "rmse_m": r3(m.rmse_m), "median_scale": r3(m.median_scale), "pixels": m.pixels})),
+            "raw_webp_base64": d.raw_webp.as_ref().map(|b| STANDARD.encode(b)),
+            "seg_webp_base64": d.seg_webp.as_ref().map(|b| STANDARD.encode(b)),
+            "normals_webp_base64": d.normals_webp.as_ref().map(|b| STANDARD.encode(b)),
+            "align": d.align.map(|a| json!({"a": r3(a.a), "b": r3(a.b), "inliers": a.inliers, "candidates": a.candidates, "inlier_share": r3(a.inlier_share), "median_rel_err": r3(a.median_rel_err), "span_m": [r3(a.span_m.0), r3(a.span_m.1)], "off_ground_normals": a.off_ground_normals})),
+            "sky": d.sky_frac.map(|f| json!({"frac": r3(f)})),
+            "flip_tta": d.flip_tta,
             "camera": self.head_view_json(),
         }))
     }

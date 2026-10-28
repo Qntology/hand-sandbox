@@ -13,9 +13,47 @@ use serde::{Deserialize, Serialize};
 use world_sim::render::View;
 use world_sim::{decode_webp, encode_webp, Camera, Frame};
 
-use crate::perception::{centre_from_surface, centre_offset_m, Candidate, EntityTable, Recognizer, ScanInput, ScanOutput};
+use crate::perception::{box_iou_and_iomin, centre_from_surface, centre_offset_m, Candidate, EntKind, EntityTable, Recognizer, ScanFilter, ScanInput, ScanOutput, SizePrior};
 
 pub const SCAN_CALIB_MODE: &str = "embedding";
+
+/// Which tiles are worth asking SigLIP2 about: a tile that is mostly sky, or whose nearest solid content is farther
+/// than any object the robot could act on, only ever produces look-alike guesses, so it is not embedded and cannot
+/// win (or lose) a non-maximum suppression.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RoiCfg {
+    pub enabled: bool,
+    pub sky_max_frac: f32,
+    pub far_m: f32,
+    pub min_valid_frac: f32,
+}
+
+impl Default for RoiCfg {
+    fn default() -> Self {
+        RoiCfg { enabled: true, sky_max_frac: 0.6, far_m: 18.0, min_valid_frac: 0.25 }
+    }
+}
+
+/// Checks a tile's label against what the depth says about the thing in it: how tall it stands above the ground it
+/// is on, and whether it touches that ground. A tree is metres tall, a boulder under a metre and a half, a log or a
+/// stone on the ground a few centimetres; SigLIP2 mixes them up on blocky renders, the geometry does not.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VerifyCfg {
+    pub enabled: bool,
+    pub top_k: usize,
+    pub sigma_ln: f32,
+    pub lift_m: f32,
+    pub drop_below: f32,
+    pub cross_iou: f32,
+    pub cross_iomin: f32,
+    pub same_object_m: f32,
+}
+
+impl Default for VerifyCfg {
+    fn default() -> Self {
+        VerifyCfg { enabled: true, top_k: 3, sigma_ln: 0.35, lift_m: 0.3, drop_below: 0.15, cross_iou: 0.5, cross_iomin: 0.7, same_object_m: 0.8 }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EmbeddingCfg {
@@ -25,11 +63,15 @@ pub struct EmbeddingCfg {
     pub report_floor: f32,
     pub nms_iou: f32,
     pub webp_quality: f32,
+    #[serde(default)]
+    pub roi: RoiCfg,
+    #[serde(default)]
+    pub verify: VerifyCfg,
 }
 
 impl Default for EmbeddingCfg {
     fn default() -> Self {
-        EmbeddingCfg { grids: vec![(2, 2), (4, 3), (6, 4)], overlap: 0.15, prejudice_weight: 0.5, report_floor: 0.10, nms_iou: 0.4, webp_quality: 80.0 }
+        EmbeddingCfg { grids: vec![(2, 2), (4, 3), (6, 4)], overlap: 0.15, prejudice_weight: 0.5, report_floor: 0.10, nms_iou: 0.4, webp_quality: 80.0, roi: RoiCfg::default(), verify: VerifyCfg::default() }
     }
 }
 
@@ -148,7 +190,11 @@ impl Recognizer for EmbeddingPerception {
         let (dw, dh, rgb) = decode_webp(&enc.bytes).map_err(|e| anyhow!("스크린샷 WebP 디코딩 실패: {e}"))?;
         let img = DynamicImage::ImageRgb8(RgbImage::from_raw(dw, dh, rgb).ok_or_else(|| anyhow!("디코딩한 프레임의 크기가 맞지 않습니다"))?);
 
-        let tiles = noto_ml::parallel::tile_layout(dw, dh, &self.cfg.grids, self.cfg.overlap);
+        let hv = input.world.head_view(input.camera);
+        let view = hv.est;
+        let sc = TileScene { frame: f, camera: input.camera, view: &view, ground_y: view.origin[1] - hv.eye_m };
+        let all = noto_ml::parallel::tile_layout(dw, dh, &self.cfg.grids, self.cfg.overlap);
+        let (tiles, mut filter) = roi_tiles(&all, &sc, &self.cfg.roi);
         let t0 = Instant::now();
         let vecs = embed_frame_tiles(&*self.image, &[(&img, &tiles)])?.pop().unwrap_or_default();
         let embed_ms = t0.elapsed().as_secs_f32() * 1000.0;
@@ -166,9 +212,11 @@ impl Recognizer for EmbeddingPerception {
         }
 
         let scene = scores.first().map(|s| s.iter().map(|e| (e.id.clone(), e.score)).collect()).unwrap_or_default();
-        let view = input.world.head_view(input.camera).est;
-        let candidates = candidates_from_tiles(&tiles, &scores, &self.table, f, input.camera, &view, &self.cfg);
-        Ok(ScanOutput { candidates, tiles: tiles.len(), embed_ms, device: self.device.clone(), scene })
+        let (candidates, verified) = candidates_from_tiles(&tiles, &scores, &self.table, &sc, &self.cfg);
+        filter.relabeled = verified.relabeled;
+        filter.dropped = verified.dropped;
+        filter.merged = verified.merged;
+        Ok(ScanOutput { candidates, tiles: tiles.len(), embed_ms, device: self.device.clone(), scene, filter })
     }
 }
 
@@ -182,6 +230,109 @@ fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
     } else {
         inter / union
     }
+}
+
+/// What the scan knows about the frame besides its pixels: the head sensor's depth, the camera, and the height of
+/// the ground the robot stands on (eye height from the joint chain).
+pub struct TileScene<'a> {
+    pub frame: &'a Frame,
+    pub camera: &'a Camera,
+    pub view: &'a View,
+    pub ground_y: f32,
+}
+
+impl TileScene<'_> {
+    fn depth(&self, x: u32, y: u32) -> f32 {
+        self.frame.depth[y as usize * self.frame.width + x as usize]
+    }
+
+    fn point(&self, x: u32, y: u32) -> Option<[f32; 3]> {
+        self.camera.world_point3_in(self.view, x as f32 + 0.5, y as f32 + 0.5, self.depth(x, y))
+    }
+
+    fn flat(&self, x: u32, y: u32) -> Option<f32> {
+        let p = self.camera.world_point3_in(self.view, x as f32 + 0.5, y as f32 + 0.5, 1.0)?;
+        let dy = p[1] - self.view.origin[1];
+        (dy < -1e-4).then(|| (self.ground_y - self.view.origin[1]) / dy)
+    }
+
+    /// A surface rising at 45° or more between this pixel and the one below it: the face of something standing,
+    /// not ground (a far slope of the terrain stays under 45°).
+    fn steep(&self, x: u32, y: u32) -> bool {
+        if y + 1 >= self.frame.height as u32 {
+            return false;
+        }
+        let (Some(a), Some(b)) = (self.point(x, y), self.point(x, y + 1)) else { return false };
+        let (dy, dh) = (a[1] - b[1], (a[0] - b[0]).hypot(a[2] - b[2]));
+        dy > 0.0 && dy >= dh && dh < 0.3
+    }
+
+    /// Stands up out of the ground: above the horizon, clearly nearer than the robot's ground plane along the ray,
+    /// or on a steep face.
+    fn solid(&self, x: u32, y: u32) -> bool {
+        let d = self.depth(x, y);
+        d.is_finite() && self.flat(x, y).map_or(true, |g| d < 0.8 * g - 0.05 || self.steep(x, y))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Roi {
+    pub sky_frac: f32,
+    pub valid_frac: f32,
+    pub near_m: f32,
+}
+
+pub fn tile_roi(sc: &TileScene, t: &Tile) -> Roi {
+    let (w, h) = (sc.frame.width as u32, sc.frame.height as u32);
+    let (mut sky, mut n) = (0u32, 0u32);
+    let mut finite: Vec<f32> = Vec::new();
+    let step = (t.w.min(t.h) / 24).max(1);
+    let mut y = t.y;
+    while y < (t.y + t.h).min(h) {
+        let mut x = t.x;
+        while x < (t.x + t.w).min(w) {
+            n += 1;
+            let d = sc.depth(x, y);
+            if d.is_finite() {
+                finite.push(d);
+            } else {
+                sky += 1;
+            }
+            x += step;
+        }
+        y += step;
+    }
+    finite.sort_by(f32::total_cmp);
+    let near_m = if finite.is_empty() { f32::INFINITY } else { finite[finite.len() * 3 / 10] };
+    Roi { sky_frac: sky as f32 / n.max(1) as f32, valid_frac: finite.len() as f32 / n.max(1) as f32, near_m }
+}
+
+/// Keeps the whole frame (it scores the scene) and the tiles with something near enough to matter in them.
+pub fn roi_tiles(tiles: &[Tile], sc: &TileScene, cfg: &RoiCfg) -> (Vec<Tile>, ScanFilter) {
+    let mut f = ScanFilter::default();
+    if !cfg.enabled {
+        return (tiles.to_vec(), f);
+    }
+    let kept = tiles
+        .iter()
+        .filter(|t| {
+            if t.level == 0 {
+                return true;
+            }
+            let r = tile_roi(sc, t);
+            if r.sky_frac > cfg.sky_max_frac || r.valid_frac < cfg.min_valid_frac {
+                f.skipped_sky += 1;
+                false
+            } else if r.near_m > cfg.far_m {
+                f.skipped_far += 1;
+                false
+            } else {
+                true
+            }
+        })
+        .copied()
+        .collect();
+    (kept, f)
 }
 
 fn median_depth(f: &Frame, t: &Tile) -> Option<f32> {
@@ -203,39 +354,156 @@ fn median_depth(f: &Frame, t: &Tile) -> Option<f32> {
     Some(v[v.len() / 2])
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn candidates_from_tiles(
-    tiles: &[Tile],
-    scores: &[Vec<EntityScore>],
-    table: &EntityTable,
-    frame: &Frame,
-    camera: &Camera,
-    view: &View,
-    cfg: &EmbeddingCfg,
-) -> Vec<Candidate> {
+/// The thing in a tile, measured from the depth: how far its top stands above the ground it is on (`top_m`), how
+/// far the bottom of its typical column floats above that ground (`lift_m`: most of a tree's columns see only the
+/// crown, a flag floats on its pole, a boulder or a log sits on the ground), and whether the frame cut its top off
+/// (`clipped`, so `top_m` is only a lower bound).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct Extent {
+    pub top_m: f32,
+    pub lift_m: f32,
+    pub clipped: bool,
+    pub columns: u32,
+}
+
+pub fn object_extent(sc: &TileScene, t: &Tile) -> Option<Extent> {
+    let (w, h) = (sc.frame.width as u32, sc.frame.height as u32);
+    let near = |a: f32, b: f32| (a - b).abs() < 0.25 + 0.1 * a.min(b);
+    let (x0, x1) = (t.x + t.w / 5, (t.x + t.w * 4 / 5).min(w));
+    let (ty0, ty1) = (t.y, (t.y + t.h).min(h));
+    let mut solid_d: Vec<f32> = Vec::new();
+    for x in (x0..x1).step_by(2) {
+        for y in (ty0..ty1).step_by(2) {
+            if sc.solid(x, y) {
+                solid_d.push(sc.depth(x, y));
+            }
+        }
+    }
+    if solid_d.len() < 8 {
+        return None;
+    }
+    solid_d.sort_by(f32::total_cmp);
+    let reference = solid_d[solid_d.len() / 4];
+    let tol = 0.35 + 0.15 * reference;
+    let on = |x: u32, y: u32| sc.solid(x, y) && (sc.depth(x, y) - reference).abs() <= tol;
+    let mut cols: Vec<(f32, f32, Option<f32>, bool)> = Vec::new();
+    for x in (x0..x1).step_by(2) {
+        let mut best: Option<(u32, u32)> = None;
+        let mut y = ty0;
+        while y < ty1 {
+            if !on(x, y) {
+                y += 1;
+                continue;
+            }
+            let start = y;
+            while y + 1 < ty1 && on(x, y + 1) && near(sc.depth(x, y), sc.depth(x, y + 1)) {
+                y += 1;
+            }
+            if best.map_or(true, |(a, b)| y - start > b - a) {
+                best = Some((start, y));
+            }
+            y += 1;
+        }
+        let Some((mut top, mut bot)) = best else { continue };
+        while top > 0 && on(x, top - 1) && near(sc.depth(x, top), sc.depth(x, top - 1)) {
+            top -= 1;
+        }
+        while bot + 1 < h && on(x, bot + 1) && near(sc.depth(x, bot), sc.depth(x, bot + 1)) {
+            bot += 1;
+        }
+        let (Some(pt), Some(pb)) = (sc.point(x, top), sc.point(x, bot)) else { continue };
+        let below = if bot + 1 < h { sc.point(x, bot + 1).map(|g| g[1]) } else { None };
+        cols.push((pt[1], pb[1], below, top == 0));
+    }
+    if cols.len() < 3 {
+        return None;
+    }
+    let mut contact: Vec<f32> = cols.iter().filter_map(|c| c.2.filter(|g| (c.1 - g).abs() < 0.06)).collect();
+    contact.sort_by(f32::total_cmp);
+    let base = match contact.get(contact.len() / 2) {
+        Some(g) => *g,
+        None => cols.iter().filter_map(|c| c.2).fold(sc.ground_y, f32::min),
+    };
+    let mut tops: Vec<f32> = cols.iter().map(|c| c.0 - base).collect();
+    let mut lifts: Vec<f32> = cols.iter().map(|c| (c.1 - base).max(0.0)).collect();
+    tops.sort_by(f32::total_cmp);
+    lifts.sort_by(f32::total_cmp);
+    let top_m = tops[(tops.len() * 4 / 5).min(tops.len() - 1)].max(0.0);
+    Some(Extent { top_m, lift_m: lifts[lifts.len() / 2], clipped: cols.iter().any(|c| c.3), columns: cols.len() as u32 })
+}
+
+/// How well a size prior fits a measured extent, in 0..1: 1 inside the prior's height band, falling off as a
+/// log-normal outside it; a floating blob fits only things that may float (a crown, a flag).
+pub fn plausibility(p: &SizePrior, e: &Extent, cfg: &VerifyCfg) -> f32 {
+    let ln = if e.top_m > p.hi_m {
+        (e.top_m / p.hi_m).ln()
+    } else if e.top_m < p.lo_m && !e.clipped {
+        (p.lo_m / e.top_m.max(0.01)).ln()
+    } else {
+        0.0
+    };
+    let mut g = (-0.5 * (ln / cfg.sigma_ln.max(0.05)).powi(2)).exp();
+    if !p.elevated && e.lift_m > cfg.lift_m {
+        g *= (-0.5 * ((e.lift_m - cfg.lift_m) / 0.15).powi(2)).exp();
+    }
+    g
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Verified {
+    pub relabeled: u32,
+    pub dropped: u32,
+    pub merged: u32,
+}
+
+/// One candidate per tile (its best label, checked against the geometry), then non-maximum suppression: first among
+/// tiles of one label, then across labels for boxes on the same object, so a boulder is not also reported as a log.
+pub fn candidates_from_tiles(tiles: &[Tile], scores: &[Vec<EntityScore>], table: &EntityTable, sc: &TileScene, cfg: &EmbeddingCfg) -> (Vec<Candidate>, Verified) {
+    let frame = sc.frame;
     let (fw, fh) = (frame.width as f32, frame.height as f32);
     let mut out: Vec<Candidate> = Vec::new();
-    for (tile, sc) in tiles.iter().zip(scores) {
+    let mut v = Verified::default();
+    for (tile, sc_tile) in tiles.iter().zip(scores) {
         if tile.level == 0 {
             continue;
         }
-        let Some(best) = sc.first() else { continue };
-        if best.score < cfg.report_floor {
+        let Some(first) = sc_tile.first() else { continue };
+        if first.score < cfg.report_floor {
             continue;
         }
+        let ranked: Vec<(&EntityScore, f32)> = match (cfg.verify.enabled, object_extent(sc, tile)) {
+            (true, Some(ext)) => {
+                let mut r: Vec<(&EntityScore, f32)> = sc_tile.iter().take(cfg.verify.top_k.max(1)).map(|e| (e, e.score * table.prior(&e.id).map_or(1.0, |p| plausibility(p, &ext, &cfg.verify)))).collect();
+                r.sort_by(|a, b| b.1.total_cmp(&a.1));
+                if r.iter().all(|(e, s)| *s < cfg.verify.drop_below * e.score.max(1e-6)) {
+                    v.dropped += 1;
+                    continue;
+                }
+                r
+            }
+            _ => sc_tile.iter().take(2).map(|e| (e, e.score)).collect(),
+        };
+        let (best, score) = ranked[0];
+        if score < cfg.report_floor {
+            v.dropped += 1;
+            continue;
+        }
+        if best.id != first.id {
+            v.relabeled += 1;
+        }
         let Some((kind, link)) = table.get(&best.id).cloned() else { continue };
-        let runner = sc.get(1);
+        let runner = ranked.get(1);
         let bbox = [tile.x as f32 / fw, tile.y as f32 / fh, (tile.x + tile.w) as f32 / fw, (tile.y + tile.h) as f32 / fh];
         let depth = median_depth(frame, tile);
         let (cx, cy) = tile.center();
-        let world = depth.and_then(|d| camera.world_point3_in(view, cx, cy, d)).map(|p| centre_from_surface(view, p, centre_offset_m(kind)));
+        let world = depth.and_then(|d| sc.camera.world_point3_in(sc.view, cx, cy, d)).map(|p| centre_from_surface(sc.view, p, centre_offset_m(kind)));
         out.push(Candidate {
             label: best.id.clone(),
             kind,
             link,
-            score: best.score,
-            margin: best.score - runner.map_or(0.0, |r| r.score),
-            runner_up: runner.map(|r| r.id.clone()),
+            score,
+            margin: score - runner.map_or(0.0, |r| r.1),
+            runner_up: runner.map(|r| r.0.id.clone()),
             bbox,
             pixels: tile.area(),
             depth_m: depth.unwrap_or(f32::INFINITY),
@@ -251,8 +519,35 @@ pub fn candidates_from_tiles(
             kept.push(c);
         }
     }
+    if cfg.verify.enabled {
+        let mut cross: Vec<Candidate> = Vec::new();
+        for c in kept {
+            let same = cross.iter_mut().find(|k| {
+                if k.label == c.label || k.kind == EntKind::Waypoint || c.kind == EntKind::Waypoint {
+                    return false;
+                }
+                let (u, m) = box_iou_and_iomin(&k.bbox, &c.bbox);
+                let close = match (k.world, c.world) {
+                    (Some(a), Some(b)) => (a.0 - b.0).hypot(a.1 - b.1) <= cfg.verify.same_object_m,
+                    _ => u >= cfg.verify.cross_iou,
+                };
+                close && (u >= cfg.verify.cross_iou || m >= cfg.verify.cross_iomin)
+            });
+            match same {
+                Some(k) => {
+                    v.merged += 1;
+                    if k.margin > k.score - c.score {
+                        k.margin = (k.score - c.score).max(0.0);
+                        k.runner_up = Some(c.label.clone());
+                    }
+                }
+                None => cross.push(c),
+            }
+        }
+        kept = cross;
+    }
     kept.sort_by(|a, b| a.depth_m.total_cmp(&b.depth_m).then_with(|| a.label.cmp(&b.label)));
-    kept
+    (kept, v)
 }
 
 #[cfg(test)]
@@ -268,22 +563,32 @@ mod tests {
     }
 
     fn world_with_tree_ahead() -> (World, Camera) {
+        world_with_ahead(NodeKind::Tree, 3.2)
+    }
+
+    fn world_with_ahead(kind: NodeKind, dist_m: f32) -> (World, Camera) {
         let mut w = World::new(WorldConfig::default()).unwrap();
         w.nodes.clear();
         w.drops.clear();
-        let (cx, cz) = w.terrain.cell_of(w.agent.x + 3.2, w.agent.z + 0.2).unwrap();
+        let (cx, cz) = w.terrain.cell_of(w.agent.x + dist_m, w.agent.z + 0.2).unwrap();
         let (x, z) = world_sim::terrain::cell_center(cx, cz);
-        w.nodes.push(Node { id: 1, kind: NodeKind::Tree, x, z, hp: 3.0, max_hp: 3.0 });
+        w.nodes.push(Node { id: 1, kind, x, z, hp: 3.0, max_hp: 3.0 });
         w.agent.yaw = 0.0;
         (w, Camera::default())
+    }
+
+    fn with_scene<R>(w: &World, f: &Frame, cam: &Camera, run: impl FnOnce(&TileScene) -> R) -> R {
+        let hv = w.head_view(cam);
+        let sc = TileScene { frame: f, camera: cam, view: &hv.est, ground_y: hv.est.origin[1] - hv.eye_m };
+        run(&sc)
     }
 
     fn score(id: &str, s: f32) -> EntityScore {
         EntityScore { id: id.into(), kind: noto_search::EntityKind::Source, link: "log".into(), bias: s, prejudice: 0.0, score: s }
     }
 
-    fn tile_with_most_tree(tiles: &[Tile], f: &Frame, w: &World) -> usize {
-        let target = w.visible_objects(f).into_iter().find(|v| v.label == "tree").expect("tree in view").bbox;
+    fn tile_with_most(tiles: &[Tile], f: &Frame, w: &World, label: &str) -> usize {
+        let target = w.visible_objects(f).into_iter().find(|v| v.label == label).expect("in view").bbox;
         let (cx, cy) = (((target[0] + target[2]) / 2) as f32, ((target[1] + target[3]) / 2) as f32);
         tiles
             .iter()
@@ -291,7 +596,7 @@ mod tests {
             .filter(|(_, t)| t.level > 0 && cx >= t.x as f32 && cx < (t.x + t.w) as f32 && cy >= t.y as f32 && cy < (t.y + t.h) as f32)
             .min_by_key(|(_, t)| t.area())
             .map(|(i, _)| i)
-            .expect("a tile holds the tree centre")
+            .expect("a tile holds the centre")
     }
 
     #[test]
@@ -300,15 +605,15 @@ mod tests {
         let f = w.render(&cam);
         let tiles = noto_ml::parallel::tile_layout(f.width as u32, f.height as u32, &[(2, 2), (4, 3)], 0.15);
         let table = EntityTable::from_lexicon(&lexicon());
-        let hit = tile_with_most_tree(&tiles, &f, &w);
+        let hit = tile_with_most(&tiles, &f, &w, "tree");
         let scores: Vec<Vec<EntityScore>> =
             (0..tiles.len()).map(|i| if i == hit { vec![score("tree", 0.82), score("boulder", 0.30)] } else { vec![score("boulder", 0.05)] }).collect();
-        let cands = candidates_from_tiles(&tiles, &scores, &table, &f, &cam, &w.head_view(&cam).est, &EmbeddingCfg::default());
+        let (cands, _) = with_scene(&w, &f, &cam, |sc| candidates_from_tiles(&tiles, &scores, &table, sc, &EmbeddingCfg::default()));
         assert_eq!(cands.len(), 1, "only the named tile reports: {cands:?}");
         let c = &cands[0];
         assert_eq!(c.label, "tree");
         assert_eq!(c.runner_up.as_deref(), Some("boulder"));
-        assert!((c.margin - 0.52).abs() < 1e-5);
+        assert!(c.margin >= 0.52 - 1e-5, "the crown floats, which no boulder does: margin {}", c.margin);
         let t = &tiles[hit];
         assert_eq!(c.bbox, [t.x as f32 / f.width as f32, t.y as f32 / f.height as f32, (t.x + t.w) as f32 / f.width as f32, (t.y + t.h) as f32 / f.height as f32]);
         let node = &w.nodes[0];
@@ -319,23 +624,30 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_tiles_of_one_label_merge_and_different_labels_stay() {
+    fn overlapping_tiles_of_one_label_merge_and_a_rival_label_on_the_same_tree_folds_in() {
         let (w, cam) = world_with_tree_ahead();
         let f = w.render(&cam);
         let tiles = noto_ml::parallel::tile_layout(f.width as u32, f.height as u32, &[(4, 3)], 0.5);
         let table = EntityTable::from_lexicon(&lexicon());
+        let hit = tile_with_most(&tiles, &f, &w, "tree");
         let scores: Vec<Vec<EntityScore>> = (0..tiles.len())
-            .map(|i| if i == 5 { vec![score("boulder", 0.7), score("tree", 0.1)] } else { vec![score("tree", 0.9 - 0.01 * i as f32), score("boulder", 0.1)] })
+            .map(|i| if i == hit { vec![score("boulder", 0.7), score("tree", 0.1)] } else { vec![score("tree", 0.9 - 0.01 * i as f32), score("boulder", 0.1)] })
             .collect();
-        let cands = candidates_from_tiles(&tiles, &scores, &table, &f, &cam, &w.head_view(&cam).est, &EmbeddingCfg::default());
-        let trees: Vec<&Candidate> = cands.iter().filter(|c| c.label == "tree").collect();
+        let plain = EmbeddingCfg { verify: VerifyCfg { enabled: false, ..VerifyCfg::default() }, ..EmbeddingCfg::default() };
+        let (old, _) = with_scene(&w, &f, &cam, |sc| candidates_from_tiles(&tiles, &scores, &table, sc, &plain));
+        let trees: Vec<&Candidate> = old.iter().filter(|c| c.label == "tree").collect();
         assert!(trees.len() < tiles.len() - 1, "NMS merged some of the {} tree tiles, left {}", tiles.len() - 2, trees.len());
         for (i, a) in trees.iter().enumerate() {
             for b in &trees[i + 1..] {
                 assert!(iou(&a.bbox, &b.bbox) < 0.4);
             }
         }
-        assert!(cands.iter().any(|c| c.label == "boulder"));
+        assert!(old.iter().any(|c| c.label == "boulder"), "per-label suppression alone keeps a boulder on the tree");
+        let (new, v) = with_scene(&w, &f, &cam, |sc| candidates_from_tiles(&tiles, &scores, &table, sc, &EmbeddingCfg::default()));
+        let node = &w.nodes[0];
+        let on_tree = |c: &&Candidate| c.world.is_some_and(|(x, z)| (x - node.x).hypot(z - node.z) < 1.0);
+        assert!(new.iter().filter(on_tree).all(|c| c.label == "tree"), "{:?}", new.iter().map(|c| (&c.label, c.score, c.world)).collect::<Vec<_>>());
+        assert!(v.relabeled + v.merged > 0, "{v:?}");
     }
 
     #[test]
@@ -345,8 +657,55 @@ mod tests {
         let tiles = noto_ml::parallel::tile_layout(f.width as u32, f.height as u32, &[(2, 2)], 0.0);
         let table = EntityTable::from_lexicon(&lexicon());
         let scores: Vec<Vec<EntityScore>> = tiles.iter().map(|_| vec![score("tree", 0.09)]).collect();
-        let cands = candidates_from_tiles(&tiles, &scores, &table, &f, &cam, &w.head_view(&cam).est, &EmbeddingCfg::default());
+        let (cands, _) = with_scene(&w, &f, &cam, |sc| candidates_from_tiles(&tiles, &scores, &table, sc, &EmbeddingCfg::default()));
         assert!(cands.is_empty());
+    }
+
+    #[test]
+    fn sky_and_far_tiles_are_left_out_before_they_are_embedded() {
+        let (w, cam) = world_with_tree_ahead();
+        let f = w.render(&cam);
+        let tiles = noto_ml::parallel::tile_layout(f.width as u32, f.height as u32, &EmbeddingCfg::default().grids, 0.15);
+        with_scene(&w, &f, &cam, |sc| {
+            let (kept, filter) = roi_tiles(&tiles, sc, &RoiCfg::default());
+            assert!(filter.skipped_sky > 0, "the top row of tiles is sky: {filter:?}");
+            assert_eq!(kept.len() + (filter.skipped_sky + filter.skipped_far) as usize, tiles.len());
+            assert!(kept.iter().any(|t| t.level == 0), "the whole frame always scores the scene");
+            assert!(kept.iter().filter(|t| t.level > 0).all(|t| tile_roi(sc, t).sky_frac <= 0.6));
+            let near = RoiCfg { far_m: 2.5, ..RoiCfg::default() };
+            let (_, f2) = roi_tiles(&tiles, sc, &near);
+            assert!(f2.skipped_far > 0, "a 2.5 m reach leaves the distant ground out: {f2:?}");
+            let (all, f0) = roi_tiles(&tiles, sc, &RoiCfg { enabled: false, ..RoiCfg::default() });
+            assert!(all.len() == tiles.len() && f0.is_empty());
+        });
+    }
+
+    #[test]
+    fn the_depth_tells_a_tree_from_a_boulder_and_a_boulder_from_a_log() {
+        let table = EntityTable::from_lexicon(&lexicon());
+        let cfg = EmbeddingCfg::default();
+        let probe = |kind: NodeKind, label: &str| {
+            let (w, cam) = world_with_ahead(kind, 2.6);
+            let f = w.render(&cam);
+            let tiles = noto_ml::parallel::tile_layout(f.width as u32, f.height as u32, &[(4, 3)], 0.15);
+            let hit = tile_with_most(&tiles, &f, &w, label);
+            with_scene(&w, &f, &cam, |sc| object_extent(sc, &tiles[hit]).expect("the object stands up out of the ground"))
+        };
+        let (tree, boulder) = (probe(NodeKind::Tree, "tree"), probe(NodeKind::Boulder, "boulder"));
+        assert!(tree.top_m > 1.3 && tree.top_m < 1.9, "{tree:?}");
+        assert!(boulder.top_m > 0.4 && boulder.top_m < 0.8 && boulder.lift_m < 0.1, "{boulder:?}");
+        let g = |label: &str, e: &Extent| plausibility(table.prior(label).unwrap(), e, &cfg.verify);
+        assert!(g("tree", &tree) > 0.9 && g("boulder", &tree) < 0.3, "a 1.6 m thing with a floating crown is no boulder: {} {}", g("tree", &tree), g("boulder", &tree));
+        assert!(g("boulder", &boulder) > 0.9 && g("log", &boulder) < 0.6 && g("tree", &boulder) < 0.2, "{} {} {}", g("boulder", &boulder), g("log", &boulder), g("tree", &boulder));
+        let (w, cam) = world_with_ahead(NodeKind::Tree, 2.6);
+        let f = w.render(&cam);
+        let tiles = noto_ml::parallel::tile_layout(f.width as u32, f.height as u32, &[(4, 3)], 0.15);
+        let hit = tile_with_most(&tiles, &f, &w, "tree");
+        let scores: Vec<Vec<EntityScore>> = (0..tiles.len()).map(|i| if i == hit { vec![score("boulder", 0.62), score("tree", 0.48), score("log", 0.2)] } else { vec![] }).collect();
+        let (cands, v) = with_scene(&w, &f, &cam, |sc| candidates_from_tiles(&tiles, &scores, &table, sc, &cfg));
+        assert_eq!(cands.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(), vec!["tree"], "SigLIP2's boulder on a tree is relabelled");
+        assert_eq!(v.relabeled, 1);
+        assert_eq!(cands[0].runner_up.as_deref(), Some("boulder"));
     }
 
     struct WordAxes;
@@ -417,7 +776,8 @@ mod tests {
         let mut p = perception();
         assert_eq!(p.mode(), "embedding");
         let out = p.scan(ScanInput { world: &w, frame: &f, camera: &cam }).unwrap();
-        assert_eq!(out.tiles, 1 + 4 + 12 + 24);
+        assert_eq!(out.tiles + (out.filter.skipped_sky + out.filter.skipped_far) as usize, 1 + 4 + 12 + 24);
+        assert!(out.filter.skipped_sky > 0, "sky tiles are not embedded: {:?}", out.filter);
         assert_eq!(out.device, "cpu (stand-in)");
         assert!(!out.scene.is_empty(), "the whole-frame scores are reported");
         assert!(out.candidates.iter().all(|c| c.truth.is_none()));

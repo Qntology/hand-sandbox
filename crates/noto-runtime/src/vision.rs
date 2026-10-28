@@ -11,12 +11,35 @@ pub struct VisionCfg {
     pub intermittent: bool,
     pub look_every_ticks: u32,
     pub sigmas: f32,
+    #[serde(default = "gaze_on")]
+    pub gaze_before_pick: bool,
+}
+
+fn gaze_on() -> bool {
+    true
 }
 
 impl Default for VisionCfg {
     fn default() -> Self {
-        VisionCfg { intermittent: true, look_every_ticks: (LOOK_AHEAD_S / world_sim::TICK_S).round() as u32, sigmas: 2.0 }
+        VisionCfg { intermittent: true, look_every_ticks: (LOOK_AHEAD_S / world_sim::TICK_S).round() as u32, sigmas: 2.0, gaze_before_pick: true }
     }
+}
+
+/// What the robot saw when it bent its head over an item before picking it up: the scan's match (label, score, box),
+/// how far away the scan put it, and the range the depth model gives inside that box.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct GazeCheck {
+    pub tick: u64,
+    pub drop: u32,
+    pub label_ko: String,
+    pub ok: bool,
+    pub score: Option<f32>,
+    pub range_m: Option<f32>,
+    pub depth_m: Option<f32>,
+    pub bbox: Option<[f32; 4]>,
+    pub reason: Option<String>,
+    pub neck_deg: f32,
+    pub pitch_deg: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -173,7 +196,8 @@ mod tests {
         assert!(!in_view(&cam, 0.5, me, 0.1, 0.3), "beside the foot");
         assert!(!in_view(&cam, 0.5, me, -2.0, 0.0), "behind");
         assert!(!in_view(&cam, 0.5, me, 0.4, 0.0), "too close in front: under the view");
-        assert_eq!(tilt_to_see(&cam, 0.5, me, 0.4, 0.0), Some(noto_core::kin::NECK_PITCH_MAX_DEG));
+        let ideal = (0.5f32.atan2(0.4).to_degrees() + cam.pitch_deg).clamp(0.0, noto_core::kin::NECK_PITCH_MAX_DEG);
+        assert_eq!(tilt_to_see(&cam, 0.5, me, 0.4, 0.0), Some(ideal), "just enough tilt to put the point in view");
         assert_eq!(tilt_to_see(&cam, 0.5, me, 3.0, 0.2), Some(0.0));
         assert_eq!(tilt_to_see(&cam, 0.5, me, 0.1, 0.3), None);
         let (pan, tilt) = gaze_to_see(&cam, 1.14, me, 1.0, 2.5).expect("to the right, ahead");

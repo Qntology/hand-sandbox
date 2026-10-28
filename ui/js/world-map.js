@@ -185,6 +185,8 @@ function draw() {
     ctx.stroke();
     ctx.restore();
   }
+  // 움직임: 후진이면 꽁무니 쪽으로 화살 꼬리를, 3점 회전·제자리 회전이면 몸 둘레에 호를 그린다.
+  const motion = snap.agent.motion;
   ctx.save();
   ctx.translate(X(ax), Y(ay));
   ctx.rotate(-yaw);
@@ -195,9 +197,30 @@ function draw() {
   ctx.lineTo(-4, -3.6);
   ctx.closePath();
   ctx.fill();
+  if (motion?.reversing) {
+    ctx.strokeStyle = cssVar('--warning');
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.moveTo(-5, 0);
+    ctx.lineTo(-12, 0);
+    ctx.moveTo(-12, 0);
+    ctx.lineTo(-9, 2.5);
+    ctx.moveTo(-12, 0);
+    ctx.lineTo(-9, -2.5);
+    ctx.stroke();
+  } else if (motion && (motion.kind === 'kturn' || motion.kind === 'pivot')) {
+    ctx.strokeStyle = cssVar('--warning');
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.arc(0, 0, 9, -0.9, 0.9);
+    ctx.stroke();
+  }
   ctx.restore();
   $('mm-left').textContent = `${bx} × ${by} m`;
-  $('mm-right').textContent = belief ? `(${ax.toFixed(1)}, ${ay.toFixed(1)}) · 믿음 오차 ${belief.error_m.toFixed(2)} m` : `(${ax.toFixed(1)}, ${ay.toFixed(1)})`;
+  const moveKo = motion ? { reverse: '후진', kturn: '3점 회전', pivot: '제자리 회전' }[motion.kind] : null;
+  const where = belief ? `(${ax.toFixed(1)}, ${ay.toFixed(1)}) · 믿음 오차 ${belief.error_m.toFixed(2)} m` : `(${ax.toFixed(1)}, ${ay.toFixed(1)})`;
+  $('mm-right').textContent = moveKo ? `${where} · ${moveKo}` : where;
+  $('mm-right').title = motion?.label_ko ?? '';
 }
 
 export function initWorldMap() {

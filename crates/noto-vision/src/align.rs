@@ -1,5 +1,5 @@
 use crate::camera::{Intrinsics, Pose};
-use crate::frame::{DepthMap, Mask};
+use crate::frame::{DepthMap, Mask, NormalMap};
 
 pub type HeightFn<'a> = &'a dyn Fn(f32, f32) -> f32;
 
@@ -24,6 +24,12 @@ pub struct AlignCfg {
     pub min_inlier_share: f32,
     #[serde(default)]
     pub clip_to_support: bool,
+    #[serde(default = "default_normal_max_deg")]
+    pub normal_max_deg: f32,
+}
+
+fn default_normal_max_deg() -> f32 {
+    35.0
 }
 
 impl Default for AlignCfg {
@@ -40,6 +46,7 @@ impl Default for AlignCfg {
             min_inliers: 40,
             min_inlier_share: 0.30,
             clip_to_support: true,
+            normal_max_deg: default_normal_max_deg(),
         }
     }
 }
@@ -56,6 +63,8 @@ pub struct AlignFit {
     pub span_m: (f32, f32),
     #[serde(default = "no_clip")]
     pub clip_above_m: f32,
+    #[serde(default)]
+    pub off_ground_normals: u32,
 }
 
 fn no_clip() -> f32 {
@@ -168,9 +177,51 @@ fn rel_residual(a: f32, b: f32, p: f32, q: f32) -> f32 {
 }
 
 pub fn fit_ground(depth: &DepthMap, intr: &Intrinsics, pose: &Pose, height: Option<HeightFn>, max_depth_m: Option<f32>, cfg: &AlignCfg) -> Option<AlignFit> {
+    fit_ground_with(depth, None, intr, pose, height, max_depth_m, cfg)
+}
+
+pub fn faces_up(n: [f32; 3], up: [f32; 3], max_deg: f32) -> bool {
+    n[0] * up[0] + n[1] * up[1] + n[2] * up[2] >= max_deg.to_radians().cos()
+}
+
+pub const GROUND_SEED_DEG: f32 = 60.0;
+
+/// The ground's normal as the model sees it in this frame: the mean of the predicted normals within
+/// `GROUND_SEED_DEG` of the camera's up, over the pixels whose rays meet the ground (one mean-shift step from the
+/// geometric up). A model trained on other cameras tilts its normals by a near-constant angle; this absorbs it.
+pub fn ground_normal(depth: &DepthMap, normals: &NormalMap, intr: &Intrinsics, pose: &Pose, height: Option<HeightFn>, cfg: &AlignCfg) -> Option<[f32; 3]> {
+    let up = intr.world_up_in_camera();
+    let (kw, kh) = (intr.width.max(1) as f32, intr.height.max(1) as f32);
+    let stride = (cfg.stride.max(1) * 2).max(2);
+    let (mut s, mut n) = ([0.0f64; 3], 0u32);
+    let mut y = stride / 2;
+    while y < depth.height {
+        let mut x = stride / 2;
+        while x < depth.width {
+            let (px, py) = ((x as f32 + 0.5) * kw / depth.width as f32, (y as f32 + 0.5) * kh / depth.height as f32);
+            if ground_depth(intr, pose, px, py, height, cfg.max_ground_m).is_some_and(|g| g >= cfg.min_ground_m) {
+                let v = normals.at_scaled(x as f32 + 0.5, y as f32 + 0.5, depth.width, depth.height);
+                if faces_up(v, up, GROUND_SEED_DEG) {
+                    for k in 0..3 {
+                        s[k] += v[k] as f64;
+                    }
+                    n += 1;
+                }
+            }
+            x += stride;
+        }
+        y += stride;
+    }
+    let len = (s[0] * s[0] + s[1] * s[1] + s[2] * s[2]).sqrt();
+    (n >= 20 && len > 1e-6).then(|| [(s[0] / len) as f32, (s[1] / len) as f32, (s[2] / len) as f32])
+}
+
+pub fn fit_ground_with(depth: &DepthMap, normals: Option<&NormalMap>, intr: &Intrinsics, pose: &Pose, height: Option<HeightFn>, max_depth_m: Option<f32>, cfg: &AlignCfg) -> Option<AlignFit> {
     let ceiling = max_depth_m.map(|m| m * cfg.saturate_frac).unwrap_or(f32::INFINITY);
     let scale_only = cfg.space == AlignSpace::Scale;
-    let mut cand: Vec<(f32, f32, f32)> = Vec::new();
+    let use_normals = normals.is_some() && cfg.normal_max_deg > 0.0 && cfg.normal_max_deg < 90.0;
+    let up = normals.filter(|_| use_normals).and_then(|n| ground_normal(depth, n, intr, pose, height, cfg)).unwrap_or_else(|| intr.world_up_in_camera());
+    let (mut cand, mut off): (Vec<(f32, f32, f32)>, Vec<(f32, f32, f32)>) = (Vec::new(), Vec::new());
     let stride = cfg.stride.max(1);
     let (kw, kh) = (intr.width.max(1) as f32, intr.height.max(1) as f32);
     let mut y = stride / 2;
@@ -183,7 +234,15 @@ pub fn fit_ground(depth: &DepthMap, intr: &Intrinsics, pose: &Pose, height: Opti
                 if let Some(g) = ground_depth(intr, pose, px, py, height, cfg.max_ground_m) {
                     if g >= cfg.min_ground_m {
                         let (p, q) = if scale_only { (z, g) } else { (1.0 / z, 1.0 / g) };
-                        cand.push((p, q, g));
+                        let ground_facing = match normals.filter(|_| use_normals) {
+                            Some(n) => faces_up(n.at_scaled(x as f32 + 0.5, y as f32 + 0.5, depth.width, depth.height), up, cfg.normal_max_deg),
+                            None => true,
+                        };
+                        if ground_facing {
+                            cand.push((p, q, g));
+                        } else {
+                            off.push((p, q, g));
+                        }
                     }
                 }
             }
@@ -191,6 +250,12 @@ pub fn fit_ground(depth: &DepthMap, intr: &Intrinsics, pose: &Pose, height: Opti
         }
         y += stride;
     }
+    let off_ground = if cand.len() < cfg.min_inliers {
+        cand.append(&mut off);
+        0
+    } else {
+        off.len() as u32
+    };
     if cand.len() < cfg.min_inliers {
         return None;
     }
@@ -246,6 +311,7 @@ pub fn fit_ground(depth: &DepthMap, intr: &Intrinsics, pose: &Pose, height: Opti
         median_rel_err: 0.0,
         span_m: (0.0, 0.0),
         clip_above_m: f32::INFINITY,
+        off_ground_normals: off_ground,
     };
     let mut errs: Vec<f32> = inliers
         .iter()
@@ -263,7 +329,11 @@ pub fn fit_ground(depth: &DepthMap, intr: &Intrinsics, pose: &Pose, height: Opti
 }
 
 pub fn ground_align(depth: &mut DepthMap, intr: &Intrinsics, pose: &Pose, height: Option<HeightFn>, max_depth_m: Option<f32>, cfg: &AlignCfg) -> Option<AlignFit> {
-    let fit = fit_ground(depth, intr, pose, height, max_depth_m, cfg);
+    ground_align_with(depth, None, intr, pose, height, max_depth_m, cfg)
+}
+
+pub fn ground_align_with(depth: &mut DepthMap, normals: Option<&NormalMap>, intr: &Intrinsics, pose: &Pose, height: Option<HeightFn>, max_depth_m: Option<f32>, cfg: &AlignCfg) -> Option<AlignFit> {
+    let fit = fit_ground_with(depth, normals, intr, pose, height, max_depth_m, cfg);
     if let Some(m) = max_depth_m {
         let ceiling = m * cfg.saturate_frac;
         for d in depth.data.iter_mut() {
@@ -308,7 +378,63 @@ mod tests {
     use crate::frame::DepthKind;
 
     fn cam() -> Intrinsics {
-        Intrinsics { width: 384, height: 256, fov_deg: 70.0, pitch_deg: -12.0 }
+        Intrinsics { width: 384, height: 256, fov_deg: 70.0, pitch_deg: -12.0, roll_deg: 0.0 }
+    }
+
+    fn distort(truth: &DepthMap, a: f32, b: f32) -> DepthMap {
+        let mut pred = truth.clone();
+        for d in pred.data.iter_mut() {
+            *d = if d.is_finite() { (1.0 / ((1.0 / *d - b) / a)).clamp(1e-3, 10.0) } else { 10.0 };
+        }
+        pred
+    }
+
+    #[test]
+    fn normals_keep_a_big_object_out_of_the_ground_fit() {
+        let (c, p) = (Intrinsics { pitch_deg: -40.0, ..cam() }, pose());
+        let truth = ground_map(&c, &p);
+        let (a, b) = (0.7f32, 0.05f32);
+        let mut pred = distort(&truth, a, b);
+        let up = c.world_up_in_camera();
+        let tilted = |deg: f32| {
+            let (s, k) = deg.to_radians().sin_cos();
+            [up[0], up[1] * k - up[2] * s, up[1] * s + up[2] * k]
+        };
+        let face = [0.0, -40f32.to_radians().sin(), 40f32.to_radians().cos()];
+        let mut normals = NormalMap { width: 384, height: 256, data: vec![tilted(25.0); 384 * 256] };
+        for y in 40..256u32 {
+            for x in 30..300u32 {
+                let i = (y * 384 + x) as usize;
+                pred.data[i] = (pred.data[i] * 0.55).max(0.3);
+                normals.data[i] = face;
+            }
+        }
+        let seen_up = ground_normal(&pred, &normals, &c, &p, None, &AlignCfg::default()).unwrap();
+        let bias = (seen_up[0] * up[0] + seen_up[1] * up[1] + seen_up[2] * up[2]).acos().to_degrees();
+        assert!((bias - 25.0).abs() < 1.0, "the model's own ground normal is found, tilt and all: {bias}");
+        let cfg = AlignCfg::default();
+        let blind = fit_ground(&pred, &c, &p, None, Some(10.0), &cfg);
+        let seen = fit_ground_with(&pred, Some(&normals), &c, &p, None, Some(10.0), &cfg).expect("the ground beside the object is enough");
+        assert!((seen.a - a).abs() < 0.03 * a && (seen.b - b).abs() < 0.02, "{seen:?}");
+        assert!(seen.off_ground_normals > 1000, "{seen:?}");
+        let blind_err = blind.map_or(f32::INFINITY, |f| (f.a - a).abs() / a);
+        assert!(blind_err > 0.05, "without normals the object's own (wrong) depth wins the fit: {blind:?}");
+        let none_up = NormalMap { width: 384, height: 256, data: vec![[1.0, 0.0, 0.0]; 384 * 256] };
+        assert!(fit_ground_with(&distort(&truth, a, b), Some(&none_up), &c, &p, None, Some(10.0), &cfg).is_some(), "too few ground normals falls back to all candidates");
+    }
+
+    #[test]
+    fn a_rolled_chassis_is_aligned_with_its_roll() {
+        let rolled = Intrinsics { roll_deg: 6.0, ..cam() };
+        let p = pose();
+        let truth = ground_map(&rolled, &p);
+        let (a, b) = (0.8f32, 0.03f32);
+        let pred = distort(&truth, a, b);
+        let cfg = AlignCfg::default();
+        let right = fit_ground(&pred, &rolled, &p, None, Some(10.0), &cfg).unwrap();
+        assert!((right.a - a).abs() < 0.02 * a && right.median_rel_err < 0.01, "{right:?}");
+        let level = fit_ground(&pred, &cam(), &p, None, Some(10.0), &cfg);
+        assert!(level.map_or(true, |f| f.median_rel_err > 2.0 * right.median_rel_err.max(0.005)), "ignoring the roll fits worse: {level:?} vs {right:?}");
     }
 
     fn pose() -> Pose {

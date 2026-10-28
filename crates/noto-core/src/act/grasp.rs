@@ -36,11 +36,13 @@ pub struct GraspInput<'a> {
     pub mode: ReachMode,
     pub aim_offset_m: [f32; 2],
     pub memory_sigma_m: f32,
+    pub lead: Option<KinPose>,
+    pub look_first: bool,
 }
 
 impl<'a> GraspInput<'a> {
     pub fn front(body: &'a Body, hand: &'a Hand, material: ItemMaterial, mass_kg: f32, size_m: [f32; 3], ground: Surface, two_arms: bool, cargo_kg: f32, aim_sigma_m: f32, seed: u64) -> GraspInput<'a> {
-        GraspInput { body, hand, material, mass_kg, size_m, ground, two_arms, cargo_kg, aim_sigma_m, seed, mode: ReachMode::Front, aim_offset_m: [0.0; 2], memory_sigma_m: 0.0 }
+        GraspInput { body, hand, material, mass_kg, size_m, ground, two_arms, cargo_kg, aim_sigma_m, seed, mode: ReachMode::Front, aim_offset_m: [0.0; 2], memory_sigma_m: 0.0, lead: None, look_first: false }
     }
 }
 
@@ -533,11 +535,25 @@ pub fn grasp(inp: &GraspInput) -> ActRollout {
     let p_success = if touching >= 2 { hit(half[0]) * hit(half[1]) * super::lognormal_above(mu.mean, mu.cov, need_mu) } else { 0.0 };
     metrics.push(("p_success", p_success));
 
-    let bottom = KinPose { closure: 0.0, ..plan.pose };
+    let mut bottom = KinPose { closure: 0.0, ..plan.pose };
+    let eyes_lead = inp.mode == ReachMode::Front && super::gaze::can_aim(body) && (inp.lead.is_some() || inp.look_first);
+    let (start, t0) = match (inp.lead, eyes_lead) {
+        (Some(p), true) => (p, 0.0),
+        (None, true) => super::gaze::lead(body, &stand, obj_ground, 0.0, &mut s.samples, &mut s.events),
+        _ => (stand, 0.0),
+    };
+    if eyes_lead {
+        bottom.neck_deg = super::gaze::aim_neck(body, &bottom, ox, obj_ground[2]);
+        metrics.push(("look_s", t0));
+    }
     let n = (plan.descend_s / SAMPLE_S).ceil().max(1.0) as usize;
-    for i in 0..=n {
+    for i in usize::from(t0 > 0.0)..=n {
         let u = min_jerk(i as f32 / n as f32);
-        s.push(body, i as f32 * SAMPLE_S, "reach", reach::blend(body, &stand, &bottom, u), KinLoads::default(), None, Some(obj_ground));
+        let mut p = reach::blend(body, &start, &bottom, u);
+        if eyes_lead {
+            p.neck_deg = super::gaze::aim_neck(body, &p, ox, obj_ground[2]);
+        }
+        s.push(body, t0 + i as f32 * SAMPLE_S, "reach", p, KinLoads::default(), None, Some(obj_ground));
     }
     let t_bottom = s.end();
     let how = match plan.approach {
@@ -984,6 +1000,52 @@ mod tests {
     fn log_input<'a>(b: &'a Body, h: &'a Hand, seed: u64) -> GraspInput<'a> {
         let (_, one) = top_grasp_ok(h, [0.15; 3], 2.4, material::pad_on(ItemMaterial::Wood).mean);
         GraspInput { two_arms: !one, ..input(b, h, seed, 0.0) }
+    }
+
+    fn camera_off_object_deg(b: &Body, pose: &KinPose, x: f32, z: f32) -> f32 {
+        let hc = crate::kin::head_camera(b, pose);
+        let axis = super::super::gaze::HEAD_CAMERA_MOUNT_DEG - hc.pitch_down_deg;
+        let to = -(hc.pos[2] - z).atan2(x - hc.pos[0]).to_degrees();
+        (axis - to).abs()
+    }
+
+    #[test]
+    fn the_eyes_go_to_the_log_before_the_body_bends_and_stay_on_it() {
+        let (b, h) = setup(BaseKind::HumanFoot, FingerCount::Five);
+        let plain = grasp(&log_input(&b, &h, 3));
+        let r = grasp(&GraspInput { look_first: true, ..log_input(&b, &h, 3) });
+        assert!(r.outcome.ok, "{:?}", r.outcome);
+        let phases: Vec<&str> = r.samples.iter().map(|s| s.phase).fold(Vec::new(), |mut v, p| {
+            if v.last() != Some(&p) {
+                v.push(p);
+            }
+            v
+        });
+        assert_eq!(&phases[..3], &["look", "check", "reach"], "{phases:?}");
+        assert!(r.samples.windows(2).all(|w| w[1].t > w[0].t));
+        let kinds: Vec<&str> = r.events.iter().map(|e| e.kind).collect();
+        let (fix, check, bottom) = (kinds.iter().position(|k| *k == "gaze_fix"), kinds.iter().position(|k| *k == "vision_check"), kinds.iter().position(|k| *k == "bend_bottom"));
+        assert!(fix < check && check < bottom, "{kinds:?}");
+        let look_end = r.samples.iter().filter(|s| s.phase == "check").last().unwrap();
+        let bent = r.samples.iter().filter(|s| s.phase == "reach").last().unwrap();
+        let eye = |p: &KinPose| crate::kin::head_camera(&b, p).pos[2];
+        assert!(look_end.pose.neck_deg > 30.0, "the neck leads: {:?}", look_end.pose);
+        assert!(eye(&look_end.pose) > eye(&bent.pose) + 0.2, "the body lowers only after the look: eye {:.2} → {:.2} m", eye(&look_end.pose), eye(&bent.pose));
+        let obj = r.samples.iter().find(|s| s.phase == "reach").unwrap().object.unwrap();
+        let worst = r
+            .samples
+            .iter()
+            .filter(|s| matches!(s.phase, "check" | "reach"))
+            .filter(|s| s.pose.neck_deg.abs() < crate::kin::NECK_PITCH_MAX_DEG - 0.5)
+            .map(|s| camera_off_object_deg(&b, &s.pose, obj[0], obj[2]))
+            .fold(0.0f32, f32::max);
+        assert!(worst < 2.0, "the log stays in the middle of the image while the body bends: {worst:.1}°");
+        let extra = r.duration_s - plain.duration_s;
+        assert!(extra > 0.4 && extra < 1.5, "a look and a fixation add under a second and a half: {extra}");
+        let lead = r.samples.iter().filter(|s| s.phase == "check").last().unwrap().pose;
+        let held = grasp(&GraspInput { lead: Some(lead), ..log_input(&b, &h, 3) });
+        assert_eq!(held.samples[0].phase, "reach", "a robot already looking starts bending at once");
+        assert!((held.samples[0].pose.neck_deg - lead.neck_deg).abs() < 1.0);
     }
 
     #[test]

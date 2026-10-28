@@ -758,8 +758,8 @@ mod tests {
         assert!(names("baseline(&s, \"preload_s:dev\")", ":dev\""));
         assert!(names("format!(\"{axis}:absdev\")", ":absdev") && !names("\"x:absdevs\"", ":absdev"));
         assert!(!names("\"x:dev_note\"", ":dev\""));
-        assert_eq!(engine_text("crates/noto-core/src/balance.rs", "engine\n/// Context the references depend on.\nfn reference("), "engine\n");
-        assert_eq!(engine_text("x.rs", "a /// Context the references depend on. b"), "a /// Context the references depend on. b");
+        assert_eq!(engine_text("crates/noto-core/src/balance.rs", "engine\npub struct RefCtx {\nfn reference("), "engine\n");
+        assert_eq!(engine_text("x.rs", "a pub struct RefCtx { b"), "a pub struct RefCtx { b");
     }
 
     #[test]

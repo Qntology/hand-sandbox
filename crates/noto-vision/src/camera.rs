@@ -6,6 +6,8 @@ pub struct Intrinsics {
     pub height: u32,
     pub fov_deg: f32,
     pub pitch_deg: f32,
+    #[serde(default)]
+    pub roll_deg: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -16,10 +18,17 @@ pub struct Pose {
     pub eye_m: f32,
 }
 
-fn basis(yaw: f32, pitch: f32) -> ([f32; 3], [f32; 3], [f32; 3]) {
+fn basis(yaw: f32, pitch: f32, roll: f32) -> ([f32; 3], [f32; 3], [f32; 3]) {
     let (sy, cy) = yaw.sin_cos();
     let (sp, cp) = pitch.sin_cos();
-    ([cy * cp, sp, sy * cp], [-sy, 0.0, cy], [-cy * sp, cp, -sy * sp])
+    let (fwd, right, up) = ([cy * cp, sp, sy * cp], [-sy, 0.0, cy], [-cy * sp, cp, -sy * sp]);
+    if roll == 0.0 {
+        return (fwd, right, up);
+    }
+    let (sr, cr) = roll.sin_cos();
+    let r = [right[0] * cr - up[0] * sr, right[1] * cr - up[1] * sr, right[2] * cr - up[2] * sr];
+    let u = [up[0] * cr + right[0] * sr, up[1] * cr + right[1] * sr, up[2] * cr + right[2] * sr];
+    (fwd, r, u)
 }
 
 pub fn wrap_angle(a: f32) -> f32 {
@@ -40,8 +49,17 @@ impl Intrinsics {
         ((2.0 * px / w - 1.0) * half_w, (1.0 - 2.0 * py / h) * half_h)
     }
 
+    fn axes(&self, yaw: f32) -> ([f32; 3], [f32; 3], [f32; 3]) {
+        basis(yaw, self.pitch_deg.to_radians(), self.roll_deg.to_radians())
+    }
+
+    pub fn world_up_in_camera(&self) -> [f32; 3] {
+        let (fwd, right, up) = self.axes(0.0);
+        [right[1], up[1], -fwd[1]]
+    }
+
     pub fn ray(&self, yaw: f32, px: f32, py: f32) -> [f32; 3] {
-        let (fwd, right, up) = basis(yaw, self.pitch_deg.to_radians());
+        let (fwd, right, up) = self.axes(yaw);
         let (sx, sy) = self.screen(px, py);
         [fwd[0] + right[0] * sx + up[0] * sy, fwd[1] + right[1] * sx + up[1] * sy, fwd[2] + right[2] * sx + up[2] * sy]
     }
@@ -106,7 +124,7 @@ impl Intrinsics {
 
     pub fn project(&self, pose: &Pose, x: f32, y_rel: f32, z: f32) -> Option<(f32, f32, f32)> {
         let (w, h) = (self.width.max(1) as f32, self.height.max(1) as f32);
-        let (fwd, right, up) = basis(pose.yaw, self.pitch_deg.to_radians());
+        let (fwd, right, up) = self.axes(pose.yaw);
         let rel = [x - pose.x, y_rel, z - pose.z];
         let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
         let depth = dot(rel, fwd);
@@ -124,7 +142,25 @@ mod tests {
     use super::*;
 
     fn cam() -> Intrinsics {
-        Intrinsics { width: 384, height: 256, fov_deg: 70.0, pitch_deg: -12.0 }
+        Intrinsics { width: 384, height: 256, fov_deg: 70.0, pitch_deg: -12.0, roll_deg: 0.0 }
+    }
+
+    #[test]
+    fn roll_turns_the_image_about_the_view_axis_and_tilts_the_up_vector() {
+        let pose = Pose { x: 0.0, z: 0.0, yaw: 0.0, eye_m: 1.0 };
+        let level = cam();
+        let rolled = Intrinsics { roll_deg: 10.0, ..cam() };
+        let (a, b) = (level.ray(0.0, 192.0, 128.0), rolled.ray(0.0, 192.0, 128.0));
+        assert!(a.iter().zip(&b).all(|(x, y)| (x - y).abs() < 1e-6), "the centre ray does not move");
+        let (l, r) = (rolled.ray(0.0, 0.0, 128.0), rolled.ray(0.0, 383.0, 128.0));
+        assert!((l[1] - r[1]).abs() > 0.1, "a rolled camera sees the horizon slanted: {l:?} {r:?}");
+        let up = level.world_up_in_camera();
+        assert!(up[0].abs() < 1e-6 && (up[1] - 12f32.to_radians().cos()).abs() < 1e-5 && (up[2] - 12f32.to_radians().sin()).abs() < 1e-5, "{up:?}");
+        let up_r = rolled.world_up_in_camera();
+        assert!(up_r[0].abs() > 0.15 && (up_r.iter().map(|c| c * c).sum::<f32>() - 1.0).abs() < 1e-5, "{up_r:?}");
+        let (px, py, d) = rolled.project(&pose, 3.0, -0.4, 0.5).unwrap();
+        let (x, z) = rolled.ground_point(&pose, px, py, d).unwrap();
+        assert!((x - 3.0).abs() < 1e-3 && (z - 0.5).abs() < 1e-3, "project and back-project agree under roll");
     }
 
     #[test]

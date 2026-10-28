@@ -39,6 +39,10 @@ pub struct Sighting {
     pub pose: Pose,
     pub heading: f32,
     pub sigma: f32,
+    /// The target's angular width (rad). Where a wide thing's visible centre sits moves with the view and with the
+    /// mask by a share of that width, which `sigma` (the tracker's centroid noise) does not count.
+    #[serde(default)]
+    pub extent: f32,
     pub depth_range_m: Option<f32>,
     pub track_id: u32,
     pub score: f32,
@@ -221,10 +225,8 @@ impl Decider {
         let bearings: Vec<Bearing> = self.rays.iter().map(|r| Bearing { x: r.pose.x, z: r.pose.z, heading: r.heading, sigma: r.sigma }).collect();
         match triangulate(&bearings, self.cfg.tri.min_parallax_deg) {
             Ok(fix) => {
-                if let Some(d) = s.depth_range_m.filter(|d| *d > 0.1) {
-                    if scale_usable(&fix, d) {
-                        rep.depth_scale = Some(fix.range_m / d);
-                    }
+                if let Some(d) = s.depth_range_m.filter(|_| scale_usable(&fix, &s)) {
+                    rep.depth_scale = Some(fix.range_m / d);
                 }
                 if let Some((x, z, band, _)) = self.forecast_position(extra) {
                     let w = self.cfg.band_widen_sigma * fix.sigma_m;
@@ -359,8 +361,18 @@ impl Decider {
     }
 }
 
-pub fn scale_usable(fix: &Fix, depth_range_m: f32) -> bool {
-    fix.rays >= 3 && fix.residual_m <= 0.15 && fix.sigma_m <= 0.15 * fix.range_m && (1.5..=9.0).contains(&fix.range_m) && depth_range_m >= 0.5
+/// Share of a target's angular width its visible centre wanders by (1σ) between views. Measured on the trees of the
+/// v1.1 integrated test against their true trunks: 0.07, 0.11 and 0.32 of the width (RMS 0.2).
+pub const LANDMARK_CENTRE_FRAC: f32 = 0.2;
+
+/// Whether a fix may set the depth model's scale against the sighting `s` it ends on: rays that meet, a range the
+/// scale is fit on, and a range error under 15 % once the target's own centre is counted. The fix's `sigma_m` comes
+/// from the rays' centroid noise; the centre of a wide target adds `LANDMARK_CENTRE_FRAC` of its width to every
+/// bearing, which scales the range error by the same ratio.
+pub fn scale_usable(fix: &Fix, s: &Sighting) -> bool {
+    let centre = s.sigma.hypot(LANDMARK_CENTRE_FRAC * s.extent) / s.sigma.max(1e-6);
+    let near = s.depth_range_m.is_some_and(|d| d >= 0.5);
+    fix.rays >= 3 && fix.residual_m <= 0.15 && fix.sigma_m * centre <= 0.15 * fix.range_m && (1.5..=9.0).contains(&fix.range_m) && near
 }
 
 pub fn centroid_sigma(width: u32, fov_deg: f32, px_err: f32) -> f32 {
@@ -378,6 +390,7 @@ mod tests {
             pose,
             heading: (target.1 - pose.z).atan2(target.0 - pose.x),
             sigma: 0.006,
+            extent: 0.0,
             depth_range_m: Some(((target.0 - pose.x).hypot(target.1 - pose.z)) * 0.6),
             track_id: id,
             score: 0.8,
@@ -475,5 +488,26 @@ mod tests {
         let r = d.observe(&pose, Some(sight(0, pose, t, 3)), false, &[], None);
         assert!(matches!(r.decision, Decision::Triangulate(_)));
         assert!(matches!(d.observe(&pose, None, false, &[], None).decision, Decision::Search { .. }));
+    }
+
+    #[test]
+    fn a_wide_targets_centre_keeps_a_short_baseline_from_setting_the_depth_scale() {
+        // Three looks at a target 6 m ahead from 0.8 m of sideways baseline (about 8° of parallax).
+        let target = (6.0, 0.0);
+        let rays: Vec<Bearing> = [-0.4f32, 0.0, 0.4]
+            .iter()
+            .map(|&z| Bearing { x: 0.0, z, heading: (target.1 - z).atan2(target.0), sigma: 0.0073 })
+            .collect();
+        let fix = triangulate(&rays, 6.0).unwrap();
+        let s = Sighting { extent: 0.0, sigma: 0.0073, ..sight(2, Pose { x: 0.0, z: 0.4, yaw: 0.0, eye_m: 0.5 }, target, 1) };
+        assert!(scale_usable(&fix, &s), "a point-like target: the rays' noise is all there is ({fix:?})");
+        let tree = Sighting { extent: 10f32.to_radians(), ..s };
+        assert!(!scale_usable(&fix, &tree), "a tree 10° wide: its centre alone moves the range by more than 15 %");
+        let wide: Vec<Bearing> = [-2.0f32, 0.0, 2.0]
+            .iter()
+            .map(|&z| Bearing { x: 0.0, z, heading: (target.1 - z).atan2(target.0), sigma: 0.0073 })
+            .collect();
+        let fix = triangulate(&wide, 6.0).unwrap();
+        assert!(scale_usable(&fix, &tree), "the same tree from 4 m of baseline ({fix:?})");
     }
 }

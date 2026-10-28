@@ -571,7 +571,7 @@ mod tests {
                 assert!(rt.stand_ins().is_empty(), "stand-ins left: {:?}", rt.stand_ins());
                 let d = rt.depth_view(80.0).map_err(|e| format!("{e:#}"))?;
                 println!("[MODELS] depth {} on {} · {:.0} ms · {:?}", d.mode, d.device, d.infer_ms, d.metrics);
-                assert_eq!(d.mode, noto_vision::tips::MODE);
+                assert!(d.mode.starts_with(noto_vision::tips::MODE), "{}", d.mode);
                 let s = rt.scan_now("test").map_err(|e| format!("{e:#}"))?;
                 println!("[MODELS] scan {} on {} · {} tiles · {} judged", s.mode, s.device, s.tiles, s.judged.len());
                 assert_ne!(s.mode, "oracle");

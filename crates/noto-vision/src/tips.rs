@@ -9,16 +9,65 @@ use candle_nn::{
 
 use noto_ml::vision::antialias_bilinear_weights;
 
-use crate::depth::{clamp_metric, DepthModel};
-use crate::frame::{DepthKind, DepthMap, Rgb};
+use crate::depth::{clamp_metric, DepthModel, DepthScene, SceneHeads};
+use crate::frame::{DepthKind, DepthMap, NormalMap, Rgb, SegMap};
 
 pub const MODE: &str = "tipsv2-b14-dpt";
 pub const DEFAULT_DIR: &str = "models/tipsv2-b14-dpt";
 pub const DIR_ENV: &str = "TIPS_DIR";
+pub const HEADS_ENV: &str = "NOTO_TIPS_HEADS";
 pub const WEIGHTS_FILE: &str = "model.safetensors";
 pub const CONFIG_FILE: &str = "config.json";
 
 pub const DEFAULT_SHORT_SIDE_PATCHES: usize = 24;
+
+pub const ADE_CLASSES: usize = 150;
+pub const ADE_SKY: usize = 2;
+pub const ADE_TREE: usize = 4;
+pub const ADE_ROCK: usize = 34;
+pub const ADE_BOX: usize = 41;
+pub const ADE_GROUND: [usize; 11] = [3, 6, 9, 11, 13, 29, 46, 52, 54, 91, 94];
+pub const ADE_VEGETATION: [usize; 4] = [4, 17, 66, 72];
+pub const ADE_FAR: [usize; 4] = [2, 16, 68, 48];
+
+pub const ADE_NAMES: [&str; ADE_CLASSES] = [
+    "wall", "building", "sky", "floor", "tree", "ceiling", "road", "bed", "windowpane", "grass", "cabinet", "sidewalk", "person", "earth", "door", "table", "mountain", "plant", "curtain", "chair",
+    "car", "water", "painting", "sofa", "shelf", "house", "sea", "mirror", "rug", "field", "armchair", "seat", "fence", "desk", "rock", "wardrobe", "lamp", "bathtub", "railing", "cushion",
+    "base", "box", "column", "signboard", "chest of drawers", "counter", "sand", "sink", "skyscraper", "fireplace", "refrigerator", "grandstand", "path", "stairs", "runway", "case", "pool table", "pillow", "screen door", "stairway",
+    "river", "bridge", "bookcase", "blind", "coffee table", "toilet", "flower", "book", "hill", "bench", "countertop", "stove", "palm", "kitchen island", "computer", "swivel chair", "boat", "bar", "arcade machine", "hovel",
+    "bus", "towel", "light", "truck", "tower", "chandelier", "awning", "streetlight", "booth", "television receiver", "airplane", "dirt track", "apparel", "pole", "land", "bannister", "escalator", "ottoman", "bottle", "buffet",
+    "poster", "stage", "van", "ship", "fountain", "conveyer belt", "canopy", "washer", "plaything", "swimming pool", "stool", "barrel", "basket", "waterfall", "tent", "bag", "minibike", "cradle", "oven", "ball",
+    "food", "step", "tank", "trade name", "microwave", "pot", "animal", "bicycle", "lake", "dishwasher", "screen", "blanket", "sculpture", "hood", "sconce", "vase", "traffic light", "tray", "ashcan", "fan",
+    "pier", "crt screen", "plate", "monitor", "bulletin board", "shower", "radiator", "glass", "clock", "flag",
+];
+
+pub fn ade_name(i: usize) -> &'static str {
+    ADE_NAMES.get(i).copied().unwrap_or("?")
+}
+
+pub fn is_ade_ground(i: usize) -> bool {
+    ADE_GROUND.contains(&i)
+}
+
+pub fn ade_colour(i: usize) -> [u8; 3] {
+    match i {
+        ADE_SKY => [120, 170, 230],
+        ADE_TREE | 17 | 66 | 72 => [40, 140, 50],
+        ADE_ROCK => [130, 130, 136],
+        ADE_BOX => [230, 150, 60],
+        9 | 29 => [110, 170, 70],
+        13 | 46 | 52 | 91 | 94 => [150, 110, 70],
+        3 | 6 | 11 | 54 => [170, 160, 150],
+        16 | 68 => [90, 100, 120],
+        21 | 26 | 60 | 128 => [40, 90, 170],
+        _ => {
+            let h = (i as u32).wrapping_mul(2_654_435_761);
+            [(64 + (h >> 24) % 160) as u8, (64 + (h >> 16) % 160) as u8, (64 + (h >> 8) % 160) as u8]
+        }
+    }
+}
+
+pub const NORMAL_RIGHT: usize = 0;
 
 const DPT_LEVELS: usize = 4;
 const FUSION_UPSAMPLE: usize = 2;
@@ -51,6 +100,7 @@ pub struct TipsConfig {
     pub min_depth: f32,
     pub max_depth: f32,
     pub readout_gelu_tanh: bool,
+    pub seg_classes: usize,
 }
 
 impl Default for TipsConfig {
@@ -71,6 +121,7 @@ impl Default for TipsConfig {
             min_depth: 1e-3,
             max_depth: 10.0,
             readout_gelu_tanh: true,
+            seg_classes: ADE_CLASSES,
         }
     }
 }
@@ -133,6 +184,7 @@ impl TipsConfig {
                 Some(a) => a.contains("tanh"),
                 None => d.readout_gelu_tanh,
             },
+            seg_classes: v["id2label"].as_object().map_or(d.seg_classes, |m| m.len()),
         })
     }
 
@@ -429,37 +481,26 @@ impl FusionBlock {
     }
 }
 
-struct DepthHead {
+struct Decoder {
     reassemble: Vec<ReassembleLevel>,
     convs: Vec<Conv2d>,
     fusion: Vec<FusionBlock>,
     project: Conv2d,
-    classifier: Linear,
-    centers: Tensor,
-    min_depth: f64,
 }
 
-impl DepthHead {
-    fn new(cfg: &TipsConfig, vb: VarBuilder) -> candle_core::Result<Self> {
+impl Decoder {
+    fn new(cfg: &TipsConfig, vb: &VarBuilder) -> candle_core::Result<Self> {
         let ch = cfg.dpt_channels;
         let same = Conv2dConfig { padding: SAME_PAD_3X3, ..Default::default() };
-        let reassemble = (0..DPT_LEVELS).map(|i| ReassembleLevel::new(i, cfg, vb.pp("reassemble"))).collect::<candle_core::Result<_>>()?;
-        let convs = (0..DPT_LEVELS)
-            .map(|i| conv2d_no_bias(cfg.post_process_channels[i], ch, 3, same, vb.pp("convs").pp(i)))
-            .collect::<candle_core::Result<_>>()?;
-        let fusion = (0..DPT_LEVELS).map(|i| FusionBlock::new(ch, i > 0, vb.pp("fusion_blocks").pp(i))).collect::<candle_core::Result<_>>()?;
-        Ok(DepthHead {
-            reassemble,
-            convs,
-            fusion,
+        Ok(Decoder {
+            reassemble: (0..DPT_LEVELS).map(|i| ReassembleLevel::new(i, cfg, vb.pp("reassemble"))).collect::<candle_core::Result<_>>()?,
+            convs: (0..DPT_LEVELS).map(|i| conv2d_no_bias(cfg.post_process_channels[i], ch, 3, same, vb.pp("convs").pp(i))).collect::<candle_core::Result<_>>()?,
+            fusion: (0..DPT_LEVELS).map(|i| FusionBlock::new(ch, i > 0, vb.pp("fusion_blocks").pp(i))).collect::<candle_core::Result<_>>()?,
             project: conv2d(ch, ch, 3, same, vb.pp("project"))?,
-            classifier: linear(ch, cfg.depth_bins, vb.pp("depth_head"))?,
-            centers: bin_centers(cfg.min_depth, cfg.max_depth, cfg.depth_bins, vb.device())?,
-            min_depth: cfg.min_depth as f64,
         })
     }
 
-    fn forward(&self, taps: &[Tap], spread: bool) -> candle_core::Result<(Tensor, Option<Tensor>)> {
+    fn forward(&self, taps: &[Tap]) -> candle_core::Result<Tensor> {
         let levels: Vec<Tensor> = taps
             .iter()
             .zip(&self.reassemble)
@@ -470,7 +511,29 @@ impl DepthHead {
         for (i, block) in self.fusion.iter().enumerate().skip(1) {
             out = block.forward(&out, Some(&levels[DPT_LEVELS - 1 - i]))?;
         }
-        let out = self.project.forward(&out)?.relu()?;
+        self.project.forward(&out)
+    }
+}
+
+struct DepthHead {
+    dec: Decoder,
+    classifier: Linear,
+    centers: Tensor,
+    min_depth: f64,
+}
+
+impl DepthHead {
+    fn new(cfg: &TipsConfig, vb: VarBuilder) -> candle_core::Result<Self> {
+        Ok(DepthHead {
+            dec: Decoder::new(cfg, &vb)?,
+            classifier: linear(cfg.dpt_channels, cfg.depth_bins, vb.pp("depth_head"))?,
+            centers: bin_centers(cfg.min_depth, cfg.max_depth, cfg.depth_bins, vb.device())?,
+            min_depth: cfg.min_depth as f64,
+        })
+    }
+
+    fn forward(&self, taps: &[Tap], spread: bool) -> candle_core::Result<(Tensor, Option<Tensor>)> {
+        let out = self.dec.forward(taps)?.relu()?;
         let logits = self.classifier.forward(&out.permute((0, 2, 3, 1))?.contiguous()?)?;
         if spread {
             let (mean, sd) = decode_bins_spread(&logits, &self.centers, self.min_depth)?;
@@ -479,6 +542,67 @@ impl DepthHead {
             Ok((decode_bins(&logits, &self.centers, self.min_depth)?.unsqueeze(1)?, None))
         }
     }
+}
+
+struct NormalsHead {
+    dec: Decoder,
+    out: Linear,
+}
+
+impl NormalsHead {
+    fn new(cfg: &TipsConfig, vb: VarBuilder) -> candle_core::Result<Self> {
+        Ok(NormalsHead { dec: Decoder::new(cfg, &vb)?, out: linear(cfg.dpt_channels, 3, vb.pp("normals_head"))? })
+    }
+
+    fn forward(&self, taps: &[Tap]) -> candle_core::Result<Tensor> {
+        let x = self.out.forward(&self.dec.forward(taps)?.permute((0, 2, 3, 1))?.contiguous()?)?;
+        unit_last(&x)?.permute((0, 3, 1, 2))?.contiguous()
+    }
+}
+
+struct SegHead {
+    dec: Decoder,
+    out: Linear,
+}
+
+impl SegHead {
+    fn new(cfg: &TipsConfig, vb: VarBuilder) -> candle_core::Result<Self> {
+        Ok(SegHead { dec: Decoder::new(cfg, &vb)?, out: linear(cfg.dpt_channels, cfg.seg_classes, vb.pp("segmentation_head"))? })
+    }
+
+    fn forward(&self, taps: &[Tap]) -> candle_core::Result<Tensor> {
+        self.out.forward(&self.dec.forward(taps)?.permute((0, 2, 3, 1))?.contiguous()?)?.permute((0, 3, 1, 2))?.contiguous()
+    }
+}
+
+fn unit_last(x: &Tensor) -> candle_core::Result<Tensor> {
+    let n = (x.sqr()?.sum_keepdim(D::Minus1)?.sqrt()? + 1e-12)?;
+    x.broadcast_div(&n)
+}
+
+fn unit_channels(x: &Tensor) -> candle_core::Result<Tensor> {
+    let n = (x.sqr()?.sum_keepdim(1)?.sqrt()? + 1e-12)?;
+    x.broadcast_div(&n)
+}
+
+fn flip_w(t: &Tensor) -> candle_core::Result<Tensor> {
+    let w = t.dim(D::Minus1)?;
+    let idx = Tensor::from_vec((0..w as u32).rev().collect::<Vec<u32>>(), w, t.device())?;
+    t.index_select(&idx, t.rank() - 1)
+}
+
+fn merge_views(t: Tensor, b: usize, views: usize, mirror: Option<usize>) -> candle_core::Result<Tensor> {
+    if views < 2 {
+        return Ok(t);
+    }
+    let a = t.narrow(0, 0, b)?;
+    let mut f = flip_w(&t.narrow(0, b, b)?)?;
+    if let Some(c) = mirror {
+        let ch = f.dim(1)?;
+        let sign: Vec<f32> = (0..ch).map(|k| if k == c { -1.0 } else { 1.0 }).collect();
+        f = f.broadcast_mul(&Tensor::from_vec(sign, (1, ch, 1, 1), f.device())?)?;
+    }
+    (a + f)? * 0.5
 }
 
 fn bin_centers(min: f32, max: f32, bins: usize, device: &Device) -> candle_core::Result<Tensor> {
@@ -506,13 +630,36 @@ pub struct TipsDepth {
     cfg: TipsConfig,
     encoder: Encoder,
     head: DepthHead,
+    normals_head: Option<NormalsHead>,
+    seg_head: Option<SegHead>,
     device: Device,
     pub input_grid: InputGrid,
     pub max_rel_spread: Option<f32>,
+    pub flip_tta: bool,
+}
+
+struct RunOut {
+    depth: DepthMap,
+    spread: Option<DepthMap>,
+    normals: Option<NormalMap>,
+    seg: Option<SegMap>,
+}
+
+pub fn heads_from_env() -> SceneHeads {
+    match std::env::var(HEADS_ENV).ok().as_deref().map(str::trim) {
+        Some("depth") | Some("none") => SceneHeads::NONE,
+        Some("normals") => SceneHeads { normals: true, segmentation: false },
+        Some("segmentation") | Some("seg") => SceneHeads { normals: false, segmentation: true },
+        _ => SceneHeads::ALL,
+    }
 }
 
 impl TipsDepth {
     pub fn load(dir: &Path, device: &Device) -> anyhow::Result<Self> {
+        Self::load_with(dir, device, heads_from_env())
+    }
+
+    pub fn load_with(dir: &Path, device: &Device, heads: SceneHeads) -> anyhow::Result<Self> {
         let weights = dir.join(WEIGHTS_FILE);
         if !weights.exists() {
             bail!(
@@ -524,24 +671,38 @@ impl TipsDepth {
         let config_path = dir.join(CONFIG_FILE);
         let cfg = if config_path.exists() { TipsConfig::from_file(&config_path)? } else { TipsConfig::default() };
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[&weights], DType::F32, device)? };
-        Self::from_var_builder(cfg, vb, device).with_context(|| format!("loading {}", weights.display()))
+        Self::from_var_builder_with(cfg, vb, device, heads).with_context(|| format!("loading {}", weights.display()))
     }
 
     pub fn from_var_builder(cfg: TipsConfig, vb: VarBuilder, device: &Device) -> anyhow::Result<Self> {
+        Self::from_var_builder_with(cfg, vb, device, SceneHeads::NONE)
+    }
+
+    pub fn from_var_builder_with(cfg: TipsConfig, vb: VarBuilder, device: &Device, heads: SceneHeads) -> anyhow::Result<Self> {
         cfg.validate()?;
         let encoder = Encoder::new(&cfg, vb.pp("vision_encoder"))?;
         let head = DepthHead::new(&cfg, vb.pp("depth_head"))?;
-        Ok(TipsDepth { cfg, encoder, head, device: device.clone(), input_grid: InputGrid::default(), max_rel_spread: None })
+        let has = |head: &str| vb.contains_tensor(&format!("{head}.project.weight"));
+        let normals_head = if heads.normals && has("normals_head") { Some(NormalsHead::new(&cfg, vb.pp("normals_head"))?) } else { None };
+        let seg_head = if heads.segmentation && has("segmentation_head") { Some(SegHead::new(&cfg, vb.pp("segmentation_head"))?) } else { None };
+        Ok(TipsDepth { cfg, encoder, head, normals_head, seg_head, device: device.clone(), input_grid: InputGrid::default(), max_rel_spread: None, flip_tta: false })
     }
 
     pub fn config(&self) -> &TipsConfig {
         &self.cfg
     }
 
+    pub fn heads(&self) -> SceneHeads {
+        SceneHeads { normals: self.normals_head.is_some(), segmentation: self.seg_head.is_some() }
+    }
+
     pub fn set_readout_gelu_tanh(&mut self, on: bool) {
         self.cfg.readout_gelu_tanh = on;
-        for level in &mut self.head.reassemble {
-            level.gelu_tanh = on;
+        let decoders = std::iter::once(&mut self.head.dec).chain(self.normals_head.as_mut().map(|h| &mut h.dec)).chain(self.seg_head.as_mut().map(|h| &mut h.dec));
+        for dec in decoders {
+            for level in &mut dec.reassemble {
+                level.gelu_tanh = on;
+            }
         }
     }
 
@@ -551,14 +712,26 @@ impl TipsDepth {
     }
 
     pub fn predict_batch(&self, frames: &[&Rgb]) -> anyhow::Result<Vec<DepthMap>> {
-        Ok(self.run_batch(frames, false)?.into_iter().map(|(d, _)| d).collect())
+        Ok(self.run_batch(frames, false, SceneHeads::NONE)?.into_iter().map(|r| r.depth).collect())
     }
 
     pub fn predict_batch_spread(&self, frames: &[&Rgb]) -> anyhow::Result<Vec<(DepthMap, DepthMap)>> {
-        Ok(self.run_batch(frames, true)?.into_iter().map(|(d, s)| (d, s.expect("spread was asked for"))).collect())
+        Ok(self.run_batch(frames, true, SceneHeads::NONE)?.into_iter().map(|r| (r.depth, r.spread.expect("spread was asked for"))).collect())
     }
 
-    fn run_batch(&self, frames: &[&Rgb], want_spread: bool) -> anyhow::Result<Vec<(DepthMap, Option<DepthMap>)>> {
+    pub fn scene_batch(&self, frames: &[&Rgb], want: SceneHeads) -> anyhow::Result<Vec<DepthScene>> {
+        Ok(self
+            .run_batch(frames, false, want)?
+            .into_iter()
+            .map(|r| {
+                let mut s = DepthScene { depth: r.depth, normals: r.normals, segmentation: r.seg };
+                s.mask_sky();
+                s
+            })
+            .collect())
+    }
+
+    fn run_batch(&self, frames: &[&Rgb], want_spread: bool, want: SceneHeads) -> anyhow::Result<Vec<RunOut>> {
         use std::collections::BTreeMap;
         let mut groups: BTreeMap<(u32, u32), Vec<usize>> = BTreeMap::new();
         for (i, f) in frames.iter().enumerate() {
@@ -567,19 +740,37 @@ impl TipsDepth {
             }
             groups.entry((f.width, f.height)).or_default().push(i);
         }
+        let want = want.and(self.heads());
         let policy = noto_ml::BatchPolicy::for_device(&self.device);
         let p = self.cfg.patch_size;
-        let mut out: Vec<Option<(DepthMap, Option<DepthMap>)>> = (0..frames.len()).map(|_| None).collect();
+        let views = if self.flip_tta { 2 } else { 1 };
+        let mut out: Vec<Option<RunOut>> = (0..frames.len()).map(|_| None).collect();
         let spread = want_spread || self.max_rel_spread.is_some();
         for (&(w, h), idx) in &groups {
             let (cols, rows) = self.input_grid.grid_for(w, h);
-            for chunk in idx.chunks(policy.image_rows(cols * rows)) {
+            for chunk in idx.chunks((policy.image_rows(cols * rows) / views).max(1)) {
+                let b = chunk.len();
                 let inputs = chunk.iter().map(|&i| model_input(frames[i], (cols * p) as u32, (rows * p) as u32, &self.device)).collect::<anyhow::Result<Vec<_>>>()?;
-                let pixels = Tensor::cat(&inputs, 0)?;
+                let mut pixels = Tensor::cat(&inputs, 0)?;
+                if views > 1 {
+                    pixels = Tensor::cat(&[&pixels, &flip_w(&pixels)?], 0)?;
+                }
                 let taps = self.encoder.taps(&pixels)?;
                 let (depth, sd) = self.head.forward(&taps, spread)?;
-                let depth = depth.upsample_bilinear2d(h as usize, w as usize, false)?;
-                let sd = sd.map(|t| t.upsample_bilinear2d(h as usize, w as usize, false)).transpose()?;
+                let depth = merge_views(depth, b, views, None)?.upsample_bilinear2d(h as usize, w as usize, false)?;
+                let sd = sd.map(|t| merge_views(t, b, views, None)?.upsample_bilinear2d(h as usize, w as usize, false)).transpose()?;
+                let normals = match (&self.normals_head, want.normals) {
+                    (Some(head), true) => Some(unit_channels(&merge_views(head.forward(&taps)?, b, views, Some(NORMAL_RIGHT))?)?),
+                    _ => None,
+                };
+                let seg = match (&self.seg_head, want.segmentation) {
+                    (Some(head), true) => {
+                        let logits = merge_views(head.forward(&taps)?, b, views, None)?;
+                        let sky = candle_nn::ops::softmax(&logits, 1)?.narrow(1, ADE_SKY, 1)?.squeeze(1)?.contiguous()?;
+                        Some((logits.argmax(1)?, sky))
+                    }
+                    _ => None,
+                };
                 for (k, &i) in chunk.iter().enumerate() {
                     let mut map = DepthMap { width: w, height: h, kind: DepthKind::Metric, data: depth.get(k)?.flatten_all()?.to_vec1()? };
                     clamp_metric(&mut map, self.cfg.max_depth);
@@ -594,7 +785,25 @@ impl TipsDepth {
                             }
                         }
                     }
-                    out[i] = Some((map, if want_spread { sd } else { None }));
+                    let normals = match &normals {
+                        Some(t) => {
+                            let n = t.get(k)?;
+                            let (_, nh, nw) = n.dims3()?;
+                            let v: Vec<f32> = n.permute((1, 2, 0))?.contiguous()?.flatten_all()?.to_vec1()?;
+                            Some(NormalMap { width: nw as u32, height: nh as u32, data: v.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect() })
+                        }
+                        None => None,
+                    };
+                    let seg = match &seg {
+                        Some((labels, sky)) => {
+                            let l = labels.get(k)?;
+                            let (sh, sw) = l.dims2()?;
+                            let labels: Vec<u32> = l.flatten_all()?.to_vec1()?;
+                            Some(SegMap { width: sw as u32, height: sh as u32, labels: labels.into_iter().map(|c| c.min(255) as u8).collect(), sky: sky.get(k)?.flatten_all()?.to_vec1()? })
+                        }
+                        None => None,
+                    };
+                    out[i] = Some(RunOut { depth: map, spread: if want_spread { sd } else { None }, normals, seg });
                 }
             }
         }
@@ -641,6 +850,14 @@ impl DepthModel for TipsDepth {
 
     fn infer_batch(&mut self, frames: &[&Rgb]) -> anyhow::Result<Vec<DepthMap>> {
         self.predict_batch(frames)
+    }
+
+    fn scene_heads(&self) -> SceneHeads {
+        self.heads()
+    }
+
+    fn infer_scene_batch(&mut self, frames: &[&Rgb], want: SceneHeads) -> anyhow::Result<Vec<DepthScene>> {
+        self.scene_batch(frames, want)
     }
 }
 
@@ -760,6 +977,88 @@ mod tests {
         assert!(unread.is_empty(), "checkpoint tensors the port ignores: {unread:?}");
         assert!(requested.iter().all(|n| expected.contains(n)), "the port read a tensor it documents as unused");
         assert_eq!(requested.len(), 175 + 52, "176 encoder tensors minus mask_token, 52 depth-head tensors");
+    }
+
+    fn full_model(fill: Fill) -> (TipsDepth, Shapes, Requested) {
+        let shapes = checkpoint_shapes();
+        let requested = Arc::new(Mutex::new(BTreeSet::new()));
+        let backend = HeaderBackend { shapes: shapes.clone(), fill, requested: requested.clone() };
+        let vb = VarBuilder::from_backend(Box::new(backend), DType::F32, Device::Cpu);
+        let model = TipsDepth::from_var_builder_with(TipsConfig::default(), vb, &Device::Cpu, SceneHeads::ALL).unwrap();
+        (model, shapes, requested)
+    }
+
+    fn mirror(rgb: &Rgb) -> Rgb {
+        let mut data = Vec::with_capacity(rgb.data.len());
+        for y in 0..rgb.height {
+            for x in (0..rgb.width).rev() {
+                data.extend_from_slice(&rgb.px(x, y));
+            }
+        }
+        Rgb::new(rgb.width, rgb.height, data)
+    }
+
+    #[test]
+    fn the_normals_and_segmentation_heads_read_every_tensor_and_share_the_encoder() {
+        let (model, shapes, requested) = full_model(Fill::Zero);
+        assert_eq!(model.heads(), SceneHeads::ALL);
+        let requested = requested.lock().unwrap();
+        let expected: BTreeSet<String> = shapes.keys().filter(|n| !UNUSED_AT_INFERENCE.contains(&n.as_str())).cloned().collect();
+        let unread: Vec<&String> = expected.difference(&requested).collect();
+        assert!(unread.is_empty(), "checkpoint tensors the port ignores: {unread:?}");
+        assert_eq!(requested.len(), 175 + 3 * 52, "one encoder, three DPT decoders of 52 tensors");
+        assert_eq!(model.config().seg_classes, ADE_CLASSES);
+        assert_eq!(ade_name(ADE_SKY), "sky");
+        assert_eq!((ade_name(ADE_TREE), ade_name(ADE_ROCK), ade_name(ADE_BOX)), ("tree", "rock", "box"));
+    }
+
+    #[test]
+    fn a_scene_has_unit_normals_ade_labels_and_no_depth_on_the_sky() {
+        let (mut model, _, _) = full_model(Fill::Random);
+        model.input_grid = InputGrid::Fixed { cols: 4, rows: 3 };
+        let s = model.scene_batch(&[&gradient(50, 37)], SceneHeads::ALL).unwrap().pop().unwrap();
+        let n = s.normals.as_ref().expect("normals");
+        assert!(n.data.iter().all(|v| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2] - 1.0).abs() < 1e-3), "unit normals");
+        let seg = s.segmentation.as_ref().expect("segmentation");
+        assert_eq!((seg.width, seg.height), (n.width, n.height), "both at the decoder's resolution");
+        assert!(seg.labels.iter().all(|&l| (l as usize) < ADE_CLASSES) && seg.sky.iter().all(|p| (0.0..=1.0).contains(p)));
+        for y in 0..37 {
+            for x in 0..50 {
+                let (sx, sy) = ((x * seg.width / 50).min(seg.width - 1), (y * seg.height / 37).min(seg.height - 1));
+                assert_eq!(seg.is_sky((sy * seg.width + sx) as usize), s.depth.at(x, y).is_infinite(), "sky pixels and only those lose their depth");
+            }
+        }
+        let only = model.scene_batch(&[&gradient(50, 37)], SceneHeads::NONE).unwrap().pop().unwrap();
+        assert!(only.normals.is_none() && only.segmentation.is_none(), "heads run only when asked");
+    }
+
+    #[test]
+    fn flip_averaging_is_mirror_symmetric() {
+        let (mut model, _, _) = full_model(Fill::Random);
+        model.input_grid = InputGrid::Fixed { cols: 4, rows: 3 };
+        model.flip_tta = true;
+        let img = gradient(56, 42);
+        let a = model.scene_batch(&[&img], SceneHeads::ALL).unwrap().pop().unwrap();
+        let b = model.scene_batch(&[&mirror(&img)], SceneHeads::ALL).unwrap().pop().unwrap();
+        for y in 0..42 {
+            for x in 0..56 {
+                let (da, db) = (a.depth.at(55 - x, y), b.depth.at(x, y));
+                assert!(da.is_infinite() == db.is_infinite() && (!da.is_finite() || (da - db).abs() <= 1e-4 * da.max(1.0)), "depth at {x},{y}: {da} vs {db}");
+            }
+        }
+        let (na, nb) = (a.normals.unwrap(), b.normals.unwrap());
+        for y in 0..na.height {
+            for x in 0..na.width {
+                let (p, q) = (na.at(na.width - 1 - x, y), nb.at(x, y));
+                assert!((p[0] + q[0]).abs() < 1e-4 && (p[1] - q[1]).abs() < 1e-4 && (p[2] - q[2]).abs() < 1e-4, "normal at {x},{y}: {p:?} vs {q:?}");
+            }
+        }
+        let (sa, sb) = (a.segmentation.unwrap(), b.segmentation.unwrap());
+        for y in 0..sa.height {
+            for x in 0..sa.width {
+                assert!((sa.sky[(y * sa.width + sa.width - 1 - x) as usize] - sb.sky[(y * sb.width + x) as usize]).abs() < 1e-4);
+            }
+        }
     }
 
     #[test]

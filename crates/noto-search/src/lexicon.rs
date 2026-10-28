@@ -117,6 +117,8 @@ pub struct VisionEntity {
     pub semantic: String,
     pub bias: Vec<Phrase>,
     pub prejudice: Vec<Phrase>,
+    pub height_m: Option<(f32, f32)>,
+    pub elevated: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -175,6 +177,10 @@ struct RawEntity {
     bias: String,
     #[serde(default)]
     prejudice: String,
+    #[serde(default)]
+    height_m: Option<[f32; 2]>,
+    #[serde(default)]
+    elevated: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -280,6 +286,11 @@ impl Lexicon {
                 }
                 other => bail!("vision entity {id}: unknown kind {other:?} (source, drop, waypoint or structure)"),
             };
+            if let Some([lo, hi]) = e.height_m {
+                if !(lo > 0.0 && hi > lo) {
+                    bail!("vision entity {id}: height_m must be [lo, hi] with 0 < lo < hi, got [{lo}, {hi}]");
+                }
+            }
             vision.push(VisionEntity {
                 id,
                 kind,
@@ -287,6 +298,8 @@ impl Lexicon {
                 semantic: e.semantic,
                 bias: weighted_phrases(&e.bias),
                 prejudice: weighted_phrases(&e.prejudice),
+                height_m: e.height_m.map(|[lo, hi]| (lo, hi)),
+                elevated: e.elevated,
             });
         }
         let q = r.quantity;
