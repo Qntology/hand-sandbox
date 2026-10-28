@@ -141,6 +141,7 @@ const handlers = {
   inventory_drop: mw.inventoryDrop,
   world_reset: mw.worldReset,
   body_reset: mw.bodyReset,
+  set_team_mode: mw.setTeamMode,
   world_terrain: async () => { throw '모의 백엔드에는 지형 격자가 없습니다'; },
 };
 

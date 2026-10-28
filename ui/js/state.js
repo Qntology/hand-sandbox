@@ -13,7 +13,6 @@ export const bus = {
 };
 
 export const state = {
-  // 손·발 구성 (hand_geometry / grasp_test / world_new 에 그대로 전달되는 NotoConfig)
   presets: null,
   dict: [],
   dictById: new Map(),
@@ -32,29 +31,29 @@ export const state = {
   grasp: null,
   topPrediction: null,
 
-  // 월드
-  snapshot: null,
-  quests: [],
-  body: null, // body_status (신체 상태 HUD)
-  bodyPlan: null, // 부품 프리셋 BodyPlan (world_new · test_start 에 그대로 전달)
-  detections: [],
-  frame: null, // {bytes, encode_ms, tick, width, height}
-  worldConfigKey: null, // 현재 월드를 만들 때 쓴 손·발 구성(JSON)
-  trail: [], // 에이전트가 지나온 위치 [x, y]
-
-  // 분석
-  perception: null,
-  lastCommand: null,
-  sds: null,
-  forecast: null,
-  device: null,
-  models: null, // models_status: {recognizer, embedding, ttm, parser_embedding, device, siglip_files, ttm_files, stand_ins, ready}
-  modelCatalog: null, // models_catalog: 필수 모델 파일·받기 진행률·불러오기 상태
-
-  // 화면
+  teamSize: 2,
+  activeRobot: 1,
   centerTab: 'world',
   mock: false,
   playing: false,
   speed: 1,
   toggles: { boxes: true, path: true, oracle: false, body: true, quest: true, pip: true },
+
+  terrain: 'rugged',
+  worldConfigKey: null,
+  snapshot: null,
+  frame: null,
+  detections: [],
+  procedure: null,
+  quests: [],
+  body: null,
+  bodyPlan: null,
+  perception: null,
+  lastCommand: null,
+  sds: null,
+  forecast: null,
+  depthView: null,
+  device: null,
+  models: null,
+  modelCatalog: null,
 };

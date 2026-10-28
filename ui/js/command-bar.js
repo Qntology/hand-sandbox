@@ -46,25 +46,40 @@ function showToast(kind, text) {
   toastTimer = setTimeout(() => { t.hidden = true; }, kind === 'err' ? 9000 : 7000);
 }
 
-/** '자동 기록' 체크(툴바). 모의 백엔드는 기록하지 않는다. */
 export function recordOn() {
-  return !state.mock && !!$('tl-record')?.checked;
+  return !state.mock && !!$('tl-record')?.checked && (state.teamSize ?? 1) <= 1;
 }
 
-/**
- * 명령 한 줄을 낸다(입력줄 · 툴바 공용). 퀘스트가 생기거나 기다리면 재생을 시작한다.
- * opts.quietHistory: 기록(↑↓)에 남기지 않는다(툴바의 중지 등).
- */
+function splitCoopCommands(text) {
+  if ((state.teamSize ?? 1) < 2 || state.mock) return [text];
+  const m = text.match(/^(.*?)(?:(\d+)\s*개|(두|둘|세|셋|네|넷)\s*개)(.*)$/);
+  if (!m) return [text];
+  const korMap = { 두: 2, 둘: 2, 세: 3, 셋: 3, 네: 4, 넷: 4 };
+  const n = m[2] ? Number(m[2]) : korMap[m[3]] ?? 1;
+  if (n <= 1 || n > 6) return [text];
+  const prefix = m[1].trim();
+  const suffix = m[4].trim();
+  return Array.from({ length: n }, () => `${prefix} 1개${suffix ? ` ${suffix}` : ''}`.trim());
+}
+
 export async function submitCommand(raw, opts = {}) {
   const text = raw.trim();
   if (!text) return null;
   try {
+    const queueTexts = splitCoopCommands(text);
     const record = recordOn();
-    const r = await call('command_submit', { text, record }, { quiet: true });
+    let lastRes = null;
+    for (const subText of queueTexts) {
+      lastRes = await call('command_submit', { text: subText, record }, { quiet: true });
+    }
+    const r = lastRes;
     state.lastCommand = { ...r, text };
     bus.emit('command', state.lastCommand);
     if (r.ok) {
-      const head = r.queued ? `⏳ 대기 ${r.queued}번째 — 지금 기록이 끝나면 시작` : `✓ ${summarize(r.parsed)} · 퀘스트 ${r.quest_id ?? '—'}`;
+      const splitNote = queueTexts.length > 1 ? ` (협동 대기열 ${queueTexts.length}건 분할 등록)` : '';
+      const head = r.queued
+        ? `⏳ 대기 ${r.queued}번째 — 순차 진행 대기 중`
+        : `✓ ${summarize(r.parsed)}${splitNote} · 퀘스트 ${r.quest_id ?? '—'}`;
       let msg = `${head} · 신뢰도 ${fmt.pct(r.parsed?.confidence ?? NaN)} · ${MODE_KO[r.mode] ?? r.mode}`;
       if (r.recording) msg += ' · 통합 테스트 기록 중';
       if (!opts.quietHistory) pushHistory(text);
@@ -75,7 +90,7 @@ export async function submitCommand(raw, opts = {}) {
         msg += ' · 재생 시작';
       }
       showToast('ok', msg);
-      setStatus(`명령 실행: ${summarize(r.parsed)}${r.queued ? ' (대기)' : ''}`);
+      setStatus(`명령 실행: ${summarize(r.parsed)}${splitNote}`);
     } else {
       showToast('err', `✕ ${r.error ?? '명령을 해석하지 못했습니다'}`);
     }

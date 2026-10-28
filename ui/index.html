@@ -82,6 +82,13 @@
                 <option value="rugged" selected>복합 지형 (바다 · 절벽 · 암벽)</option>
                 <option value="open">열린 평지 (언덕 · 연석 벽)</option>
               </select></div>
+            <div class="form-group span-2">
+              <label for="world-team">로봇 운용 (협동 시나리오)</label>
+              <select id="world-team" title="순차 협동(2대): 물리 엔진은 두 로봇이 함께 힘을 쓴다고 가정하고, 비전/AI 시뮬레이션은 로봇 1 → 로봇 2 순서로 하나씩 진행하여 스펙 부하를 단일 로봇 수준으로 유지합니다.">
+                <option value="1">단독 운용 (로봇 1대)</option>
+                <option value="2" selected>순차 협동 (로봇 2대 · 중첩 물리)</option>
+              </select>
+            </div>
           </div>
           <button type="button" class="btn btn-block" id="world-new">월드 재생성</button>
           <div class="btn-row reset-row">
@@ -176,6 +183,8 @@
           <button type="button" class="vt-btn active" id="tg-body" aria-pressed="true">신체</button>
           <button type="button" class="vt-btn active" id="tg-quest" aria-pressed="true">퀘스트</button>
           <button type="button" class="vt-btn active" id="tg-pip" aria-pressed="true">PiP</button>
+          <div class="vt-sep"></div>
+          <button type="button" class="vt-btn active" id="tg-coop-agent" data-tip-title="순차 협동 활성 로봇" data-tip="현재 비전·AI 시뮬레이션을 수행 중인 로봇입니다. 누르면 로봇 1 ↔ 로봇 2의 시점과 제어 주체를 수동 전환하거나 순차 협동 모드를 토글합니다.">로봇 1 (협동 대기)</button>
           <div class="vt-sep"></div>
           <label class="vt-label" for="view-select">시점</label>
           <select id="view-select" title="3인칭: 로봇 뒤 추적 카메라에 관절 동역학(프리셋 질량·액추에이터)으로 움직이는 몸과 관절 토크·ZMP를 겹쳐 그립니다. 포커스: 행위가 쓰는 부위의 근접 화면과 그 부위의 힘·관절 그림"><option value="agent">에이전트 시점 (1인칭)</option><option value="chase">3인칭 (관절 물리)</option><option value="top">탑뷰</option><option value="focus:hand">포커스 · 손 근접</option><option value="focus:side">포커스 · 옆 (허리·목·다리)</option><option value="focus:low">포커스 · 낮게 (발·바퀴·트랙)</option></select>

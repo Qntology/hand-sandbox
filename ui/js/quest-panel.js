@@ -60,16 +60,27 @@ function buildCard(q) {
   const open = isOpen(q);
   const finished = q.state === 'done' || q.state === 'failed';
   const pct = Math.round(overall(q) * 100);
+  const coopTag = (state.teamSize ?? 1) >= 2
+    ? (q.state === 'active'
+      ? ` · 순차 협동 (로봇 ${state.activeRobot ?? 1}/2 연산 중)`
+      : q.state === 'pending'
+        ? ' · 순차 협동 대기열 (로봇 1→2)'
+        : ' · 순차 협동')
+    : '';
   return el('article', { class: `quest-card ${q.state}`, dataset: { quest: q.id }, aria: { label: `퀘스트 ${q.title}` } },
     el('div', { class: 'quest-head' },
       el('div', { class: 'quest-title', text: q.title }),
       el('span', { class: `badge ${STATE_BADGE[q.state] ?? 'badge-dim'}`, text: STATE_KO[q.state] ?? q.state })),
-    el('div', { class: 'quest-meta', text: `${q.id} · 생성 틱 ${q.created_tick} · ${pct}%` }),
-    el('div', { class: `bar-pill${q.state === 'done' ? ' lv-ok' : q.state === 'failed' ? ' lv-crit' : ''}`, aria: { hidden: 'true' } }, el('span', { style: `width:${pct}%` })),
+    el('div', { class: 'quest-meta', text: `${q.id} · 생성 틱 ${q.created_tick} · ${pct}%${coopTag}` }),
+    el('div', { class: `bar-pill${q.state === 'done' ? ' lv-ok' : q.state === 'failed' ? ' lv-crit' : ''}`, aria: { hidden: 'true' } },
+      el('span', { style: `width:${pct}%` })),
     open ? el('ol', { class: 'quest-steps' }, (q.steps ?? []).map(stepNode)) : null,
     finished && q.result ? resultNode(q) : null,
     finished ? el('button', {
-      type: 'button', class: 'quest-toggle', text: open ? '단계 접기' : '단계 보기', aria: { expanded: String(open) },
+      type: 'button',
+      class: 'quest-toggle',
+      text: open ? '단계 접기' : '단계 보기',
+      aria: { expanded: String(open) },
       on: { click: () => { expanded.set(q.id, !open); renderList(state.quests); } },
     }) : null);
 }
@@ -206,7 +217,7 @@ let stockSig = '';
 function renderStock(snap) {
   const box = $('stock-list');
   const wps = snap?.waypoints ?? [];
-  const q = state.quests.find((x) => x.state === 'active');
+  const q = (state.quests ?? []).find((x) => x.state === 'active');
   const stepLabel = q?.steps?.find((x) => x.state === 'active')?.label_ko ?? '';
   const sig = JSON.stringify([wps.map((w) => [w.id, (w.stock ?? []).map((s) => [s.item_id, s.amount ?? s.count])]), stepLabel]);
   if (sig === stockSig) return;

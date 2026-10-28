@@ -125,11 +125,58 @@ function stack(list) {
   return [...merged.values()];
 }
 
+export function setTeamMode({ teamSize = 2, activeRobot = 1 } = {}) {
+  const w = need();
+  w.teamSize = teamSize >= 2 ? 2 : 1;
+  if (w.agent.activeRobot !== activeRobot && w.teamSize === 2) {
+    const prevPos = [...w.agent.pos];
+    const prevYaw = w.agent.yaw;
+    if (w.partnerPos) {
+      w.agent.pos = [...w.partnerPos];
+      w.agent.yaw = w.partnerYaw ?? 0;
+    } else {
+      w.agent.pos = [prevPos[0] - 0.9, prevPos[1] + 0.5];
+    }
+    w.partnerPos = prevPos;
+    w.partnerYaw = prevYaw;
+  }
+  w.agent.activeRobot = w.teamSize === 2 ? activeRobot : 1;
+  return { snapshot: snapshot(), body: bodyStatus() };
+}
+
 export function snapshot() {
   const w = need();
+  const teamSize = w.teamSize ?? 2;
+  const activeRobot = w.active?.rt?.coPhase ?? w.agent.activeRobot ?? 1;
+  const partnerPos = w.partnerPos ?? [w.agent.pos[0] - 0.85, w.agent.pos[1] + 0.45];
+  const partnerYawDeg = ((w.partnerYaw ?? w.agent.yaw) * 180) / Math.PI;
   return {
-    tick: w.tick, time_s: w.tick * DT, seed: w.seed, bounds: w.bounds, terrain: 'open',
-    agent: { pos: [...w.agent.pos], yaw_deg: (w.agent.yaw * 180) / Math.PI, speed_mps: w.agent.speed, base: w.base, carrying: stack(w.agent.carrying), motion: w.agent.maneuver ? { kind: 'kturn', label_ko: '3점 회전: 전진·후진·전진', reversing: !!w.agent.reversing } : w.agent.reversing ? { kind: 'reverse', label_ko: '목표가 뒤쪽: 돌지 않고 후진', reversing: true } : null },
+    tick: w.tick,
+    time_s: w.tick * DT,
+    seed: w.seed,
+    bounds: w.bounds,
+    terrain: 'open',
+    team_size: teamSize,
+    agent: {
+      pos: [...w.agent.pos],
+      yaw_deg: (w.agent.yaw * 180) / Math.PI,
+      speed_mps: w.agent.speed,
+      base: w.base,
+      active_robot: activeRobot,
+      co_phase: w.active?.rt?.coPhase ?? null,
+      partner: teamSize === 2 ? {
+        robot_index: activeRobot === 1 ? 2 : 1,
+        pos: partnerPos,
+        yaw_deg: partnerYawDeg,
+        holding: w.active?.rt?.coPhase === 2,
+      } : null,
+      carrying: stack(w.agent.carrying),
+      motion: w.agent.maneuver
+        ? { kind: 'kturn', label_ko: '3점 회전: 전진·후진·전진', reversing: !!w.agent.reversing }
+        : w.agent.reversing
+          ? { kind: 'reverse', label_ko: '목표가 뒤쪽: 돌지 않고 후진', reversing: true }
+          : null
+    },
     waypoints: w.waypoints.map((p) => ({ ...p, stock: stack(p.pile ?? []) })),
     nodes: w.nodes.filter((n) => n.hp > 0).map(({ id, kind, label_ko, pos, hp }) => ({ id, kind, label_ko, pos, hp })),
     drops: w.drops,
@@ -261,11 +308,20 @@ export function commandSubmit({ text }) {
   const confidence = Math.min(0.97, 0.5 + (item.alias ? 0.12 : 0.25) + (num || kor ? 0.1 : 0) + (verb ? 0.08 : 0) + (wp ? 0.07 : 0));
   trace.push({ stage: 'assign', text: `${action}: ${item.it.ko} ×${count}${dest ? ` → ${dest.label_ko}` : ''}`, score: confidence, role: null, accepted: true });
   const parsed = { action, item_id: item.key, item_label_ko: item.it.ko, count, destination: dest, confidence };
-  const q = createQuest(parsed);
+  const teamCoop = (W.teamSize ?? 2) >= 2;
+  let firstQuest = null;
+  if (teamCoop && count > 1) {
+    for (let idx = 1; idx <= count; idx++) {
+      const sub = createQuest({ ...parsed, count: 1, batchIndex: idx, batchTotal: count });
+      if (!firstQuest) firstQuest = sub;
+    }
+  } else {
+    firstQuest = createQuest(parsed);
+  }
   const mode = item.alias ? 'embedding' : 'lexical';
   log('search', 'info', `명령 해석: ${item.it.ko} ×${count}${dest ? ` → ${dest.label_ko}` : ''} (신뢰도 ${confidence.toFixed(2)}, ${mode})`, { confidence, mode, action });
   if (mode === 'embedding') log('embed', 'info', `임베딩 보조 일치: "${item.hit}" → ${item.it.ko}`, { score: 0.78 });
-  return { ok: true, parsed, quest_id: q.id, trace, error: null, mode };
+  return { ok: true, parsed, quest_id: firstQuest.id, queued: teamCoop && count > 1 ? count - 1 : 0, trace, error: null, mode };
 }
 
 function waypointRef(id) {
@@ -276,25 +332,27 @@ function waypointRef(id) {
 function createQuest(p) {
   const it = ITEMS[p.item_id];
   const isDropOnly = !it.node || p.action === 'collect';
+  const teamCoop = (W.teamSize ?? 2) >= 2;
+  const batchTag = p.batchTotal > 1 ? ` [${p.batchIndex}/${p.batchTotal}대기열]` : '';
   const steps = [
     { kind: 'locate', label_ko: `${it.ko} 탐색` },
     { kind: 'approach', label_ko: `${it.ko} 가까이 접근` },
-    isDropOnly
-      ? { kind: 'look_down', label_ko: `${it.ko} 내려다보며 확인` }
-      : { kind: 'mine', label_ko: `${it.ko} 채취 ${p.count}개` },
-    { kind: 'collect', label_ko: `${it.ko} 줍기 ${p.count}개` },
+    isDropOnly ? { kind: 'look_down', label_ko: `${it.ko} 내려다보며 확인` } : { kind: 'mine', label_ko: `${it.ko} 채취 ${p.count}개` },
+    teamCoop
+      ? { kind: 'collect', label_ko: `${it.ko} 순차 협동 줍기 (로봇 1 지지 → 로봇 2 수렴)` }
+      : { kind: 'collect', label_ko: `${it.ko} 줍기 ${p.count}개` },
   ];
-  if (p.destination) steps.push({ kind: 'carry', label_ko: `${p.destination.label_ko} 운반` }, { kind: 'deliver', label_ko: `${p.destination.label_ko} 인도` });
+  if (p.destination) steps.push({ kind: 'carry', label_ko: `${p.destination.label_ko} 협동 운반` }, { kind: 'deliver', label_ko: `${p.destination.label_ko} 인도` });
   const q = {
     id: `q${W.nextQuest++}`,
-    title: `${it.ko} ${p.count}개 ${ isDropOnly ? '줍기' : '채취' }${p.destination ? ` → ${p.destination.label_ko} 운반` : ''}`,
+    title: `${it.ko} ${p.count}개 ${isDropOnly ? '줍기' : '채취'}${p.destination ? ` → ${p.destination.label_ko} 운반` : ''}${batchTag}`,
     state: 'pending',
     created_tick: W.tick,
     steps: steps.map((s) => ({ ...s, state: 'pending', progress: 0 })),
   };
   W.quests.push(q);
   W.rt.set(q.id, { i: 0, it, key: p.item_id, count: p.count, dest: p.destination, work: 0, mined: 0, collected: 0, node: null, energy: 0, target: null });
-  log('quest', 'info', `퀘스트 생성: ${q.title}`, { quest: q.id, steps: steps.length });
+  log('quest', 'info', `퀘스트 대기열 등록: ${q.title}`, { quest: q.id, steps: steps.length });
   return q;
 }
 
@@ -510,7 +568,7 @@ function startPick(rt, drop) {
   rt.pick = { drop, stage: 'approach', t: 0, check: null };
 }
 
-function pickStep(q, rt) {
+function pickStep(q, rt, needsCoCarry = false, coPhase = 1) {
   const a = W.agent;
   const p = rt.pick;
   const drop = p.drop;
@@ -532,7 +590,7 @@ function pickStep(q, rt) {
       gazeAt(a, drop.pos, Math.min(1, 0.6 + 0.2 * p.t), 0);
       if (p.t >= 2 && Math.abs(rem) < 0.06) {
         Object.assign(p, { stage: 'check', t: 0 });
-        log('vision', 'info', `시선 고정: ${rt.it.ko} — 목 ${a.neck_deg.toFixed(0)}° 숙임, 카메라 피치 ${a.pitch_deg.toFixed(0)}°`, { neck_deg: Number(a.neck_deg.toFixed(1)), pitch_deg: Number(a.pitch_deg.toFixed(1)) });
+        log('vision', 'info', `[로봇 ${coPhase}] 시선 고정: ${rt.it.ko} — 목 ${a.neck_deg.toFixed(0)}° 숙임, 카메라 피치 ${a.pitch_deg.toFixed(0)}°`, { robot_index: coPhase, neck_deg: Number(a.neck_deg.toFixed(1)), pitch_deg: Number(a.pitch_deg.toFixed(1)) });
       }
       break;
     }
@@ -542,10 +600,8 @@ function pickStep(q, rt) {
       if (p.t === 1) {
         const seen = visibleObjects(6).find((o) => o.id === drop.id && o.in_pitch && o.forward > 0.15);
         const range = dist2(a.pos, drop.pos);
-        p.check = seen
-          ? { ok: true, label_ko: rt.it.ko, score: Number((0.86 + W.rng() * 0.1).toFixed(2)), range_m: Number(range.toFixed(2)), depth_m: Number((range * (1 + (W.rng() - 0.5) * 0.04)).toFixed(2)) }
-          : { ok: false, reason: '숙인 화면 안에 대상이 없음' };
-        log('vision', p.check.ok ? 'info' : 'warn', p.check.ok ? `비전 확인 ✓ ${rt.it.ko} ${p.check.range_m} m (깊이 ${p.check.depth_m} m)` : `비전 확인 실패: ${p.check.reason}`, { check: p.check });
+        p.check = seen ? { ok: true, label_ko: rt.it.ko, score: Number((0.86 + W.rng() * 0.1).toFixed(2)), range_m: Number(range.toFixed(2)), depth_m: Number((range * (1 + (W.rng() - 0.5) * 0.04)).toFixed(2)) } : { ok: false, reason: '숙인 화면 안에 대상이 없음' };
+        log('vision', p.check.ok ? 'info' : 'warn', p.check.ok ? `[로봇 ${coPhase}] 비전 확인 ✓ ${rt.it.ko} ${p.check.range_m} m (깊이 ${p.check.depth_m} m)` : `[로봇 ${coPhase}] 비전 확인 실패: ${p.check.reason}`, { robot_index: coPhase, check: p.check });
       }
       if (p.t >= 2) Object.assign(p, p.check?.ok ? { stage: 'bend', t: 0 } : { stage: 'approach', t: 0, check: null });
       break;
@@ -561,6 +617,9 @@ function pickStep(q, rt) {
       p.t += 1;
       gazeAt(a, drop.pos, 1, 1);
       if (p.t >= 2) {
+        if (needsCoCarry && coPhase === 1) {
+          return 'phase1_ready';
+        }
         W.drops.splice(W.drops.indexOf(drop), 1);
         a.carrying.push({ item_id: rt.key, label_ko: rt.it.ko, mass_kg: rt.it.mass });
         Object.assign(p, { stage: 'lift', t: 0, from: { neck: a.neck_deg, total: a.head_pitch_deg, crouch: (a.standing_eye_m ?? 1) - a.eye_m } });
@@ -573,7 +632,7 @@ function pickStep(q, rt) {
       a.neck_deg = p.from.neck * (1 - u);
       a.trunk_deg = Math.max(0, (p.from.total - p.from.neck) * (1 - u));
       applyCameraPose(a, p.from.total * (1 - u), p.from.crouch * (1 - u));
-      W.energy += 25 * DT;
+      W.energy += (needsCoCarry ? 12.5 : 25) * DT;
       if (u >= 1) {
         rt.pick = null;
         a.neck_deg = 0;
@@ -678,21 +737,59 @@ function runStep(q, rt) {
       break;
     }
     case 'collect': {
-      if (W.config?.fingers <= 2 && rt.it.mass >= 3) return failQuest(q, rt, `손가락 ${W.config.fingers}개로는 ${rt.it.ko}(${rt.it.mass} kg)를 안정적으로 쥘 수 없습니다 (파지 불안정)`);
-      if (loadKg() + rt.it.mass > LOAD_LIMIT) return failQuest(q, rt, `적재 한계 초과 (${(loadKg() + rt.it.mass).toFixed(1)} > ${LOAD_LIMIT} kg)`);
+      const soloGripFail = W.config?.fingers <= 2 && rt.it.mass >= 3;
+      const soloLoadFail = loadKg() + rt.it.mass > LOAD_LIMIT;
+      const needsCoCarry = soloGripFail || soloLoadFail;
+      const effectiveMass = needsCoCarry ? rt.it.mass * 0.5 : rt.it.mass;
+      const teamLimit = LOAD_LIMIT * 2 * 0.85;
+
+      if (needsCoCarry && loadKg() + effectiveMass > LOAD_LIMIT) {
+        return failQuest(q, rt, `협동 분담 한계 초과 (분담 후 ${(loadKg() + effectiveMass).toFixed(1)} > ${LOAD_LIMIT} kg, 팀 한계 ${teamLimit.toFixed(1)} kg)`);
+      }
+
+      if (!rt.coPhase) {
+        rt.coPhase = 1;
+        rt.savedPos = [a.pos[0], a.pos[1]];
+        rt.savedYaw = a.yaw;
+      }
+
       if (!rt.pick) {
         const drop = nearest(W.drops, rt.key);
         if (!drop) return failQuest(q, rt, `줍을 ${rt.it.ko} 드롭이 없습니다`);
+        if (needsCoCarry && rt.coPhase === 1) {
+          log('world', 'info', `협동 모드(중첩 물리): 2번 로봇의 반대편 지지를 가정하여 1번 로봇 일차 시뮬레이션 시작 (유효 하중 ${effectiveMass.toFixed(1)} kg)`, { co_phase: 1, effective_mass_kg: effectiveMass });
+        }
         startPick(rt, drop);
       }
-      const r = pickStep(q, rt);
+
+      const r = pickStep(q, rt, needsCoCarry, rt.coPhase);
+
+      if (r === 'phase1_ready') {
+        rt.coPhase = 2;
+        a.pos = [rt. pick.drop.pos[0] - 0.9, rt.pick.drop.pos[1] + 0.4];
+        a.yaw = Math.atan2(rt.pick.drop.pos[1] - a.pos[1], rt.pick.drop.pos[0] - a.pos[0]);
+        Object.assign(rt.pick, { stage: 'approach', t: 0, check: null });
+        log('world', 'info', `1번 로봇 파지 위치 확보 완료 → 2번 로봇 시점으로 전환하여 이차 시뮬레이션 진행`, { co_phase: 2 });
+        break;
+      }
+
       if (r === 'picked') {
+        if (needsCoCarry) {
+          const lastItem = a.carrying[a.carrying.length - 1];
+          if (lastItem) lastItem.mass_kg = effectiveMass;
+        }
+        rt.coPhase = null;
         rt.collected += 1;
         s.note = `${rt.collected}/${rt.count}`;
-        log('world', 'info', `${rt.it.ko} 줍기 (${rt.collected}/${rt.count}), 적재 ${loadKg().toFixed(1)} kg — 고개 숙여 확인 → 자세 낮춤 → 들어올림`, { grasp_margin: 0.8 });
+        log('world', 'info', `${rt.it.ko} ${needsCoCarry ? '순차 협동 ' : ''}줍기 완료 (${rt.collected}/${rt.count}), 분담 적재 ${loadKg().toFixed(1)} kg`, { grasp_margin: needsCoCarry ? 0.85 : 0.8 });
       }
+
       const at = rt.pick ? PICK_STAGES.findIndex(([id]) => id === rt.pick.stage) : 0;
-      s.progress = (rt.collected + at / PICK_STAGES.length) / rt.count;
+      const phaseFrac = needsCoCarry
+        ? ((rt.coPhase - 1) * 0.5 + (at / PICK_STAGES.length) * 0.5)
+        : (at / PICK_STAGES.length);
+      s.progress = (rt.collected + phaseFrac) / rt.count;
+
       if (rt.collected >= rt.count) {
         applyCameraPose(a, 0, 0);
         nextStep(q, rt);

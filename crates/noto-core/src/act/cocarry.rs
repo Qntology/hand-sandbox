@@ -553,6 +553,39 @@ pub struct LetGo {
     pub events: Vec<ActEvent>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SequentialCoCarry {
+    pub active_index: usize,
+    pub assumed_partner_index: usize,
+    pub effective_load_kg: f32,
+    pub effective_peak_kg: f32,
+    pub share_ratio: f32,
+    pub team_ok: bool,
+    pub active_member_ok: bool,
+    pub cocarry: CoCarry,
+}
+
+pub fn share_sequential(
+    load: &Load,
+    carriers: &[Carrier],
+    active_index: usize,
+    opts: &CarryOpts,
+) -> SequentialCoCarry {
+    let cc = share(load, carriers, opts);
+    let m = &cc.members[active_index];
+    let partner_idx = if active_index == 0 { 1 } else { 0 };
+    SequentialCoCarry {
+        active_index,
+        assumed_partner_index: partner_idx,
+        effective_load_kg: m.load_kg,
+        effective_peak_kg: m.peak_kg,
+        share_ratio: m.share,
+        team_ok: cc.ok,
+        active_member_ok: m.ok,
+        cocarry: cc,
+    }
+}
+
 pub fn let_go(load: &Load, carriers: &[Carrier], i: usize, opts: &CarryOpts) -> LetGo {
     let rest: Vec<Carrier> = carriers.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, c)| c.clone()).collect();
     let mut events = vec![ActEvent::new(0.0, "co_drop", format!("{}번 로봇이 놓음: 나머지 {}대가 다시 나눔", i + 1, rest.len()), &[Part::Hand], None, false)];

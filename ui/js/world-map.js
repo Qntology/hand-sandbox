@@ -130,8 +130,8 @@ function draw() {
   for (const d of snap.drops) if (d.support) ctx.strokeRect(X(d.pos[0]) - 3.5, Y(d.pos[1]) - 3.5, 7, 7);
 
   // 목표 웨이포인트: 활성 퀘스트의 현재 단계 문구에 이름이 들어 있는 곳
-  const q = state.quests.find((x) => x.state === 'active');
-  const stepLabel = q?.steps.find((x) => x.state === 'active')?.label_ko ?? '';
+  const q = (state.quests ?? []).find((x) => x.state === 'active');
+  const stepLabel = (q?.steps ?? []).find((x) => x.state === 'active')?.label_ko ?? '';
   ctx.font = `9px ${cssVar('--font-sans')}`;
   for (const w of snap.waypoints) {
     const x = X(w.pos[0]);
@@ -186,6 +186,36 @@ function draw() {
     ctx.restore();
   }
   // 움직임: 후진이면 꽁무니 쪽으로 화살 꼬리를, 3점 회전·제자리 회전이면 몸 둘레에 호를 그린다.
+const partner = snap.agent.partner;
+  if (partner && Array.isArray(partner.pos)) {
+    const [px, py] = partner.pos;
+    const pyaw = ((partner.yaw_deg ?? 0) * Math.PI) / 180;
+    if (partner.holding) {
+      ctx.strokeStyle = cssVar('--signal');
+      ctx.lineWidth = 1.2;
+      ctx.setLineDash([3, 2]);
+      ctx.beginPath();
+      ctx.moveTo(X(ax), Y(ay));
+      ctx.lineTo(X(px), Y(py));
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    ctx.save();
+    ctx.translate(X(px), Y(py));
+    ctx.rotate(-pyaw);
+    ctx.strokeStyle = cssVar('--signal');
+    ctx.fillStyle = partner.holding ? cssVar('--signal') : 'rgba(80, 180, 220, 0.35)';
+    ctx.lineWidth = 1.3;
+    ctx.beginPath();
+    ctx.moveTo(5.5, 0);
+    ctx.lineTo(-3.8, 3.2);
+    ctx.lineTo(-3.8, -3.2);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+  }
+
   const motion = snap.agent.motion;
   ctx.save();
   ctx.translate(X(ax), Y(ay));
@@ -215,8 +245,7 @@ function draw() {
     ctx.arc(0, 0, 9, -0.9, 0.9);
     ctx.stroke();
   }
-  ctx.restore();
-  $('mm-left').textContent = `${bx} × ${by} m`;
+  ctx.restore();  $('mm-left').textContent = `${bx} × ${by} m`;
   const moveKo = motion ? { reverse: '후진', kturn: '3점 회전', pivot: '제자리 회전' }[motion.kind] : null;
   const where = belief ? `(${ax.toFixed(1)}, ${ay.toFixed(1)}) · 믿음 오차 ${belief.error_m.toFixed(2)} m` : `(${ax.toFixed(1)}, ${ay.toFixed(1)})`;
   $('mm-right').textContent = moveKo ? `${where} · ${moveKo}` : where;
