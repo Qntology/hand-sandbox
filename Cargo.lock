@@ -5678,11 +5678,13 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "image",
+ "noto-core",
  "noto-ml",
  "noto-ts",
  "rayon",
  "serde",
  "serde_json",
+ "world-sim",
 ]
 
 [[package]]

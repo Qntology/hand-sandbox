@@ -53,7 +53,16 @@ pub struct AgentView {
     pub battery_ratio: f32,
     pub action: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub motion: Option<MotionView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub belief: Option<BeliefView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MotionView {
+    pub kind: String,
+    pub label_ko: String,
+    pub reversing: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

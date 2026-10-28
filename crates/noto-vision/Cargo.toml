@@ -17,6 +17,10 @@ candle-transformers = { workspace = true }
 noto-ml = { path = "../noto-ml" }
 noto-ts = { path = "../noto-ts" }
 
+[dev-dependencies]
+noto-core = { path = "../noto-core" }
+world-sim = { path = "../world-sim" }
+
 [features]
 default = []
 cuda = ["noto-ml/cuda"]

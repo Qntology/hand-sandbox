@@ -17,8 +17,10 @@ ui/
    ├─ main.js            시작 순서 조립
    ├─ api.js             invoke 래퍼 (Tauri 가 없으면 모의 백엔드로 자동 전환)
    ├─ state.js util.js toast.js layout.js
-   ├─ sim.js world-view.js world-map.js world-panel.js     월드 · 시뮬레이션 · 프레임 폴링
+   ├─ sim.js world-view.js world-map.js world-panel.js     월드 · 시뮬레이션 · 프레임 폴링 (미니맵의 후진 · 회전 표시)
    ├─ body-hud.js quest-panel.js command-bar.js            오버레이와 오른쪽 패널
+   ├─ pick-hud.js        줍기 절차 HUD (world_frame.procedure: 다가가기 → 고개 숙여 응시 → 비전 확인 → 자세 낮춤 → 쥐기 → 들어올림)
+   ├─ depth-view.js      깊이 · 카메라 탭 (정렬 깊이 · 원출력 · 정답 · ADE20K 분할 · 법선)
    ├─ hand-canvas.js hand-panel.js vision-upload.js        손·발 측면도와 파지 시험
    ├─ logs.js analysis.js timeseries.js data-panel.js device.js
    └─ mock-*.js          브라우저 전용 모의 백엔드 (mock-backend.js 가 진입점)

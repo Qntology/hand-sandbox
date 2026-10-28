@@ -42,22 +42,31 @@ function render(d) {
     return;
   }
   const m = d.metrics;
-  $('depth-meta').textContent = `틱 ${d.tick} · ${d.mode} · ${d.device} · 추론 ${fmt.n(d.infer_ms, 0)} ms${d.max_depth_m ? ` · 최대 ${fmt.n(d.max_depth_m, 0)} m` : ''}`;
+  const r = d.metrics_raw;
+  const tta = d.flip_tta ? ' · 좌우 반전 평균' : '';
+  $('depth-meta').textContent = `틱 ${d.tick} · ${d.mode} · ${d.device} · 추론 ${fmt.n(d.infer_ms, 0)} ms${tta}${d.max_depth_m ? ` · 모델 상한 ${fmt.n(d.max_depth_m, 0)} m` : ''}`;
   const [lo, hi] = d.scale_m ?? [0, 1];
+  const figs = [
+    el('figure', {}, img(d.rgb_webp_base64, '머리 카메라 원본'), el('figcaption', { text: '머리 카메라 (흔들림·블러 포함)' })),
+    el('figure', {}, img(d.pred_webp_base64, '깊이 모델 추정 (정렬)'), el('figcaption', { text: d.align ? `추정 깊이 — 지면 정렬 · 하늘 제외 (${d.mode})` : `추정 깊이 — ${d.mode}` })),
+    el('figure', {}, img(d.truth_webp_base64, '렌더러 정답 깊이'), el('figcaption', { text: '정답 깊이 (렌더러)' })),
+  ];
+  if (d.raw_webp_base64) figs.push(el('figure', {}, img(d.raw_webp_base64, '모델 원출력'), el('figcaption', { text: '모델 원출력 (실내 NYU 척도, 정렬 전)' })));
+  if (d.seg_webp_base64) figs.push(el('figure', {}, img(d.seg_webp_base64, 'ADE20K 분할'), el('figcaption', { text: `분할 (ADE20K) — 하늘 ${fmt.pct(d.sky?.frac ?? 0, 0)} 깊이에서 제외` })));
+  if (d.normals_webp_base64) figs.push(el('figure', {}, img(d.normals_webp_base64, '표면 법선'), el('figcaption', { text: `표면 법선 — 지면 아닌 후보 ${d.align?.off_ground_normals ?? 0}개를 정렬에서 뺌` })));
+  const fit = d.align;
   box.append(
-    el('div', { class: 'depth-grid' },
-      el('figure', {}, img(d.rgb_webp_base64, '머리 카메라 원본'), el('figcaption', { text: '머리 카메라 (흔들림·블러 포함)' })),
-      el('figure', {}, img(d.pred_webp_base64, '깊이 모델 추정'), el('figcaption', { text: `추정 깊이 — ${d.mode}` })),
-      el('figure', {}, img(d.truth_webp_base64, '렌더러 정답 깊이'), el('figcaption', { text: '정답 깊이 (렌더러)' }))),
+    el('div', { class: 'depth-grid' }, ...figs),
     el('div', { class: 'depth-legend' },
       el('span', { text: `${fmt.n(lo, 1)} m 가까움` }),
       el('span', { class: 'depth-ramp', role: 'img', aria: { label: '색 척도: 빨강 가까움, 파랑 멂 (역깊이)' } }),
       el('span', { text: `멂 ${fmt.n(hi, 1)} m` })),
     kv([
-      ['AbsRel', m ? fmt.n(m.absrel, 3) : '—'],
-      ['δ1 (< 1.25)', m ? fmt.pct(m.delta1, 1) : '—'],
-      ['RMSE', m ? `${fmt.n(m.rmse_m, 2)} m` : '—'],
+      ['AbsRel (정렬 · 원출력)', m ? `${fmt.n(m.absrel, 3)} · ${r ? fmt.n(r.absrel, 3) : '—'}` : '—'],
+      ['δ1 (< 1.25)', m ? `${fmt.pct(m.delta1, 1)} · ${r ? fmt.pct(r.delta1, 1) : '—'}` : '—'],
+      ['RMSE', m ? `${fmt.n(m.rmse_m, 2)} m · ${r ? `${fmt.n(r.rmse_m, 2)} m` : '—'}` : '—'],
       ['중앙 축척 (정답/추정)', m ? fmt.n(m.median_scale, 2) : '—'],
+      ['지면 정렬', fit ? `1/Z = ${fmt.n(fit.a, 3)}/Z모델 + ${fmt.n(fit.b, 3)} · 내층 ${fit.inliers}/${fit.candidates} · 잔차 중앙 ${fmt.pct(fit.median_rel_err, 1)} · 지면 ${fmt.n(fit.span_m?.[0], 1)}–${fmt.n(fit.span_m?.[1], 1)} m` : '맞춤 없음 (지면이 충분히 보이지 않음)'],
       ...cameraRows(d.camera),
     ]),
   );

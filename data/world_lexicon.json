@@ -153,77 +153,91 @@
       "link": "log",
       "semantic": "a tree standing in the world: a brown blocky trunk with a green crown",
       "bias": "a tree, a blocky tree with a brown trunk and green leaves, a voxel tree, a minecraft oak tree, a tree trunk with green foliage",
-      "prejudice": "a grey boulder, a green bush, a grass field, a wooden log lying on the ground, a house"
+      "prejudice": "a grey boulder, a green bush, a grass field, a wooden log lying on the ground, a house",
+      "height_m": [1.2, 9],
+      "elevated": true
     },
     "boulder": {
       "kind": "source",
       "link": "stone",
       "semantic": "a grey boulder: a big blocky rock",
       "bias": "a grey boulder, a big grey rock, a blocky stone block, a voxel rock, a minecraft stone block",
-      "prejudice": "a tree, a coal ore block, an iron ore block, a gravel path"
+      "prejudice": "a tree, a coal ore block, an iron ore block, a gravel path",
+      "height_m": [0.25, 1.2]
     },
     "coal_ore": {
       "kind": "source",
       "link": "coal",
       "semantic": "a dark stone block with black coal spots",
       "bias": "a coal ore block, a dark grey stone block with black dots, black coal spots on stone, minecraft coal ore",
-      "prejudice": "a plain grey boulder, an iron ore block, a tree"
+      "prejudice": "a plain grey boulder, an iron ore block, a tree",
+      "height_m": [0.25, 1.2]
     },
     "iron_ore_node": {
       "kind": "source",
       "link": "iron_ore",
       "semantic": "a stone block with orange-brown iron spots",
       "bias": "an iron ore block, a stone block with orange brown dots, rusty iron spots on stone, minecraft iron ore",
-      "prejudice": "a plain grey boulder, a coal ore block, a tree"
+      "prejudice": "a plain grey boulder, a coal ore block, a tree",
+      "height_m": [0.25, 1.2]
     },
     "log": {
       "kind": "drop",
       "link": "log",
       "semantic": "a small wooden log lying on the ground",
       "bias": "a small wooden log lying on the ground, a brown log item, a short piece of wood",
-      "prejudice": "a standing tree, a grey stone piece, a lump of coal"
+      "prejudice": "a standing tree, a grey stone piece, a lump of coal",
+      "height_m": [0.03, 0.35]
     },
     "stone": {
       "kind": "drop",
       "link": "stone",
       "semantic": "a small grey stone piece lying on the ground",
       "bias": "a small grey stone on the ground, a stone piece, a cobblestone item",
-      "prejudice": "a wooden log, a lump of coal, a big boulder"
+      "prejudice": "a wooden log, a lump of coal, a big boulder",
+      "height_m": [0.03, 0.35]
     },
     "coal": {
       "kind": "drop",
       "link": "coal",
       "semantic": "a small black lump of coal lying on the ground",
       "bias": "a small black lump of coal on the ground, a coal item, a black rock piece",
-      "prejudice": "a grey stone piece, a wooden log, raw iron"
+      "prejudice": "a grey stone piece, a wooden log, raw iron",
+      "height_m": [0.03, 0.35]
     },
     "iron_ore": {
       "kind": "drop",
       "link": "iron_ore",
       "semantic": "a small lump of raw iron ore lying on the ground",
       "bias": "a small piece of raw iron ore on the ground, an orange brown iron lump, a raw iron item",
-      "prejudice": "a grey stone piece, a lump of coal, a wooden log"
+      "prejudice": "a grey stone piece, a lump of coal, a wooden log",
+      "height_m": [0.03, 0.35]
     },
     "parcel": {
       "kind": "drop",
       "link": "parcel",
       "semantic": "a small brown cardboard parcel box lying on the ground",
       "bias": "a small cardboard box on the ground, a brown parcel box, a small package, a taped carton",
-      "prejudice": "a wooden log, a grey stone piece, a tree"
+      "prejudice": "a wooden log, a grey stone piece, a tree",
+      "height_m": [0.04, 0.7]
     },
     "base_camp": {
       "kind": "waypoint",
       "link": "base_camp",
       "semantic": "the base camp waypoint: an orange flag on a thin white pole",
       "bias": "an orange flag on a thin white pole, a small orange banner on a post, an orange marker flag",
-      "prejudice": "a blue flag on a pole, a tree, a grey boulder"
+      "prejudice": "a blue flag on a pole, a tree, a grey boulder",
+      "height_m": [0.7, 3.5],
+      "elevated": true
     },
     "warehouse": {
       "kind": "waypoint",
       "link": "warehouse",
       "semantic": "the warehouse waypoint: a blue flag on a thin white pole",
       "bias": "a blue flag on a thin white pole, a small blue banner on a post, a blue marker flag",
-      "prejudice": "an orange flag on a pole, a tree, a grey boulder"
+      "prejudice": "an orange flag on a pole, a tree, a grey boulder",
+      "height_m": [0.7, 3.5],
+      "elevated": true
     },
     "house": {
       "kind": "structure",

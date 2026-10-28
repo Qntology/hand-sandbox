@@ -129,7 +129,7 @@ export function snapshot() {
   const w = need();
   return {
     tick: w.tick, time_s: w.tick * DT, seed: w.seed, bounds: w.bounds, terrain: 'open',
-    agent: { pos: [...w.agent.pos], yaw_deg: (w.agent.yaw * 180) / Math.PI, speed_mps: w.agent.speed, base: w.base, carrying: stack(w.agent.carrying) },
+    agent: { pos: [...w.agent.pos], yaw_deg: (w.agent.yaw * 180) / Math.PI, speed_mps: w.agent.speed, base: w.base, carrying: stack(w.agent.carrying), motion: w.agent.maneuver ? { kind: 'kturn', label_ko: '3점 회전: 전진·후진·전진', reversing: !!w.agent.reversing } : w.agent.reversing ? { kind: 'reverse', label_ko: '목표가 뒤쪽: 돌지 않고 후진', reversing: true } : null },
     waypoints: w.waypoints.map((p) => ({ ...p, stock: stack(p.pile ?? []) })),
     nodes: w.nodes.filter((n) => n.hp > 0).map(({ id, kind, label_ko, pos, hp }) => ({ id, kind, label_ko, pos, hp })),
     drops: w.drops,
@@ -312,13 +312,16 @@ function wrapAngle(rad) {
   return r;
 }
 
+const turnSpec = () => BASE_TURN_SPECS[W.base] ?? BASE_TURN_SPECS.wheel;
+const loadFactor = (k) => 1 - k * Math.min(1, loadKg() / LOAD_LIMIT);
+
+// 제자리에서 목표 쪽으로 돈다: 바퀴·트랙은 바닥을 비비며(pivot_rate), 다리는 발을 디뎌(step turn) 돈다.
 function turnToward(targetPos) {
   const a = W.agent;
   const desired = Math.atan2(targetPos[1] - a.pos[1], targetPos[0] - a.pos[0]);
   const diff = wrapAngle(desired - a.yaw);
-  const spec = BASE_TURN_SPECS[W.base] ?? BASE_TURN_SPECS.wheel;
-  const loadPenalty = 1 - 0.25 * Math.min(1, loadKg() / LOAD_LIMIT);
-  const maxTurn = spec.turn_rate_rad_s * loadPenalty * DT;
+  const maxTurn = turnSpec().pivot_rate_rad_s * loadFactor(0.25) * DT;
+  a.reversing = false;
   if (Math.abs(diff) <= maxTurn) {
     a.yaw = desired;
     return 0;
@@ -327,27 +330,95 @@ function turnToward(targetPos) {
   return wrapAngle(desired - a.yaw);
 }
 
+function drive(dir, ds, kappa) {
+  const a = W.agent;
+  a.pos[0] += dir * Math.cos(a.yaw) * ds;
+  a.pos[1] += dir * Math.sin(a.yaw) * ds;
+  a.yaw = wrapAngle(a.yaw + kappa * dir * ds);
+  a.reversing = dir < 0;
+  W.lastMoved = ds;
+}
+
+// 3점 회전(K-턴): 앞으로 꺾어 돌고, 반대로 꺾어 후진하고, 다시 앞으로. 세 토막 모두 같은 방향으로 몸을 돌린다.
+function startKTurn(err) {
+  const s = Math.sign(err) || 1;
+  const R = Math.max(0.4, turnSpec().min_radius_m);
+  const parts = [0.45, 0.35, 0.2].map((f) => Math.abs(err) * f);
+  W.agent.maneuver = { kind: 'kturn', seg: 0, segs: [{ dir: 1, kappa: s / R, left: parts[0] }, { dir: -1, kappa: -s / R, left: parts[1] }, { dir: 1, kappa: s / R, left: parts[2] }] };
+  log('world', 'info', `(모의) 3점 회전 시작: ${((err * 180) / Math.PI).toFixed(0)}° — 전진·후진·전진 (반경 ${R.toFixed(2)} m)`, { maneuver: 'kturn', turn_deg: Number(((err * 180) / Math.PI).toFixed(1)) });
+}
+
+function runManeuver(target, reach) {
+  const a = W.agent;
+  const m = a.maneuver;
+  const seg = m.segs[m.seg];
+  const spec = turnSpec();
+  const v = (seg.dir > 0 ? BASES[W.base].max_speed_mps * 0.45 : spec.reverse_mps) * loadFactor(0.35);
+  const dpsi = Math.min(seg.left, Math.abs(seg.kappa) * v * DT);
+  drive(seg.dir, dpsi / Math.abs(seg.kappa), seg.kappa);
+  seg.left -= dpsi;
+  if (seg.left <= 1e-3) {
+    m.seg += 1;
+    if (m.seg >= m.segs.length) {
+      a.maneuver = null;
+      a.reversing = false;
+    }
+  }
+  return Math.max(0, dist2(a.pos, target) - reach);
+}
+
+// 목표로 간다. 바퀴·트랙은 차처럼 달리며 반경 안에서 꺾고, 크게 틀어야 하면 3점 회전(트랙) 또는 제자리 회전(바퀴),
+// 뒤쪽 가까이 있으면 돌지 않고 후진한다. 다리는 걸으며 휘고(굽은 길에서 느려짐), 크게 틀 때는 발을 디뎌 돈다.
 function moveToward(target, reach) {
   const a = W.agent;
   const d = dist2(a.pos, target);
+  W.lastMoved = 0;
   if (d <= reach) {
+    a.maneuver = null;
     turnToward(target);
     return 0;
   }
-  const remYaw = turnToward(target);
-  const absErr = Math.abs(remYaw);
-  const spec = BASE_TURN_SPECS[W.base] ?? BASE_TURN_SPECS.wheel;
-  if (absErr > spec.turn_move_rad) {
-    W.lastMoved = 0;
+  if (a.maneuver) return runManeuver(target, reach);
+  const spec = turnSpec();
+  const bearing = Math.atan2(target[1] - a.pos[1], target[0] - a.pos[0]);
+  const err = wrapAngle(bearing - a.yaw);
+  const vmax = BASES[W.base].max_speed_mps * loadFactor(0.35);
+  if (spec.holonomic) {
+    const step = Math.min(vmax * DT, d - reach * 0.9);
+    a.pos[0] += Math.cos(bearing) * step;
+    a.pos[1] += Math.sin(bearing) * step;
+    a.yaw = wrapAngle(a.yaw + Math.max(-spec.turn_rate_rad_s * DT, Math.min(spec.turn_rate_rad_s * DT, err)));
+    W.lastMoved = step;
+    return d - step;
+  }
+  const rearErr = wrapAngle(bearing - (a.yaw + Math.PI));
+  if (spec.reverse_max_m > 0 && Math.abs(err) > 2.2 && d <= spec.reverse_max_m) {
+    const v = spec.reverse_mps * loadFactor(0.35);
+    const ds = Math.min(v * DT, d - reach * 0.9);
+    const kmax = 1 / Math.max(0.3, spec.min_radius_m);
+    drive(-1, ds, Math.max(-kmax, Math.min(kmax, -rearErr / Math.max(ds, 1e-3))) * 0.5);
+    if (!a.reversingLogged) {
+      log('world', 'info', `(모의) 목표가 뒤쪽 ${d.toFixed(1)} m — 돌지 않고 후진`, { maneuver: 'reverse' });
+      a.reversingLogged = true;
+    }
+    return Math.max(0, d - ds);
+  }
+  a.reversingLogged = false;
+  if (Math.abs(err) > spec.turn_move_rad) {
+    if (spec.kturn && Math.abs(err) > 1.0 && d > 1.2) {
+      startKTurn(err);
+      return runManeuver(target, reach);
+    }
+    turnToward(target);
     return d;
   }
-  const alignFactor = Math.max(0.2, Math.cos(absErr));
-  const speed = BASES[W.base].max_speed_mps * (1 - 0.35 * Math.min(1, loadKg() / LOAD_LIMIT)) * alignFactor;
-  const step = Math.min(speed * DT, d - reach * 0.9);
-  a.pos[0] += Math.cos(a.yaw) * step;
-  a.pos[1] += Math.sin(a.yaw) * step;
-  W.lastMoved = step;
-  return d - step;
+  const curveSlow = spec.legs ? Math.max(0.45, Math.cos(err) ** 0.33) : Math.max(0.35, Math.cos(err));
+  const v = vmax * curveSlow;
+  const omega = Math.min(spec.turn_rate_rad_s, v / Math.max(0.05, spec.min_radius_m));
+  const ds = Math.min(v * DT, d - reach * 0.9);
+  const dpsi = Math.max(-omega * DT, Math.min(omega * DT, err));
+  drive(1, ds, dpsi / Math.max(ds, 1e-3));
+  return d - ds;
 }
 
 function nearest(list, kind, claimed) {
@@ -411,6 +482,135 @@ function lookDownAt(a, targetPos) {
   applyCameraPose(a, headPitch, crouch);
 }
 
+// ── 사람처럼 줍기: 고개를 먼저 숙여 응시(목) → 비전 확인 → 자세 낮춤(무릎·허리) → 쥐기 → 들어올림 ─────────
+// 시선이 손보다 먼저 물건에 가고(Land & Hayhoe 2001, Johansson 외 2001), 몸을 낮추는 동안에도 물건을 화면 가운데에 둔다.
+const NECK_MAX_DEG = 45;
+const CROUCH_M = { human_foot: 0.42, wheel: 0.22, track: 0.22, mecanum: 0.22 };
+export const PICK_STAGES = [
+  ['approach', '다가가기'],
+  ['look', '고개 숙여 응시'],
+  ['check', '비전 확인'],
+  ['bend', '자세 낮춤'],
+  ['grip', '쥐기'],
+  ['lift', '들어올림'],
+];
+
+function gazeAt(a, targetPos, neckFrac, crouchFrac) {
+  const crouch = (CROUCH_M[W.base] ?? 0.22) * crouchFrac;
+  const eye = Math.max(0.35, (a.standing_eye_m ?? 1.0) - crouch);
+  const d = Math.max(0.2, dist2(a.pos, targetPos));
+  const wantPitch = -(Math.atan2(Math.max(0.05, eye - ((targetPos[2] ?? 0) + 0.06)), d) * 180) / Math.PI;
+  const total = Math.max(0, (a.mount_deg ?? -12.0) - wantPitch) * neckFrac;
+  a.neck_deg = Math.min(NECK_MAX_DEG, total);
+  a.trunk_deg = Math.max(0, total - NECK_MAX_DEG) + 30 * crouchFrac;
+  applyCameraPose(a, total, crouch);
+}
+
+function startPick(rt, drop) {
+  rt.pick = { drop, stage: 'approach', t: 0, check: null };
+}
+
+function pickStep(q, rt) {
+  const a = W.agent;
+  const p = rt.pick;
+  const drop = p.drop;
+  if (!['grip', 'lift'].includes(p.stage) && !W.drops.includes(drop)) {
+    rt.pick = null;
+    return 'lost';
+  }
+  switch (p.stage) {
+    case 'approach': {
+      const left = moveToward(drop.pos, 0.75);
+      if (dist2(a.pos, drop.pos) <= 1.8) gazeAt(a, drop.pos, 0.6, 0);
+      else applyCameraPose(a, 0, 0);
+      if (left <= 0) Object.assign(p, { stage: 'look', t: 0 });
+      break;
+    }
+    case 'look': {
+      const rem = turnToward(drop.pos);
+      p.t += 1;
+      gazeAt(a, drop.pos, Math.min(1, 0.6 + 0.2 * p.t), 0);
+      if (p.t >= 2 && Math.abs(rem) < 0.06) {
+        Object.assign(p, { stage: 'check', t: 0 });
+        log('vision', 'info', `시선 고정: ${rt.it.ko} — 목 ${a.neck_deg.toFixed(0)}° 숙임, 카메라 피치 ${a.pitch_deg.toFixed(0)}°`, { neck_deg: Number(a.neck_deg.toFixed(1)), pitch_deg: Number(a.pitch_deg.toFixed(1)) });
+      }
+      break;
+    }
+    case 'check': {
+      p.t += 1;
+      gazeAt(a, drop.pos, 1, 0);
+      if (p.t === 1) {
+        const seen = visibleObjects(6).find((o) => o.id === drop.id && o.in_pitch && o.forward > 0.15);
+        const range = dist2(a.pos, drop.pos);
+        p.check = seen
+          ? { ok: true, label_ko: rt.it.ko, score: Number((0.86 + W.rng() * 0.1).toFixed(2)), range_m: Number(range.toFixed(2)), depth_m: Number((range * (1 + (W.rng() - 0.5) * 0.04)).toFixed(2)) }
+          : { ok: false, reason: '숙인 화면 안에 대상이 없음' };
+        log('vision', p.check.ok ? 'info' : 'warn', p.check.ok ? `비전 확인 ✓ ${rt.it.ko} ${p.check.range_m} m (깊이 ${p.check.depth_m} m)` : `비전 확인 실패: ${p.check.reason}`, { check: p.check });
+      }
+      if (p.t >= 2) Object.assign(p, p.check?.ok ? { stage: 'bend', t: 0 } : { stage: 'approach', t: 0, check: null });
+      break;
+    }
+    case 'bend': {
+      p.t += 1;
+      gazeAt(a, drop.pos, 1, Math.min(1, p.t / 4));
+      W.energy += 15 * DT;
+      if (p.t >= 4) Object.assign(p, { stage: 'grip', t: 0 });
+      break;
+    }
+    case 'grip': {
+      p.t += 1;
+      gazeAt(a, drop.pos, 1, 1);
+      if (p.t >= 2) {
+        W.drops.splice(W.drops.indexOf(drop), 1);
+        a.carrying.push({ item_id: rt.key, label_ko: rt.it.ko, mass_kg: rt.it.mass });
+        Object.assign(p, { stage: 'lift', t: 0, from: { neck: a.neck_deg, total: a.head_pitch_deg, crouch: (a.standing_eye_m ?? 1) - a.eye_m } });
+      }
+      break;
+    }
+    case 'lift': {
+      p.t += 1;
+      const u = Math.min(1, p.t / 4);
+      a.neck_deg = p.from.neck * (1 - u);
+      a.trunk_deg = Math.max(0, (p.from.total - p.from.neck) * (1 - u));
+      applyCameraPose(a, p.from.total * (1 - u), p.from.crouch * (1 - u));
+      W.energy += 25 * DT;
+      if (u >= 1) {
+        rt.pick = null;
+        a.neck_deg = 0;
+        a.trunk_deg = 0;
+        return 'picked';
+      }
+      break;
+    }
+    default:
+      break;
+  }
+  return 'busy';
+}
+
+export function procedureView() {
+  if (!W) return null;
+  const q = W.quests.find((x) => x.state === 'active');
+  const rt = q && W.rt.get(q.id);
+  const p = rt?.pick;
+  if (!p) return null;
+  const a = W.agent;
+  const at = PICK_STAGES.findIndex(([id]) => id === p.stage);
+  return {
+    act: 'pick',
+    target: p.drop.id,
+    label_ko: rt.it.ko,
+    stage: p.stage,
+    stages: PICK_STAGES.map(([id, label_ko], i) => ({ id, label_ko, state: i < at ? 'done' : i === at ? 'active' : 'pending' })),
+    neck_deg: a.neck_deg ?? 0,
+    trunk_deg: a.trunk_deg ?? 0,
+    eye_m: a.eye_m,
+    standing_eye_m: a.standing_eye_m,
+    pitch_deg: a.pitch_deg,
+    check: p.check,
+  };
+}
+
 function runStep(q, rt) {
   const s = q.steps[rt.i];
   const a = W.agent;
@@ -444,19 +644,14 @@ function runStep(q, rt) {
       break;
     }
     case 'look_down': {
-      const drop = nearest(W.drops, rt.key) ?? rt.node;
+      // 첫 물건: 다가가 고개를 숙여 응시하고 비전으로 확인할 때까지. 몸을 낮춰 드는 것은 다음 단계(줍기)에서.
+      const drop = rt.pick?.drop ?? nearest(W.drops, rt.key);
       if (!drop) return failQuest(q, rt, `확인할 ${rt.it.ko} 드롭이 없습니다`);
-      const remYaw = turnToward(drop.pos);
-      lookDownAt(a, drop.pos);
-      if (Math.abs(remYaw) > 0.08) break;
-      rt.work += 1;
-      s.progress = rt.work / 5;
-      if (rt.work === 1) {
-        log('vision', 'info', `근거리(${dist2(a.pos, drop.pos).toFixed(2)} m) 바닥 확인: 카메라 피치 ${a.pitch_deg.toFixed(1)}° (목·허리 ${a.head_pitch_deg.toFixed(1)}° 숙임)`, { pitch_deg: Number(a.pitch_deg.toFixed(1)), eye_m: Number(a.eye_m.toFixed(2)) });
-      }
-      if (rt.work >= 5) {
-        nextStep(q, rt);
-      }
+      if (!rt.pick) startPick(rt, drop);
+      if (pickStep(q, rt) === 'lost') break;
+      const at = PICK_STAGES.findIndex(([id]) => id === rt.pick?.stage);
+      s.progress = Math.min(1, at / 3);
+      if (rt.pick?.stage === 'bend') nextStep(q, rt);
       break;
     }
     case 'mine': {
@@ -485,24 +680,19 @@ function runStep(q, rt) {
     case 'collect': {
       if (W.config?.fingers <= 2 && rt.it.mass >= 3) return failQuest(q, rt, `손가락 ${W.config.fingers}개로는 ${rt.it.ko}(${rt.it.mass} kg)를 안정적으로 쥘 수 없습니다 (파지 불안정)`);
       if (loadKg() + rt.it.mass > LOAD_LIMIT) return failQuest(q, rt, `적재 한계 초과 (${(loadKg() + rt.it.mass).toFixed(1)} > ${LOAD_LIMIT} kg)`);
-      const drop = nearest(W.drops, rt.key);
-      if (!drop) return failQuest(q, rt, `줍을 ${rt.it.ko} 드롭이 없습니다`);
-      if (moveToward(drop.pos, 0.8) > 0) {
-        lookDownAt(a, drop.pos);
-        break;
+      if (!rt.pick) {
+        const drop = nearest(W.drops, rt.key);
+        if (!drop) return failQuest(q, rt, `줍을 ${rt.it.ko} 드롭이 없습니다`);
+        startPick(rt, drop);
       }
-      lookDownAt(a, drop.pos);
-      rt.work += 1;
-      W.energy += 20 * DT;
-      if (rt.work >= 4) {
-        rt.work = 0;
-        W.drops.splice(W.drops.indexOf(drop), 1);
-        a.carrying.push({ item_id: rt.key, label_ko: rt.it.ko, mass_kg: rt.it.mass });
+      const r = pickStep(q, rt);
+      if (r === 'picked') {
         rt.collected += 1;
         s.note = `${rt.collected}/${rt.count}`;
-        log('world', 'info', `${rt.it.ko} 줍기 (${rt.collected}/${rt.count}), 적재 ${loadKg().toFixed(1)} kg`, { grasp_margin: 0.8 });
+        log('world', 'info', `${rt.it.ko} 줍기 (${rt.collected}/${rt.count}), 적재 ${loadKg().toFixed(1)} kg — 고개 숙여 확인 → 자세 낮춤 → 들어올림`, { grasp_margin: 0.8 });
       }
-      s.progress = (rt.collected + rt.work / 4) / rt.count;
+      const at = rt.pick ? PICK_STAGES.findIndex(([id]) => id === rt.pick.stage) : 0;
+      s.progress = (rt.collected + at / PICK_STAGES.length) / rt.count;
       if (rt.collected >= rt.count) {
         applyCameraPose(a, 0, 0);
         nextStep(q, rt);

@@ -1557,16 +1557,27 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn print_flat_reference_hashes() {
+        for (name, f) in flat_reference_frames() {
+            println!("(\"{name}\", {:#018x}),", frame_hash(&f));
+        }
+    }
+
+    #[test]
     fn flat_lighting_renders_the_pixels_of_v09() {
         let want: [(&str, u64); 7] = [
             ("rest", 0x72c1_1091_ad87_f209),
-            ("turn", 0xd6f8_4e05_c909_f65a),
-            ("walk", 0xe86e_d1c6_773e_3ffc),
+            ("turn", 0xb3ce_dd00_33e7_2869),
+            ("walk", 0x7b25_914d_aaa0_a85a),
             ("rugged", 0xd0ae_544e_dcbd_f643),
             ("chase", 0x9450_bf96_efbd_49ea),
             ("focus", 0x4633_c830_3896_1054),
             ("top", 0x1777_dd2f_41f0_963c),
         ];
+        // "turn" and "walk" are poses after one tick of turning and seven of walking: they moved when the turn rate
+        // became the base's own (steer::TurnCaps) and the walk started from where the robot stands. The other frames
+        // are the v0.9 pixels.
         let frames = flat_reference_frames();
         assert_eq!(frames.len(), want.len());
         for ((name, f), (wname, h)) in frames.iter().zip(want) {

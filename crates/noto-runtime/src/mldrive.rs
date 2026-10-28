@@ -513,8 +513,8 @@ impl Runtime {
             self.sds.record_agreement(&Scope::new(Track::Fusion, &label, ""), "commit_ok", true);
         }
 
-        if let (Some(fix), Some(tgt)) = (&rep.fix, &out.frame.target) {
-            if let Some(d) = tgt.depth_range_m.filter(|d| noto_vision::scale_usable(fix, *d)) {
+        if let (Some(fix), Some(s)) = (&rep.fix, &out.sighting) {
+            if let Some(d) = s.depth_range_m.filter(|_| noto_vision::scale_usable(fix, s)) {
                 let scope = Scope::new(Track::Depth, &self.ml.depth_mode(), &label);
                 self.sds.record_calibration(&scope, "scale", fix.range_m as f64, d as f64);
             }

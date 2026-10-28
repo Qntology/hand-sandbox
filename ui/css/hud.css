@@ -144,3 +144,31 @@
 .focus-hud .fh-cap .fail { color: var(--danger); }
 .viewport-canvas-wrap[data-w="tiny"] .focus-hud { display: none; }
 #orbit-range { width: 96px; flex: 0 0 96px; }
+
+/* 줍기 절차: 고개 숙여 응시 → 비전 확인 → 자세 낮춤 → 쥐기 → 들어올림 (procedure) */
+.pick-hud { width: 236px; padding: 8px 10px 9px; font-size: 0.66rem; color: var(--text); }
+.pick-hud .ph-head { font-size: 0.72rem; color: var(--text-bright); margin-bottom: 4px; overflow-wrap: anywhere; }
+.ph-stages { list-style: none; display: flex; flex-direction: column; gap: 2px; margin: 0 0 5px; padding: 0; }
+.ph-stage { display: grid; grid-template-columns: 8px minmax(0, 1fr) auto; gap: 6px; align-items: center; color: var(--text-muted); }
+.ph-stage .ph-dot { width: 7px; height: 7px; border-radius: 50%; border: 1px solid var(--border-strong); }
+.ph-stage .ph-st { font-size: 0.58rem; }
+.ph-stage.done { color: var(--text-dim); }
+.ph-stage.done .ph-dot { background: var(--success); border-color: var(--success); }
+.ph-stage.active { color: var(--text-bright); font-weight: 600; }
+.ph-stage.active .ph-dot { background: var(--accent-strong); border-color: var(--accent-strong); animation: pulse 1s ease-in-out infinite; }
+.ph-stage.failed { color: var(--danger); }
+.ph-stage.failed .ph-dot { background: var(--danger); border-color: var(--danger); }
+.ph-check { line-height: 1.4; padding: 3px 6px; border-radius: 4px; border-left: 3px solid var(--border-strong); background: rgba(255, 255, 255, 0.03); overflow-wrap: anywhere; }
+.ph-check.ok { border-left-color: var(--success); color: var(--text-bright); }
+.ph-check.fail { border-left-color: var(--danger); color: #f0a5a5; }
+.ph-check.wait { border-left-color: var(--warning); color: var(--text-dim); }
+.ph-pose { margin-top: 4px; font-family: var(--font-mono); font-size: 0.56rem; color: var(--text-muted); line-height: 1.45; }
+.gaze-reticle { position: absolute; width: 34px; height: 34px; margin: -17px 0 0 -17px; border: 1.5px solid var(--warning); border-radius: 50%; box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.5); }
+.gaze-reticle::before, .gaze-reticle::after { content: ''; position: absolute; background: currentColor; }
+.gaze-reticle { color: var(--warning); }
+.gaze-reticle::before { left: 50%; top: -8px; bottom: -8px; width: 1.5px; margin-left: -0.75px; }
+.gaze-reticle::after { top: 50%; left: -8px; right: -8px; height: 1.5px; margin-top: -0.75px; }
+.gaze-reticle.ok { border-color: var(--success); color: var(--success); }
+.gaze-reticle.fail { border-color: var(--danger); color: var(--danger); }
+.viewport-canvas-wrap[data-h="short"] .pick-hud .ph-pose { display: none; }
+@media (prefers-reduced-motion: reduce) { .ph-stage.active .ph-dot { animation: none; } }

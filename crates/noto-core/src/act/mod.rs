@@ -8,6 +8,7 @@ pub mod drive;
 pub mod fall;
 pub mod focus;
 pub mod gait;
+pub mod gaze;
 pub mod grasp;
 pub mod material;
 pub mod push;
@@ -24,10 +25,11 @@ pub enum ActKind {
     Walk,
     Drive,
     Bend,
+    Look,
 }
 
 impl ActKind {
-    pub const ALL: [ActKind; 6] = [ActKind::Grasp, ActKind::Release, ActKind::Push, ActKind::Walk, ActKind::Drive, ActKind::Bend];
+    pub const ALL: [ActKind; 7] = [ActKind::Grasp, ActKind::Release, ActKind::Push, ActKind::Walk, ActKind::Drive, ActKind::Bend, ActKind::Look];
 
     pub fn id(self) -> &'static str {
         match self {
@@ -37,6 +39,7 @@ impl ActKind {
             ActKind::Walk => "walk",
             ActKind::Drive => "drive",
             ActKind::Bend => "bend",
+            ActKind::Look => "look",
         }
     }
 
@@ -48,6 +51,7 @@ impl ActKind {
             ActKind::Walk => "걷기",
             ActKind::Drive => "주행",
             ActKind::Bend => "굽히기",
+            ActKind::Look => "응시",
         }
     }
 }

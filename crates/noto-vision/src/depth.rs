@@ -1,7 +1,54 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::frame::{DepthKind, DepthMap, Rgb};
+use crate::frame::{DepthKind, DepthMap, NormalMap, Rgb, SegMap};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SceneHeads {
+    pub normals: bool,
+    pub segmentation: bool,
+}
+
+impl SceneHeads {
+    pub const NONE: SceneHeads = SceneHeads { normals: false, segmentation: false };
+    pub const ALL: SceneHeads = SceneHeads { normals: true, segmentation: true };
+
+    pub fn and(self, other: SceneHeads) -> SceneHeads {
+        SceneHeads { normals: self.normals && other.normals, segmentation: self.segmentation && other.segmentation }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DepthScene {
+    pub depth: DepthMap,
+    pub normals: Option<NormalMap>,
+    pub segmentation: Option<SegMap>,
+}
+
+impl DepthScene {
+    pub fn depth_only(depth: DepthMap) -> DepthScene {
+        DepthScene { depth, normals: None, segmentation: None }
+    }
+
+    pub fn mask_sky(&mut self) -> u32 {
+        let Some(seg) = &self.segmentation else { return 0 };
+        let (w, h) = (self.depth.width, self.depth.height);
+        let mut n = 0;
+        for y in 0..h {
+            for x in 0..w {
+                let (sx, sy) = ((x * seg.width / w.max(1)).min(seg.width - 1), (y * seg.height / h.max(1)).min(seg.height - 1));
+                if seg.is_sky((sy * seg.width + sx) as usize) {
+                    let d = &mut self.depth.data[(y * w + x) as usize];
+                    if d.is_finite() {
+                        n += 1;
+                    }
+                    *d = f32::INFINITY;
+                }
+            }
+        }
+        n
+    }
+}
 
 pub trait DepthModel: Send {
     fn mode(&self) -> &str;
@@ -14,6 +61,16 @@ pub trait DepthModel: Send {
     fn infer(&mut self, rgb: &Rgb) -> Result<DepthMap>;
     fn infer_batch(&mut self, frames: &[&Rgb]) -> Result<Vec<DepthMap>> {
         frames.iter().map(|f| self.infer(f)).collect()
+    }
+    fn scene_heads(&self) -> SceneHeads {
+        SceneHeads::NONE
+    }
+    fn infer_scene_batch(&mut self, frames: &[&Rgb], _want: SceneHeads) -> Result<Vec<DepthScene>> {
+        Ok(self.infer_batch(frames)?.into_iter().map(DepthScene::depth_only).collect())
+    }
+    fn infer_scene(&mut self, rgb: &Rgb, want: SceneHeads) -> Result<DepthScene> {
+        let mut v = self.infer_scene_batch(&[rgb], want)?;
+        v.pop().ok_or_else(|| anyhow::anyhow!("no scene for the frame"))
     }
 }
 
@@ -73,6 +130,17 @@ mod tests {
 
     fn map(v: Vec<f32>) -> DepthMap {
         DepthMap { width: v.len() as u32, height: 1, kind: DepthKind::Metric, data: v }
+    }
+
+    #[test]
+    fn the_segmentation_takes_the_sky_out_of_the_depth() {
+        let depth = DepthMap { width: 4, height: 2, kind: DepthKind::Metric, data: vec![9.0, 9.5, 8.0, 7.0, 2.0, 2.0, 1.5, 1.0] };
+        let seg = SegMap { width: 2, height: 1, labels: vec![crate::tips::ADE_SKY as u8, 9], sky: vec![0.9, 0.1] };
+        let mut s = DepthScene { depth, normals: None, segmentation: Some(seg) };
+        assert_eq!(s.mask_sky(), 4, "the left half of both rows maps onto the sky cell");
+        assert!(s.depth.data[0].is_infinite() && s.depth.data[1].is_infinite() && s.depth.data[4].is_infinite());
+        assert_eq!(s.depth.data[2], 8.0);
+        assert_eq!(DepthScene::depth_only(s.depth.clone()).mask_sky(), 0);
     }
 
     #[test]

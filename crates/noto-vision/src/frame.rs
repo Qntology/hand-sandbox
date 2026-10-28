@@ -99,6 +99,71 @@ impl DepthMap {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct NormalMap {
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<[f32; 3]>,
+}
+
+impl NormalMap {
+    #[inline]
+    pub fn at(&self, x: u32, y: u32) -> [f32; 3] {
+        self.data[(y * self.width + x) as usize]
+    }
+
+    pub fn at_scaled(&self, x: f32, y: f32, src_w: u32, src_h: u32) -> [f32; 3] {
+        let sx = ((x / src_w.max(1) as f32) * self.width as f32).clamp(0.0, self.width as f32 - 1.0) as u32;
+        let sy = ((y / src_h.max(1) as f32) * self.height as f32).clamp(0.0, self.height as f32 - 1.0) as u32;
+        self.at(sx, sy)
+    }
+
+    pub fn colorize(&self) -> Rgb {
+        let mut out = Vec::with_capacity((self.width * self.height * 3) as usize);
+        for n in &self.data {
+            out.extend(n.iter().map(|c| ((c.clamp(-1.0, 1.0) * 0.5 + 0.5) * 255.0) as u8));
+        }
+        Rgb::new(self.width, self.height, out)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SegMap {
+    pub width: u32,
+    pub height: u32,
+    pub labels: Vec<u8>,
+    pub sky: Vec<f32>,
+}
+
+impl SegMap {
+    #[inline]
+    pub fn label_at(&self, x: u32, y: u32) -> u8 {
+        self.labels[(y * self.width + x) as usize]
+    }
+
+    pub fn label_scaled(&self, x: f32, y: f32, src_w: u32, src_h: u32) -> u8 {
+        let sx = ((x / src_w.max(1) as f32) * self.width as f32).clamp(0.0, self.width as f32 - 1.0) as u32;
+        let sy = ((y / src_h.max(1) as f32) * self.height as f32).clamp(0.0, self.height as f32 - 1.0) as u32;
+        self.label_at(sx, sy)
+    }
+
+    pub fn is_sky(&self, i: usize) -> bool {
+        self.labels[i] as usize == crate::tips::ADE_SKY || self.sky[i] >= 0.5
+    }
+
+    pub fn sky_fraction(&self) -> f32 {
+        (0..self.labels.len()).filter(|&i| self.is_sky(i)).count() as f32 / self.labels.len().max(1) as f32
+    }
+
+    pub fn colorize(&self) -> Rgb {
+        let mut out = Vec::with_capacity((self.width * self.height * 3) as usize);
+        for &l in &self.labels {
+            out.extend_from_slice(&crate::tips::ade_colour(l as usize));
+        }
+        Rgb::new(self.width, self.height, out)
+    }
+}
+
 pub fn turbo(t: f32) -> [u8; 3] {
     let t = t.clamp(0.0, 1.0) as f64;
     let r = 0.13572138 + t * (4.61539260 + t * (-42.66032258 + t * (132.13108234 + t * (-152.94239396 + t * 59.28637943))));

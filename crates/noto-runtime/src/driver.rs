@@ -56,6 +56,7 @@ pub(crate) enum MoveFor {
 pub(crate) enum Act {
     Move(MoveFor),
     Turn,
+    Look(u32),
     Mine(u32),
     Pick(u32),
     Deliver(ItemKind),
@@ -163,6 +164,7 @@ pub(crate) struct Task {
     pub place_fixes: u32,
     pub deliver_retry: bool,
     pub look_turn: Option<u32>,
+    pub gazed: Option<u32>,
 }
 
 fn add_amount(list: &mut Vec<(String, f32)>, id: &str, a: f32) {
@@ -284,6 +286,7 @@ impl Task {
             place_fixes: 0,
             deliver_retry: false,
             look_turn: None,
+            gazed: None,
         })
     }
 
@@ -1072,6 +1075,7 @@ impl Runtime {
                 Err(ActionError::OutOfReach { .. }) if !t.pick_retry => {
                     t.pick_retry = true;
                     t.side = None;
+                    t.gazed = None;
                     let m = t.mem.get(&id).copied().unwrap_or(m);
                     match self.issue(t, Action::MoveTo { x: m.x, z: m.z, reach_m: 0.2 }, Act::Move(MoveFor::Drop)) {
                         Ok(()) => Flow::Continue,
@@ -1107,7 +1111,14 @@ impl Runtime {
         let me = self.me();
         let side = t.side.is_some_and(|(sid, _)| sid == id);
         let intermittent = self.cfg.vision.intermittent;
-        if !intermittent || !memory_ok(sigma, tolerance, &self.cfg.vision) {
+        if !side && t.gazed != Some(id) && self.cfg.vision.gaze_before_pick && noto_core::act::gaze::can_aim(&self.world.body) {
+            t.gazed = Some(id);
+            if self.issue(t, Action::Look { x: m.x, z: m.z }, Act::Look(id)).is_ok() {
+                return Err(Flow::Continue);
+            }
+        }
+        let looked_down = t.gazed == Some(id) && self.gaze_check.as_ref().is_some_and(|g| g.drop == id && g.ok && self.world.tick.saturating_sub(g.tick) <= 3);
+        if !looked_down && (!intermittent || !memory_ok(sigma, tolerance, &self.cfg.vision)) {
             if let Some((pan, tilt)) = gaze_to_see(&self.cam, self.world.standing_eye_m(), me, m.x, m.z) {
                 let before = sigma;
                 if self.scan_gaze(if intermittent { "glance" } else { "pre_act" }, pan, tilt).is_ok() {
@@ -1133,7 +1144,7 @@ impl Runtime {
             }
         }
         let side = side && t.side.is_some();
-        let looked = m.tick == self.world.tick;
+        let looked = m.tick == self.world.tick || looked_down;
         let blind = side || !looked;
         if blind {
             t.blind_acts += 1;
@@ -1179,6 +1190,101 @@ impl Runtime {
                 self.note_look("pattern", format!("d{id}"), Some(sigma), Some(fused.sigma_m(odo, rate)), Some(innov));
             }
         }
+    }
+
+    /// The look before the hand: the head is down over the item now, so the frame the scan sees is the close-up the
+    /// pick-up needs. The scan names it and fixes where it lies; the depth model, aligned to the ground under the tilted
+    /// camera, gives its range inside the scan's box.
+    fn check_gaze(&mut self, t: &mut Task, id: u32) {
+        let Some(m) = t.mem.get(&id).copied() else { return };
+        let Some(kind) = self.world.drop_item(id).map(|d| d.kind) else { return };
+        let (rate, odo) = (self.drift_rate(), self.world.odom.travelled_m);
+        let before = m.sigma_m(odo, rate);
+        let name = kind.spec().label_ko.to_string();
+        let hv = self.world.head_view(&self.cam);
+        let (neck_deg, pitch_deg) = (self.world.current_kin_pose().neck_deg, hv.view.pitch.to_degrees());
+        let scanned = self.scan_now("gaze").is_ok();
+        t.looks += 1;
+        self.vstats.looks += 1;
+        let mem = self.mem_ctx();
+        let seen: Vec<(f32, [f32; 4], (f32, f32), f32)> = self
+            .last_scan
+            .as_ref()
+            .filter(|_| scanned)
+            .map(|s| {
+                s.judged
+                    .iter()
+                    .filter(|j| (j.accepted || j.sound()) && j.cand.kind == EntKind::Drop && j.cand.link == kind.id())
+                    .filter_map(|j| j.cand.world.map(|w| (j.cand.score, j.cand.bbox, w, j.cand.depth_m)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let off = |w: (f32, f32)| (w.0 - m.x).hypot(w.1 - m.z);
+        let nearest = seen.iter().copied().min_by(|a, b| off(a.2).total_cmp(&off(b.2)));
+        // Data association: the look fixes the memory only with what lies inside the memory's and the look's own
+        // uncertainty. Several of one kind lie close together (a felled tree drops its logs a hand apart); the
+        // nearest one outside that gate is a neighbour, and the memory stays as it was.
+        let matched = nearest.filter(|c| off(c.2) <= (3.0 * before.hypot(mem.sigma_obs(c.3))).max(0.06));
+        let range_m = nearest.map(|c| self.dist_me(c.2 .0, c.2 .1));
+        let depth_m = nearest.and_then(|c| self.depth_in_box(c.1));
+        let ok = nearest.is_some();
+        let reason = match (nearest, matched) {
+            (None, _) => Some(format!("숙인 화면에서 {name}을 찾지 못함")),
+            (Some(c), None) => Some(format!("{name}이 보이지만 기억과 {:.0} cm 떨어져 이웃 것으로 봄 — 기억 위치로 집음", off(c.2) * 100.0)),
+            _ => None,
+        };
+        let depth = depth_m.map(|d| format!(" · 깊이 모델 {d:.2} m")).unwrap_or_default();
+        if let Some(c) = matched {
+            let (f, innov) = m.fuse(c.2 .0, c.2 .1, mem.sigma_obs(c.3), odo, self.world.tick, rate);
+            t.mem.insert(id, f);
+            self.note_look("gaze", format!("d{id}"), Some(before), Some(f.sigma_m(odo, rate)), Some(innov));
+            let msg = format!("비전 확인 ✓ {name}: 고개 {neck_deg:.0}° 숙여 {:.2} m에서 봄{depth} — 기억 ±{:.0} → ±{:.0} cm", range_m.unwrap_or(f32::NAN), 2.0 * before * 100.0, 2.0 * f.sigma_m(odo, rate) * 100.0);
+            self.log("vision", Level::Info, msg, Some(json!({"drop": id, "neck_deg": neck_deg, "pitch_deg": pitch_deg, "range_m": range_m, "depth_m": depth_m, "innovation_m": innov})));
+        } else if ok {
+            let msg = format!("비전 확인 ✓ {name} 있음: 고개 {neck_deg:.0}° 숙여 봄{depth} · {}", reason.clone().unwrap_or_default());
+            self.log("vision", Level::Info, msg, Some(json!({"drop": id, "neck_deg": neck_deg, "pitch_deg": pitch_deg, "range_m": range_m, "depth_m": depth_m})));
+        } else {
+            let msg = format!("비전 확인 실패: {} — 기억(±{:.0} cm)으로 집음", reason.clone().unwrap_or_default(), 2.0 * before * 100.0);
+            self.log("vision", Level::Warn, msg, Some(json!({"drop": id, "neck_deg": neck_deg, "pitch_deg": pitch_deg})));
+        }
+        self.gaze_check = Some(crate::vision::GazeCheck { tick: self.world.tick, drop: id, label_ko: name, ok, score: nearest.map(|h| h.0), range_m, depth_m, bbox: nearest.map(|h| h.1), reason, neck_deg, pitch_deg });
+    }
+
+    /// How far from the robot's feet the thing filling the middle of `bbox` (normalised) lies, by the depth model
+    /// aligned under the current camera pose.
+    fn depth_in_box(&mut self, bbox: [f32; 4]) -> Option<f32> {
+        let frame = self.world.render(&self.cam);
+        let rgb = noto_vision::Rgb::new(frame.width as u32, frame.height as u32, frame.rgb.clone());
+        let intr = crate::record::intrinsics(&self.world, &self.cam);
+        let pose = crate::record::odometry(&self.world, &self.cam);
+        let truth = crate::ml::KeyTruth::capture(&self.world, &frame);
+        let fix = self.ml.fix.clone();
+        let depth = match &mut self.ml.depth {
+            crate::ml::DepthEngine::Model(m) => {
+                let max = m.max_depth_m();
+                let s = m.infer_scene(&rgb, crate::ml::scene_heads(&fix)).ok()?;
+                let mut d = s.depth;
+                if let Some(cfg) = &fix.align {
+                    noto_vision::ground_align_with(&mut d, s.normals.as_ref().filter(|_| fix.normals), &intr, &pose, None, max, cfg)?;
+                }
+                d
+            }
+            crate::ml::DepthEngine::StandIn(s) => s.run(&truth),
+        };
+        let (w, h) = (frame.width as f32, frame.height as f32);
+        let mut mask = noto_vision::Mask::empty(depth.width, depth.height);
+        let (sx, sy) = (depth.width as f32 / w, depth.height as f32 / h);
+        let (x0, x1) = ((((bbox[0] * 0.75 + bbox[2] * 0.25) * w) * sx) as u32, (((bbox[0] * 0.25 + bbox[2] * 0.75) * w) * sx) as u32);
+        let (y0, y1) = ((((bbox[1] * 0.75 + bbox[3] * 0.25) * h) * sy) as u32, (((bbox[1] * 0.25 + bbox[3] * 0.75) * h) * sy) as u32);
+        for y in y0..=y1.min(depth.height - 1) {
+            for x in x0..=x1.min(depth.width - 1) {
+                mask.set(x, y);
+            }
+        }
+        let d = depth.median_in(&mask)?;
+        let (cx, cy) = ((bbox[0] + bbox[2]) * 0.5 * w, (bbox[1] + bbox[3]) * 0.5 * h);
+        let (x, z) = intr.ground_point(&pose, cx, cy, d)?;
+        Some(self.dist_me(x, z))
     }
 
     pub(crate) fn refresh_memory(&self, m: &Memory, kind: ItemKind, odo: f32) -> Option<(Memory, f32)> {
@@ -1570,6 +1676,7 @@ impl Runtime {
             }
             match act {
                 Act::Pick(id) => {
+                    t.gazed = None;
                     if why == "grasp_missed" {
                         if let (Some(m), Some(d)) = (t.mem.get_mut(&id), self.world.drop_item(id)) {
                             let size = d.kind.spec().piece_size_m(d.amount);
@@ -1612,7 +1719,7 @@ impl Runtime {
                     t.reset_locate();
                     Flow::Continue
                 }
-                Act::Move(MoveFor::Search) | Act::Turn => Flow::Continue,
+                Act::Move(MoveFor::Search) | Act::Turn | Act::Look(_) => Flow::Continue,
                 _ => fail(&why, format!("동작이 실패했습니다: {why}")),
             };
         }
@@ -1622,6 +1729,10 @@ impl Runtime {
         match act {
             Act::Turn => {
                 t.scan_cooldown = 0;
+                Flow::Continue
+            }
+            Act::Look(id) => {
+                self.check_gaze(t, id);
                 Flow::Continue
             }
             Act::Move(MoveFor::Search) => {

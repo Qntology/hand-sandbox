@@ -31,6 +31,14 @@ impl ActPlay {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GazeHold {
+    pub pose: KinPose,
+    pub x: f32,
+    pub z: f32,
+    pub since_s: f64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct WalkState {
     pub since_step_m: f32,
@@ -101,6 +109,7 @@ impl World {
         let (ox, oz) = (at.0 - d.x, at.1 - d.z);
         let offset = [ox * ch + oz * sh, ox * sh - oz * ch];
         let mode = if side { ReachMode::Side } else { ReachMode::Front };
+        let lead = self.gaze.take().filter(|g| !side && (g.x - at.0).hypot(g.z - at.1) < 0.5).map(|g| g.pose);
         let inp = agrasp::GraspInput {
             body: &self.body,
             hand: &self.hand,
@@ -115,6 +124,8 @@ impl World {
             mode,
             aim_offset_m: offset,
             memory_sigma_m,
+            look_first: lead.is_none(),
+            lead,
         };
         let mut rollout = agrasp::grasp(&inp);
         if matches!(rollout.outcome.code, Some("reach_ground") | Some("reach_side")) {
@@ -156,6 +167,37 @@ impl World {
         let dur = rollout.duration_s;
         self.act = Some(ActPlay::new(rollout, self.time_s, Some((d.kind, d.amount)), (self.agent.x, self.agent.z, heading)));
         Ok((dur, (!side).then_some(at)))
+    }
+
+    /// A look at the ground point (`x`, `z`) — at the middle of an item lying there, if there is one.
+    pub(super) fn start_look(&mut self, x: f32, z: f32) -> f32 {
+        let (dx, dz) = (x - self.agent.x, z - self.agent.z);
+        let heading = dz.atan2(dx);
+        let here = self.agent_ground_m();
+        let h = self
+            .drops
+            .iter()
+            .filter(|d| (d.x - x).hypot(d.z - z) < 0.35)
+            .min_by(|a, b| (a.x - x).hypot(a.z - z).total_cmp(&(b.x - x).hypot(b.z - z)))
+            .map_or(0.05, |d| self.drop_base_m(d) - here + 0.5 * d.kind.spec().piece_size_m(d.amount)[1]);
+        let from = self.body.stand(self.carried_kg());
+        let r = noto_core::act::gaze::look(&self.body, &from, [dx.hypot(dz), 0.0, h]);
+        let dur = r.duration_s;
+        self.act = Some(ActPlay::new(r, self.time_s, None, (self.agent.x, self.agent.z, heading)));
+        dur
+    }
+
+    /// Keeps the head where the look left it until the base moves again (or a pick-up starts from it).
+    pub(super) fn hold_gaze(&mut self, play: Option<&ActPlay>, at: (f32, f32)) {
+        self.gaze = play.filter(|p| p.rollout.outcome.ok).and_then(|p| p.rollout.samples.last()).map(|s| GazeHold { pose: s.pose, x: at.0, z: at.1, since_s: self.time_s });
+    }
+
+    /// The phase of what the body is doing now: an act's phase, or "hold" while the gaze is held after a look.
+    pub fn act_phase(&self) -> Option<(ActKind, &'static str)> {
+        if let Some(p) = &self.act {
+            return p.rollout.sample_at(p.t()).map(|s| (p.rollout.kind, s.phase));
+        }
+        self.gaze.map(|_| (ActKind::Look, "hold"))
     }
 
     pub(super) fn can_step_to(&self, x: f32, z: f32) -> bool {
@@ -324,7 +366,7 @@ impl World {
             let (pose, loads, _) = gait::pose_at(&self.body, &g, self.walk.stance, u, self.carried_kg());
             return Some((pose, loads, Source::FootLift));
         }
-        None
+        self.gaze.map(|g| (g.pose, KinLoads::default(), Source::Quiet))
     }
 
     pub(super) fn act_body_pose(&self) -> Option<BodyPose> {

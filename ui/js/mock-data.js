@@ -41,11 +41,14 @@ export const BASES = {
   human_foot: { kind: 'human_foot', max_speed_mps: 1.2, max_slope_deg: 20.0, max_step_m: 0.18, holonomic: false, power_w: 180.0, footprint_m: 0.25 },
 };
 
+// 회전 방식(Rust world-sim::steer 와 같은 규칙의 모의값): turn_move_rad 보다 크게 틀어야 하면 멈춰서 돈다(pivot) 또는
+// 앞뒤로 끊어 돈다(kturn: 트랙터식 3점 회전). 뒤쪽 가까이(reverse_max_m 안)의 목표는 돌지 않고 후진한다.
+// min_radius_m 는 달리며 도는 가장 작은 반경, pivot_rate 는 제자리 회전 속도(스키드 조향의 비비는 저항으로 느림).
 export const BASE_TURN_SPECS = {
-  wheel: { turn_rate_rad_s: 1.4, turn_move_rad: 0.45 },
-  mecanum: { turn_rate_rad_s: 1.8, turn_move_rad: 0.85 },
-  track: { turn_rate_rad_s: 0.75, turn_move_rad: 0.25 },
-  human_foot: { turn_rate_rad_s: 1.0, turn_move_rad: 0.35 },
+  wheel: { turn_rate_rad_s: 1.4, turn_move_rad: 0.45, min_radius_m: 0.55, pivot_rate_rad_s: 0.9, reverse_mps: 0.6, reverse_max_m: 3.0, kturn: false },
+  mecanum: { turn_rate_rad_s: 1.8, turn_move_rad: 0.85, min_radius_m: 0.0, pivot_rate_rad_s: 1.8, reverse_mps: 1.0, reverse_max_m: 0, kturn: false, holonomic: true },
+  track: { turn_rate_rad_s: 0.75, turn_move_rad: 0.25, min_radius_m: 0.9, pivot_rate_rad_s: 0.35, reverse_mps: 0.4, reverse_max_m: 2.5, kturn: true },
+  human_foot: { turn_rate_rad_s: 1.0, turn_move_rad: 0.35, min_radius_m: 0.3, pivot_rate_rad_s: 1.6, reverse_mps: 0.35, reverse_max_m: 1.0, kturn: false, legs: true },
 };
 
 export const BASE_LABELS = {

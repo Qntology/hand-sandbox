@@ -35,6 +35,7 @@ pub struct ScanReport {
     pub total_ms: f32,
     pub judged: Vec<Judged>,
     pub scene: Vec<(String, f32)>,
+    pub filter: crate::perception::ScanFilter,
 }
 
 impl ScanReport {
@@ -159,6 +160,13 @@ pub struct DepthView {
     pub rgb_webp: Vec<u8>,
     pub pred_webp: Vec<u8>,
     pub truth_webp: Vec<u8>,
+    pub metrics_raw: Option<noto_vision::DepthMetrics>,
+    pub raw_webp: Option<Vec<u8>>,
+    pub seg_webp: Option<Vec<u8>>,
+    pub normals_webp: Option<Vec<u8>>,
+    pub align: Option<noto_vision::AlignFit>,
+    pub sky_frac: Option<f32>,
+    pub flip_tta: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -255,6 +263,7 @@ pub struct Runtime {
     pub(crate) quests: QuestBook,
     pub(crate) task: Option<Task>,
     pub(crate) last_scan: Option<ScanReport>,
+    pub(crate) gaze_check: Option<crate::vision::GazeCheck>,
     pub(crate) pending_fix: Option<PoseFix>,
     scan_seq: u64,
     last_device: String,
@@ -305,6 +314,7 @@ impl Runtime {
             quests: QuestBook::new(),
             task: None,
             last_scan: None,
+            gaze_check: None,
             pending_fix: None,
             scan_seq: 0,
             last_device: String::new(),
@@ -804,6 +814,7 @@ impl Runtime {
             total_ms: t0.elapsed().as_secs_f32() * 1000.0,
             judged,
             scene: out.scene,
+            filter: out.filter,
         };
         self.note_scan(&report);
         self.last_scan = Some(report);
@@ -887,6 +898,10 @@ impl Runtime {
                 let (x, z) = self.world.true_of(x, z);
                 Action::Face { x, z }
             }
+            Action::Look { x, z } => {
+                let (x, z) = self.world.true_of(x, z);
+                Action::Look { x, z }
+            }
             Action::Turn { yaw_deg } => Action::Turn { yaw_deg: self.world.true_yaw_of(yaw_deg.to_radians()).to_degrees() },
             Action::Push { drop, x, z } => {
                 let (x, z) = self.world.true_of(x, z);
@@ -956,6 +971,12 @@ impl Runtime {
         }
         let why_txt = if why.is_empty() { String::new() } else { format!(" (차단: {})", why.iter().map(|(g, n)| format!("{g}×{n}")).collect::<Vec<_>>().join(" ")) };
         let level = if r.judged.is_empty() { Level::Debug } else { Level::Info };
+        let f = r.filter;
+        let filter_txt = if f.is_empty() {
+            String::new()
+        } else {
+            format!(" · 타일 제외 하늘 {} · 원거리 {} · 기하 재분류 {} · 기하 탈락 {} · 교차 억제 {}", f.skipped_sky, f.skipped_far, f.relabeled, f.dropped, f.merged)
+        };
         let list: Vec<Value> = r
             .judged
             .iter()
@@ -965,8 +986,8 @@ impl Runtime {
         self.log(
             "vision",
             level,
-            format!("스캔 #{} [{}]: 후보 {}건 → 수락 {accepted}건{why_txt}", r.seq, r.trigger, r.judged.len()),
-            Some(json!({"seq": r.seq, "tick": r.tick, "total_ms": r.total_ms, "candidates": list})),
+            format!("스캔 #{} [{}]: 후보 {}건 → 수락 {accepted}건{why_txt}{filter_txt}", r.seq, r.trigger, r.judged.len()),
+            Some(json!({"seq": r.seq, "tick": r.tick, "total_ms": r.total_ms, "candidates": list, "filter": f})),
         );
         let need = self.cfg.gates.confirm_sightings;
         for j in &r.judged {
@@ -1019,24 +1040,34 @@ impl Runtime {
         self.audit.tail(after_seq, limit, cat)
     }
 
+    /// The depth tab: the model's answer on what the head camera sees now, put through what the robot does with it —
+    /// ADE20K sky taken out, then aligned to the ground under the camera's own pose (eye height, pitch with the neck's
+    /// tilt, chassis roll), with the predicted normals keeping objects out of that fit — next to the raw output and
+    /// the renderer's truth on one colour scale.
     pub fn depth_view(&mut self, quality: f32) -> Result<DepthView> {
         let frame = self.world.render(&self.cam);
         let truth = crate::ml::KeyTruth::capture(&self.world, &frame);
         let rgb = noto_vision::Rgb::new(frame.width as u32, frame.height as u32, frame.rgb.clone());
+        let intr = crate::record::intrinsics(&self.world, &self.cam);
+        let pose = crate::record::odometry(&self.world, &self.cam);
         let t0 = Instant::now();
-        let pred = match &mut self.ml.depth {
-            crate::ml::DepthEngine::Model(m) => m.infer(&rgb)?,
-            crate::ml::DepthEngine::StandIn(s) => s.run(&truth),
+        let fix = self.ml.fix.clone();
+        let (scene, max_depth_m) = match &mut self.ml.depth {
+            crate::ml::DepthEngine::Model(m) => (m.infer_scene(&rgb, noto_vision::SceneHeads::ALL)?, m.max_depth_m()),
+            crate::ml::DepthEngine::StandIn(s) => (noto_vision::DepthScene::depth_only(s.run(&truth)), None),
         };
         let infer_ms = t0.elapsed().as_secs_f32() * 1000.0;
+        let raw = scene.depth.clone();
+        let mut pred = scene.depth.clone();
+        let align = match (max_depth_m, &fix.align) {
+            (Some(max), Some(cfg)) => noto_vision::ground_align_with(&mut pred, scene.normals.as_ref().filter(|_| fix.normals), &intr, &pose, None, Some(max), cfg),
+            _ => None,
+        };
         let true_map = truth.depth_map();
         let metrics = noto_vision::depth_metrics(&pred, &true_map, 24.0, false);
+        let metrics_raw = max_depth_m.and_then(|_| noto_vision::depth_metrics(&raw, &true_map, 24.0, false));
         let (lo, hi) = true_map.range();
         let enc = |img: &noto_vision::Rgb| encode_webp(&img.data, img.width, img.height, quality).map(|e| e.bytes).map_err(|e| anyhow!("WebP 인코딩 실패: {e}"));
-        let max_depth_m = match &self.ml.depth {
-            crate::ml::DepthEngine::Model(m) => m.max_depth_m(),
-            crate::ml::DepthEngine::StandIn(_) => None,
-        };
         Ok(DepthView {
             tick: self.world.tick,
             width: frame.width as u32,
@@ -1050,6 +1081,13 @@ impl Runtime {
             rgb_webp: enc(&rgb)?,
             pred_webp: enc(&pred.colorize_in(lo, hi))?,
             truth_webp: enc(&true_map.colorize_in(lo, hi))?,
+            metrics_raw,
+            raw_webp: max_depth_m.map(|_| enc(&raw.colorize_in(lo, hi))).transpose()?,
+            seg_webp: scene.segmentation.as_ref().map(|s| enc(&s.colorize())).transpose()?,
+            normals_webp: scene.normals.as_ref().map(|n| enc(&n.colorize())).transpose()?,
+            align,
+            sky_frac: scene.segmentation.as_ref().map(|s| s.sky_fraction()),
+            flip_tta: false,
         })
     }
 

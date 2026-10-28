@@ -63,6 +63,30 @@ pub struct ScanOutput {
     pub embed_ms: f32,
     pub device: String,
     pub scene: Vec<(String, f32)>,
+    #[serde(default)]
+    pub filter: ScanFilter,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct ScanFilter {
+    pub skipped_sky: u32,
+    pub skipped_far: u32,
+    pub relabeled: u32,
+    pub dropped: u32,
+    pub merged: u32,
+}
+
+impl ScanFilter {
+    pub fn is_empty(&self) -> bool {
+        *self == ScanFilter::default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct SizePrior {
+    pub lo_m: f32,
+    pub hi_m: f32,
+    pub elevated: bool,
 }
 
 pub trait Recognizer: Send {
@@ -77,15 +101,23 @@ pub trait Recognizer: Send {
 #[derive(Clone, Debug, Default)]
 pub struct EntityTable {
     map: HashMap<String, (EntKind, String)>,
+    priors: HashMap<String, SizePrior>,
 }
 
 impl EntityTable {
     pub fn from_lexicon(lex: &Lexicon) -> EntityTable {
-        EntityTable { map: lex.vision.iter().map(|e| (e.id.clone(), (EntKind::from(&e.kind), e.link.clone()))).collect() }
+        EntityTable {
+            map: lex.vision.iter().map(|e| (e.id.clone(), (EntKind::from(&e.kind), e.link.clone()))).collect(),
+            priors: lex.vision.iter().filter_map(|e| e.height_m.map(|(lo_m, hi_m)| (e.id.clone(), SizePrior { lo_m, hi_m, elevated: e.elevated }))).collect(),
+        }
     }
 
     pub fn get(&self, label: &str) -> Option<&(EntKind, String)> {
         self.map.get(label)
+    }
+
+    pub fn prior(&self, label: &str) -> Option<&SizePrior> {
+        self.priors.get(label)
     }
 
     pub fn labels(&self) -> Vec<&str> {

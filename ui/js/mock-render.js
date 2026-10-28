@@ -1,6 +1,6 @@
 // 모의 프레임 렌더러: 오프스크린 캔버스에 단순한 가짜 3D 장면(하늘 그라데이션, 지면 체크 무늬, 나무·바위·광석 블록)을
 // 에이전트 기준으로 그리고 WebP 로 인코딩한다. 실제 world-sim 의 레이캐스터가 아니다.
-import { DETECT_LABEL, visibleObjects, world } from './mock-world.js';
+import { DETECT_LABEL, procedureView, visibleObjects, world } from './mock-world.js';
 
 // 1×1 무손실 WebP (캔버스를 쓸 수 없는 환경용 대체 프레임)
 const BLANK_WEBP = 'UklGRhoAAABXRUJQVlA4TA0AAAAvAAAAEAcQERGIiP4HAA==';
@@ -214,5 +214,11 @@ export function renderFrame({ width, height, quality, view }) {
       rate_dps: moving ? [2, 4, 1] : [0, 0, 0],
     },
   };
-  return { webp_base64: b64, width: w, height: h, bytes: Math.floor((b64.length * 3) / 4) - pad, encode_ms, tick: W.tick, detections, camera };
+  // 줍기 절차와 비전 확인 대상의 상자 (1인칭에서만): HUD 가 조준점을 그 위에 둔다.
+  const procedure = camera ? procedureView() : null;
+  if (procedure?.check) {
+    const hit = hits.find((x) => x.o.id === procedure.target);
+    if (hit) procedure.check = { ...procedure.check, bbox: hit.bbox.map((v, i) => Number(Math.max(0, Math.min(1, v / (i % 2 ? h : w))).toFixed(4))) };
+  }
+  return { webp_base64: b64, width: w, height: h, bytes: Math.floor((b64.length * 3) / 4) - pad, encode_ms, tick: W.tick, detections, camera, procedure };
 }

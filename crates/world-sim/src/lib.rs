@@ -10,6 +10,7 @@ pub mod render;
 pub mod rng;
 pub mod site;
 pub mod snapshot;
+pub mod steer;
 pub mod terrain;
 pub mod world;
 
@@ -20,6 +21,6 @@ pub use odometry::{OdomCfg, Odometry};
 pub use fixture::{Fixture, FixtureKind};
 pub use render::{Camera, Frame, ObjectClass, VisibleObject};
 pub use site::{Site, SiteCfg, Support};
-pub use snapshot::{GraspInfo, SiteView, TerrainGrid, WorldSnapshot};
+pub use snapshot::{GraspInfo, MotionView, SiteView, TerrainGrid, WorldSnapshot};
 pub use terrain::{CurbKind, TerrainKind};
 pub use world::{amount_text, Action, ActionError, BalanceEvent, TimedEvent, World, WorldConfig, WorldEvent, TICK_S};
