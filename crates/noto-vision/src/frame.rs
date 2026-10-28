@@ -1,8 +1,5 @@
-//! Images the ML logic works on: an RGB keyframe, a depth map, a mask.
-
 use serde::{Deserialize, Serialize};
 
-/// An 8-bit RGB image, row-major.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Rgb {
     pub width: u32,
@@ -27,13 +24,10 @@ impl Rgb {
     }
 }
 
-/// What a depth map's numbers mean.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DepthKind {
-    /// Forward distance in metres (as the renderer writes it).
     Metric,
-    /// Metric up to one unknown scale factor.
     Relative,
 }
 
@@ -42,7 +36,6 @@ pub struct DepthMap {
     pub width: u32,
     pub height: u32,
     pub kind: DepthKind,
-    /// Forward depth per pixel; not finite where the model has no answer (sky).
     pub data: Vec<f32>,
 }
 
@@ -52,14 +45,12 @@ impl DepthMap {
         self.data[(y * self.width + x) as usize]
     }
 
-    /// Value at a pixel of an image of another size (nearest neighbour).
     pub fn at_scaled(&self, x: f32, y: f32, src_w: u32, src_h: u32) -> f32 {
         let sx = ((x / src_w.max(1) as f32) * self.width as f32).clamp(0.0, self.width as f32 - 1.0) as u32;
         let sy = ((y / src_h.max(1) as f32) * self.height as f32).clamp(0.0, self.height as f32 - 1.0) as u32;
         self.at(sx, sy)
     }
 
-    /// Median of the finite values under a mask of another size.
     pub fn median_in(&self, mask: &Mask) -> Option<f32> {
         let mut v: Vec<f32> = Vec::new();
         for y in 0..mask.height {
@@ -79,13 +70,11 @@ impl DepthMap {
         Some(v[v.len() / 2])
     }
 
-    /// 8-bit colour image of the map (near is warm, far is cool), for the UI.
     pub fn colorize(&self) -> Rgb {
         let (lo, hi) = self.range();
         self.colorize_in(lo, hi)
     }
 
-    /// The 2nd and 98th percentiles of the finite depths, metres (`colorize`'s scale).
     pub fn range(&self) -> (f32, f32) {
         let finite: Vec<f32> = self.data.iter().copied().filter(|d| d.is_finite() && *d > 0.0).collect();
         if finite.is_empty() {
@@ -96,7 +85,6 @@ impl DepthMap {
         (s[s.len() / 50], s[s.len() - 1 - s.len() / 50].max(s[s.len() / 50] + 1e-3))
     }
 
-    /// [`DepthMap::colorize`] on a given scale, so that two maps compare.
     pub fn colorize_in(&self, lo: f32, hi: f32) -> Rgb {
         let mut out = Vec::with_capacity((self.width * self.height * 3) as usize);
         for &d in &self.data {
@@ -104,7 +92,6 @@ impl DepthMap {
                 out.extend_from_slice(&[12, 12, 16]);
                 continue;
             }
-            // Inverse depth spreads the near range, where decisions are made.
             let t = ((1.0 / d - 1.0 / hi) / (1.0 / lo.max(1e-3) - 1.0 / hi)).clamp(0.0, 1.0);
             out.extend_from_slice(&turbo(t));
         }
@@ -112,7 +99,6 @@ impl DepthMap {
     }
 }
 
-/// Polynomial fit of the "turbo" colour map (Mikhailov 2019), t in 0..1.
 pub fn turbo(t: f32) -> [u8; 3] {
     let t = t.clamp(0.0, 1.0) as f64;
     let r = 0.13572138 + t * (4.61539260 + t * (-42.66032258 + t * (132.13108234 + t * (-152.94239396 + t * 59.28637943))));
@@ -121,7 +107,6 @@ pub fn turbo(t: f32) -> [u8; 3] {
     [(r.clamp(0.0, 1.0) * 255.0) as u8, (g.clamp(0.0, 1.0) * 255.0) as u8, (b.clamp(0.0, 1.0) * 255.0) as u8]
 }
 
-/// A binary mask, row-major.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Mask {
     pub width: u32,
@@ -149,7 +134,6 @@ impl Mask {
         self.bits.iter().filter(|b| **b).count() as u32
     }
 
-    /// Centroid in pixels, `None` when empty.
     pub fn centroid(&self) -> Option<(f32, f32)> {
         let (mut sx, mut sy, mut n) = (0.0f64, 0.0f64, 0u64);
         for y in 0..self.height {
@@ -164,7 +148,6 @@ impl Mask {
         (n > 0).then(|| ((sx / n as f64) as f32, (sy / n as f64) as f32))
     }
 
-    /// Inclusive box `[x0, y0, x1, y1]`, `None` when empty.
     pub fn bbox(&self) -> Option<[u32; 4]> {
         let mut b: Option<[u32; 4]> = None;
         for y in 0..self.height {
@@ -196,7 +179,6 @@ impl Mask {
         }
     }
 
-    /// Run-length encoding of the rows, `[start, length, ...]` per row, for the UI.
     pub fn rle(&self) -> Vec<Vec<u32>> {
         (0..self.height)
             .map(|y| {

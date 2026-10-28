@@ -1,5 +1,3 @@
-//! The integrated test's records go to Lance and come back with the same counts.
-
 use noto_data::test_tables::{write_mirror, TABLE_BALANCE_EFFORT, TABLE_ML_KEYFRAMES, TABLE_QUEST_RUNS, TABLE_QUEST_STATS, TABLE_QUEST_STEPS};
 use noto_data::LanceStore;
 use noto_sds::{BalanceRow, KeyframeRow, QuestRun, StepRecord, TestDb};
@@ -95,7 +93,6 @@ async fn test_records_round_trip_through_lance() {
     assert_eq!(store.row_count(TABLE_BALANCE_EFFORT).await.unwrap(), 1);
     let stats = store.row_count(TABLE_QUEST_STATS).await.unwrap();
     assert_eq!(stats, db.stats().len());
-    // The success table is replaced, not appended to.
     write_mirror(&store, &db.take_mirror(), &db.stats()).await.unwrap();
     assert_eq!(store.row_count(TABLE_QUEST_STATS).await.unwrap(), stats);
     let _ = std::fs::remove_dir_all(&dir);

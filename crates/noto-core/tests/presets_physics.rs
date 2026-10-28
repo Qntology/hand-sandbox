@@ -1,10 +1,3 @@
-//! Do the part presets reach the physics? For every segment and tier, the
-//! robot is built with only that segment changed from the mid-tier default,
-//! and the quantities the preset should drive are checked in both models:
-//! the quasi-static balance (`balance`) and the joint dynamics (`dynamics`).
-//! Each check prints a `[PRESET]` line (collected by `test_summary.ps1`).
-//! These are correctness checks, not benchmarks: nothing is timed.
-
 use noto_core::balance::{Body, FeedForward, Posture, Source};
 use noto_core::dynamics::{simulate, DynCfg, Rollout};
 use noto_core::parts::*;
@@ -41,7 +34,6 @@ fn hold(b: &Body, p: &Posture) -> Rollout {
 
 #[test]
 fn every_preset_reaches_its_joints_in_the_dynamics() {
-    // The actuator each simulated or statics joint carries is the preset's.
     for tier in Tier::ALL {
         let p = BodyPlan::uniform(tier);
         let r = hold(&body(&p, BaseKind::HumanFoot), &Posture::quiet(0.0));
@@ -63,7 +55,6 @@ fn each_segment_changes_what_it_should() {
     let base = body(&BodyPlan::default(), BaseKind::HumanFoot);
     let base_w = body(&BodyPlan::default(), BaseKind::Wheel);
     for tier in [Tier::Budget, Tier::Pro] {
-        // Head: neck actuator and gaze stabilisation decide how much body tilt reaches the camera.
         let h = body(&plan_with("head", tier), BaseKind::Wheel);
         let slope = Posture { source: Source::Slope, slope_deg: 8.0, ..Posture::quiet(0.0) };
         let (a, b) = (hold(&h, &slope), hold(&base_w, &slope));
@@ -75,13 +66,11 @@ fn each_segment_changes_what_it_should() {
         }
         println!("[PRESET] head  {:<6} camera tilt on 8° slope {ha:.2}° (mid {hb:.2}°), neck {}", tier.id(), h.head.neck.name);
 
-        // Chest: battery energy and mass; the CoM height follows.
         let c = body(&plan_with("chest", tier), BaseKind::HumanFoot);
         assert_ne!(c.battery_j(), base.battery_j());
         assert_ne!(c.mass_kg(), base.mass_kg());
         println!("[PRESET] chest {:<6} battery {:.0} Wh · mass {:.1} kg (mid {:.1}) · CoM {:.3} m (mid {:.3})", tier.id(), c.chest.battery_wh, c.mass_kg(), base.mass_kg(), c.com_height_m(), base.com_height_m());
 
-        // Belly: only a pitch actuator lets the trunk lean to restore balance.
         let bl = body(&plan_with("belly", tier), BaseKind::HumanFoot);
         let lift = Posture::arm_lift(4.0, true, 0.0);
         let (rb, r0) = (bl.solve(&lift, &ff, 500.0), base.solve(&lift, &ff, 500.0));
@@ -93,7 +82,6 @@ fn each_segment_changes_what_it_should() {
         let _ = lim_b;
         println!("[PRESET] belly {:<6} lean for a 4 kg lift {:.1}° (mid {:.1}°), restore {:.2} (mid {:.2})", tier.id(), rb.trunk_lean_deg, r0.trunk_lean_deg, rb.restore_frac, r0.restore_frac);
 
-        // Arm: shoulder and elbow torque decide what can be lifted.
         let ar = body(&plan_with("arm", tier), BaseKind::Wheel);
         let one = Posture::arm_lift(2.4, false, 0.0);
         let (sa, s0) = (ar.solve(&one, &ff, 500.0), base_w.solve(&one, &ff, 500.0));
@@ -102,20 +90,16 @@ fn each_segment_changes_what_it_should() {
         if tier == Tier::Budget {
             assert!(ea > e0 && sh_a > sh_0, "budget: elbow {ea} vs {e0}, shoulder {sh_a} vs {sh_0}");
         } else {
-            // The pro arm's gain is the shoulder (RS03, 60 N·m). Its elbow (RS02) has the
-            // mid elbow's 17 N·m peak on a heavier arm, so it is not less loaded (research §5).
             assert!(sh_a < sh_0, "pro shoulder {sh_a} vs mid {sh_0}");
             assert!(ea >= e0 * 0.95, "pro elbow {ea} vs mid {e0}");
         }
         println!("[PRESET] arm   {:<6} 2.4 kg one-arm lift: shoulder {:.0}% (mid {:.0}%) · elbow {:.0}% (mid {:.0}%)", tier.id(), sh_a * 100.0, sh_0 * 100.0, ea * 100.0, e0 * 100.0);
 
-        // Legs: knee torque decides the step and the speed.
         let lg = body(&plan_with("leg", tier), BaseKind::HumanFoot);
         let (ll, l0) = (lg.drive_limits(&BaseKind::HumanFoot.spec(), 0.0), base.drive_limits(&BaseKind::HumanFoot.spec(), 0.0));
         assert!(if tier == Tier::Budget { ll.max_step_m < l0.max_step_m } else { ll.max_step_m >= l0.max_step_m }, "{} vs {}", ll.max_step_m, l0.max_step_m);
         println!("[PRESET] leg   {:<6} step {:.0} cm (mid {:.0}) · speed {:.2} m/s (mid {:.2})", tier.id(), ll.max_step_m * 100.0, l0.max_step_m * 100.0, ll.max_speed_mps, l0.max_speed_mps);
 
-        // Chassis (the leg slot on a wheeled base): drive force decides the slope.
         let ch = body(&plan_with("leg", tier), BaseKind::Wheel);
         let (cl, c0) = (ch.drive_limits(&BaseKind::Wheel.spec(), 0.0), base_w.drive_limits(&BaseKind::Wheel.spec(), 0.0));
         println!("[PRESET] chassis {:<6} slope {:.1}° (mid {:.1}°) · speed {:.2} m/s (mid {:.2}) · {}", tier.id(), cl.max_slope_deg, c0.max_slope_deg, cl.max_speed_mps, c0.max_speed_mps, ch.chassis.name);
@@ -125,7 +109,6 @@ fn each_segment_changes_what_it_should() {
 
 #[test]
 fn hand_and_battery_options_reach_the_physics() {
-    // A heavier hand loads the elbow; the battery in the pelvis lowers the CoM.
     let two = Body::new(&BodyPlan::default(), BaseKind::Wheel, FingerCount::Two);
     let five = Body::new(&BodyPlan::default(), BaseKind::Wheel, FingerCount::Five);
     let p = Posture::arm_raise(0.0);
@@ -149,9 +132,6 @@ fn hand_and_battery_options_reach_the_physics() {
 
 #[test]
 fn the_dynamics_never_allow_a_lift_the_statics_refuse() {
-    // Items of the world: coal 1.4, log 2.4, stone 2.6, iron ore 4.0 kg. The
-    // dynamics add the torque-speed line and the stall of a self-locking servo
-    // to the static torque check, so they may refuse more, never less.
     let ff = FeedForward::default();
     for tier in Tier::ALL {
         let b = body(&plan_with("arm", tier), BaseKind::Wheel);

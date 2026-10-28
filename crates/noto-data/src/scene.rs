@@ -1,12 +1,5 @@
-//! Domain randomization: draws a synthetic scene (hand configuration, object
-//! size, mass, material friction and placement) from a seed.
-//!
-//! The random generator is a small SplitMix64, so the same seed always gives
-//! the same scene on every platform without an extra dependency.
-
 use noto_core::{Actuation, BaseKind, FingerCount, GraspSetup, NotoConfig, JointKind, JointOptions, Payload};
 
-/// Deterministic 64-bit generator (SplitMix64).
 #[derive(Clone, Debug)]
 pub struct SplitMix64 {
     state: u64,
@@ -25,24 +18,19 @@ impl SplitMix64 {
         z ^ (z >> 31)
     }
 
-    /// Uniform float in `[0, 1)`.
     pub fn unit(&mut self) -> f32 {
         (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
     }
 
-    /// Uniform float in `[lo, hi)`.
     pub fn range(&mut self, lo: f32, hi: f32) -> f32 {
         lo + (hi - lo) * self.unit()
     }
 
-    /// Uniform index in `[0, n)`.
     pub fn index(&mut self, n: usize) -> usize {
         (self.next_u64() % n as u64) as usize
     }
 }
 
-/// Material with a friction range. The ranges are modelling assumptions to
-/// be checked against the sources in `data/README.md`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Material {
     pub name: &'static str,
@@ -68,7 +56,6 @@ pub const MATERIALS: [Material; 4] = [
     },
 ];
 
-/// Everything needed to simulate one synthetic episode.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SceneSpec {
     pub sample_id: String,
@@ -80,7 +67,6 @@ pub struct SceneSpec {
     pub setup: GraspSetup,
 }
 
-/// Draws a scene from `seed`. `label` names the object class.
 pub fn random_scene(seed: u64, label: &str) -> SceneSpec {
     let mut rng = SplitMix64::new(seed);
 

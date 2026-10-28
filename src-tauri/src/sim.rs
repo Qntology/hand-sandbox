@@ -1,10 +1,3 @@
-//! Tauri commands of the simulated world. Each one hands its arguments to
-//! `noto_runtime::Runtime::api_*`, which builds the JSON the UI reads. Nothing
-//! is decided here.
-//!
-//! The commands are `async` so that a long call (a few hundred ticks, a frame
-//! encode) runs on the async runtime and not on the window's main thread.
-
 use std::sync::Arc;
 
 use noto_core::{BodyPlan, NotoConfig};
@@ -30,12 +23,8 @@ pub async fn world_new(state: App<'_>, seed: u64, size: usize, config: Option<No
     })
 }
 
-/// Runtime calls that run the world (and its models), refused until the models are loaded.
 const RUNS_WORLD: [&str; 2] = ["test_start", "test_step"];
 
-/// The runtime's other JSON calls (integrated test, part presets) by name, with
-/// the arguments the UI sends. Runs off the window's thread: a test step can
-/// render and analyse several keyframes.
 #[tauri::command]
 pub async fn rt_call(state: App<'_>, cmd: String, args: Option<Value>) -> Result<Value, String> {
     if RUNS_WORLD.contains(&cmd.as_str()) {
@@ -47,8 +36,6 @@ pub async fn rt_call(state: App<'_>, cmd: String, args: Option<Value>) -> Result
         .map_err(|e| e.to_string())?
 }
 
-/// Copies the test records written since the last call into the Lance store
-/// (`quest_runs`, `quest_steps`, `quest_stats`, `ml_keyframes`, `balance_effort`).
 #[tauri::command]
 pub async fn test_db_mirror(state: App<'_>, store_dir: Option<String>) -> Result<Value, String> {
     let (batch, stats) = state.with_world(|rt| {
@@ -61,9 +48,6 @@ pub async fn test_db_mirror(state: App<'_>, store_dir: Option<String>) -> Result
     Ok(json!({"store_dir": dir.display().to_string(), "written": counts}))
 }
 
-/// Loads TIPSv2-B/14 DPT from [`tips_dir`] onto the selected device as the
-/// ML depth model (`enabled: false` goes back to the stand-in). Keyframes are
-/// batched per pass on that device.
 #[tauri::command]
 pub async fn tips_use(state: App<'_>, enabled: Option<bool>) -> Result<Value, String> {
     let shared: Arc<AppState> = state.inner().clone();
@@ -85,8 +69,6 @@ pub async fn tips_use(state: App<'_>, enabled: Option<bool>) -> Result<Value, St
     .map_err(|e| e.to_string())?
 }
 
-/// Loads SAM (MobileSAM or ViT-B, from [`sam_dir`]) onto the selected device
-/// as the mask tracker (`enabled: false` goes back to region growing).
 #[tauri::command]
 pub async fn sam_use(state: App<'_>, enabled: Option<bool>) -> Result<Value, String> {
     let shared: Arc<AppState> = state.inner().clone();
@@ -108,7 +90,6 @@ pub async fn sam_use(state: App<'_>, enabled: Option<bool>) -> Result<Value, Str
     .map_err(|e| e.to_string())?
 }
 
-/// The device picked in the UI (or at start-up), from the shared cache.
 fn selected_device(state: &AppState) -> Result<candle_core::Device, String> {
     let (backend, ordinal) = state.selected();
     state.device().map_err(|e| format!("{}:{ordinal} 장치를 열 수 없습니다: {e:#}", backend.name()))
@@ -125,8 +106,6 @@ pub async fn world_frame(state: App<'_>, width: u32, height: u32, quality: f32, 
     state.with_world(|rt| rt.api_world_frame(width, height, quality, view.as_deref().unwrap_or("agent")))
 }
 
-/// `record: true` records the command as a live integrated test (or queues it
-/// behind the recording that runs).
 #[tauri::command]
 pub async fn command_submit(state: App<'_>, text: String, record: Option<bool>) -> Result<Value, String> {
     state.require_models()?;
@@ -164,15 +143,10 @@ pub async fn log_tail(state: App<'_>, after_seq: u64, limit: usize, category: Op
     state.with_world(|rt| rt.api_log_tail(after_seq, limit, category.as_deref()))
 }
 
-/// Whether every model is attached to the world (none of the stand-ins runs).
 pub(crate) fn all_live(rt: &Runtime) -> bool {
     rt.stand_ins().is_empty()
 }
 
-/// What `models_status` and the model switches answer: the runtime's own
-/// view plus what only the host knows (which device, which folders, whether the
-/// files are there). The switches also keep the ready flag honest: switching
-/// one model back to its stand-in stops the world until it is loaded again.
 pub(crate) fn models_json(state: &AppState, rt: &Runtime) -> Result<Value, String> {
     if state.models_ready() && !all_live(rt) {
         state.set_models_ready(false);
@@ -199,10 +173,6 @@ pub async fn models_status(state: App<'_>) -> Result<Value, String> {
     state.with_world(|rt| models_json(&state, rt))
 }
 
-/// `mode` is `"embedding"` (SigLIP2 on the screenshot tiles) or `"oracle"` (the
-/// stand-in that reads the ground-truth id buffer). Loading the model and
-/// embedding the phrase bank can take a while the first time, so it runs off the
-/// window's thread.
 #[tauri::command]
 pub async fn recognizer_use(state: App<'_>, mode: String) -> Result<Value, String> {
     let shared: Arc<AppState> = state.inner().clone();
@@ -226,8 +196,6 @@ pub async fn recognizer_use(state: App<'_>, mode: String) -> Result<Value, Strin
     .map_err(|e| e.to_string())?
 }
 
-/// Switches Granite TTM on (loads it from [`ttm_dir`] onto the selected device)
-/// or off.
 #[tauri::command]
 pub async fn ttm_use(state: App<'_>, enabled: bool) -> Result<Value, String> {
     let shared: Arc<AppState> = state.inner().clone();

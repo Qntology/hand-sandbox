@@ -1,26 +1,3 @@
-//! Robot status shown like a body-part health display (head, thorax, stomach,
-//! arms, legs).
-//!
-//! Every value is computed from simulation variables. The two "arms" are two
-//! metrics of the working (right) hand or gripper (grip and joints) and the
-//! two "legs" are two metrics of the base (drive and terrain margin). They are
-//! not anatomical left and right.
-//!
-//! The zones follow the form (`morph`): the drive and terrain zones are named
-//! after the lower body (발, 바퀴, 메카넘 바퀴, 트랙), the vision zone after the
-//! camera (a head, a mast camera, a chassis camera, none without one), the
-//! cargo zone after the cargo (the bay `stomach`, a bed `bed`, a tote `tote`,
-//! none without one), and the grip and arm zones exist only with a
-//! manipulator. Today's humanoid keeps its seven zones in their order.
-//!
-//! Modelling assumptions (not measured values) are named constants here and
-//! listed in `data/README.md`:
-//! * [`BATTERY_RUNTIME_S`]: battery energy is cruise power times this runtime.
-//! * [`BaseKind::carry_capacity_kg`]: cargo limit per base.
-//!
-//! Joint wear is the reducers' Miner damage (`wear`), joint heat the
-//! world's thermal state; both come in through [`BodyInputs`].
-
 use serde::{Deserialize, Serialize};
 
 use crate::balance::{Coupling, JointLoad};
@@ -28,11 +5,9 @@ use crate::base::{BaseKind, BaseSpec};
 use crate::morph::{Cargo, HeadMount, Lower, Manip, Morphology, Torso};
 use crate::surface::{slip_probability, Contact};
 
-/// Battery energy equals cruise power times this many seconds (assumption).
 pub const BATTERY_RUNTIME_S: f64 = 1800.0;
 
 impl BaseKind {
-    /// Cargo limit in kilograms (assumption; see `data/README.md`).
     pub fn carry_capacity_kg(self) -> f32 {
         match self {
             BaseKind::Wheel => 20.0,
@@ -43,12 +18,10 @@ impl BaseKind {
     }
 }
 
-/// Battery capacity in joules for a base: cruise power times [`BATTERY_RUNTIME_S`].
 pub fn battery_capacity_j(spec: &BaseSpec) -> f64 {
     spec.power_w as f64 * BATTERY_RUNTIME_S
 }
 
-/// Ordered from best to worst, so `max` is the worse of two.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BodyLevel {
@@ -59,7 +32,6 @@ pub enum BodyLevel {
 }
 
 impl BodyLevel {
-    /// Maps a 0..1 health ratio to a level: >= 0.6 ok, >= 0.3 warn, >= 0.1 bad, else crit.
     pub fn from_ratio(ratio: f32) -> BodyLevel {
         if ratio >= 0.6 {
             BodyLevel::Ok
@@ -73,7 +45,6 @@ impl BodyLevel {
     }
 }
 
-/// Identifiers of the seven body zones, in display order.
 pub const PART_IDS: [&str; 7] = [
     "head", "thorax", "stomach", "arm_l", "arm_r", "leg_l", "leg_r",
 ];
@@ -84,7 +55,6 @@ pub struct BodyPart {
     pub label_ko: String,
     pub value: f32,
     pub max: f32,
-    /// Health ratio, 0 (worst) to 1 (best).
     pub ratio: f32,
     pub level: BodyLevel,
     pub detail: String,
@@ -101,7 +71,6 @@ pub struct BodyEffect {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HandSummary {
     pub fingers: u8,
-    /// Friction capacity over required force (>= 1 means the last grasp was stable).
     pub grip_margin: Option<f32>,
 }
 
@@ -112,29 +81,22 @@ pub struct FootSummary {
     pub terrain_margin: Option<f32>,
 }
 
-/// Balance and joint load of the current posture (see `balance`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BalanceSummary {
-    /// Body preset id.
     pub plan: String,
     pub source: String,
     pub source_ko: String,
-    /// Terrain and phase bucket, such as `flat|mine`.
     pub state: String,
     pub margin: f32,
     pub margin_noff: f32,
     pub trunk_lean_deg: f32,
     pub head_tilt_deg: f32,
     pub worst_joint: Option<String>,
-    /// Largest torque over peak rating.
     pub worst_ratio: f32,
     pub effort_sum: f32,
     pub mass_kg: f32,
     pub com_height_m: f32,
-    /// Hottest joint's heat state (above 1 the joint is derated).
     pub heat_max: f32,
-    /// The joint closest to a limit and its index: the larger of torque over
-    /// peak and RMS (`√heat`) over the continuous rating.
     #[serde(default)]
     pub load_joint: Option<String>,
     #[serde(default)]
@@ -142,17 +104,13 @@ pub struct BalanceSummary {
     #[serde(default)]
     pub load_rms: f32,
     pub joints: Vec<JointLoad>,
-    /// The N:N cells of this state.
     pub couplings: Vec<Coupling>,
-    /// Ground under the robot.
     #[serde(default)]
     pub ground: String,
-    /// Friction the contacts need on that ground against what it gives.
     #[serde(default)]
     pub contact: Option<Contact>,
 }
 
-/// Limits that the part presets set; without them the base's defaults apply.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BodyLimits {
     pub battery_j: f64,
@@ -170,47 +128,32 @@ pub struct BodyStatus {
     pub foot: FootSummary,
     #[serde(default)]
     pub balance: Option<BalanceSummary>,
-    /// The robot's form, for the silhouette (`morph`).
     #[serde(default)]
     pub morph: Morphology,
-    /// The named form's id (`truck`, ...) or `custom`, and its Korean name.
     #[serde(default)]
     pub form: String,
     #[serde(default)]
     pub form_ko: String,
 }
 
-/// Simulation variables the status is computed from.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BodyInputs {
     pub base: BaseKind,
-    /// The robot's form (its lower body follows `base`).
     pub morph: Morphology,
     pub fingers: u8,
-    /// Recent perception confidence 0..1. `None` when nothing was perceived yet.
     pub vision_confidence: Option<f32>,
-    /// Latest frame pipeline time in milliseconds, for the detail text.
     pub frame_ms: Option<f32>,
     pub energy_used_j: f64,
     pub carried_kg: f32,
-    /// Friction capacity over required force of the latest grasp, if any.
     pub grip_margin: Option<f32>,
     pub joint_strikes: u32,
-    /// Life used by the working arm's joints and by the most worn joint (Miner damage, 1 = worn out).
     pub arm_wear: f32,
     pub wear_max: f32,
     pub wear_joint: Option<String>,
-    /// Current speed over the base's top speed, 0..1.
     pub speed_factor: f32,
-    /// Smallest remaining margin to the base's slope or step limit on the
-    /// current route segment, 0..1. `None` without a route.
     pub terrain_margin: Option<f32>,
-    /// Limits from the part presets (battery, cargo, speed, slope, step).
     pub limits: Option<BodyLimits>,
-    /// Robot mass without cargo, for the load over body mass.
     pub body_mass_kg: Option<f32>,
-    /// Cargo the drive still pushes on the ground and slope here, when that
-    /// is less than the continuous limit (soft ground, a slope), and the ground.
     pub capacity_here: Option<(f32, String)>,
     pub balance: Option<BalanceSummary>,
 }
@@ -228,9 +171,6 @@ fn part(id: &str, label_ko: &str, value: f32, max: f32, ratio: f32, detail: Stri
     }
 }
 
-/// Level of a friction margin (available − required): the 1%, 5% and 50%
-/// points of the slip fit (`surface::slip_probability`). Applied to wheels and
-/// tracks too, as a convention.
 pub fn slip_level(margin: f32) -> BodyLevel {
     match slip_probability(margin) {
         p if p < 0.01 => BodyLevel::Ok,
@@ -240,8 +180,6 @@ pub fn slip_level(margin: f32) -> BodyLevel {
     }
 }
 
-/// The zone names the form gives: vision, battery, cargo (id and name), grip,
-/// arm joints and the lower body's word (`None` where the form has no such zone).
 struct ZoneNames {
     head: Option<&'static str>,
     thorax: &'static str,
@@ -279,7 +217,6 @@ fn zone_names(m: &Morphology) -> ZoneNames {
     }
 }
 
-/// Computes the zones of the form (today's humanoid: seven) and the active effects from `inp`.
 pub fn compute(inp: &BodyInputs) -> BodyStatus {
     let morph = inp.morph.fit(inp.base);
     let names = zone_names(&morph);
@@ -294,7 +231,6 @@ pub fn compute(inp: &BodyInputs) -> BodyStatus {
         None => (battery_capacity_j(&spec), inp.base.carry_capacity_kg(), format!("순항 전력 × {:.0}분 가정", BATTERY_RUNTIME_S / 60.0)),
     };
 
-    // head: vision (the camera wherever the form has it)
     let head = names.head.map(|label| match inp.vision_confidence {
         Some(c) => {
             let ms = inp
@@ -313,7 +249,6 @@ pub fn compute(inp: &BodyInputs) -> BodyStatus {
         None => part("head", label, 100.0, 100.0, 1.0, "인식 기록 없음".into()),
     });
 
-    // thorax: battery
     let used = inp.energy_used_j.max(0.0).min(cap_j);
     let battery = (1.0 - used / cap_j) as f32;
     let thorax = part(
@@ -325,7 +260,6 @@ pub fn compute(inp: &BodyInputs) -> BodyStatus {
         format!("잔량 {:.0} / {:.0} kJ ({runtime_note})", (cap_j - used) / 1000.0, cap_j / 1000.0),
     );
 
-    // stomach: cargo (ratio is the remaining capacity, on this ground when the drive limits it)
     let carried = inp.carried_kg.max(0.0);
     let here = inp.capacity_here.as_ref().filter(|(kg, _)| *kg < cap_kg);
     let room = here.map_or(cap_kg, |(kg, _)| *kg);
@@ -345,7 +279,6 @@ pub fn compute(inp: &BodyInputs) -> BodyStatus {
         )
     });
 
-    // arm_l: grip margin (2.0 or more counts as full)
     let arm_l = names.arms.map(|(grip, _)| match inp.grip_margin {
         Some(m) => part(
             "arm_l",
@@ -358,7 +291,6 @@ pub fn compute(inp: &BodyInputs) -> BodyStatus {
         None => part("arm_l", grip, 2.0, 2.0, 1.0, "파지 대기".into()),
     });
 
-    // arm_r: the working arm's wear (reducer life used).
     let wear = inp.arm_wear.clamp(0.0, 1.0);
     let arm_r = names.arms.map(|(_, joints)| {
         part(
@@ -371,9 +303,6 @@ pub fn compute(inp: &BodyInputs) -> BodyStatus {
         )
     });
 
-    // leg_l: drive. This is a speed gauge, not a health bar: a robot standing
-    // still is not hurt, so the level stays "ok" unless the battery is empty and
-    // the base cannot move at all.
     let sf = inp.speed_factor.clamp(0.0, 1.0);
     let speed = sf * spec.max_speed_mps;
     let depleted = used >= cap_j;
@@ -393,7 +322,6 @@ pub fn compute(inp: &BodyInputs) -> BodyStatus {
     );
     leg_l.level = if depleted { BodyLevel::Crit } else { BodyLevel::Ok };
 
-    // leg_r: terrain margin (the route's slope and step limits, the ground's friction and drive limits included)
     let ground = inp.balance.as_ref().map(|b| b.ground.as_str()).filter(|g| !g.is_empty());
     let terrain_label = format!("{} · 지형", names.lower);
     let leg_r = match inp.terrain_margin {
@@ -418,8 +346,6 @@ pub fn compute(inp: &BodyInputs) -> BodyStatus {
 
     let level_of = |id: &str| -> Option<(BodyLevel, f32)> { parts.iter().find(|p| p.id == id).map(|p| (p.level, p.ratio)) };
     let mut effects = Vec::new();
-    // Fatigue: short term the hottest joint's heat (above 1 it is derated),
-    // long term the most worn reducer.
     let heat = inp.balance.as_ref().map_or(0.0, |b| b.heat_max);
     let worn = inp.wear_max.max(inp.arm_wear);
     let fatigue_level = BodyLevel::from_ratio(1.0 - heat.min(1.0)).max(BodyLevel::from_ratio(1.0 - worn.min(1.0)));
@@ -433,7 +359,6 @@ pub fn compute(inp: &BodyInputs) -> BodyStatus {
             inp.wear_joint.as_ref().map(|j| format!(" ({j})")).unwrap_or_default()
         ),
     });
-    // Load: what is left of the cargo place (a form without one has no load effect).
     if let Some((load_level, load_left)) = names.cargo.and_then(|(id, _)| level_of(id)) {
         effects.push(BodyEffect {
             id: "load".into(),
@@ -446,8 +371,6 @@ pub fn compute(inp: &BodyInputs) -> BodyStatus {
             ),
         });
     }
-    // Slip: the friction picture of the ground under the robot when the
-    // balance model has one, else the route's margin to the slope limit.
     match inp.balance.as_ref().and_then(|b| b.contact.map(|c| (b, c))) {
         Some((b, c)) => effects.push(BodyEffect {
             id: "slip".into(),
@@ -472,10 +395,7 @@ pub fn compute(inp: &BodyInputs) -> BodyStatus {
             });
         }
     }
-    // Balance and joint strain, when the part presets are in play.
     if let Some(b) = &inp.balance {
-        // Stability: tipping (the ZMP's margin) and sliding (the friction
-        // margin) — whichever is closer to failing decides the level.
         let tip = BodyLevel::from_ratio(b.margin);
         let (level, slide) = match &b.contact {
             Some(c) => (tip.max(slip_level(c.margin)), format!(" · 미끄러짐 여유 {:.0}%{}", (1.0 - c.utilisation).max(-9.99) * 100.0, if slip_level(c.margin) > tip { " — 미끄러짐이 먼저" } else { "" })),
@@ -487,8 +407,6 @@ pub fn compute(inp: &BodyInputs) -> BodyStatus {
             level,
             detail: format!("{} · 넘어짐 여유 {:.0}% (피드포워드 없으면 {:.0}%){slide}", b.source_ko, b.margin * 100.0, b.margin_noff * 100.0),
         });
-        // Joint load: the motor sizing rules, peak against the peak rating and
-        // RMS against the continuous one, whichever is closer to its limit.
         let index = b.load_index.max(b.worst_ratio);
         effects.push(BodyEffect {
             id: "strain".into(),
@@ -580,7 +498,6 @@ mod tests {
         let thorax = s.parts.iter().find(|p| p.id == "thorax").unwrap();
         assert!((thorax.ratio - 0.25).abs() < 1e-4);
         assert_eq!(thorax.level, BodyLevel::Bad);
-        // Over-use clamps to empty instead of going negative.
         inp.energy_used_j = cap * 3.0;
         let s = compute(&inp);
         let thorax = s.parts.iter().find(|p| p.id == "thorax").unwrap();
@@ -596,7 +513,6 @@ mod tests {
         let stomach = s.parts.iter().find(|p| p.id == "stomach").unwrap();
         assert!((stomach.ratio - 0.5).abs() < 1e-5);
         assert_eq!(stomach.max, 30.0);
-        // The same load is worse on a base with a smaller limit.
         let mut small = idle(BaseKind::Mecanum);
         small.carried_kg = 15.0;
         let s = compute(&small);
@@ -614,7 +530,6 @@ mod tests {
         inp.grip_margin = Some(1.0);
         let s = compute(&inp);
         assert!((s.parts[3].ratio - 0.5).abs() < 1e-6);
-        // 0.9 / 2 = 0.45 -> warn; 0.4 / 2 = 0.2 -> bad.
         inp.grip_margin = Some(0.9);
         let s = compute(&inp);
         assert_eq!(s.parts[3].level, BodyLevel::Warn);
@@ -634,10 +549,8 @@ mod tests {
         assert_eq!(fatigue.level, BodyLevel::Crit);
         assert!(s.parts[4].detail.contains("9000"));
         inp.arm_wear = 2.0;
-        // Life used past the rating clamps to fully worn, never negative.
         let s = compute(&inp);
         assert_eq!(s.parts[4].ratio, 0.0);
-        // A worn joint elsewhere also tires the robot.
         let mut leg = idle(BaseKind::HumanFoot);
         leg.wear_max = 0.75;
         leg.wear_joint = Some("knee".into());
@@ -683,7 +596,6 @@ mod tests {
         let stomach = s.parts.iter().find(|p| p.id == "stomach").unwrap();
         assert!((stomach.ratio - 0.2).abs() < 1e-5, "4 of the 5 kg the drive pushes on sand");
         assert!(stomach.detail.contains("모래") && stomach.detail.contains("몸무게의 20%"), "{}", stomach.detail);
-        // A wheel on a grass slope: far from tipping, close to sliding.
         let c = crate::surface::contact(BaseKind::Wheel, crate::surface::Surface::Grass.props(), 13.0, 0.0, true);
         inp.balance = Some(balance(0.8, Some(c)));
         let s = compute(&inp);

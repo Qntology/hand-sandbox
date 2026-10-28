@@ -1,15 +1,3 @@
-//! Time-series forecasting for score histories.
-//!
-//! * [`holt`]: damped Holt trend (statistical fallback).
-//! * [`fusion`]: holdout backtest of several predictors with inverse-variance
-//!   weights that also use the errors the SDS remembers.
-//! * [`gate`]: temporal consistency gate built on the fused forecast.
-//! * `ttm` (feature `granite`): Granite TTM-R3 on candle, copied from
-//!   endmill-sandbox, and [`ttm_predictor`] to plug it into the fusion.
-//!
-//! This crate does not depend on the SDS crate; remembered errors come in as
-//! plain [`HistoryMse`] values.
-
 pub mod fusion;
 pub mod gate;
 pub mod holt;

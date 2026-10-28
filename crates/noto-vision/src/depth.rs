@@ -1,60 +1,31 @@
-//! ML track 1: depth from one keyframe.
-//!
-//! The model the project uses is `google/tipsv2-b14-dpt` (TIPSv2, CVPR 2026):
-//! a DINOv2-style ViT-B/14 with a DPT head that predicts metric depth in
-//! metres as the expectation over 256 bins between 0.001 and 10 m. Two facts
-//! about it shape the rest of the ML logic:
-//!
-//! * it was trained on NYUv2, indoors, so its metric scale on this outdoor
-//!   voxel renderer is a guess, and
-//! * it cannot say anything beyond 10 m.
-//!
-//! That is why the decision step triangulates before trusting a range, and
-//! why the SDS learns a per-scene `depth_scale` (triangulated range over the
-//! model's range) instead of believing the metres. [`DepthMetrics`] compares a
-//! prediction with the renderer's depth for the evaluation columns only.
-
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::frame::{DepthKind, DepthMap, Rgb};
 
 pub trait DepthModel: Send {
-    /// `tipsv2-b14-dpt` or the name of a stand-in.
     fn mode(&self) -> &str;
     fn device(&self) -> String {
         "cpu".into()
     }
-    /// Largest depth the model can report, metres (`None` when unbounded).
     fn max_depth_m(&self) -> Option<f32> {
         None
     }
     fn infer(&mut self, rgb: &Rgb) -> Result<DepthMap>;
-    /// Depth of several keyframes, in input order. A model that can batch
-    /// overrides this; each map must be the one [`DepthModel::infer`] gives.
     fn infer_batch(&mut self, frames: &[&Rgb]) -> Result<Vec<DepthMap>> {
         frames.iter().map(|f| self.infer(f)).collect()
     }
 }
 
-/// Standard monocular depth errors over pixels where both maps are finite and
-/// the truth is within `max_m`.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DepthMetrics {
-    /// Mean |pred - true| / true.
     pub absrel: f32,
-    /// Share of pixels with max(pred/true, true/pred) < 1.25.
     pub delta1: f32,
-    /// Root mean square error, metres.
     pub rmse_m: f32,
-    /// Median of true / pred: the scale that would have fixed the prediction.
     pub median_scale: f32,
     pub pixels: u32,
 }
 
-/// Compares `pred` with `truth` (metric, same or other size). With `align`
-/// the prediction is first scaled by the median ratio (the usual protocol for
-/// relative depth).
 pub fn depth_metrics(pred: &DepthMap, truth: &DepthMap, max_m: f32, align: bool) -> Option<DepthMetrics> {
     let mut pairs: Vec<(f32, f32)> = Vec::new();
     for y in 0..truth.height {
@@ -87,8 +58,6 @@ pub fn depth_metrics(pred: &DepthMap, truth: &DepthMap, max_m: f32, align: bool)
     Some(DepthMetrics { absrel: (ar / n) as f32, delta1: (d1 as f64 / n) as f32, rmse_m: (se / n).sqrt() as f32, median_scale, pixels: pairs.len() as u32 })
 }
 
-/// Keeps the finite values of a metric map inside `(0, max_m]` and marks the
-/// rest as unknown, the way a bounded model reports them.
 pub fn clamp_metric(map: &mut DepthMap, max_m: f32) {
     map.kind = DepthKind::Metric;
     for d in map.data.iter_mut() {

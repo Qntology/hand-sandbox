@@ -1,25 +1,3 @@
-//! Where the ML tracks, the balance model and the quests write to the SDS and
-//! to the test records, and where the SDS is read back into decisions.
-//!
-//! Every keyframe the ML logic analyses leaves:
-//! * `depth|<mode>|<label>`: absrel and delta1 against the renderer (evaluation),
-//!   and the `scale` calibration (triangulated range / depth range) when a fix exists;
-//!   on the ground-aligned path (`<model>+ground`) also the fit's `align_a`,
-//!   `align_b`, `align_inliers` and `align_err` (v1.0);
-//! * `locate|<label>|<mode>`: peak score, margin, presence, pixel error (evaluation);
-//! * `tracker|<label>|<mode>`: IoU with the previous keyframe, area, score, IoU
-//!   with the truth (evaluation), agreement `alive`;
-//! * `fusion|<label>|`: the mixed features, each z-scored against its own
-//!   baseline before the new value goes in.
-//!
-//! Every balance state the world enters leaves `balance|<source>><target>|<state>`
-//! cells (with the research reference where there is one), `effort|<segment>|<source>|<state>`
-//! joint loads, and the `ff` calibration that becomes the next feed-forward gain.
-//! While the robot travels or mines, its condition is also run as an effects
-//! benchmark scenario (`noto_core::effects`): `balance|fx:<effect>|<ground>|<state>`
-//! cells against the measurements, the limits as agreements, and the reducers'
-//! wear as `effort|wear|<state>` baselines.
-
 use std::collections::BTreeMap;
 
 use anyhow::Result;
@@ -33,11 +11,6 @@ use crate::ml::{overlay, MlFrame};
 use crate::record::{Keyframe, MlView, PointView, TargetView, TrackView};
 use crate::runtime::Runtime;
 
-/// Default score floor for semantic points used as prompts, per locator mode,
-/// until the SDS has a baseline (stand-in scores live in 0..1; SigLIP2 pair
-/// probabilities are much smaller on this renderer, so its floor is 0; the
-/// v1.0 path gates the real locator with its calibrated threshold instead,
-/// `MlPipeline::passes_calibration`, and so does the stand-in measured on it).
 fn default_floor(mode: &str) -> f32 {
     if mode.starts_with("stand-in") && !mode.contains("measured") {
         0.35
@@ -46,13 +19,10 @@ fn default_floor(mode: &str) -> f32 {
     }
 }
 
-/// Whether a mode is one of the stand-ins (whose SDS statistics keep the
-/// backoff to the label's and the track's scopes they always had).
 fn is_stand_in(mode: &str) -> bool {
     mode.starts_with("stand-in")
 }
 
-/// z-score of `x` against the baseline of `scope/axis`, if the SDS has one.
 fn z_of(rt: &Runtime, scope: &Scope, axis: &str, x: f64) -> Option<f64> {
     rt.sds.adaptive_baseline(scope, axis).map(|(m, sd, _)| (x - m) / sd.max(1e-6))
 }
@@ -63,17 +33,12 @@ pub(crate) struct MlOut {
 }
 
 impl Runtime {
-    /// The learned metric scale of the depth model for a label, if any. A real
-    /// model only takes a scale learned under its own mode: the track's global
-    /// scope mixes every mode, the stand-in's exact 0.8 included.
     pub(crate) fn depth_scale(&self, label: &str) -> Option<f32> {
         let mode = self.ml.depth_mode();
         let scope = Scope::new(Track::Depth, &mode, label);
         self.sds.calibration_factor(&scope, "scale").filter(|(_, _, _, key)| is_stand_in(&mode) || *key != scope.key_global()).map(|(f, _, _, _)| f as f32)
     }
 
-    /// Runs the ML tracks on a keyframe, fills its view and overlay, and
-    /// records the depth, locate, tracker and fusion tracks.
     pub(crate) fn ml_analyse(&mut self, kf: &mut Keyframe, wanted: &[String], prefer: Option<u32>) -> Result<MlOut> {
         let rgb = kf.rgb()?;
         let lmode = self.ml.locate_mode();
@@ -82,14 +47,11 @@ impl Runtime {
             .iter()
             .map(|l| {
                 let s = Scope::new(Track::Locate, l, &lmode);
-                // A real locator reads only its own mode's baseline: the label's
-                // scope mixes the stand-in's 0..1 scores in.
                 let learned = self.sds.adaptive_baseline_scoped(&s, "score").filter(|(_, key)| is_stand_in(&lmode) || *key == s.key_secondary()).map(|(b, _)| b);
                 let f = learned.map(|(m, sd, _)| (m - 2.0 * sd) as f32).unwrap_or(floor_default).max(floor_default.min(0.2));
                 (l.clone(), f)
             })
             .collect();
-        // The robot's map around it: ground height relative to the ground under the camera.
         let ground0 = self.world.surface_m(kf.pose.x, kf.pose.z);
         let world = &self.world;
         let height = move |x: f32, z: f32| world.surface_m(x, z) - ground0;
@@ -97,7 +59,6 @@ impl Runtime {
         let (dmode, tmode) = (self.ml.depth_mode(), self.ml.track_mode());
         let label = frame.target.as_ref().map(|t| t.label.clone()).or_else(|| wanted.first().cloned()).unwrap_or_default();
 
-        // depth
         let dscope = Scope::new(Track::Depth, &dmode, &label);
         if let Some(m) = &frame.depth_metrics {
             self.sds.record_baseline(&dscope, "absrel", m.absrel as f64);
@@ -109,7 +70,6 @@ impl Runtime {
             self.sds.record_baseline(&dscope, "align_inliers", f.inlier_share as f64);
             self.sds.record_baseline(&dscope, "align_err", f.median_rel_err as f64);
         }
-        // locate
         let point = frame.points.iter().find(|p| wanted.contains(&p.label)).cloned();
         let lscope = Scope::new(Track::Locate, &label, &lmode);
         let mut sds_lane: BTreeMap<String, f32> = BTreeMap::new();
@@ -124,7 +84,6 @@ impl Runtime {
                 self.sds.record_baseline(&lscope, "err_px", e as f64);
             }
         }
-        // tracker
         let tscope = Scope::new(Track::Tracker, &label, &tmode);
         let target_track = frame.target.as_ref().and_then(|t| frame.tracks.iter().find(|m| m.id == t.track_id));
         self.sds.record_agreement(&tscope, "alive", target_track.is_some());
@@ -186,7 +145,6 @@ impl Runtime {
         }
         sds_lane.insert("fusion".into(), zmax as f32);
         if let Some(b) = &kf.balance {
-            // Balance on the lane: how far the posture's margin is below the kept margin.
             sds_lane.insert("balance".into(), ((noto_core::balance::MARGIN_KEEP - b.margin) / 0.1).max(0.0));
         }
 
@@ -223,7 +181,6 @@ impl Runtime {
         Ok(MlOut { frame, sighting })
     }
 
-    /// Writes the keyframe's row to the test records.
     pub(crate) fn record_keyframe_row(&mut self, pass: &str, kf: &Keyframe, target: &str) {
         let ml = kf.ml.as_ref();
         let t = ml.and_then(|m| m.target.as_ref());
@@ -260,9 +217,6 @@ impl Runtime {
         self.db.record_keyframe(row);
     }
 
-    /// The five effects of a world state, scored by the benchmark's own cells:
-    /// likeness and floor cells as references, limits as agreements, the rest
-    /// as baselines (the engine never reads these back).
     fn record_effects(&mut self, post: &noto_core::Posture, state: &str) {
         use noto_core::effects::{evaluate, live_scenario, Rule};
         let Some(s) = live_scenario(&self.world.body, post) else { return };
@@ -289,8 +243,6 @@ impl Runtime {
         }
     }
 
-    /// Balance states from the world into the SDS `balance`/`effort` tracks
-    /// and the test records; the learned feed-forward gains go back to the world.
     pub(crate) fn record_balance_events(&mut self) {
         let events = self.world.take_balance_events();
         if events.is_empty() {
@@ -300,8 +252,6 @@ impl Runtime {
         let body_kg = self.world.body.mass_kg();
         let nn_lib = noto_core::nn::library(&self.world.body);
         for ev in &events {
-            // Composite N:N: the development scenario phases this state counts as,
-            // scored with their research weights (`noto_core::nn`).
             let Some(d) = &ev.dynamics else { continue };
             self.record_effects(&ev.posture, &ev.state);
             for (spec, phase) in noto_core::nn::matching_phases(&nn_lib, &ev.posture) {
@@ -361,8 +311,6 @@ impl Runtime {
                 self.sds.record_baseline(&scope, &format!("{}:peak_ratio", j.joint), j.peak_ratio as f64);
                 self.sds.record_baseline(&scope, &format!("{}:effort", j.joint), j.effort as f64);
             }
-            // The joint dynamics of the change into this state: the transient the
-            // quasi-static cells above cannot show (torque-speed, stall, late reaction).
             if let Some(d) = &ev.dynamics {
                 let scope = Scope::new(Track::Effort, "dynamics", &format!("{src}|{}", ev.state));
                 self.sds.record_baseline(&scope, "min_margin", d.min_margin as f64);
@@ -379,8 +327,6 @@ impl Runtime {
                 }
             }
         }
-        // Only a gain learned for this source counts; the global scope mixes
-        // sources whose nominal models are wrong in different ways.
         for s in Source::ALL {
             let scope = Scope::new(Track::Balance, &format!("{}>foot", s.id()), "");
             if let Some((f, _, _, key)) = self.sds.calibration_factor(&scope, "ff") {
@@ -391,7 +337,6 @@ impl Runtime {
         }
     }
 
-    /// One finished quest (either pass) into the test records and the SDS `quest` track.
     pub(crate) fn record_quest_run(&mut self, quest_id: &str, attempts: &[u32]) {
         let Some(q) = self.quests.get(quest_id).cloned() else { return };
         let kind = match &q.plan {

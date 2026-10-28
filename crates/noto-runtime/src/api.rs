@@ -1,20 +1,3 @@
-//! The calls the UI makes, as JSON in and JSON out.
-//!
-//! `ui/js/api.js` talks to a backend that answers ten commands. The browser
-//! mock (`ui/js/mock-backend.js`) was written first and fixed the shapes; this
-//! module answers with the same shapes from the real [`Runtime`]. The Tauri
-//! commands and the development server (`examples/serve.rs`) are thin wrappers
-//! around it, so what the UI sees does not depend on which one runs.
-//!
-//! Two conventions differ between the simulator and the UI, and are converted
-//! here and nowhere else:
-//!
-//! * The simulator has `x` and `z` on the ground and `y` up. The UI draws a map
-//!   with `x` to the right and `y` up, so a position goes out as
-//!   `[x, depth - z, height]`. The simulator's right-hand side is `+z`, which
-//!   would mirror the map, hence the flip.
-//! * The same flip turns the yaw: `yaw_ui = -yaw_sim`.
-
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use noto_core::{BaseKind, NotoConfig};
@@ -28,11 +11,9 @@ use noto_sds::LogLine;
 use crate::precision::Judged;
 use crate::runtime::{label_ko, FrameView, Runtime, Submission};
 
-/// Smallest and largest world the UI may ask for, in cells of 0.5 m.
 pub const MIN_CELLS: usize = 32;
 pub const MAX_CELLS: usize = 160;
 
-/// Names of the commands [`Runtime::api_call`] answers.
 pub const COMMANDS: [&str; 33] = [
     "act_status",
     "inventory_drop",
@@ -69,12 +50,10 @@ pub const COMMANDS: [&str; 33] = [
     "world_light",
 ];
 
-/// How many steps ahead the time-series tab forecasts.
 const FORECAST_HORIZON: usize = 16;
 
 fn r3(x: f32) -> f64 {
     let v = ((x as f64) * 1000.0).round() / 1000.0;
-    // no "-0.0" in the JSON
     if v == 0.0 { 0.0 } else { v }
 }
 
@@ -82,14 +61,11 @@ fn r4(x: f64) -> f64 {
     (x * 1e4).round() / 1e4
 }
 
-/// Calendar date and time of a Unix time in milliseconds, as ISO 8601 in UTC.
-/// The logs keep integers; the UI wants a string it can cut the clock out of.
 pub fn iso_ms(ms: i64) -> String {
     let secs = ms.div_euclid(1000);
     let milli = ms.rem_euclid(1000);
     let days = secs.div_euclid(86_400);
     let sod = secs.rem_euclid(86_400);
-    // Days since 1970-01-01 to a civil date (H. Hinnant's algorithm).
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -116,22 +92,18 @@ fn pos(p: &Pos3, depth_m: f32) -> Value {
     json!([r3(p.x), r3(depth_m - p.z), r3(p.y)])
 }
 
-/// A ground point `[x, z]` for the UI: `[x, depth - z]`.
 fn at2(p: [f32; 2], depth_m: f32) -> Value {
     json!([r3(p[0]), r3(depth_m - p[1])])
 }
 
-/// A ground point with its height `[x, z, h]`: `[x, depth - z, h]`.
 fn at3(p: [f32; 3], depth_m: f32) -> Value {
     json!([r3(p[0]), r3(depth_m - p[1]), r3(p[2])])
 }
 
-/// A rectangle `[x0, z0, x1, z1]` for the UI, still min before max: `[x0, depth - z1, x1, depth - z0]`.
 fn rect(r: [f32; 4], depth_m: f32) -> Value {
     json!([r3(r[0]), r3(depth_m - r[3]), r3(r[2]), r3(depth_m - r[1])])
 }
 
-/// Houses, the logistics centre and their fixtures, through the same flip as every position.
 fn site_json(s: &SiteView, d: f32) -> Value {
     json!({
         "houses": s.houses.iter().map(|h| json!({
@@ -156,8 +128,6 @@ fn site_json(s: &SiteView, d: f32) -> Value {
     })
 }
 
-/// `mass_kg` in a carry entry is the mass of one item, as the UI reads it;
-/// `amount` counts broken pieces (half a stone is 0.5), `total_kg` is the stack.
 fn carry(c: &CarryView) -> Value {
     json!({"item_id": c.item.id(), "label_ko": c.label_ko, "count": c.count, "amount": r3(c.amount), "mass_kg": r3(c.unit_kg), "total_kg": r3(c.mass_kg)})
 }
@@ -181,7 +151,6 @@ pub fn snapshot_json(s: &WorldSnapshot) -> Value {
             "capacity_kg": r3(s.agent.capacity_kg),
             "battery_ratio": r3(s.agent.battery_ratio),
             "action": s.agent.action,
-            // Where the robot believes it is (its odometry) and how far that is off: the map shows both.
             "belief": s.agent.belief.as_ref().map(|b| json!({"pos": [r3(b.x), r3(d - b.z)], "yaw_deg": r3(wrap_deg(-b.yaw_deg)), "error_m": r3(b.error_m), "since_fix_m": r3(b.since_fix_m)})),
         },
         "waypoints": s.waypoints.iter().map(|w| json!({
@@ -196,7 +165,6 @@ pub fn snapshot_json(s: &WorldSnapshot) -> Value {
         })).collect::<Vec<_>>(),
         "drops": s.drops.iter().map(|x| {
             let mut v = json!({"id": x.id, "item_id": x.item.id(), "label_ko": x.label_ko, "pos": pos(&x.pos, d), "amount": r3(x.amount)});
-            // On a porch, a shelf deck or a table: `pos[2]` is that surface's height.
             if !x.support.is_ground() {
                 let mut on = json!(x.support);
                 on["label_ko"] = json!(x.support.label_ko());
@@ -240,7 +208,6 @@ fn stage_of(v: Via) -> &'static str {
     }
 }
 
-/// What the UI's command line shows about a parsed command.
 fn parsed_json(rt: &Runtime, p: &ParsedCommand) -> Value {
     let w = rt.world();
     let place = |id: &str| json!({"kind": "waypoint", "id": id, "label_ko": label_ko(w, id)});
@@ -250,7 +217,6 @@ fn parsed_json(rt: &Runtime, p: &ParsedCommand) -> Value {
             .iter()
             .map(|t| {
                 let mut v = json!({"item_id": t.resource, "label_ko": label_ko(w, &t.resource), "count": t.quantity, "score": r3(t.score)});
-                // Where the command says it lies: a search hint ("창고 선반에서").
                 if !t.origin.is_empty() {
                     v["origin"] = json!(t.origin.iter().map(|o| json!({"id": o.place, "text": o.text})).collect::<Vec<_>>());
                 }
@@ -262,7 +228,6 @@ fn parsed_json(rt: &Runtime, p: &ParsedCommand) -> Value {
         Some(Plan::Fetch { targets, destination }) => {
             let scores: Vec<f32> = targets.iter().map(|t| t.score).chain(std::iter::once(destination.score)).collect();
             let mut dest = place(&destination.place);
-            // Not said: parcels go back to the base camp.
             if destination.implied() {
                 dest["implied"] = json!(true);
             }
@@ -275,8 +240,6 @@ fn parsed_json(rt: &Runtime, p: &ParsedCommand) -> Value {
         Some(Plan::Goto { place: pl }) => ("goto", None, None, None, Some(place(&pl.place)), pl.score, Vec::new()),
         Some(Plan::Drop { items, place: pl }) => {
             let one = items.len() == 1;
-            // One item with a count reads "원목 ×1" (the count goes in its own field);
-            // everything else spells out its amounts.
             let item_ko = match items.as_slice() {
                 [] => Some("적재함 전부".to_string()),
                 [t] if t.quantity.is_some() => Some(label_ko(w, &t.resource)),
@@ -313,7 +276,6 @@ fn summary_of(targets: &[noto_search::Target], action: &'static str, dest: Optio
     (action, first.map(|t| t.resource.clone()), item_ko, if one { first.map(|t| t.quantity) } else { None }, dest, conf, tj)
 }
 
-/// The steps of the parse as table rows for the analysis tab.
 fn trace_json(p: &ParsedCommand, conf: f64) -> Vec<Value> {
     let mut rows = vec![json!({"stage": "normalize", "text": p.normalized, "score": null, "role": null, "accepted": true})];
     for h in &p.hits {
@@ -360,7 +322,6 @@ fn submission_json(rt: &Runtime, text: &str, s: &Submission) -> Value {
     })
 }
 
-/// One row per label of a scan: the best candidate of the label.
 fn scan_labels(rt: &Runtime, judged: &[Judged], top_k: usize) -> Vec<Value> {
     use std::collections::BTreeMap;
     let mut best: BTreeMap<&str, (&Judged, u32, bool)> = BTreeMap::new();
@@ -401,8 +362,6 @@ fn text<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(Value::as_str)
 }
 
-/// The `devices` answer of a host without device state: every backend this
-/// build has, and the start-up choice with its reason.
 pub fn device_json(sel: &noto_ml::Selection) -> Value {
     json!({
         "backends": noto_ml::probe_backends(),
@@ -413,9 +372,6 @@ pub fn device_json(sel: &noto_ml::Selection) -> Value {
 }
 
 impl Runtime {
-    /// The integrated test drives the world itself; stepping it or adding
-    /// quests from outside would mix into the recording. A live recording is
-    /// the play loop's own (see [`Runtime::live_running`]).
     fn refuse_during_test(&self) -> Result<(), String> {
         match self.test_session().filter(|t| !t.live).map(|t| t.phase) {
             Some(crate::TestPhase::Game) | Some(crate::TestPhase::Perceive) | Some(crate::TestPhase::Decide) => {
@@ -425,13 +381,10 @@ impl Runtime {
         }
     }
 
-    /// A live recording that has not finished yet.
     pub fn live_running(&self) -> bool {
         self.test_session().is_some_and(|t| t.live && t.phase != crate::TestPhase::Done)
     }
 
-    /// What the play loop needs to know about the recording (the timeline asks
-    /// `test_status` for the rest when these numbers change).
     fn live_brief(&self) -> Value {
         match self.test_session() {
             None => json!({"active": false, "queued": self.live_queue.len()}),
@@ -445,7 +398,6 @@ impl Runtime {
         }
     }
 
-    /// Starts the next queued command as a live recording when nothing runs.
     fn live_pump(&mut self) {
         if self.live_running() || self.busy() {
             return;
@@ -457,14 +409,10 @@ impl Runtime {
         }
     }
 
-    // ----- the ten commands -----
-
-    /// `world_new({seed, size, config, base})`: a fresh world, and its snapshot.
     pub fn api_world_new(&mut self, seed: u64, size: usize, config: Option<NotoConfig>, base: Option<&str>) -> Result<Value, String> {
         if !(MIN_CELLS..=MAX_CELLS).contains(&size) {
             return Err(format!("size 는 {MIN_CELLS}~{MAX_CELLS} 셀이어야 합니다 (받은 값 {size})"));
         }
-        // A new world ends any integrated test that was running.
         if self.test_session().is_some() {
             let _ = self.api_test_call("test_cancel", &Value::Null);
         }
@@ -480,9 +428,6 @@ impl Runtime {
         Ok(snapshot_json(&self.snapshot()))
     }
 
-    /// `sim_step({ticks})`: runs ticks, answers the new state and the notable
-    /// log lines. With a live recording on, the ticks advance the recording
-    /// (the game pass, then perception, then the ML decision pass).
     pub fn api_sim_step(&mut self, ticks: u32) -> Result<Value, String> {
         self.refuse_during_test()?;
         let ticks = ticks.clamp(1, 200);
@@ -505,9 +450,6 @@ impl Runtime {
         }))
     }
 
-    /// `inventory_drop({item, amount})`: a quest that sets carried items down
-    /// here (onto a waypoint's pile when one is in reach). `item` null drops
-    /// everything, `amount` null all of that kind.
     pub fn api_inventory_drop(&mut self, item: Option<&str>, amount: Option<u32>) -> Result<Value, String> {
         self.refuse_during_test()?;
         if self.world().agent.carried.is_empty() {
@@ -527,7 +469,6 @@ impl Runtime {
         Ok(json!({"ok": true, "quest_id": id, "quests": self.api_quest_list()?}))
     }
 
-    /// `world_reset()`: the world as its seed made it, the body as it is.
     pub fn api_world_reset(&mut self) -> Result<Value, String> {
         if self.test_session().is_some() {
             let _ = self.api_test_call("test_cancel", &Value::Null);
@@ -537,15 +478,11 @@ impl Runtime {
         Ok(json!({"snapshot": snapshot_json(&self.snapshot()), "quests": self.api_quest_list()?, "body": self.api_body_status()?}))
     }
 
-    /// `body_reset()`: battery, joint heat and wear back to rested.
     pub fn api_body_reset(&mut self) -> Result<Value, String> {
         self.reset_body();
         Ok(json!({"snapshot": snapshot_json(&self.snapshot()), "body": self.api_body_status()?}))
     }
 
-    /// `world_terrain()`: the height field and ground kinds, once per world.
-    /// Rows go along the simulator's `z` from 0, which the UI draws at the top
-    /// (`y = depth`); see the module comment on the flip.
     pub fn api_world_terrain(&self) -> Result<Value, String> {
         let g = self.world().terrain_grid();
         let mut v = json!({
@@ -554,17 +491,12 @@ impl Runtime {
             "ground_kinds": world_sim::Ground::ALL.iter().map(|k| json!({"code": k.code(), "id": k.id(), "label_ko": k.label_ko(), "color": k.color()})).collect::<Vec<_>>(),
             "layout": self.world().layout,
         });
-        // With a site: what each curb is (0 kerb, 1 stair tread, 2 raised floor, 3 ramp), row by row like the heights.
         if !g.curb_kind.is_empty() {
             v["curb_kind"] = json!(g.curb_kind);
         }
         Ok(v)
     }
 
-    /// `physics_status()`: the ground under the robot and what it does to the
-    /// five effects now — the friction picture, each joint's heat and life
-    /// used, the cargo the drive carries here, the world's condition scored as
-    /// an effects benchmark scenario, and the ground table.
     pub fn api_physics_status(&self) -> Value {
         let w = self.world();
         let (post, state) = w.posture_now();
@@ -602,9 +534,6 @@ impl Runtime {
         })
     }
 
-    /// `act_status()`: the action being played (how far in, its physics
-    /// moments so far), the last one finished with its numbers, the walk's
-    /// steps and slips, and the focus views of now.
     pub fn api_act_status(&self) -> Value {
         let w = self.world();
         let brief = |r: &noto_core::act::ActRollout, upto: f32| {
@@ -626,11 +555,6 @@ impl Runtime {
         })
     }
 
-    /// `world_frame({width, height, quality, view})`: a WebP screenshot and the
-    /// boxes of the last scan. `view` is `agent`, `top`, `chase:<orbit°>`,
-    /// `focus:<hand|side|low>` or `iso:<direction 0-3>:<zoom>[:30]`
-    /// (`views::parse_view`; an unknown id is an error); a focus view also
-    /// returns the focus views of the instant (`focus`, as a keyframe's).
     pub fn api_world_frame(&mut self, width: u32, height: u32, quality: f32, view: &str) -> Result<Value, String> {
         let view = crate::views::parse_view(view)?;
         let view_id = if view == FrameView::Agent { "agent" } else { "other" };
@@ -660,9 +584,6 @@ impl Runtime {
         }))
     }
 
-    /// The head camera now, for the UI: where it is, how it is turned by the
-    /// body and the neck, how it shakes and blurs, and how far the robot's
-    /// own estimate of it is off (the gyro's random walk over the shake).
     pub fn head_view_json(&self) -> Value {
         let w = self.world();
         let hv = w.head_view(&self.cam);
@@ -683,7 +604,6 @@ impl Runtime {
         })
     }
 
-    /// `depth_view({quality})`: the depth model on the head camera's view now, beside the renderer's depth.
     pub fn api_depth_view(&mut self, quality: f32) -> Result<Value, String> {
         let d = self.depth_view(quality).map_err(|e| format!("{e:#}"))?;
         Ok(json!({
@@ -695,14 +615,10 @@ impl Runtime {
         }))
     }
 
-    /// `command_submit({text})`: parses a typed command and queues its quest.
     pub fn api_command_submit(&mut self, input: &str) -> Result<Value, String> {
         self.api_command_submit_rec(input, false)
     }
 
-    /// `command_submit({text, record})`: with `record`, the command is
-    /// recorded as a live integrated test (three timeline rows) when nothing
-    /// runs, else it waits its turn; a stop always acts at once.
     pub fn api_command_submit_rec(&mut self, input: &str, record: bool) -> Result<Value, String> {
         self.refuse_during_test()?;
         if !record {
@@ -711,7 +627,6 @@ impl Runtime {
         }
         let probe = self.parser().parse(input, None);
         if matches!(probe.plan, Some(Plan::Stop)) {
-            // A stop acts at once: the recording, the waiting commands, the quests.
             self.live_queue.clear();
             if self.live_running() {
                 let _ = self.api_test_call("test_cancel", &Value::Null);
@@ -737,7 +652,6 @@ impl Runtime {
         serde_json::to_value(self.quests()).map_err(|e| e.to_string())
     }
 
-    /// `perception_scan({topK})`: looks now and answers one row per label.
     pub fn api_perception_scan(&mut self, top_k: usize) -> Result<Value, String> {
         self.scan_now("manual").map_err(|e| e.to_string())?;
         let r = self.last_scan().ok_or("스캔 결과가 없습니다")?;
@@ -758,12 +672,10 @@ impl Runtime {
         serde_json::to_value(self.body_status()).map_err(|e| e.to_string())
     }
 
-    /// `sds_status()`: the SDS tables plus what the precision gates have done.
     pub fn api_sds_status(&self) -> Result<Value, String> {
         let mut v = serde_json::to_value(self.sds_status()).map_err(|e| e.to_string())?;
         let g = self.gates();
         let landmarks = g.landmarks();
-        // The pairs the time-series tab can chart: only these have a history.
         let forecastable: Vec<Value> = g
             .series_labels()
             .into_iter()
@@ -788,11 +700,6 @@ impl Runtime {
         Ok(v)
     }
 
-    /// `ts_forecast({scope, axis})`: history and forecast of a score or margin series.
-    ///
-    /// The SDS keeps running statistics, not histories. The only histories are
-    /// the per-label score and margin series of the precision gates, so those
-    /// are the axes that can be forecast; anything else answers with a reason.
     pub fn api_ts_forecast(&self, scope: &str, axis: &str) -> Result<Value, String> {
         let label = scope.split('|').nth(1).unwrap_or("").trim();
         if label.is_empty() {
@@ -821,23 +728,12 @@ impl Runtime {
         }))
     }
 
-    /// `log_tail({afterSeq, limit, category})`.
     pub fn api_log_tail(&self, after_seq: u64, limit: usize, category: Option<&str>) -> Result<Value, String> {
         let cat = category.filter(|c| !c.is_empty());
         let (lines, next) = self.log_tail(after_seq, limit.clamp(1, 2000), cat);
         Ok(json!({"lines": lines.iter().map(log_json).collect::<Vec<_>>(), "next_seq": next}))
     }
 
-    // ----- by name -----
-
-    /// Answers a command by name with the JSON arguments the UI sends (camelCase keys).
-    /// `tips_use` and `sam_use` for a host without its own device state (the
-    /// development server): the device is the start-up choice
-    /// ([`noto_ml::preferred`]: `NOTO_DEVICE`, else the first GPU that opens),
-    /// the folder `dir`, else the model's environment variable, else
-    /// `models/...` under the working directory. `enabled: false` goes back to
-    /// the stand-in. The Tauri app has its own commands that use the device
-    /// picked in the UI.
     pub fn api_model_use(&mut self, which: &str, args: &Value) -> Result<Value, String> {
         let enabled = args.get("enabled").and_then(Value::as_bool).unwrap_or(true);
         let sel = noto_ml::preferred();
@@ -862,8 +758,6 @@ impl Runtime {
         Ok(v)
     }
 
-    /// Which recogniser and which time-series model are in use right now. The
-    /// host (Tauri) adds the model folders and whether their files exist.
     pub fn api_models_status(&self) -> Result<Value, String> {
         let mode = self.recognizer_mode();
         Ok(json!({
@@ -1003,7 +897,6 @@ mod tests {
         assert_eq!(j["stairs"]["risers"], h.stairs.risers);
         assert!(v["site"]["warehouse"]["shelves"].as_u64().unwrap() > 0);
         assert!(v["site"]["fixtures"].as_array().unwrap().iter().any(|f| f["kind"] == "shelf" && f["levels_m"].as_array().unwrap().len() == 3));
-        // A parcel on a shelf or a porch says so, and its height is that surface's.
         let raised: Vec<&Value> = v["drops"].as_array().unwrap().iter().filter(|x| x.get("support").is_some()).collect();
         assert!(!raised.is_empty());
         for x in raised {
@@ -1032,7 +925,6 @@ mod tests {
 
     #[test]
     fn the_flip_keeps_the_map_unmirrored() {
-        // A node on the robot's right-hand side (+z when facing +x) must be below the robot on the UI map (smaller y).
         let mut rt = rt();
         let (ax, az) = (rt.world().agent.x, rt.world().agent.z);
         rt.world_mut().agent.yaw = 0.0;
@@ -1055,7 +947,6 @@ mod tests {
         assert_eq!(v["agent"]["fingers"], 2);
         assert_eq!(v["agent"]["base"], "track");
         assert_eq!(v["bounds"][0].as_f64().unwrap(), 24.0);
-        // a refused request leaves the world as it was
         assert!(rt.api_world_new(9, 8, None, None).is_err());
         assert_eq!(rt.snapshot().seed, 5);
     }
@@ -1208,7 +1099,6 @@ mod tests {
             "decoder_mode": "common_channel", "use_decoder": true, "adaptive_patching_levels": 0
         }))
         .unwrap();
-        // Weights are all zero: this checks the wiring, not forecast quality.
         let vm = VarMap::new();
         let vb = VarBuilder::from_varmap(&vm, DType::F32, &Device::Cpu);
         let ttm = Arc::new(TtmForecaster::from_varbuilder(cfg, vb, std::path::PathBuf::from("zeros")).expect("model builds"));
@@ -1232,7 +1122,6 @@ mod tests {
         assert!(weights.iter().any(|w| w["method"] == "ttm"), "ttm takes part: {after}");
         assert_eq!(after["point"].as_array().unwrap().len(), 16);
         assert!(after["point"].as_array().unwrap().iter().all(|v| v.as_f64().is_some_and(|x| x.is_finite())));
-        // the log says so, and detaching goes back
         let ts = rt.api_log_tail(0, 50, Some("ts")).unwrap();
         assert!(ts["lines"].as_array().unwrap().iter().any(|l| l["msg"].as_str().unwrap().contains("Granite TTM 연결")));
         rt.attach_ttm(None);

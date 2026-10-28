@@ -1,42 +1,3 @@
-//! [MLAB] The controlled A/B of the ML tracks: the stand-ins against the real
-//! models (TIPSv2 DPT, SigLIP2, MobileSAM) on identical keyframes, one factor
-//! at a time, before and after the v1.0 fixes (`docs/research/ml-ab.md`).
-//!
-//!     set SIGLIP2_DIR=...\models\siglip2-base-patch16-naflex
-//!     set TIPS_DIR=...\models\tipsv2-b14-dpt
-//!     set SAM_DIR=...\models\sam
-//!     set RUNTIME_DIR=...\runtime            (its `bank` keeps the phrase vectors)
-//!     test_cuda.bat -p noto-runtime --test ml_ab -- --ignored --nocapture
-//!
-//! Every scene is the seed's world with its nodes and drops cleared, one
-//! target placed in front of the robot (plus a distractor), seen from the
-//! head camera at a distance and a head tilt; some scenes have no target. The
-//! keyframe is made by the runtime's own capture code (`record::odometry`,
-//! `record::intrinsics`, `KeyTruth::capture`, WebP q70), so every arm sees the
-//! same bytes. The arms:
-//!
-//! | arm | depth | semantic location | masks |
-//! |---|---|---|---|
-//! | A0 | stand-in | stand-in | region-grow |
-//! | A1 | TIPS | stand-in | region-grow |
-//! | A2 | stand-in | SigLIP2 dense | region-grow |
-//! | A3 | stand-in | stand-in | MobileSAM |
-//! | A4 | TIPS | SigLIP2 dense | MobileSAM |
-//! | A5 | TIPS + v1.0 | SigLIP2 + v1.0 | MobileSAM |
-//!
-//! A0–A4 run the port as it was before v1.0 (plain bilinear SigLIP2
-//! positions, exact-GELU TIPS readout); A5 runs the v1.0 port and fixes.
-//! Per frame it measures depth (raw, median-aligned, oracle least-squares in
-//! disparity, ground-aligned; banded by true range; on the target), the
-//! locator's presence AUROC/AP per label, the peak inside the true box, the
-//! tracker's IoU with the truth and the target range error, and the tile
-//! recogniser's precision/recall after the score and margin gates against the
-//! oracle. The calibration of A5's gate is fitted on the fit seeds and scored
-//! on the others; the fitted table is written to `$MLAB_OUT/ml_calib.json`.
-//!
-//! Group B references below are for scoring only; the engine never reads them
-//! (`the_engine_never_names_an_ml_benchmark_source`).
-
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
@@ -58,49 +19,22 @@ use world_sim::{decode_webp, encode_webp, Camera, ItemKind, NodeKind, ObjectClas
 
 const LEX: &str = include_str!("../../../data/world_lexicon.json");
 
-// ----- references (benchmark side only; the engine never reads these) -----
-
-/// Zero-shot relative depth on a rendered movie (Sintel) after per-image
-/// affine alignment: DPT-Large AbsRel 0.270 (Ranftl, Bochkovskiy & Koltun,
-/// ICCV 2021, Table 1); Depth Anything ViT-L 0.458, MiDaS v3.1 0.587 (Yang et
-/// al., CVPR 2024, Table 2). The renderer's oracle-aligned TIPS AbsRel is read
-/// against the spread of these three.
 const SINTEL_ALIGNED_ABSREL: (f32, f32) = (0.438, 0.160);
 const CITE_SINTEL: &str = "렌더 영화(Sintel) 제로샷 깊이, 이미지별 아핀 정렬 후 AbsRel: DPT-L 0.270 (Ranftl 2021) · Depth Anything 0.458 · MiDaS 3.1 0.587 (Yang 2024)";
-/// Scale from the known camera height over the ground plane against the
-/// ground-truth median scale on KITTI: AbsRel 0.118 vs 0.113 (Xue et al.,
-/// DNet, IROS 2020): a ratio of 1.044.
 const DNET_GROUND_OVER_MEDIAN: f32 = 0.118 / 0.113;
 const CITE_DNET: &str = "카메라 높이(지면)로 정한 축척 대 정답 중앙값 축척: KITTI AbsRel 0.118 / 0.113 = 1.04 (Xue 2020, DNet)";
-/// Metric depth outside the training domain (no alignment): an NYU-finetuned
-/// head on Hypersim AbsRel 0.363, delta1 0.361 (Yang et al. 2024, ZoeDepth framework).
 const OFFDOMAIN_METRIC_ABSREL: f32 = 0.363;
 const CITE_OFFDOMAIN: &str = "학습 영역 밖 미터 깊이(정렬 없음): NYU 미세조정 헤드를 Hypersim에 AbsRel 0.363 · δ1 0.361 (Yang 2024)";
-/// Training-free patch-text location quality: raw CLIP patch tokens 14.1 mIoU
-/// against 30.3 for the MaskCLIP value path (Wang, Mei & Yuille, SCLIP, ECCV
-/// 2024, 8-benchmark average) — the value path more than doubles a raw readout.
 const CITE_SCLIP: &str = "학습 없는 패치-텍스트 위치: CLIP 패치 원시 14.1 대 MaskCLIP 값 경로 30.3 mIoU (Wang 2024, SCLIP 8개 평균)";
-/// Prompt ensembling: about +3.5 points of zero-shot accuracy on top of a
-/// single template (Radford et al., CLIP, ICML 2021).
 const CITE_ENSEMBLE: &str = "프롬프트 앙상블: 단일 템플릿보다 제로샷 정확도 약 +3.5점 (Radford 2021, CLIP)";
-/// Zero-shot calibration: ECE 6.3–6.7% before temperature scaling, 1.4–2.2%
-/// after (LeVine et al. 2023, LAION ViT-B/16 and ViT-L/14).
 const CITE_CALIB: &str = "제로샷 보정: 온도 보정 전 ECE 6.3–6.7% → 후 1.4–2.2% (LeVine 2023)";
 
-// ----- the grid -----
-
 const TARGETS: [&str; 9] = ["tree", "boulder", "coal_ore", "iron_ore_node", "log", "stone", "coal", "iron_ore", "parcel"];
-/// A label counts as in view from this many pixels (full keyframe), and as
-/// absent at zero; in between it is not scored for presence.
 const PRESENT_PX: u32 = 16;
-/// Calibration targets of the A5 gate: a threshold at this precision on the
-/// fit seeds, else at this false-positive rate. Engineering choices.
 const CALIB_PRECISION: f32 = 0.9;
 const CALIB_FPR: f32 = 0.05;
-/// Scan gates as the runtime's defaults (`GateCfg`).
 const GATE_SCORE: f32 = 0.30;
 const GATE_MARGIN: f32 = 0.04;
-/// One locator patch is about 20 px of a 384-px keyframe.
 const PATCH_PX: f32 = 20.0;
 
 #[derive(Clone, Debug)]
@@ -108,7 +42,6 @@ struct Scene {
     seed: u64,
     terrain: TerrainKind,
     base: BaseKind,
-    /// What is placed and what the decision asks for (`query`).
     target: Option<&'static str>,
     query: &'static str,
     distractor: Option<&'static str>,
@@ -147,7 +80,6 @@ fn scenes() -> Vec<Scene> {
     let tilts: Vec<f32> = env_list("MLAB_TILTS", &[0.0, 30.0]);
     let mut out = Vec::new();
     for &seed in &seeds {
-        // Seeds 1–2 legs, 3–4 wheels; odd seeds fit the calibration, even ones score it.
         let base = if seed <= 2 { BaseKind::HumanFoot } else { BaseKind::Wheel };
         for terrain in [TerrainKind::Open, TerrainKind::Rugged] {
             for (k, &t) in TARGETS.iter().enumerate() {
@@ -158,7 +90,6 @@ fn scenes() -> Vec<Scene> {
                     }
                 }
             }
-            // Nothing asked for is there: only a look-alike, or nothing at all.
             for (k, &tilt) in tilts.iter().enumerate() {
                 for (j, q) in ["parcel", "log", "stone"].into_iter().enumerate() {
                     let distractor = if j == 2 { None } else { Some(look_alike_of(q)) };
@@ -175,7 +106,6 @@ fn base_world(seed: u64, terrain: TerrainKind, base: BaseKind) -> World {
     Runtime::new(cfg, LEX, None).expect("runtime").world().clone()
 }
 
-/// Places a vision label at `(x, z)`; returns its packed id.
 fn place(w: &mut World, label: &str, id: u32, x: f32, z: f32) -> u32 {
     let node = |k| Node { id, kind: k, x, z, hp: 10.0, max_hp: 10.0 };
     let item = |k| DropItem::whole(id, k, x, z);
@@ -194,8 +124,6 @@ fn place(w: &mut World, label: &str, id: u32, x: f32, z: f32) -> u32 {
     pack_id(class, id)
 }
 
-/// One captured scene: the keyframe as the runtime records it, plus what the
-/// scan path needs (the full frame, the world, the camera).
 struct Shot {
     rgb: Rgb,
     intr: Intrinsics,
@@ -223,7 +151,6 @@ fn shoot(bases: &mut BTreeMap<(u64, u8, u8), World>, s: &Scene) -> Shot {
         place(&mut w, d, 9002, px, pz);
     }
     let cam = Camera { pitch_deg: Camera::default().pitch_deg - s.tilt_deg, ..Camera::default() };
-    // The runtime's capture: the renderer's frame, WebP q70 for the models, the truth at half size.
     let frame = w.render(&cam);
     let enc = encode_webp(&frame.rgb, frame.width as u32, frame.height as u32, 70.0).expect("webp");
     let (dw, dh, data) = decode_webp(&enc.bytes).expect("webp");
@@ -231,8 +158,6 @@ fn shoot(bases: &mut BTreeMap<(u64, u8, u8), World>, s: &Scene) -> Shot {
     let truth = KeyTruth::capture(&w, &frame);
     Shot { rgb, intr: intrinsics(&w, &cam), pose: odometry(&w, &cam), truth, world: w, frame, cam, target_raw }
 }
-
-// ----- the bookkeeping -----
 
 #[derive(Default)]
 struct Book {
@@ -291,10 +216,6 @@ impl Book {
     }
 }
 
-// ----- depth -----
-
-/// AbsRel, δ1, RMSE and coverage of `pred` on the truth pixels within `cap`,
-/// plus AbsRel per true-range band and on the target's pixels.
 struct DepthEval {
     absrel: f32,
     delta1: f32,
@@ -352,7 +273,6 @@ fn depth_eval(pred: &DepthMap, truth: &KeyTruth, cap: f32, target_raw: Option<u3
     })
 }
 
-/// The best a per-frame scale and shift in disparity could do (truth in the loop: harness only).
 fn oracle_lsq(pred: &DepthMap, truth: &KeyTruth, cap: f32) -> DepthMap {
     let (mut sp, mut sq, mut spp, mut spq, mut n) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
     for y in 0..truth.height {
@@ -396,17 +316,10 @@ fn record_depth(book: &mut Book, arm: &str, pred: &DepthMap, truth: &KeyTruth, t
     }
 }
 
-/// Pixel samples of `ln(pred/true)` against `ln(true)`, summed per frame, for
-/// an error model of the depth model: `pred = e^(a + η + ε) · true^(1+b)`
-/// with a per-frame offset η and a per-pixel residual ε (the honest depth
-/// stand-in, `DepthErrModel`). Also what the model answers where the truth
-/// is sky.
 #[derive(Default)]
 struct ErrFit {
-    /// Per frame: n, Σx, Σy, Σxx, Σxy, Σyy with x = ln t, y = ln(p/t).
     frames: Vec<[f64; 6]>,
     sky: Vec<f32>,
-    /// Per metre of true depth (0–40 m): pixels answered, pixels "unknown".
     known: Vec<(u32, u32)>,
 }
 
@@ -418,7 +331,6 @@ impl ErrFit {
                 let t = truth.depth[(y * truth.width + x) as usize];
                 let p = pred.at_scaled(x as f32 + 0.5, y as f32 + 0.5, truth.width, truth.height);
                 if !t.is_finite() {
-                    // What the model says where the truth is sky (INFINITY: unknown).
                     if p > 0.0 {
                         self.sky.push(p);
                     }
@@ -451,7 +363,6 @@ impl ErrFit {
         }
     }
 
-    /// `(a, b, frame sd, pixel sd, median sky answer)`.
     fn fit(&self) -> Option<(f64, f64, f64, f64, f32)> {
         let mut t = [0.0f64; 6];
         for f in &self.frames {
@@ -470,7 +381,6 @@ impl ErrFit {
         for f in &self.frames {
             let (nf, mx, my) = (f[0], f[1] / f[0], f[2] / f[0]);
             between.push(my - a - b * mx);
-            // Σ(y − b·x − (ȳ − b·x̄))² from the sums.
             within += (f[5] - 2.0 * b * f[4] + b * b * f[3]) - nf * (my - b * mx).powi(2);
             wn += nf;
         }
@@ -481,23 +391,16 @@ impl ErrFit {
         Some((a, b, tau, (within / wn.max(1.0)).max(0.0).sqrt(), sky.get(sky.len() / 2).copied().unwrap_or(f32::INFINITY)))
     }
 
-    /// The nearest true depth (whole metres, at least 50 pixels) from which
-    /// most pixels are "unknown".
     fn unknown_beyond(&self) -> f32 {
         self.known.iter().enumerate().find(|(_, (k, u))| k + u >= 50 && u > k).map_or(f32::INFINITY, |(m, _)| m as f32)
     }
 
-    /// The fit as the honest stand-in's error model (`cap_m`: the model's
-    /// ceiling; the blur radius is the stand-in's estimate).
     fn model(&self, cap_m: f32) -> Option<DepthErrModel> {
         let (a, b, tau, sigma, sky) = self.fit()?;
         Some(DepthErrModel { a: a as f32, b: b as f32, frame_sd: tau as f32, patch_sd: sigma as f32, sky_m: sky, cap_m, unknown_beyond_m: self.unknown_beyond(), ..DepthErrModel::TIPS_GROUND })
     }
 }
 
-// ----- given models: one computation shared by several arms -----
-
-/// A depth "model" that returns the map the harness computed for this frame.
 struct GivenDepth {
     mode: String,
     max: Option<f32>,
@@ -516,7 +419,6 @@ impl DepthModel for GivenDepth {
     }
 }
 
-/// A locator that returns the points the harness computed for this frame.
 struct GivenPoints {
     mode: String,
     points: Arc<Mutex<Vec<SemanticPoint>>>,
@@ -542,7 +444,6 @@ struct Arm {
     pipe: MlPipeline,
     depth: Src,
     locate: Src,
-    /// Error models of honest stand-ins (fitted on the fit seeds).
     honest: Option<(DepthErrModel, LocateErrModel)>,
 }
 
@@ -559,10 +460,8 @@ fn arm(name: &'static str, lex: &Lexicon, depth: Src, locate: Src, tracker: Box<
     Arm { name, pipe, depth, locate, honest: None }
 }
 
-/// Runs one arm's chain on a shot and books the tracker and range numbers.
 fn run_arm(book: &mut Book, a: &mut Arm, shot: &Shot, scene: &Scene, height: Option<noto_vision::align::HeightFn>) {
     a.pipe.reset();
-    // The stand-ins are re-seeded per scene so every arm gets the same draws.
     if a.depth == Src::StandIn {
         let mut d = DepthStandIn::new(scene.seed * 1000 + scene.dist_m as u64);
         d.err = a.honest.map(|h| h.0);
@@ -573,8 +472,6 @@ fn run_arm(book: &mut Book, a: &mut Arm, shot: &Shot, scene: &Scene, height: Opt
         l.err = a.honest.map(|h| h.1);
         a.pipe.locate = LocateEngine::StandIn(l);
     }
-    // The runtime's default floors (`mlsds::default_floor`): the chosen stand-in's
-    // 0.35; the real locators and the honest stand-in are gated by calibration.
     let floor_default = if a.locate == Src::StandIn && a.honest.is_none() { 0.35 } else { 0.0 };
     let wanted = vec![scene.query.to_string()];
     let out = a.pipe.analyse_with(&shot.rgb, &shot.intr, &shot.pose, Some(&shot.truth), &wanted, &|_| floor_default, None, height).expect("analyse");
@@ -599,7 +496,6 @@ fn run_arm(book: &mut Book, a: &mut Arm, shot: &Shot, scene: &Scene, height: Opt
         }
     }
     if scene.target.is_none() {
-        // Asked for something that is not there: any track is a phantom.
         book.flag(format!("{name}/track/phantom_when_absent"), tracked);
     }
     if let Some(f) = out.align {
@@ -622,10 +518,6 @@ fn pack_raw(o: &world_sim::VisibleObject) -> Option<u32> {
     Some(pack_id(class, id))
 }
 
-// ----- semantic location -----
-
-/// Presence label of every target label in a shot: `Some(true)` in view
-/// (≥ PRESENT_PX), `Some(false)` absent, `None` too small to say.
 fn presence(shot: &Shot, label: &str) -> Option<bool> {
     let px = shot.truth.objects.iter().filter(|o| o.label == label).map(|o| o.pixels).max().unwrap_or(0);
     if px >= PRESENT_PX {
@@ -656,7 +548,6 @@ fn locate_err(shot: &Shot, p: &SemanticPoint) -> Option<f32> {
         .min_by(f32::total_cmp)
 }
 
-/// Books the presence statistics and the peak hit of every label for one locator variant.
 fn record_locate(book: &mut Book, variant: &str, shot: &Shot, scene: &Scene, points: &[SemanticPoint], per_frame: &mut Vec<serde_json::Value>) {
     for label in TARGETS {
         let Some(present) = presence(shot, label) else { continue };
@@ -680,27 +571,18 @@ fn record_locate(book: &mut Book, variant: &str, shot: &Shot, scene: &Scene, poi
     }
 }
 
-// ----- the tile scan -----
-
-/// One scan candidate as the calibration sees it: its label, raw (or
-/// calibrated) score, margin, and whether it lies within the gates' 1 m of a
-/// visible object of that label.
 struct ScanCand {
     label: String,
     score: f32,
     tp: bool,
 }
 
-/// What one scan did against the truth: every candidate, every visible
-/// target object (its pixels and whether a passing candidate named it within
-/// 1 m), and the passing candidates' outcomes.
 #[derive(Default)]
 struct ScanRec {
     cands: Vec<ScanCand>,
     objects: Vec<(u32, bool)>,
     false_pass: u32,
     pos_err: Vec<f32>,
-    /// (score, margin) of passing candidates that were right, and wrong.
     pass_true: Vec<(f32, f32)>,
     pass_false: Vec<(f32, f32)>,
 }
@@ -750,7 +632,6 @@ fn record_scan(book: &mut Book, name: &str, shot: &Shot, rec: &mut dyn Recognize
     r
 }
 
-/// The honest scan stand-in's error model from scans of the real recogniser.
 #[derive(Default)]
 struct ScanFit {
     lnpx: Vec<f32>,
@@ -780,7 +661,6 @@ impl ScanFit {
             return None;
         }
         let pos = self.det.iter().filter(|d| **d).count();
-        // Never or always detected: a flat logistic at the observed (smoothed) rate.
         let (det_a, det_b) = match noto_vision::calib::platt_fit(&self.lnpx, &self.det) {
             Some(f) => f,
             None => {
@@ -799,7 +679,6 @@ impl ScanFit {
         let st: Vec<f32> = self.pass_true.iter().map(|x| x.0).collect();
         let sf: Vec<f32> = self.pass_false.iter().map(|x| x.0).collect();
         let mg: Vec<f32> = self.pass_true.iter().chain(&self.pass_false).map(|x| x.1).collect();
-        // Radial errors of a 2-D Gaussian: E[d²] = 2σ².
         let pos_sd_m = if self.pos.is_empty() { 0.0 } else { (self.pos.iter().map(|d| d * d).sum::<f32>() / (2.0 * self.pos.len() as f32)).sqrt() };
         Some(noto_runtime::perception::ScanErrModel {
             det_a,
@@ -815,8 +694,6 @@ impl ScanFit {
     }
 }
 
-/// Per-label Platt maps of the tile score, with a pooled `*` entry for labels
-/// with too few candidates of either kind.
 fn fit_scan_calibration(cands: &[ScanCand]) -> CalibTable {
     let mut t = CalibTable { mode: noto_runtime::embedding::SCAN_CALIB_MODE.into(), statistic: "tile_score".into(), note: "ml_ab.rs 맞춤 시드: 후보가 1 m 안의 같은 라벨 물체인 확률의 Platt 맞춤".into(), ..CalibTable::default() };
     let logit = |p: f32| (p / (1.0 - p)).ln();
@@ -825,15 +702,10 @@ fn fit_scan_calibration(cands: &[ScanCand]) -> CalibTable {
         if h.len() < 10 {
             return;
         }
-        // A score that does not rank right candidates above wrong ones (no
-        // positive slope), or too few right ones to tell, says nothing: the
-        // label's base rate, flat.
         let rate = (pos as f32 + 0.5) / (h.len() as f32 + 1.0);
         let flat = (0.0f32, logit(rate));
         let fit = if pos >= 5 { noto_vision::calib::platt_fit(&s, &h).filter(|f| f.0 > 0.0) } else { None };
         if let Some((a, b)) = fit.or(Some(flat)) {
-            // The raw score at which the probability reaches the gates' floor
-            // (JSON has no infinity: a fit that never gets there says f32::MAX).
             let threshold = if a > 0.0 { (logit(GATE_SCORE) - b) / a } else { f32::MAX };
             t.labels.insert(key.into(), noto_vision::LabelCalib { threshold, platt: Some((a, b)), positives: pos as u32, negatives: (h.len() - pos) as u32, precision: None, recall: None });
         }
@@ -846,11 +718,6 @@ fn fit_scan_calibration(cands: &[ScanCand]) -> CalibTable {
     t
 }
 
-/// The honest locate stand-in's outcome model from the fit seeds' records of
-/// one locator variant, gated by that variant's table: how often a label in
-/// view gets a passing point on its object (logistic in ln pixels), how often
-/// a passing point lands elsewhere or appears for an absent label, and the
-/// calibrated scores of passing and blocked points.
 fn locate_errmodel(per_frame: &[serde_json::Value], variant: &str, table: &CalibTable) -> Option<LocateErrModel> {
     let (mut lnpx, mut hits) = (Vec::new(), Vec::new());
     let (mut miss_pass, mut absent_pass) = (Book::default(), Book::default());
@@ -889,7 +756,6 @@ fn locate_errmodel(per_frame: &[serde_json::Value], variant: &str, table: &Calib
         }
     };
     let ms = |b: &Book, dflt: (f32, f32)| b.mean("p").map_or(dflt, |(m, _)| (m, b.sd("p").unwrap_or(0.0)));
-    // The probability each label's threshold stands for, averaged.
     let at: Vec<f32> = table.labels.values().filter(|c| c.threshold.is_finite() && c.threshold < f32::MAX).filter_map(|c| c.probability(c.threshold)).collect();
     let gate_p = if at.is_empty() { 0.5 } else { at.iter().sum::<f32>() / at.len() as f32 };
     Some(LocateErrModel {
@@ -902,8 +768,6 @@ fn locate_errmodel(per_frame: &[serde_json::Value], variant: &str, table: &Calib
         gate_p,
     })
 }
-
-// ----- the harness -----
 
 fn device() -> candle_core::Device {
     noto_ml::preferred().backend.device(0).expect("device")
@@ -935,8 +799,6 @@ fn print_rank(book: &Book, variant: &str, stat: &str) {
     println!("[MLAB] {variant}/eval/{stat} 라벨별 AUROC: {}", per.join(" · "));
 }
 
-/// SigLIP2 behind a lock, so one loaded model serves the old and the v1.0
-/// port (the position filter is switched between them on the same frame).
 struct Sig(Arc<RwLock<noto_ml::Siglip2>>);
 
 impl noto_ml::ImageEmbedder for Sig {
@@ -961,7 +823,6 @@ impl noto_ml::TextEmbedder for Sig {
     }
 }
 
-/// Wall time per stage, seconds.
 #[derive(Default)]
 struct Timers(BTreeMap<&'static str, f64>);
 
@@ -987,13 +848,11 @@ fn ml_ab_benchmark() {
     let (scale, bias) = siglip.logit_scale_bias();
     println!("[MLAB] 장치 {} · SigLIP2 exp(t) {scale:.1}, b {bias:.2} (짝 확률 0.5인 코사인 {:.3})", noto_ml::device_label(&dev), -bias / scale);
     let mut scenes = scenes();
-    // Fit seeds first: the gate and the scan calibration are fitted on them before the others are scored.
     scenes.sort_by_key(|s| !s.fit());
     let n_fit = scenes.iter().filter(|s| s.fit()).count();
     println!("[MLAB] 장면 {}개 (맞춤 {n_fit}, 평가 {}) · 시드 {:?}", scenes.len(), scenes.len() - n_fit, env_list::<u64>("MLAB_SEEDS", &[1, 2, 3, 4]));
     let labels: Vec<LabelPrompt> = MlPipeline::stand_in(&lex, 7).labels().to_vec();
 
-    // The text side of every locator variant (text vectors do not depend on the image tower's switch).
     let variants: Vec<(&str, LocateCfg)> = vec![
         ("loc/old_pairprob", LocateCfg::default()),
         ("loc/new_pairprob", LocateCfg::default()),
@@ -1033,9 +892,6 @@ fn ml_ab_benchmark() {
         arm("A4", &lex, Src::Model, Src::Model, Box::new(SamTracker::new(Arc::clone(&sam))), &d_cell, &p_cell, "tipsv2-b14-dpt", "siglip2-dense", legacy.clone()),
     ];
     let mut a4n = arm("A4new", &lex, Src::Model, Src::Model, Box::new(SamTracker::new(Arc::clone(&sam))), &d_cell, &p_cell, "tipsv2-b14-dpt", "siglip2-dense", legacy.clone());
-    // A shipped calibration (data/ml_calib.json with the dense gate and the
-    // scan table) is used from the first scene; `MLAB_REFIT=1` or an empty
-    // file fits both on the fit seeds instead.
     let shipped: Option<Vec<CalibTable>> = {
         let t = CalibTable::parse(noto_runtime::ml::ML_CALIB_JSON).unwrap_or_default();
         let dense = t.iter().any(|x| x.mode.starts_with("siglip2-dense"));
@@ -1047,7 +903,6 @@ fn ml_ab_benchmark() {
     if let Some(t) = &shipped {
         let dense = t.iter().find(|x| x.mode.starts_with("siglip2-dense")).unwrap().clone();
         let scan_t = t.iter().find(|x| x.mode == noto_runtime::embedding::SCAN_CALIB_MODE).unwrap().clone();
-        // Variant 0 is the old port; the shipped table belongs to the v1.0 port.
         let vk = (1..variants.len()).find(|k| variants[*k].1.mode() == dense.mode).unwrap_or_else(|| panic!("no locator variant scores like the shipped table {}", dense.mode));
         println!("[MLAB] 실린 보정 사용: 위치 {} · {} / 스캔 라벨 {}개", dense.mode, dense.statistic, scan_t.labels.len());
         scan_cal.set_calibration(Some(scan_t.clone()));
@@ -1063,12 +918,9 @@ fn ml_ab_benchmark() {
     let mut bases: BTreeMap<(u64, u8, u8), World> = BTreeMap::new();
     let mut scan_fit: Vec<ScanCand> = Vec::new();
     let mut errfit = ErrFit::default();
-    // The honest stand-ins' depth model: v1.0 TIPS after the ground alignment, fit seeds only.
     let mut errfit_ground = ErrFit::default();
     let mut honest: Vec<Arm> = Vec::new();
     for (i, s) in scenes.iter().enumerate() {
-        // The fit stage, once the fit seeds are done: the gate and the scan
-        // calibration (unless shipped) and the honest stand-ins.
         if i == n_fit {
             if a5.is_none() {
                 let mut best: Option<(f32, usize, &str)> = None;
@@ -1098,10 +950,6 @@ fn ml_ab_benchmark() {
                 tables = vec![table, scan_table];
                 a5 = Some(a5_arms(&lex, &prompting, &tables[0], vk, &sam, &d_cell, &p_cell));
             }
-            // The honest stand-ins, fitted on the fit seeds: the depth the v1.0
-            // path hands on (TIPS after the ground alignment), where the gated
-            // locator's peaks landed and how they scored through its table,
-            // and (with a shipped scan table) what the calibrated scan did.
             let vk = a5.as_ref().map(|a| a.2).unwrap();
             let dmodel = errfit_ground.model(f32::INFINITY);
             let lmodel = locate_errmodel(&per_frame, variants[vk].0, &tables[0]);
@@ -1125,7 +973,6 @@ fn ml_ab_benchmark() {
             }
         }
         let shot = timers.time("render", || shoot(&mut bases, s));
-        // ---------- the port as it was (A0–A4) ----------
         set_port(&*sig, &mut tips, false);
         let (raw, spread) = timers.time("tips", || tips.predict_batch_spread(&[&shot.rgb]).unwrap().pop().unwrap());
         timers.time("metrics", || {
@@ -1139,7 +986,6 @@ fn ml_ab_benchmark() {
             record_depth(&mut book, "depth/tips_oracle_lsq", &oracle_lsq(&raw, &shot.truth, 10.0), &shot.truth, shot.target_raw);
             let si = DepthStandIn::new(s.seed * 1000 + s.dist_m as u64).run(&shot.truth);
             record_depth(&mut book, "depth/standin", &si, &shot.truth, shot.target_raw);
-            // Does the bin spread flag the large errors (a pixel sample)?
             for y in (0..shot.truth.height).step_by(4) {
                 for x in (0..shot.truth.width).step_by(4) {
                     let t = shot.truth.depth[(y * shot.truth.width + x) as usize];
@@ -1166,7 +1012,6 @@ fn ml_ab_benchmark() {
         timers.time("scan_siglip", || record_scan(&mut book, "A4", &shot, &mut scan));
         timers.time("scan_siglip", || record_scan(&mut book, "A4tpl", &shot, &mut scan_tpl));
 
-        // ---------- the v1.0 port and fixes ----------
         set_port(&*sig, &mut tips, true);
         let raw1 = timers.time("tips", || tips.predict(&shot.rgb).unwrap());
         let ground0 = shot.world.surface_m(shot.pose.x, shot.pose.z);
@@ -1180,16 +1025,12 @@ fn ml_ab_benchmark() {
             }
             errfit.add_frame(&raw1, &shot.truth, 10.0);
         });
-        // The same frame without the WebP q70 round trip (cause 9: what the
-        // lossy keyframe costs the depth model).
         let lossless = Rgb::new(shot.frame.width as u32, shot.frame.height as u32, shot.frame.rgb.clone());
         let raw_ll = timers.time("tips", || tips.predict(&lossless).unwrap());
         timers.time("metrics", || {
             record_depth(&mut book, "depth/tips_v1_lossless", &raw_ll, &shot.truth, shot.target_raw);
             record_depth(&mut book, "depth/tips_v1_lossless_oracle_lsq", &oracle_lsq(&raw_ll, &shot.truth, 10.0), &shot.truth, shot.target_raw);
         });
-        // The input grid: the checkpoint's own square 448 x 448 (32 x 32 patches,
-        // the aspect squeezed) instead of the 504 x 336 that keeps it.
         tips.input_grid = InputGrid::Fixed { cols: 32, rows: 32 };
         let sq = timers.time("tips", || tips.predict(&shot.rgb).unwrap());
         tips.input_grid = InputGrid::default();
@@ -1234,7 +1075,6 @@ fn ml_ab_benchmark() {
                 pts
             })
             .collect();
-        // The contrast locator on the lossless frame (cause 9 for the locator).
         let dense_ll = timers.time("siglip_dense", || sig.0.read().unwrap().embed_dense_batch(&[lossless.to_dynamic()]).unwrap().pop().unwrap());
         let pts_ll = points_with_presence(lossless.width, lossless.height, label_heats(&dense_ll, &texts[3], &variants[3].1, scale, bias));
         record_locate(&mut book, "loc/new_contrast_lossless", &shot, s, &pts_ll, &mut per_frame);
@@ -1246,8 +1086,6 @@ fn ml_ab_benchmark() {
                 book.pair("A5raw/scan/eval_score", c.score, c.tp);
             }
         }
-        // The calibrated scan: on every scene with a shipped table (the fit
-        // seeds feed the honest scan stand-in), else on the held-out seeds.
         if scan_cal.calibration().is_some() {
             let name = if s.fit() { "A5cal_fit" } else { "A5cal" };
             let cal = timers.time("scan_siglip", || record_scan(&mut book, name, &shot, &mut scan_cal));
@@ -1263,7 +1101,6 @@ fn ml_ab_benchmark() {
         if !s.fit() {
             if let Some((x, y, vk)) = a5.as_mut() {
                 let pts = &pts_new[*vk - 1];
-                // The gate on the held-out seeds, point by point.
                 let t = &tables[0];
                 for p in pts.iter().filter(|p| TARGETS.contains(&p.label.as_str())) {
                     let (Some(c), Some(present)) = (t.labels.get(&p.label), presence(&shot, &p.label)) else { continue };
@@ -1314,7 +1151,6 @@ fn ml_ab_benchmark() {
         std::fs::write(dir.join("mlab_frames.jsonl"), lines.join("\n")).unwrap();
     }
 
-    // ---------- report ----------
     let times: Vec<String> = timers.0.iter().map(|(k, v)| format!("{k} {v:.0} s")).collect();
     println!("[MLAB] 시간: {}", times.join(" · "));
     println!("[MLAB] ===== 깊이 (진실 10 m 이하 화소; NYU 상한과 같은 범위) =====");
@@ -1384,7 +1220,6 @@ fn ml_ab_benchmark() {
         }
     }
     if shipped.is_none() {
-        // Without a shipped table the calibrated scan ran on the held-out seeds only: in-sample.
         println!("[MLAB] scan/errmodel (평가 시드, 표본 안) {:?}", scan_honest_fit.model());
     }
     for k in ["A5raw/scan/eval_score", "A5cal/scan/platt"] {
@@ -1394,7 +1229,6 @@ fn ml_ab_benchmark() {
         }
     }
 
-    // ---------- scored cells (Group B) ----------
     println!("[MLAB] ===== 기준 대비 =====");
     if let Some((v, _)) = book.mean("depth/tips_v1_oracle_lsq/absrel") {
         let z = (v - SINTEL_ALIGNED_ABSREL.0) / SINTEL_ALIGNED_ABSREL.1;
@@ -1411,8 +1245,6 @@ fn ml_ab_benchmark() {
     println!("[MLAB-SUM] {}개 장면 · {:.0} s", scenes.len(), t0.elapsed().as_secs_f32());
 }
 
-/// The v1.0 arms (chain with MobileSAM, and with the region tracker) for the
-/// locator variant `vk` gated by `table`.
 #[allow(clippy::too_many_arguments)]
 fn a5_arms(lex: &Lexicon, prompting: &VisionPrompting, table: &CalibTable, vk: usize, sam: &Arc<SamModel>, d: &Arc<Mutex<Option<DepthMap>>>, p: &Arc<Mutex<Vec<SemanticPoint>>>) -> (Arm, Arm, usize) {
     let vcfg = LocateCfg::from_mode(&table.mode, &prompting.background, &prompting.templates).expect("a dense locator mode");
@@ -1425,14 +1257,11 @@ fn a5_arms(lex: &Lexicon, prompting: &VisionPrompting, table: &CalibTable, vk: u
     (x, y, vk)
 }
 
-/// A depth error model as Rust source (for `DepthErrModel::TIPS_GROUND`).
 fn depth_model_rs(m: &DepthErrModel) -> String {
     let f = |v: f32| if v.is_finite() { format!("{v:.4}") } else { "f32::INFINITY".into() };
     format!("DepthErrModel {{ a: {}, b: {}, frame_sd: {}, patch_sd: {}, sky_m: {}, cap_m: {}, unknown_beyond_m: {}, blur_px: {} }}", f(m.a), f(m.b), f(m.frame_sd), f(m.patch_sd), f(m.sky_m), f(m.cap_m), f(m.unknown_beyond_m), m.blur_px)
 }
 
-/// One closed-loop quest: the game pass, perception of its keyframes and the
-/// ML decision pass, as `tests/integrated.rs` runs them.
 fn run_quest(rt: &mut Runtime, cmd: &str, seed: u64, base: BaseKind) -> serde_json::Value {
     rt.test_start(cmd, seed, noto_core::BodyPlan::default(), Some(base)).expect("test starts");
     let mut guard = 0;
@@ -1444,10 +1273,6 @@ fn run_quest(rt: &mut Runtime, cmd: &str, seed: u64, base: BaseKind) -> serde_js
     rt.api_test_status().unwrap()
 }
 
-/// [MLAB] level 2: whole quests (game pass, perception, ML decision pass)
-/// with the stand-ins, the honest stand-ins, the real models as they were
-/// before v1.0 and the real models on the v1.0 path. `MLAB_QUESTS` (commands
-/// separated by `;`) and `MLAB_QUEST_SEEDS` choose the grid.
 #[test]
 #[ignore]
 fn ml_ab_quests() {
@@ -1461,7 +1286,6 @@ fn ml_ab_quests() {
     let bank = bank_dir();
     let mut rows: BTreeMap<&str, Vec<serde_json::Value>> = BTreeMap::new();
     for arm in ["standin", "honest", "real_v0.9", "real_v1.0"] {
-        // One SigLIP2 at a time on the 4 GB card; the old port resizes positions without antialias.
         let siglip = arm.starts_with("real").then(|| {
             let mut s = noto_ml::Siglip2::load(&sig_dir, &dev).expect("SigLIP2");
             s.set_position_antialias(arm == "real_v1.0");
@@ -1521,12 +1345,6 @@ fn write_f32(path: PathBuf, v: &[f32]) {
     std::fs::write(&path, bytes).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
 }
 
-/// The port against its references (cause 10 of `docs/research/ml-ab.md`).
-/// For a few rendered keyframes it writes the exact pixels TIPS and SigLIP2
-/// were given (after this port's own resize) and what the port made of them,
-/// plus the token ids and text vectors of a few prompts, to `$MLAB_OUT/parity`.
-/// `tests/ml_parity.py` runs the Hugging Face implementations on the same
-/// inputs (CPU) and prints the differences.
 #[test]
 #[ignore]
 fn ml_port_dump() {
@@ -1554,7 +1372,6 @@ fn ml_port_dump() {
     for (k, s) in scenes.iter().enumerate() {
         let shot = shoot(&mut bases, s);
         let src = image::RgbImage::from_raw(shot.rgb.width, shot.rgb.height, shot.rgb.data.clone()).unwrap();
-        // TIPS: the keyframe on its patch grid, as `model_input` resizes it.
         let (cols, rows) = tips.input_grid.grid_for(shot.rgb.width, shot.rgb.height);
         let p = tips.config().patch_size as u32;
         let t_img = image::imageops::resize(&src, cols as u32 * p, rows as u32 * p, image::imageops::FilterType::Triangle);
@@ -1564,7 +1381,6 @@ fn ml_port_dump() {
             tips.set_readout_gelu_tanh(tanh);
             write_f32(dir.join(format!("kf{k}_tips_{tag}.f32")), &tips.predict(&t_rgb).unwrap().data);
         }
-        // SigLIP2: the keyframe on its NaFlex grid, as `preprocess` resizes it.
         let (gh, gw) = noto_ml::preprocess::naflex_grid(shot.rgb.width, shot.rgb.height, cfg.patch_size, cfg.max_patches);
         let s_img = shot.rgb.to_dynamic().resize_exact((gw * cfg.patch_size) as u32, (gh * cfg.patch_size) as u32, image::imageops::FilterType::Triangle).to_rgb8();
         s_img.save(dir.join(format!("kf{k}_siglip.png"))).unwrap();
@@ -1575,7 +1391,6 @@ fn ml_port_dump() {
         manifest.push(serde_json::json!({"k": k, "scene": s.id(), "tips": [t_img.width(), t_img.height()], "siglip_grid": [gh, gw]}));
     }
     siglip.set_position_antialias(true);
-    // Text: this port's tokens (canonicalised: lowercase, punctuation to spaces) and vectors.
     let prompts = ["a cardboard parcel", "a photo of a cardboard parcel.", "a wooden log", "a grey boulder", "green grass", "a rendering of a stone.", "a tree in a video game."];
     let tok = noto_ml::tokenizer::TextTokenizer::from_file(&sig_dir.join("tokenizer.json"), cfg.text_pad_id, cfg.text_max_len).unwrap();
     let (ids, mask) = tok.encode(&prompts).unwrap();

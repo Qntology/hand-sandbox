@@ -1,38 +1,19 @@
-//! Heightfield terrain on a square cell grid.
-//!
-//! Heights are stored in centimetres, quantised to 5 cm, and rendered as flat
-//! topped columns (a blocky look). Smooth height changes between neighbouring
-//! cells are judged as slopes. Sharp obstacles are separate "curbs": a curb
-//! sits on top of a cell and is judged as a step. That mirrors the two kinds of
-//! terrain segment in `noto_core::Terrain` (`Slope` and `Step`). A site's
-//! porches, stair treads and ramps (`crate::site`) are curbs too, tagged with a
-//! [`CurbKind`]: a stair keeps the step rule, a ramp joins its cells as a slope.
-
 use serde::{Deserialize, Serialize};
 
 use crate::kinds::Ground;
 use crate::rng::{fbm, hash2, Rng};
 
-/// Edge length of one cell in metres.
 pub const CELL_M: f32 = 0.5;
-/// Height quantisation in centimetres.
 pub const HEIGHT_QUANT_CM: i32 = 5;
-/// Largest height difference allowed between neighbouring cells, centimetres.
 pub const MAX_NEIGHBOR_DIFF_CM: i32 = 20;
 
-/// A circular area flattened to ground level, in metres: `(x, z, radius)`.
 pub type FlatZone = (f32, f32, f32);
 
-/// Which landscape the world is built on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TerrainKind {
-    /// Rolling hills and the curb wall (the v0.2–v0.4 map).
     #[default]
     Open,
-    /// The open map plus a sea bay, mesas walled by cliffs and rock ridges:
-    /// places that block the camera and the base, so targets have to be
-    /// searched for from other viewpoints.
     Rugged,
 }
 
@@ -53,48 +34,27 @@ impl TerrainKind {
     }
 }
 
-/// Height of a cliff-walled mesa top above the ground, centimetres (est:
-/// above the 1.2 m robot's eye, so it hides what is behind and on top).
 pub const MESA_CM: i32 = 160;
-/// Height of a rock ridge, centimetres (est: taller than the camera at 0.5 m).
 pub const RIDGE_CM: i32 = 140;
-/// Rise per cell of the ramp onto the climbable mesa, centimetres: 15 cm over
-/// 0.5 m is 16.7°, past the wheel (15°) and mecanum (8°) limits and inside the
-/// track (30°) and walking (20°) ones.
 pub const RAMP_RISE_CM: i32 = 15;
 
-/// What the rugged stamping put where, for the world's resource placement and the logs.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RuggedLayout {
-    /// `(x, z, radius)` of each mesa, metres, and whether a ramp leads up.
     pub mesas: Vec<(f32, f32, f32, bool)>,
-    /// End points of each ridge, metres.
     pub ridges: Vec<((f32, f32), (f32, f32))>,
     pub water_cells: usize,
 }
 
-/// Largest curb difference between two cells, centimetres, that a ramp joins
-/// as a smooth slope instead of a step (est: the 1:12 ramp rises 4.2 cm per
-/// 0.5 m cell, plus a centimetre of rounding to whole centimetres).
 pub const RAMP_SMOOTH_MAX_CM: i32 = 6;
 
-/// What a cell's curb is. The map's curb wall is a sharp edge at the cell's
-/// border (a step between cells); a site's structures raise cells the same
-/// way (`crate::site`) and say what the raise is, so the route planner, the
-/// renderer and the map tell a stair from a kerb and a ramp from a step.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum CurbKind {
-    /// A kerb: a sharp step at the cell's edge (the curb wall).
     #[default]
     Curb = 0,
-    /// A stair tread: a step like a curb, built as a stair.
     Step = 1,
-    /// A raised floor slab (a porch landing, a house floor): level on top, a step at its edge.
     Floor = 2,
-    /// A ramp: between two cells of which one is a ramp cell, a curb
-    /// difference up to [`RAMP_SMOOTH_MAX_CM`] is a slope, not a step.
     Ramp = 3,
 }
 
@@ -116,7 +76,6 @@ pub struct Terrain {
     heights_cm: Vec<i16>,
     curb_cm: Vec<u8>,
     ground: Vec<Ground>,
-    /// [`CurbKind`] per cell; empty when every curb is a kerb (maps without a site).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     curb_kind: Vec<u8>,
 }
@@ -127,8 +86,6 @@ fn smoothstep(t: f32) -> f32 {
 }
 
 impl Terrain {
-    /// Builds terrain from `seed`. Cells inside a flat zone are at height 0 and
-    /// blend into the hills over 0.6 radii.
     pub fn generate(seed: u64, w: usize, d: usize, zones: &[FlatZone]) -> Terrain {
         assert!(w >= 8 && d >= 8, "terrain must be at least 8x8 cells");
         let mut raw = vec![0i32; w * d];
@@ -144,7 +101,6 @@ impl Terrain {
                 raw[cz * w + cx] = (h / HEIGHT_QUANT_CM as f32).round() as i32 * HEIGHT_QUANT_CM;
             }
         }
-        // Relax so neighbouring cells never differ by more than the limit.
         for _ in 0..8 {
             let mut changed = false;
             for cz in 0..d {
@@ -170,7 +126,6 @@ impl Terrain {
             for cx in 0..w {
                 let h = heights_cm[cz * w + cx] as i32;
                 let jitter = (hash2(seed, cx as i32, cz as i32) & 0xF) as i32;
-                // Gravel is only used for the waypoint pads (set by the world), sand for the beach.
                 ground.push(if h < 70 && jitter == 0 {
                     Ground::Dirt
                 } else if h < 70 {
@@ -230,7 +185,6 @@ impl Terrain {
         self.ground[i] = g;
     }
 
-    /// What the curb on a cell is ([`CurbKind::Curb`] unless a site said otherwise).
     pub fn curb_kind(&self, cx: usize, cz: usize) -> CurbKind {
         if self.curb_kind.is_empty() {
             return CurbKind::Curb;
@@ -249,13 +203,10 @@ impl Terrain {
         self.curb_kind[i] = k as u8;
     }
 
-    /// The curb kinds as codes per cell (row by row), empty when every curb is a kerb.
     pub fn curb_kind_codes(&self) -> &[u8] {
         &self.curb_kind
     }
 
-    /// The curb difference from `a` to `b` when a ramp joins them smoothly,
-    /// metres (signed, up positive); `None` when it is a step or there is none.
     pub fn ramp_rise_m(&self, a: (usize, usize), b: (usize, usize)) -> Option<f32> {
         if self.curb_kind.is_empty() {
             return None;
@@ -265,17 +216,12 @@ impl Terrain {
         (ramp && d != 0 && d.abs() <= RAMP_SMOOTH_MAX_CM).then(|| d as f32 / 100.0)
     }
 
-    /// Sets a cell height, quantised to the grid step. Used by scenario setup
-    /// and tests; generated terrain already respects the neighbour limit.
     pub fn set_height_cm(&mut self, cx: usize, cz: usize, cm: i32) {
         let q = (cm.max(0) as f32 / HEIGHT_QUANT_CM as f32).round() as i32 * HEIGHT_QUANT_CM;
         let i = self.idx(cx, cz);
         self.heights_cm[i] = q as i16;
     }
 
-    /// Adds a curb of `cm` centimetres along the border of the inclusive cell
-    /// rectangle, leaving the inside open. Cells that already carry a taller
-    /// curb keep it.
     pub fn add_curb_ring(&mut self, x0: usize, z0: usize, x1: usize, z1: usize, cm: u8) {
         for cz in z0..=z1.min(self.d - 1) {
             for cx in x0..=x1.min(self.w - 1) {
@@ -288,7 +234,6 @@ impl Terrain {
         }
     }
 
-    /// Flattens the inclusive cell rectangle to ground level and clears curbs.
     pub fn flatten_rect(&mut self, x0: usize, z0: usize, x1: usize, z1: usize) {
         for cz in z0..=z1.min(self.d - 1) {
             for cx in x0..=x1.min(self.w - 1) {
@@ -299,7 +244,6 @@ impl Terrain {
         }
     }
 
-    /// Highest terrain top (height plus curb), metres.
     pub fn max_top_m(&self) -> f32 {
         (0..self.w * self.d).map(|i| (self.heights_cm[i] as i32 + self.curb_cm[i] as i32) as f32 / 100.0).fold(0.0, f32::max)
     }
@@ -308,11 +252,6 @@ impl Terrain {
         self.ground[self.idx(cx, cz)].is_water()
     }
 
-    /// Adds the rugged features: a sea bay in the corner far from both
-    /// waypoints with a wet-sand shore, cliff-walled mesas (the first with a
-    /// ramp that only tracks and legs can climb) and rock ridges. Nothing is
-    /// placed within the clear zones, nor within `corridor_m` of the protected
-    /// polyline (the way between the waypoints), so the waypoints stay connected.
     pub fn stamp_rugged(&mut self, seed: u64, clear: &[FlatZone], polyline: &[(f32, f32)], corridor_m: f32) -> RuggedLayout {
         let (w, d) = (self.w, self.d);
         let (size_x, size_z) = self.size_m();
@@ -322,7 +261,6 @@ impl Terrain {
         let near_polyline = |x: f32, z: f32, r: f32| polyline.windows(2).any(|s| seg_dist(x, z, s[0], s[1]) < r);
         let near_clear = |x: f32, z: f32, r: f32| clear.iter().any(|&(cx, cz, cr)| ((x - cx).powi(2) + (z - cz).powi(2)).sqrt() < cr + r);
 
-        // 1. The sea: a bay around the (max x, min z) corner with a ragged coast.
         let corner = (size_x * 1.02, -0.02 * size_z);
         let reach = 0.36 * span;
         for cz in 0..d {
@@ -340,9 +278,6 @@ impl Terrain {
                 }
             }
         }
-        // The beach: land near the water slopes down to it and stays wet. The
-        // protected way keeps its ground (a road along the shore, not a slope
-        // of loose sand a wheel cannot climb).
         let shore = self.water_distance_m(8.0);
         for i in 0..w * d {
             let (x, z) = cell_center(i % w, i / w);
@@ -351,7 +286,6 @@ impl Terrain {
             }
             let h = self.heights_cm[i] as f32 * (shore[i] / 2.5);
             self.heights_cm[i] = ((h / HEIGHT_QUANT_CM as f32).round() as i32 * HEIGHT_QUANT_CM) as i16;
-            // The waves keep the first metre wet; behind it the beach is dry, loose sand.
             if self.curb_cm[i] == 0 {
                 self.ground[i] = if shore[i] <= 1.05 { Ground::WetSand } else { Ground::Sand };
             }
@@ -361,7 +295,6 @@ impl Terrain {
             shore[cz * w + cx]
         };
         let mut rng = Rng::new(seed ^ 0xC11F_F5EA_0BAD_CAFE);
-        // 2. Mesas: a flat rock top walled by cliffs.
         let mut tries = 0;
         while layout.mesas.len() < 2 && tries < 400 {
             tries += 1;
@@ -391,7 +324,6 @@ impl Terrain {
             }
             layout.mesas.push((x, z, r, ramp));
         }
-        // 3. Rock ridges: one cell thick, taller than the camera.
         let mut tries = 0;
         while layout.ridges.len() < 3 && tries < 600 {
             tries += 1;
@@ -429,8 +361,6 @@ impl Terrain {
         layout
     }
 
-    /// Distance from every cell centre to the nearest water cell, metres,
-    /// capped at `cap_m` (8-neighbour chamfer distance).
     pub fn water_distance_m(&self, cap_m: f32) -> Vec<f32> {
         let (w, d) = (self.w, self.d);
         let mut dist = vec![cap_m; w * d];
@@ -460,8 +390,6 @@ impl Terrain {
         dist
     }
 
-    /// A ramp two cells wide from the rim of the mesa at `(x, z, r)` outward
-    /// along `heading`, falling [`RAMP_RISE_CM`] per cell to the ground.
     fn stamp_ramp(&mut self, x: f32, z: f32, r: f32, heading: f32, fixed: &mut [bool]) {
         let (dx, dz) = (heading.cos(), heading.sin());
         let (nx, nz) = (-dz, dx);
@@ -489,8 +417,6 @@ impl Terrain {
         }
     }
 
-    /// The neighbour limit of [`Terrain::generate`], applied again after the
-    /// rugged features, leaving the features (cliffs on purpose) alone.
     fn relax_except(&mut self, fixed: &[bool]) {
         let (w, d) = (self.w, self.d);
         for _ in 0..8 {
@@ -527,7 +453,6 @@ impl Terrain {
         (cx < self.w && cz < self.d).then_some((cx, cz))
     }
 
-    /// Ground height in metres under the point (the containing cell's height).
     pub fn height_at(&self, x: f32, z: f32) -> f32 {
         match self.cell_of(x, z) {
             Some((cx, cz)) => self.height_m(cx, cz),
@@ -535,11 +460,6 @@ impl Terrain {
         }
     }
 
-    /// Surface height (curbs included) at a point, bilinear between cell
-    /// centres: the ground a wheel or a track rolls over as it climbs from one
-    /// cell's height to the next. Cells more than `step_m` above or below
-    /// `base_m` (a wall, a drop the base cannot climb) count at `base_m`: the
-    /// wheel stands against them, not on them.
     pub fn surface_smooth_m(&self, x: f32, z: f32, base_m: f32, step_m: f32) -> f32 {
         let fx = (x / CELL_M - 0.5).clamp(0.0, (self.w - 1) as f32);
         let fz = (z / CELL_M - 0.5).clamp(0.0, (self.d - 1) as f32);
@@ -559,7 +479,6 @@ impl Terrain {
         near * (1.0 - v) + far * v
     }
 
-    /// Slope in degrees between the centres of two cells.
     pub fn slope_deg(&self, a: (usize, usize), b: (usize, usize)) -> f32 {
         let (ax, az) = cell_center(a.0, a.1);
         let (bx, bz) = cell_center(b.0, b.1);
@@ -569,12 +488,10 @@ impl Terrain {
     }
 }
 
-/// Centre of a cell in metres.
 pub fn cell_center(cx: usize, cz: usize) -> (f32, f32) {
     ((cx as f32 + 0.5) * CELL_M, (cz as f32 + 0.5) * CELL_M)
 }
 
-/// Distance from a point to a segment, metres.
 pub fn seg_dist(x: f32, z: f32, a: (f32, f32), b: (f32, f32)) -> f32 {
     let (vx, vz) = (b.0 - a.0, b.1 - a.1);
     let len2 = vx * vx + vz * vz;
@@ -582,8 +499,6 @@ pub fn seg_dist(x: f32, z: f32, a: (f32, f32), b: (f32, f32)) -> f32 {
     ((x - a.0 - t * vx).powi(2) + (z - a.1 - t * vz).powi(2)).sqrt()
 }
 
-/// Cells a straight line between two points crosses (no gaps diagonally:
-/// a ridge built on it blocks a ray as well as a base).
 fn line_cells(x0: f32, z0: f32, x1: f32, z1: f32) -> Vec<(usize, usize)> {
     if x0.min(x1) < 0.0 || z0.min(z1) < 0.0 {
         return vec![];
@@ -597,7 +512,6 @@ fn line_cells(x0: f32, z0: f32, x1: f32, z1: f32) -> Vec<(usize, usize)> {
             if last == c {
                 continue;
             }
-            // A diagonal move would leave a corner gap: fill it.
             if last.0 != c.0 && last.1 != c.1 {
                 out.push((c.0, last.1));
             }
@@ -705,7 +619,6 @@ mod tests {
         t.heights_cm[0] = 0;
         t.heights_cm[1] = 20;
         let deg = t.slope_deg((0, 0), (1, 0));
-        // 0.20 m rise over 0.5 m run
         assert!((deg - (0.2f32 / 0.5).atan().to_degrees()).abs() < 1e-3);
     }
 }

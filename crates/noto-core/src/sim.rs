@@ -1,23 +1,3 @@
-//! Hand simulation: rate-limited joint motion for animation, and a quasi-static
-//! grasp model that closes every finger until it touches a logistics object.
-//!
-//! The grasp model is kinematic, not a rigid-body physics engine:
-//!
-//! 1. The object rests on the palm, centred over it at `GraspSetup::z_offset`.
-//! 2. Each finger closes in small steps. A step is rejected for a finger when
-//!    any of its sample points would enter the object (signed distance below
-//!    the contact margin), so the finger stops at the first contact.
-//! 3. The palm is a contact too when the object's footprint overlaps it.
-//! 4. Contact normals point from the object centre to the contact point, the
-//!    convex-object approximation. Force closure (normals not all in one
-//!    half-space) is reported as a diagnostic.
-//! 5. Contact force is the knuckle torque divided by the lever arm to the
-//!    contact point. Friction at every contact (palm included, with the palm
-//!    squeeze equal to the finger forces) must exceed `mass * g * safety`.
-//! 6. The object counts as supported when the palm touches it or it is
-//!    force-closed. The grasp is stable when it is supported, at least two
-//!    fingers touch it and the friction capacity covers the weight.
-
 use serde::{Deserialize, Serialize};
 
 use crate::finger::{sample_points, FingerSpec};
@@ -27,33 +7,22 @@ use crate::math::Vec3;
 
 pub const GRAVITY_MPS2: f32 = 9.81;
 
-/// Number of closing steps when a finger is driven to full closure.
 const CLOSE_STEPS: usize = 100;
-/// Smallest lever arm used for force estimates, metres.
 const MIN_LEVER_M: f32 = 0.02;
-/// Directions sampled when testing force closure.
 const FORCE_CLOSURE_DIRS: usize = 512;
 
-/// A rectangular logistics object: carton, tote, bag, etc.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Payload {
     pub name: String,
-    /// Width x height x depth, metres.
     pub size_m: [f32; 3],
     pub mass_kg: f32,
-    /// Coulomb friction coefficient between finger pad and surface.
     pub friction: f32,
 }
 
-/// Where the object sits on the palm, and how strict the test is.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GraspSetup {
-    /// Position of the object's centre along the palm, metres. Its bottom
-    /// face always rests on the palm plane (y = 0).
     pub z_offset: f32,
-    /// Distance at which a sample point counts as touching, metres.
     pub contact_margin_m: f32,
-    /// Required friction margin over the object weight.
     pub safety_factor: f32,
 }
 
@@ -77,9 +46,7 @@ pub enum ContactSource {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Contact {
     pub source: ContactSource,
-    /// Contact point in the hand frame.
     pub point: Vec3,
-    /// Unit normal pointing from the object centre to the contact point.
     pub normal: Vec3,
     pub force_n: f32,
 }
@@ -88,9 +55,7 @@ pub struct Contact {
 #[serde(rename_all = "snake_case")]
 pub enum GraspType {
     None,
-    /// Two or fewer fingers in contact.
     Pinch,
-    /// Three or more fingers in contact.
     Power,
 }
 
@@ -98,25 +63,19 @@ pub enum GraspType {
 pub struct GraspResult {
     pub contacts: Vec<Contact>,
     pub grasp_type: GraspType,
-    /// True when the contact normals cannot all lie in one half-space.
     pub force_closed: bool,
-    /// Friction force the contacts can resist, N.
     pub friction_capacity_n: f32,
-    /// Weight times safety factor, N.
     pub required_n: f32,
     pub stable: bool,
-    /// Heaviest object this hand can hold with the configured safety factor.
     pub max_payload_kg: f32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GraspOutcome {
     pub result: GraspResult,
-    /// Joint angles of every finger at the moment it stopped.
     pub angles: Vec<Vec<JointAngles>>,
 }
 
-/// Joint angles that a closure value in `[0, 1]` commands for one finger.
 pub fn closure_angles(finger: &FingerSpec, actuation: Actuation, closure: f32) -> Vec<JointAngles> {
     let closure = closure.clamp(0.0, 1.0);
     let mut out = Vec::with_capacity(finger.joint_count());
@@ -142,7 +101,6 @@ pub fn closure_angles(finger: &FingerSpec, actuation: Actuation, closure: f32) -
     out
 }
 
-/// Joint points of every finger for the given angles, hand frame.
 pub fn fk_all(hand: &Hand, angles: &[Vec<JointAngles>]) -> Vec<Vec<Vec3>> {
     hand.fingers
         .iter()
@@ -151,8 +109,6 @@ pub fn fk_all(hand: &Hand, angles: &[Vec<JointAngles>]) -> Vec<Vec<Vec3>> {
         .collect()
 }
 
-/// Signed distance from `p` to an axis-aligned box centred at `c` with half
-/// sizes `h`. Negative inside the box.
 fn box_sdf(p: Vec3, c: Vec3, h: Vec3) -> f32 {
     let d = p - c;
     let q = Vec3::new(d.x.abs() - h.x, d.y.abs() - h.y, d.z.abs() - h.z);
@@ -161,15 +117,10 @@ fn box_sdf(p: Vec3, c: Vec3, h: Vec3) -> f32 {
     outside + inside
 }
 
-/// Unit direction from the object centre to `p`: the normal of a convex
-/// object at that point.
 fn radial_normal(p: Vec3, center: Vec3) -> Vec3 {
     (p - center).normalized()
 }
 
-/// True when no direction sees all normals on the same side, i.e. the
-/// normals positively span space and can resist any load. Checked by sampling
-/// directions on a Fibonacci sphere.
 fn force_closed(normals: &[Vec3]) -> bool {
     if normals.len() < 2 {
         return false;
@@ -187,7 +138,6 @@ fn force_closed(normals: &[Vec3]) -> bool {
     true
 }
 
-/// Closes every finger on the object and reports whether it can be held.
 pub fn grasp(hand: &Hand, payload: &Payload, setup: &GraspSetup) -> GraspOutcome {
     let actuation = hand.config.joints.actuation;
     let half = Vec3::new(
@@ -195,7 +145,6 @@ pub fn grasp(hand: &Hand, payload: &Payload, setup: &GraspSetup) -> GraspOutcome
         payload.size_m[1] * 0.5,
         payload.size_m[2] * 0.5,
     );
-    // The object rests on the palm, so its bottom face sits on the palm plane.
     let center = Vec3::new(0.0, half.y, setup.z_offset);
     let margin = setup.contact_margin_m;
 
@@ -215,7 +164,6 @@ pub fn grasp(hand: &Hand, payload: &Payload, setup: &GraspSetup) -> GraspOutcome
             }
             let candidate = closure_angles(finger, actuation, closure);
             let points = finger.points(&candidate);
-            // Points at palm level belong to the palm, not to the finger.
             let touch = sample_points(&points)
                 .into_iter()
                 .filter(|p| p.y >= margin)
@@ -242,8 +190,6 @@ pub fn grasp(hand: &Hand, payload: &Payload, setup: &GraspSetup) -> GraspOutcome
         }
     }
 
-    // The palm supports the object when its footprint overlaps the palm. The
-    // palm squeeze balances the finger forces.
     let footprint_on_palm = center.x - half.x <= hand.palm.width * 0.5
         && center.x + half.x >= -hand.palm.width * 0.5
         && center.z - half.z <= 0.0
@@ -305,85 +251,39 @@ fn score(contacts: &[Contact], payload: &Payload, setup: &GraspSetup) -> GraspRe
     }
 }
 
-// ----- per-phalanx contacts of a grasp from above (v1.0, `docs/research/tactile.md` §2) -----
-
-/// Half thickness of a phalanx with its pad: a phalanx touches the object
-/// when its centre line comes this close to the surface (est: the 18 mm
-/// finger links `kin` draws).
 pub const PHALANX_PAD_M: f32 = 0.009;
-/// In a grasp from above the object's top face meets the palm this far
-/// below the palm plane (est: the palm plate the hand view draws).
 pub const PALM_PAD_M: f32 = 0.012;
-/// The hand sets down with the object's far face this far behind the
-/// knuckle line beyond a pad's thickness, metres (est: the fingers close
-/// down over that face, the palm on the top face behind it).
 pub const FACE_GAP_M: f32 = 0.001;
-/// Points tested along each phalanx.
 const PHALANX_SAMPLES: usize = 9;
-/// A phalanx this much farther than its pad from the surface at the stop still counts as touching, metres.
 const TOUCH_TOL_M: f32 = 0.0005;
 
-/// One phalanx touching the object in a grasp from above.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct PhalanxContact {
     pub finger: usize,
     pub phalanx: usize,
-    /// The touching point on the object's surface and the surface normal
-    /// there (the box's signed-distance gradient, out of the object), hand frame.
     pub point: Vec3,
     pub normal: Vec3,
-    /// Where along the phalanx it touches (0 at its joint, 1 at its end).
     pub along: f32,
-    /// Per joint: how far a unit flexion of that joint presses the contact
-    /// into the object, `−n·∂p/∂q_j` (the contact Jacobian's rows), m/rad.
     pub jac: Vec<f32>,
-    /// Normal force the finger's drive presses this contact with at its
-    /// torque limits (`τ = Jᵀλ`, honouring the actuation), N.
     pub max_n: f32,
 }
 
-/// The fingers closed on a box held from above: the palm on its top face,
-/// the box's far face just behind the knuckle line (the fingers close down
-/// over it), each finger closing until a phalanx touches. A tendon-coupled
-/// finger stops as a whole at its first touch; a directly driven one keeps
-/// closing its distal joints until their phalanges touch too (the finger
-/// wraps). The fingers press the far face. Nothing in this hand touches the
-/// near face: the presets mount the thumb in the fingers' row, not opposite
-/// them, and the box's near face lies at or past the palm's heel. What
-/// presses back against the fingers' squeeze is therefore an assumption
-/// (est): with one hand a reaction this model does not place (the palm's
-/// heel or the wrist against the near face), with two hands the other
-/// hand's fingers on the opposite face (its own `TopGrasp`). Its friction
-/// is not counted: `act::grasp` holds each hand's share of the load by
-/// that hand's finger pads alone (`act::grasp::SQUEEZE_SURFACES`, one
-/// face). A finger that meets nothing (a thumb in the row whose short
-/// knuckle range does not reach the far face) closes fully and presses nothing.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct TopGrasp {
-    /// The box's centre and half sizes in the hand frame.
     pub center: Vec3,
     pub half: Vec3,
-    /// The contact-stopped angles of every finger (fully closed where it met nothing).
     pub angles: Vec<Vec<JointAngles>>,
-    /// Per finger: the knuckle's flexion over its range at the stop.
     pub closure: Vec<f32>,
     pub contacts: Vec<PhalanxContact>,
-    /// Per finger: the largest total normal force its drive presses with, N.
     pub finger_max_n: Vec<f32>,
-    /// Fingers that touch the box.
     pub touching: usize,
 }
 
 impl TopGrasp {
-    /// The squeeze every finger together presses with at their torque limits, N.
     pub fn squeeze_max_n(&self) -> f32 {
         self.finger_max_n.iter().sum()
     }
 
-    /// Mean knuckle closure of the fingers that press the box (the scalar
-    /// `KinPose::closure` draws with: a finger that met nothing closed on past
-    /// it, and drawing every finger that far would sink the others into the
-    /// box). Every finger's when none presses.
     pub fn mean_closure(&self) -> f32 {
         let on: Vec<f32> = self.closure.iter().zip(&self.finger_max_n).filter(|(_, n)| **n > 1e-6).map(|(c, _)| *c).collect();
         let v = if on.is_empty() { &self.closure[..] } else { &on[..] };
@@ -395,7 +295,6 @@ impl TopGrasp {
     }
 }
 
-/// The closest point of an axis-aligned box to `p` and the outward normal there.
 fn box_closest(p: Vec3, c: Vec3, h: Vec3) -> (Vec3, Vec3) {
     let d = p - c;
     let q = Vec3::new(d.x.clamp(-h.x, h.x), d.y.clamp(-h.y, h.y), d.z.clamp(-h.z, h.z));
@@ -404,7 +303,6 @@ fn box_closest(p: Vec3, c: Vec3, h: Vec3) -> (Vec3, Vec3) {
     if out.length() > 1e-7 {
         return (b, out.normalized());
     }
-    // Inside: the nearest face.
     let gaps = [h.x - d.x.abs(), h.y - d.y.abs(), h.z - d.z.abs()];
     let k = (0..3).min_by(|&i, &j| gaps[i].total_cmp(&gaps[j])).unwrap_or(0);
     let n = match k {
@@ -415,10 +313,6 @@ fn box_closest(p: Vec3, c: Vec3, h: Vec3) -> (Vec3, Vec3) {
     (b, n)
 }
 
-/// The closest approach of each phalanx's centre line to the box: (distance
-/// beyond the pad, the point along the phalanx 0..1). A phalanx lying along
-/// a face (a line contact) touches at the middle of the stretch that is
-/// closest.
 fn phalanx_gaps(points: &[Vec3], c: Vec3, h: Vec3) -> Vec<(f32, f32)> {
     points
         .windows(2)
@@ -438,13 +332,11 @@ fn phalanx_gaps(points: &[Vec3], c: Vec3, h: Vec3) -> Vec<(f32, f32)> {
         .collect()
 }
 
-/// A point `along` phalanx `k` for the given angles.
 fn phalanx_point(finger: &FingerSpec, angles: &[JointAngles], k: usize, along: f32) -> Vec3 {
     let pts = finger.points(angles);
     pts[k] + (pts[k + 1] - pts[k]).scale(along)
 }
 
-/// `∂p/∂q_j` of a point `along` phalanx `k` for every joint (numerical, central).
 fn phalanx_jacobian(finger: &FingerSpec, angles: &[JointAngles], k: usize, along: f32) -> Vec<Vec3> {
     let eps = 1e-3f32;
     (0..finger.joint_count())
@@ -461,14 +353,10 @@ fn phalanx_jacobian(finger: &FingerSpec, angles: &[JointAngles], k: usize, along
         .collect()
 }
 
-/// The torque each joint of a finger holds when the object pushes on
-/// phalanx `k` (at `along`) with `force_on_finger` (hand frame): the contact
-/// statics `τ_j = −(∂p/∂q_j)·F`. Flexion positive.
 pub fn finger_joint_torques(finger: &FingerSpec, angles: &[JointAngles], k: usize, along: f32, force_on_finger: Vec3) -> Vec<f32> {
     phalanx_jacobian(finger, angles, k.min(finger.joint_count().saturating_sub(1)), along).iter().map(|d| -d.dot(force_on_finger)).collect()
 }
 
-/// Closes one finger on the box and returns its stop angles and touching phalanges (index, along).
 fn close_finger(finger: &FingerSpec, actuation: Actuation, c: Vec3, h: Vec3) -> (Vec<JointAngles>, Vec<(usize, f32)>) {
     let n = finger.joint_count();
     let touching = |angles: &[JointAngles]| -> Vec<(usize, f32, f32)> {
@@ -484,7 +372,6 @@ fn close_finger(finger: &FingerSpec, actuation: Actuation, c: Vec3, h: Vec3) -> 
                 for step in 1..=CLOSE_STEPS {
                     let u = step as f32 / CLOSE_STEPS as f32;
                     if touching(&closure_angles(finger, actuation, u)).iter().any(|t| t.1 <= 0.0) {
-                        // The touch between the last free step and this one.
                         let (mut lo, mut hi) = (prev, u);
                         for _ in 0..24 {
                             let mid = 0.5 * (lo + hi);
@@ -505,7 +392,6 @@ fn close_finger(finger: &FingerSpec, actuation: Actuation, c: Vec3, h: Vec3) -> 
             (angles, hit)
         }
         Actuation::Direct => {
-            // Each joint closes at its own drive; a touching phalanx freezes the joints that move it.
             let mut frozen = vec![false; n];
             let mut angles = vec![JointAngles::default(); n];
             let target = |u: f32, j: usize| finger.joints[j].clamp_flex(u * finger.joints[j].flex_max);
@@ -558,16 +444,6 @@ fn close_finger(finger: &FingerSpec, actuation: Actuation, c: Vec3, h: Vec3) -> 
     }
 }
 
-/// Closes the hand on a box of `size_m` (width x, height y, depth z) held
-/// from above and works out each contact's face normal and the force each
-/// finger's drive can press it with (contact statics `τ = Jᵀλ`):
-///
-/// * a tendon-coupled finger has one drive (the knuckle's torque) acting
-///   along the coupled motion; its contacts share the force by how far that
-///   motion presses each (equal pad compliance), and no joint may hold more
-///   than its rating;
-/// * a directly driven finger has a drive per joint; the distal contact
-///   takes what its joints allow, each more proximal one what is left.
 pub fn top_grasp(hand: &Hand, size_m: [f32; 3]) -> TopGrasp {
     let actuation = hand.config.joints.actuation;
     let half = Vec3::new(size_m[0] * 0.5, size_m[1] * 0.5, size_m[2] * 0.5);
@@ -589,7 +465,6 @@ pub fn top_grasp(hand: &Hand, size_m: [f32; 3]) -> TopGrasp {
             .collect();
         match actuation {
             Actuation::Coupled { .. } => {
-                // The coupled motion: how each joint moves per unit of the knuckle (joint limits included).
                 let c0 = out.closure[fi];
                 let dc = if c0 < 0.99 { 0.01 } else { -0.01 };
                 let (a, b) = (closure_angles(finger, actuation, c0), closure_angles(finger, actuation, c0 + dc));
@@ -600,7 +475,6 @@ pub fn top_grasp(hand: &Hand, size_m: [f32; 3]) -> TopGrasp {
                 if s2 > 1e-12 {
                     let tau_in = finger.joints[0].max_torque;
                     let mut lam: Vec<f32> = j_in.iter().map(|j| if *j > 1e-6 { tau_in * j / s2 } else { 0.0 }).collect();
-                    // No distal joint holds more than its rating.
                     let mut scale = 1.0f32;
                     for (jj, spec) in finger.joints.iter().enumerate().skip(1) {
                         let t: f32 = cs.iter().zip(&lam).map(|(c, l)| l * c.jac[jj]).sum();
@@ -615,7 +489,6 @@ pub fn top_grasp(hand: &Hand, size_m: [f32; 3]) -> TopGrasp {
                 }
             }
             Actuation::Direct => {
-                // Distal contact first: it takes what the joints behind it allow; the next one what is left.
                 let mut room: Vec<f32> = finger.joints.iter().map(|j| j.max_torque).collect();
                 let mut order: Vec<usize> = (0..cs.len()).collect();
                 order.sort_by(|&a, &b| cs[b].phalanx.cmp(&cs[a].phalanx));
@@ -641,8 +514,6 @@ pub fn top_grasp(hand: &Hand, size_m: [f32; 3]) -> TopGrasp {
     out
 }
 
-/// Animated hand: each finger's closure command is tracked by rate-limited
-/// joints, so the motion respects each joint's speed and limits.
 #[derive(Clone, Debug)]
 pub struct HandSim {
     hand: Hand,
@@ -669,8 +540,6 @@ impl HandSim {
         &self.hand
     }
 
-    /// Sets the closure command per finger, each clamped to `[0, 1]`.
-    /// Entries beyond the finger count are ignored.
     pub fn set_closure(&mut self, closure: &[f32]) {
         for (dst, src) in self.closure.iter_mut().zip(closure) {
             *dst = src.clamp(0.0, 1.0);
@@ -681,7 +550,6 @@ impl HandSim {
         &self.closure
     }
 
-    /// Advances joint angles by `dt` seconds toward the commanded closure.
     pub fn step(&mut self, dt: f32) {
         let actuation = self.hand.config.joints.actuation;
         for ((finger, angles), &c) in self
@@ -796,13 +664,11 @@ mod tests {
                 assert_eq!(g.angles.len(), hand.fingers.len());
                 assert!(g.touching >= 2, "{count:?} {size}: {} touching", g.touching);
                 for c in &g.contacts {
-                    // The point is on the surface, the normal unit and outward.
                     assert!(box_sdf(c.point, g.center, g.half).abs() < 1e-4, "{c:?}");
                     assert!((c.normal.length() - 1.0).abs() < 1e-4);
                     assert!((c.point + c.normal.scale(0.01) - g.center).length() > (c.point - g.center).length());
                     assert!(c.max_n >= 0.0 && c.max_n < 200.0, "{c:?}");
                 }
-                // No phalanx sinks into the box: every centre line stays a pad's thickness out.
                 for (f, a) in hand.fingers.iter().zip(&g.angles) {
                     for (gap, _) in phalanx_gaps(&f.points(a), g.center, g.half) {
                         assert!(gap > -1e-3, "{count:?} {size}: {gap}");
@@ -819,7 +685,6 @@ mod tests {
         let g = top_grasp(&hand, [0.10; 3]);
         let c = g.contacts.iter().max_by(|a, b| a.max_n.total_cmp(&b.max_n)).unwrap();
         let f = &hand.fingers[c.finger];
-        // Pressing with λ along the normal: τ_j = λ · J_j.
         let tau = finger_joint_torques(f, &g.angles[c.finger], c.phalanx, c.along, c.normal.scale(2.0));
         for (j, t) in tau.iter().enumerate() {
             assert!((t - 2.0 * c.jac[j]).abs() < 1e-3, "{j}: {t} vs {}", 2.0 * c.jac[j]);

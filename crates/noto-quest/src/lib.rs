@@ -1,15 +1,3 @@
-//! Quests: the structured form of a command, shown like a game quest.
-//!
-//! A [`Plan`](noto_search::Plan) becomes a list of steps. For each requested
-//! resource the steps are locate, approach, mine and collect; a plan that
-//! brings the items somewhere then adds one carry and one deliver step.
-//! An item that lies where it was put (a parcel) is checked by looking down at
-//! it instead of being mined, is picked from where the command said it lies
-//! ("선반에서 택배 집기"), and with no destination said goes back to the base
-//! camp ("베이스캠프로 복귀").
-//! This crate holds the data and the legal state transitions only. Running a
-//! quest against the world is `noto-runtime`'s job.
-
 use noto_search::Plan;
 use serde::Serialize;
 
@@ -22,9 +10,7 @@ pub enum StepKind {
     Collect,
     Carry,
     Deliver,
-    /// Walk to a place, for a plan with no items.
     Goto,
-    /// Set down what is already carried.
     Unload,
 }
 
@@ -42,14 +28,11 @@ pub struct Step {
     pub kind: StepKind,
     pub label_ko: String,
     pub state: State,
-    /// 0.0 to 1.0.
     pub progress: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
-    /// Resource this step works on, when it works on one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource: Option<String>,
-    /// How many times the quest went back to this step.
     #[serde(skip_serializing_if = "is_zero")]
     pub retries: u32,
 }
@@ -60,7 +43,6 @@ fn is_zero(n: &u32) -> bool {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Failure {
-    /// Stable code such as `locate_timeout`, `no_path`, `grasp_unstable`.
     pub code: String,
     pub message_ko: String,
     pub step: usize,
@@ -71,14 +53,10 @@ pub struct QuestResult {
     pub ticks: u64,
     pub time_s: f64,
     pub energy_j: f64,
-    /// Share of accepted detections that touching the object later confirmed.
     pub precision: Option<f64>,
     pub summary: String,
-    /// Items that ended up delivered (or held), by resource id.
     pub items: Vec<(String, u32)>,
-    /// Mining or pick-up actions that gave something other than what was asked.
     pub wasted_actions: u32,
-    /// Round trips made because the load did not fit in one (the last trip included).
     pub trips: u32,
 }
 
@@ -95,22 +73,16 @@ pub struct Quest {
     pub result: Option<QuestResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<Failure>,
-    /// The plan the quest was made from.
     pub plan: Plan,
 }
 
-/// Korean names for the ids that appear in plans.
 pub trait Labels {
     fn resource_ko(&self, id: &str) -> String;
     fn place_ko(&self, id: &str) -> String;
-    /// Whether the resource is mined out of a node (a tree's logs) or lies where
-    /// it was placed (a parcel: the third step touches it instead of mining).
     fn resource_mined(&self, id: &str) -> bool {
         let _ = id;
         true
     }
-    /// Korean name of a place a search starts from: the places of a site
-    /// (houses, doorsteps, shelves, tables) have no waypoint to name them.
     fn origin_ko(&self, id: &str) -> String {
         match id {
             "house" => "집".into(),
@@ -145,8 +117,6 @@ impl std::fmt::Display for QuestError {
 
 impl std::error::Error for QuestError {}
 
-/// The third step of a target: mining its node, or looking down at what lies
-/// there (a parcel near the feet leaves a level camera's view) to check it.
 fn mine_label(labels: &dyn Labels, resource: &str, name: &str) -> String {
     if labels.resource_mined(resource) {
         format!("{name} 채취")
@@ -155,8 +125,6 @@ fn mine_label(labels: &dyn Labels, resource: &str, name: &str) -> String {
     }
 }
 
-/// The four gathering steps of one target. With a search hint ("창고 선반에서")
-/// the search names where it looks, and a placed item is picked from there.
 fn gather_steps(steps: &mut Vec<Step>, t: &noto_search::Target, labels: &dyn Labels) {
     let name = labels.resource_ko(&t.resource);
     let at: Vec<String> = t.origin.iter().map(|p| labels.origin_ko(&p.place)).collect();
@@ -176,7 +144,6 @@ fn step(kind: StepKind, label: String, resource: Option<&str>) -> Step {
 }
 
 impl Quest {
-    /// Builds the quest for a plan. `Plan::Stop` has no quest.
     pub fn from_plan(id: String, plan: &Plan, labels: &dyn Labels, tick: u64) -> Result<Quest, QuestError> {
         let mut steps = Vec::new();
         let title;
@@ -186,7 +153,6 @@ impl Quest {
                     gather_steps(&mut steps, t, labels);
                 }
                 let place = labels.place_ko(&destination.place);
-                // Nowhere said: the parcels go back with the robot to where it set out.
                 let carry = if destination.implied() { "복귀" } else { "운반" };
                 steps.push(step(StepKind::Carry, format!("{place}{} {carry}", noto_search::text::euro(&place)), None));
                 steps.push(step(StepKind::Deliver, format!("{place}에 인도"), None));
@@ -248,12 +214,10 @@ impl Quest {
         matches!(self.state, State::Done | State::Failed)
     }
 
-    /// Index of the active step.
     pub fn current(&self) -> Option<usize> {
         self.steps.iter().position(|s| s.state == State::Active)
     }
 
-    /// Pending -> active, with the first step active.
     pub fn start(&mut self, tick: u64) -> Result<(), QuestError> {
         if self.state != State::Pending {
             return Err(QuestError::NotPending);
@@ -284,8 +248,6 @@ impl Quest {
         Ok(())
     }
 
-    /// Marks step `i` done and activates the next one. Returns true when it was the last step
-    /// (the quest stays active until [`Quest::finish`] gives it a result).
     pub fn complete_step(&mut self, i: usize) -> Result<bool, QuestError> {
         let s = self.active_step(i)?;
         s.state = State::Done;
@@ -299,9 +261,6 @@ impl Quest {
         }
     }
 
-    /// Goes back to an earlier step (for example to look for another tree when
-    /// the first one gave too few logs). Steps from `to` on become pending
-    /// again and `to` becomes the active step with `note`.
     pub fn rewind(&mut self, to: usize, note: &str) -> Result<(), QuestError> {
         if self.state != State::Active {
             return Err(QuestError::NotActive);
@@ -322,7 +281,6 @@ impl Quest {
         Ok(())
     }
 
-    /// Finishes an active quest whose steps are all done.
     pub fn finish(&mut self, result: QuestResult) -> Result<(), QuestError> {
         if self.state != State::Active {
             return Err(QuestError::NotActive);
@@ -335,7 +293,6 @@ impl Quest {
         Ok(())
     }
 
-    /// Fails the quest at step `i` (or the active step).
     pub fn fail(&mut self, code: &str, message_ko: &str, result: Option<QuestResult>) -> Result<(), QuestError> {
         if self.is_finished() {
             return Err(QuestError::NotActive);
@@ -360,7 +317,6 @@ fn item_list(targets: &[noto_search::Target], labels: &dyn Labels) -> String {
         .join(", ")
 }
 
-/// The quests of a session, in the order they were given.
 #[derive(Clone, Debug, Default)]
 pub struct QuestBook {
     quests: Vec<Quest>,
@@ -372,7 +328,6 @@ impl QuestBook {
         QuestBook { quests: Vec::new(), next: 1 }
     }
 
-    /// Adds a quest for `plan`. Returns its id.
     pub fn add(&mut self, plan: &Plan, labels: &dyn Labels, tick: u64) -> Result<String, QuestError> {
         let id = format!("q{}", self.next.max(1));
         let q = Quest::from_plan(id.clone(), plan, labels, tick)?;
@@ -393,7 +348,6 @@ impl QuestBook {
         self.quests.iter_mut().find(|q| q.id == id)
     }
 
-    /// The quest being worked on, else the oldest pending one.
     pub fn current_id(&self) -> Option<String> {
         self.quests
             .iter()
@@ -485,20 +439,17 @@ mod tests {
 
     #[test]
     fn a_parcel_is_looked_down_at_picked_where_it_lies_and_brought_back_to_the_base() {
-        // "창고 선반에서 택배 가져와": a search hint, a pick from the shelf, the implied way home.
         let mut t = target("parcel", 1);
         t.origin = vec![place("warehouse"), place("shelf")];
         let home = PlaceRef { place: "base_camp".into(), via: Via::Exact, score: 1.0, text: String::new() };
         let q = Quest::from_plan("q".into(), &Plan::Fetch { targets: vec![t], destination: home.clone() }, &Parcels, 0).unwrap();
         let labels: Vec<&str> = q.steps.iter().map(|s| s.label_ko.as_str()).collect();
         assert_eq!(labels, vec!["창고 선반 택배 탐색", "택배 가까이 접근", "택배 내려다보며 확인", "선반에서 택배 집기 1개", "베이스캠프로 복귀", "베이스캠프에 인도"]);
-        // Said out loud, the base camp is a delivery like any other; with no hint the parcel is picked up as before.
         let said = PlaceRef { text: "베이스캠프로".into(), ..home };
         let q = Quest::from_plan("q".into(), &Plan::Fetch { targets: vec![target("parcel", 2)], destination: said }, &Parcels, 0).unwrap();
         assert_eq!(q.steps[0].label_ko, "택배 탐색");
         assert_eq!(q.steps[3].label_ko, "택배 줍기 2개");
         assert_eq!(q.steps[4].label_ko, "베이스캠프로 운반");
-        // From a doorstep: the site place has its own Korean name.
         let mut t = target("parcel", 1);
         t.origin = vec![place("doorstep")];
         let q = Quest::from_plan("q".into(), &Plan::Collect { targets: vec![t] }, &Parcels, 0).unwrap();

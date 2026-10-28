@@ -1,6 +1,3 @@
-//! JSON calls of the integrated test and the part presets (see `api.rs` for
-//! the conventions). Kept apart from the ten world calls of v0.2.
-
 use noto_core::balance::{reference, Body, FeedForward, Posture, RefCtx, Source};
 use noto_core::parts::{ArmPreset, BellyPreset, ChassisPreset, ChestPreset, HeadPreset, LegPreset, Segment, Tier};
 use noto_core::{BaseKind, BodyPlan, FingerCount};
@@ -18,7 +15,6 @@ fn r3(x: f32) -> f64 {
     }
 }
 
-/// A body plan from `{body}` (full object) or `{preset}` (a named plan).
 pub fn plan_from(args: &Value) -> Result<Option<BodyPlan>, String> {
     if let Some(b) = args.get("body").filter(|b| !b.is_null()) {
         return serde_json::from_value::<BodyPlan>(b.clone()).map(Some).map_err(|e| format!("body(BodyPlan)를 읽을 수 없습니다: {e}"));
@@ -36,7 +32,6 @@ fn base_from(args: &Value) -> Result<Option<BaseKind>, String> {
     }
 }
 
-/// Every preset of every segment, for the preset panel.
 pub fn presets_json() -> Value {
     let act = |a: &noto_core::parts::Actuator| json!({"name": a.name, "peak_nm": a.peak_nm, "cont_nm": a.cont_nm, "speed_rad_s": a.speed_rad_s, "mass_kg": a.mass_kg, "price_usd": a.price_usd, "backdrivable": a.backdrivable, "src": a.src});
     let tiers: Vec<Value> = Tier::ALL.iter().map(|t| json!({"id": t.id(), "label_ko": t.label_ko()})).collect();
@@ -56,9 +51,6 @@ pub fn presets_json() -> Value {
     })
 }
 
-/// What a plan means physically: mass, CoM, limits empty and loaded, which
-/// items it can lift (one or two arms), and the N:N cells of typical states
-/// next to their references.
 pub fn plan_eval_json(plan: &BodyPlan, base: BaseKind, fingers: FingerCount) -> Value {
     let body = Body::new(plan, base, fingers);
     let spec = base.spec();
@@ -81,7 +73,6 @@ pub fn plan_eval_json(plan: &BodyPlan, base: BaseKind, fingers: FingerCount) -> 
         (Posture::arm_raise(0.0), "flat"),
         (Posture::arm_lift(ItemKind::Log.spec().mass_kg, false, 0.0), "flat"),
         (Posture { source: Source::FootLift, single_support: true, ..Posture::quiet(0.0) }, "flat"),
-        // The step this base can actually climb (a wheel never meets a 10 cm curb).
         (Posture { source: Source::StepUp, step_m: base.spec().max_step_m.min(0.10), single_support: base == BaseKind::HumanFoot, ..Posture::quiet(0.0) }, "step"),
         (Posture { source: Source::Slope, slope_deg: 10.0, ..Posture::quiet(0.0) }, "up_hi"),
         (Posture::quiet(4.0), "flat"),

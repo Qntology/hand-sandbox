@@ -1,8 +1,3 @@
-//! Minimal 3D math used by the kinematics: vectors and rotation matrices.
-//!
-//! Conventions: right-handed frame, angles in radians, rotations are active
-//! (they rotate points counter-clockwise about the named axis).
-
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -59,7 +54,6 @@ impl std::ops::Sub for Vec3 {
     }
 }
 
-/// Row-major 3x3 rotation matrix.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Mat3 {
     pub m: [[f32; 3]; 3],
@@ -122,12 +116,10 @@ mod tests {
     #[test]
     fn rotations_map_axes_as_expected() {
         let z = Vec3::new(0.0, 0.0, 1.0);
-        // Abduction: positive angle swings the +Z axis toward +X.
         assert!(approx(
             Mat3::rot_y(std::f32::consts::FRAC_PI_2).apply(z),
             Vec3::new(1.0, 0.0, 0.0)
         ));
-        // Flexion (rot_x with negative angle) swings +Z toward +Y.
         assert!(approx(
             Mat3::rot_x(-std::f32::consts::FRAC_PI_2).apply(z),
             Vec3::new(0.0, 1.0, 0.0)

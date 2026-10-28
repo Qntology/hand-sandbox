@@ -1,9 +1,3 @@
-//! Damped Holt trend (the statistical fallback when no TTM weights exist).
-//!
-//! Ported from endmill-sandbox `src/timeseries.rs` (`holt_damped`): a small
-//! grid search over smoothing parameters minimising one-step squared error,
-//! then a damped-trend forecast with a variance that grows with the horizon.
-
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -15,8 +9,6 @@ pub struct HoltFit {
     pub sigma: f64,
 }
 
-/// Returns `(point, sd, fit)` for `horizon` steps. With fewer than three
-/// points it repeats the last value with zero spread.
 pub fn holt_damped(y: &[f64], horizon: usize) -> (Vec<f64>, Vec<f64>, HoltFit) {
     let n = y.len();
     if n == 0 {

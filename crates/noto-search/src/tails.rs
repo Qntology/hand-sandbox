@@ -1,44 +1,23 @@
-//! Closed tail tables and tail peeling.
-//!
-//! A Korean eojeol is a stem plus a particle or an ending. The tables here are
-//! closed lists, as in logis-center: a word is split only when its ending is
-//! one of the listed tails *and* the tail agrees with the stem's last syllable
-//! (batchim agreement). Nothing here carries vocabulary; the words themselves
-//! live in the lexicon file.
-
 use crate::text::{ends_with_final, ends_with_rieul};
 
-/// What a tail says about the word it is attached to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TailKind {
-    /// No tail: the bare word.
     Bare,
-    /// Object or topic marker (을 를 은 는 만 도 ...).
     Object,
-    /// Toward / at a place (으로 로 에 까지 에게 한테 쪽으로 ...).
     Direction,
-    /// From a place (에서 부터 에게서 ...).
     Source,
-    /// Possessive or link (의 ...).
     Link,
-    /// Plural marker with or without a particle (들 들을 ...).
     Plural,
-    /// "is" forms (이고 이며 입니다 ...).
     Copula,
 }
 
-/// How a tail depends on the stem's last syllable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Agree {
     Any,
-    /// Needs a final consonant.
     Final,
-    /// Needs no final consonant.
     Open,
-    /// Needs a final consonant that is not ㄹ (으로).
     FinalNotRieul,
-    /// Needs no final consonant, or ㄹ (로).
     OpenOrRieul,
 }
 
@@ -55,7 +34,6 @@ const fn t(text: &'static str, kind: TailKind, agree: Agree) -> Tail {
 use Agree::*;
 use TailKind::*;
 
-/// Nominal tails, longest first within a shared suffix so the longest wins.
 const NOMINAL: &[Tail] = &[
     t("에서는", Source, Any),
     t("에서도", Source, Any),
@@ -124,7 +102,6 @@ const NOMINAL: &[Tail] = &[
     t("도", Object, Any),
 ];
 
-/// "is" forms. The copula 이 can follow a vowel too, so there is no agreement rule.
 const COPULA: &[Tail] = &[
     t("입니다", Copula, Any),
     t("이어야", Copula, Any),
@@ -138,9 +115,6 @@ const COPULA: &[Tail] = &[
     t("이다", Copula, Any),
 ];
 
-/// Endings that follow a verb stem: "-해서", "-해줘", "-세요" and so on.
-/// Stems of two or more syllables take these; one-syllable verbs are listed
-/// in the lexicon as complete surface forms instead.
 pub const VERB_TAILS: &[&str] = &[
     "", "해", "해서", "해줘", "해와", "해와라", "해주세요", "해라", "해봐", "해보자", "해다", "해다가", "해다줘",
     "해다놔", "해오세요", "해오라", "해오고", "해놔", "해놓고", "하세요", "하라", "하고", "한", "할", "하기",
@@ -150,7 +124,6 @@ pub const VERB_TAILS: &[&str] = &[
     "다가", "다", "놔", "놔라", "놔줘", "놓아", "놓아라", "놓아줘", "두고", "둬", "두세요", "봐", "보자",
 ];
 
-/// A way of reading one eojeol: a stem and the tail removed from it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Reading {
     pub stem: String,
@@ -168,9 +141,6 @@ fn agrees(stem: &str, agree: Agree) -> bool {
     }
 }
 
-/// All ways to read `word` as stem + closed tail, the bare word first. A
-/// stem must keep at least one character. When the stem is not Hangul the
-/// agreement rule cannot be checked, so tails that need agreement are skipped.
 pub fn peel(word: &str) -> Vec<Reading> {
     let mut out = vec![Reading { stem: word.to_string(), tail: String::new(), kind: TailKind::Bare }];
     for tail in NOMINAL.iter().chain(COPULA.iter()) {
@@ -189,7 +159,6 @@ pub fn peel(word: &str) -> Vec<Reading> {
     out
 }
 
-/// Splits `word` as `entry` + verb tail when the remainder is a listed verb ending.
 pub fn verb_remainder<'a>(word: &'a str, entry: &str) -> Option<&'a str> {
     let rest = word.strip_prefix(entry)?;
     VERB_TAILS.contains(&rest).then_some(rest)
@@ -213,12 +182,10 @@ mod tests {
 
     #[test]
     fn direction_particle_ro_and_euro_agree_with_the_stem() {
-        // 창고 ends in a vowel -> 로; 베이스캠프 ends in a vowel -> 로; 석탄 ends in ㄴ -> 으로
         assert!(stems("창고로").contains(&("창고".into(), "로".into())));
         assert!(!stems("창고으로").iter().any(|(s, _)| s == "창고"));
         assert!(stems("석탄으로").contains(&("석탄".into(), "으로".into())));
         assert!(!stems("석탄로").iter().any(|(s, t)| s == "석탄" && t == "로"));
-        // a stem ending in ㄹ takes 로, not 으로
         assert!(stems("돌로").contains(&("돌".into(), "로".into())));
         assert!(!stems("돌으로").iter().any(|(s, t)| s == "돌" && t == "으로"));
     }

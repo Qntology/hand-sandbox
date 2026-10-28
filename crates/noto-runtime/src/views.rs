@@ -1,21 +1,3 @@
-//! The views of the world besides the robot's own camera, and the light
-//! they are rendered under (v1.0). See `docs/research/camera.md` §10 and
-//! `docs/research/lighting.md`.
-//!
-//! * View ids: the UI asks for a frame by a string ([`parse_view`]):
-//!   `agent`, `top`, `chase[:<orbit°>]`, `focus:<hand|side|low>` and
-//!   `iso[:<direction>[:<zoom>[:<pitch>]]]`. An unknown id is an error, not
-//!   the robot's camera.
-//! * The isometric view ([`render_iso`]) looks at the robot from a
-//!   world-fixed diagonal. Where it is centred follows the robot through a
-//!   critically damped spring advanced in simulated time ([`IsoFollow`]):
-//!   frames asked for faster or slower give the same picture for the same
-//!   moment, a pause holds it still, and the follow ignores the camera's
-//!   shake and the chassis's tilt (it tracks the base on the ground). It is
-//!   a view for people, never the robot's perception.
-//! * `world_light` sets the sun: a mode, an elevation and azimuth, a named
-//!   time of day, or a clock ([`Runtime::api_world_light`]).
-
 use noto_sds::Level;
 use serde_json::{json, Value};
 use world_sim::iso::{IsoView, RobotExtent};
@@ -25,13 +7,7 @@ use world_sim::{Camera, Frame, World};
 
 use crate::runtime::{FrameView, Runtime};
 
-/// Smoothing time of the iso camera's follow, s (design: about half a
-/// second). The spring is critically damped with `ω = 2/T`, the
-/// frame-rate-independent follow of Lowe's "Critically Damped Ease-In/Ease-Out
-/// Smoothing" (Game Programming Gems 4, 2004), here solved exactly.
 pub const ISO_FOLLOW_S: f32 = 0.5;
-/// A jump in simulated time longer than this, or backwards (a new world, a
-/// replay), puts the camera straight onto the robot, s.
 pub const ISO_SNAP_S: f64 = 5.0 * ISO_FOLLOW_S as f64;
 
 fn r3(x: f32) -> f64 {
@@ -39,7 +15,6 @@ fn r3(x: f32) -> f64 {
     if v == 0.0 { 0.0 } else { v }
 }
 
-/// The iso camera's centre following the robot.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct IsoFollow {
     state: Option<FollowState>,
@@ -53,9 +28,6 @@ struct FollowState {
 }
 
 impl IsoFollow {
-    /// The centre at simulated time `now_s` while following `target`, which
-    /// is taken to have held still since the last call. The first call, a
-    /// gap of more than [`ISO_SNAP_S`] or time going back puts it on the target.
     pub fn advance(&mut self, target: [f32; 3], now_s: f64) -> [f32; 3] {
         let st = match self.state {
             Some(s) if now_s >= s.t_s && now_s - s.t_s <= ISO_SNAP_S => {
@@ -64,7 +36,6 @@ impl IsoFollow {
                 let e = (-w * dt).exp();
                 let mut next = FollowState { pos: s.pos, vel: s.vel, t_s: now_s };
                 for k in 0..3 {
-                    // x(t) = target + (c0 + c1·t)·e^(−ωt), c0 = x0 − target, c1 = v0 + ω·c0.
                     let c0 = s.pos[k] - target[k];
                     let c1 = s.vel[k] + w * c0;
                     next.pos[k] = target[k] + (c0 + c1 * dt) * e;
@@ -78,13 +49,11 @@ impl IsoFollow {
         st.pos
     }
 
-    /// Where the centre is now, if it has started.
     pub fn centre(&self) -> Option<[f32; 3]> {
         self.state.map(|s| s.pos)
     }
 }
 
-/// The frame a view id asks for. Unknown ids and unreadable numbers are errors.
 pub fn parse_view(view: &str) -> Result<FrameView, String> {
     let mut parts = view.trim().split(':');
     let id = parts.next().unwrap_or("");
@@ -119,8 +88,6 @@ pub fn parse_view(view: &str) -> Result<FrameView, String> {
     }
 }
 
-/// The iso direction of a number: a step 0–3, or a heading in degrees
-/// snapped to the nearest of 45°, 135°, 225° and 315°.
 fn iso_step(a: f32) -> u8 {
     if a >= 0.0 && a <= 3.0 && a.fract() == 0.0 {
         a as u8
@@ -129,9 +96,6 @@ fn iso_step(a: f32) -> u8 {
     }
 }
 
-/// The isometric view of the robot now: the follow advanced to the world's
-/// time, the frame (robot links tilted with the chassis, cutaway) and the
-/// joint/CoM/ZMP overlay projected orthographically.
 pub fn render_iso(world: &World, cam: &Camera, follow: &mut IsoFollow, az_step: u8, zoom: f32, dimetric: bool) -> (Frame, Option<Value>) {
     let pose = world.body_pose();
     let tilt = pose.as_ref().map(|p| world.base_tilt(p)).unwrap_or_default();
@@ -142,7 +106,6 @@ pub fn render_iso(world: &World, cam: &Camera, follow: &mut IsoFollow, az_step: 
     let view = IsoView::new(centre, az_step, ext.iso_half_h_m(zoom), dimetric);
     let cut = Cutaway::around(&view, [world.agent.x, world.agent.z], ground, &ext);
     let frame = world_sim::iso::render_iso(world, cam, &view, &boxes, Some(&cut));
-    // The direction the camera looks, as a compass bearing (0 north, 90 east; the map's).
     let look_compass = (90.0 + view.yaw.to_degrees()).rem_euclid(360.0);
     let camera = json!({
         "kind": "iso", "centre": view.centre.map(r3), "az_step": az_step, "look_compass_deg": r3(look_compass),
@@ -153,7 +116,6 @@ pub fn render_iso(world: &World, cam: &Camera, follow: &mut IsoFollow, az_step: 
     (frame, overlay)
 }
 
-/// The lighting a `world_light` call asks for; `None` when it asks for nothing (a query).
 pub fn parse_light(args: &Value, now: Lighting) -> Result<Option<Lighting>, String> {
     let num = |k: &str| args.get(k).and_then(Value::as_f64).map(|v| v as f32);
     let overcast = match num("overcast") {
@@ -212,13 +174,11 @@ pub fn parse_light(args: &Value, now: Lighting) -> Result<Option<Lighting>, Stri
             Ok(Some(Lighting::Sun { elevation_deg: e, azimuth_deg: a.rem_euclid(360.0), overcast: overcast.unwrap_or(o0) }))
         }
         Some(m) if m != "sun" => Err(format!("알 수 없는 조명 모드 '{m}' (flat 또는 sun)")),
-        // Only clouds: the sun stays where it is (the flat lighting has none to cover).
         _ => Ok(overcast.map(|_| with_clouds(now))),
     }
 }
 
 impl Runtime {
-    /// Sets the lighting of this world and of the worlds made after it.
     pub fn set_lighting(&mut self, lighting: Lighting) {
         self.cfg.lighting = lighting;
         self.world.set_lighting(lighting);
@@ -226,11 +186,6 @@ impl Runtime {
         self.log("world", Level::Info, format!("조명: {} · 조도 {:.0} lx · 노출 {:.2} ms", s.label_ko, s.lux, s.exposure_ms), Some(json!({"lighting": lighting})));
     }
 
-    /// `world_light({mode, elevation, azimuth, overcast, preset, clock})`: sets
-    /// the sun (or the flat lighting) and answers the lighting now; with no
-    /// arguments it only answers. `preset` is a time of day (`dawn`/`새벽`,
-    /// `morning`/`아침`, `noon`/`정오`, `afternoon`/`오후`, `dusk`/`해질녘`);
-    /// `clock` an hour or `{hour, day, lat_deg}`.
     pub fn api_world_light(&mut self, args: &Value) -> Result<Value, String> {
         if let Some(l) = parse_light(args, self.cfg.lighting)? {
             self.set_lighting(l);
@@ -239,7 +194,6 @@ impl Runtime {
     }
 }
 
-/// The lighting of a world as the UI reads it, with the times of day it offers.
 pub fn light_json(world: &World) -> Value {
     let mut v = serde_json::to_value(world.lighting().summary()).unwrap_or(Value::Null);
     if let Value::Object(o) = &mut v {
@@ -279,9 +233,7 @@ mod tests {
     fn the_iso_follow_runs_on_simulated_time_and_settles() {
         let mut f = IsoFollow::default();
         assert_eq!(f.advance([1.0, 2.0, 3.0], 10.0), [1.0, 2.0, 3.0]);
-        // A target that holds still holds the camera still.
         assert_eq!(f.advance([1.0, 2.0, 3.0], 10.5), [1.0, 2.0, 3.0]);
-        // The robot moves a metre: asked every tick or once at the end, the camera is in the same place.
         let (mut a, mut b) = (f.clone(), f.clone());
         let target = [2.0, 2.0, 3.0];
         let mut last = 1.0f32;
@@ -292,15 +244,12 @@ mod tests {
         }
         let once = b.advance(target, 11.5)[0];
         assert!((once - last).abs() < 1e-4, "{once} vs {last}");
-        // Asking again at the same instant changes nothing.
         assert_eq!(b.advance(target, 11.5)[0], once);
-        // After one smoothing time it has come most of the way; after four it is there.
         let mut c = f.clone();
         let half = c.advance(target, 10.5 + ISO_FOLLOW_S as f64)[0] - 1.0;
         assert!(half > 0.5 && half < 0.7, "{half}");
         let settled = c.advance(target, 10.5 + 4.0 * ISO_FOLLOW_S as f64)[0];
         assert!((settled - 2.0).abs() < 0.01, "{settled}");
-        // A new world (time back) or a long pause puts it on the robot at once.
         assert_eq!(c.advance([9.0, 0.0, 9.0], 1.0), [9.0, 0.0, 9.0]);
         assert_eq!(c.advance([5.0, 0.0, 5.0], 1.0 + 2.0 * ISO_SNAP_S), [5.0, 0.0, 5.0]);
     }
@@ -320,7 +269,6 @@ mod tests {
         assert!(o["joints"].as_array().unwrap().iter().filter(|j| j["at"]["visible"] == true).count() >= 3);
         let (x0, y0) = robot_centre(&f);
         assert!((x0 - 96.0).abs() < 15.0 && (y0 - 64.0).abs() < 18.0, "({x0}, {y0})");
-        // Drive somewhere: the view lags a little behind, never loses the robot.
         let (ax, az) = (rt.world.agent.x, rt.world.agent.z);
         let goal = (0..16)
             .map(|k| (k as f32 * std::f32::consts::TAU / 16.0).sin_cos())
@@ -347,7 +295,6 @@ mod tests {
         assert_eq!(f["light"]["mode"], "flat");
         let err = rt.api_call("world_frame", &json!({"view": "isometric"})).unwrap_err();
         assert!(err.contains("isometric"), "{err}");
-        // The robot's camera reports the light it exposes for.
         rt.api_call("world_light", &json!({"preset": "dusk"})).unwrap();
         let a = rt.api_call("world_frame", &json!({"width": 160, "height": 96, "view": "agent"})).unwrap();
         let lux = a["camera"]["sensor"]["scene_lux"].as_f64().unwrap();
@@ -371,14 +318,12 @@ mod tests {
         assert!(set["exposure_ms"].as_f64().unwrap() > noon["exposure_ms"].as_f64().unwrap());
         let clock = rt.api_world_light(&json!({"clock": {"hour": 15.0, "day": 172}})).unwrap();
         assert!(clock["sun"]["azimuth_deg"].as_f64().unwrap() > 180.0);
-        // Only clouds: the sun stays where it is.
         let cloudy = rt.api_world_light(&json!({"overcast": 1.0})).unwrap();
         assert_eq!(cloudy["sun"]["azimuth_deg"], clock["sun"]["azimuth_deg"]);
         assert_eq!(cloudy["sun"]["direct_normal_lux"].as_f64().unwrap(), 0.0);
         for bad in [json!({"preset": "midnight"}), json!({"mode": "moon"}), json!({"elevation": 95.0}), json!({"clock": {"hour": 25}}), json!({"overcast": 2.0})] {
             assert!(rt.api_world_light(&bad).is_err(), "{bad}");
         }
-        // The lighting outlives a new world, and the flat mode comes back whole.
         rt.reset(Some(3)).unwrap();
         assert_eq!(rt.world().lighting(), rt.cfg.lighting);
         assert!(matches!(rt.world().lighting(), Lighting::Sun { .. }));

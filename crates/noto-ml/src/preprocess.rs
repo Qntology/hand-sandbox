@@ -1,29 +1,17 @@
-//! NaFlex preprocessing: keep the aspect ratio, pick the largest grid that
-//! fits in `max_patches`, and cut the image into patches.
-//!
-//! The rule follows the SigLIP2 image processor: normalize with mean 0.5 and
-//! std 0.5 (so pixels go to [-1, 1]) and flatten each patch as (row, col,
-//! channel), channels last.
-
 use image::{imageops::FilterType, DynamicImage};
 
 use crate::config::Siglip2Config;
 
-/// Patches of one image, ready for the vision encoder.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NaflexInput {
-    /// `grid_h * grid_w` rows of `patch_size * patch_size * 3` values, row-major.
     pub patches: Vec<f32>,
     pub grid_h: usize,
     pub grid_w: usize,
     pub patch_dim: usize,
-    /// Original image size, for mapping patches back to pixels.
     pub width: u32,
     pub height: u32,
 }
 
-/// Grid (rows, cols) for an image of `width` x `height`: the largest scale
-/// whose patch count stays within `max_patches`.
 pub fn naflex_grid(width: u32, height: u32, patch: usize, max_patches: usize) -> (usize, usize) {
     let scaled_dim = |scale: f64, size: u32| -> usize {
         let scaled = scale * size as f64;
@@ -49,7 +37,6 @@ pub fn naflex_grid(width: u32, height: u32, patch: usize, max_patches: usize) ->
     ((th / patch).max(1), (tw / patch).max(1))
 }
 
-/// Resizes, normalizes and patchifies `image` for a model described by `cfg`.
 pub fn preprocess(image: &DynamicImage, cfg: &Siglip2Config) -> NaflexInput {
     let p = cfg.patch_size;
     let (grid_h, grid_w) = naflex_grid(image.width(), image.height(), p, cfg.max_patches);
@@ -93,7 +80,6 @@ mod tests {
         let (h, w) = naflex_grid(640, 480, 16, 256);
         assert!(h * w <= 256);
         assert!(h >= 1 && w >= 1);
-        // 4:3 image should give a wider-than-tall grid.
         assert!(w > h);
         let (h2, w2) = naflex_grid(480, 640, 16, 256);
         assert!(h2 > w2);
@@ -117,7 +103,6 @@ mod tests {
         assert_eq!(input.patch_dim, 4 * 4 * 3);
         assert_eq!(input.patches.len(), input.grid_h * input.grid_w * input.patch_dim);
         assert!(input.patches.iter().all(|v| (-1.0..=1.0).contains(v)));
-        // First channel of a pure-red-channel pixel maps to +1.
         assert!((input.patches[0] - 1.0).abs() < 1e-6);
         assert!((input.patches[1] + 1.0).abs() < 1e-6);
     }

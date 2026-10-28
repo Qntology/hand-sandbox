@@ -1,34 +1,3 @@
-//! Composite N:N scenarios: several causes acting together, each N:N cell
-//! weighted the way published test batteries weight their items, scored
-//! against the human references. Sources and the derivation of every weight
-//! are in `docs/research/nn-scenarios.md`.
-//!
-//! How a scenario is scored (research §3.0):
-//!
-//! 1. Every cell with a human reference gets `z = (value − ref) / tol` and a
-//!    likeness score `100 − 10·|z|` (floor 0; the Gait Deviation Index scale,
-//!    10 points per tolerance). Cells without a reference are reported raw.
-//! 2. Gates come before any weighting (the DARPA Robotics Challenge rule that
-//!    completion outranks everything): the dynamic margin below zero, a joint
-//!    over its peak torque, a target not reached, or the camera tilted more
-//!    than 20° (Pozzo 1990) gives the phase, and the scenario, a 0.
-//! 3. A phase score is the segment-weighted mean of its cells' scores. The
-//!    segment weights come from REBA / RULA maximum segment scores or from
-//!    equal weights within a BESTest subsystem.
-//! 4. The scenario score is the phase scores weighted by the subsystem
-//!    shares of BESTest, Mini-BESTest or Brief-BESTest (items × points).
-//!    A braking ladder takes its worst rung (the NIOSH composite lifting
-//!    index's floor), and the work-shift composite is the NIOSH sequential
-//!    lifting index.
-//! 5. Every raw cell, its reference and z are reported with the score.
-//!
-//! What keeps this from becoming a target to tune (research §4): the
-//! controller never reads the references (a test scans `balance.rs` and
-//! `dynamics.rs` for it), every scenario runs with the same controller
-//! parameters, and the held-out scenarios ([`holdout`]) draw their
-//! conditions from ranges the development scenarios do not use and are only
-//! counted, never used to change anything.
-
 use std::collections::BTreeSet;
 
 use serde::Serialize;
@@ -37,7 +6,6 @@ use crate::balance::{reference, Body, BalanceReport, FeedForward, Posture, Sourc
 use crate::dynamics::{simulate, DynCfg, DynDigest};
 use crate::parts::Segment;
 
-/// What acts on the robot in a posture (more than its single `Source`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Cause {
@@ -51,7 +19,6 @@ pub enum Cause {
     Brake,
 }
 
-/// Every cause present in a posture.
 pub fn causes_of(p: &Posture) -> BTreeSet<Cause> {
     let mut c = BTreeSet::new();
     if p.source == Source::ArmRaise || p.arm_elev_deg[0] >= 60.0 {
@@ -81,22 +48,16 @@ pub fn causes_of(p: &Posture) -> BTreeSet<Cause> {
     c
 }
 
-/// Segment order of the weight arrays: head, chest, belly, arm, hand, leg, foot.
 pub const SEGMENTS: [Segment; 7] = Segment::ALL;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct PhaseSpec {
     pub id: String,
-    /// BESTest subsystem the phase stands for (`anticipatory`, `reactive`, `sensory`, `gait`, `limits`).
     pub subsystem: &'static str,
     pub weight: f32,
     pub posture: Posture,
-    /// The causes a world posture must have to count as this phase.
     pub causes: Vec<Cause>,
-    /// Rungs of one ladder share this id; the phase takes the worst rung.
     pub ladder: Option<&'static str>,
-    /// An outside disturbance (a vehicle braking under the robot), not a motion the
-    /// robot chose. Only these may exceed what people withstand without a step.
     pub imposed: bool,
 }
 
@@ -104,16 +65,13 @@ pub struct PhaseSpec {
 pub struct ScenarioSpec {
     pub id: &'static str,
     pub name_ko: &'static str,
-    /// Segment weights (head, chest, belly, arm, hand, leg, foot), summing to 1.
     pub seg_w: [f32; 7],
-    /// Where the phase and segment weights come from.
     pub weights_from: &'static str,
     pub needs_legs: bool,
     pub holdout: bool,
     pub phases: Vec<PhaseSpec>,
 }
 
-/// One N:N cell of a scenario phase.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Cell {
     pub source: Source,
@@ -125,7 +83,6 @@ pub struct Cell {
     pub cite: Option<&'static str>,
     pub z: Option<f32>,
     pub score: Option<f32>,
-    /// From the joint dynamics rather than the quasi-static model.
     pub dynamic: bool,
 }
 
@@ -136,19 +93,15 @@ pub struct PhaseResult {
     pub weight: f32,
     pub ladder: Option<&'static str>,
     pub cells: Vec<Cell>,
-    /// Mean cell score per segment, `None` where no cell has a reference.
     pub seg_scores: [Option<f32>; 7],
     pub score: f32,
-    /// Mini-BESTest-style item: 2 all scored cells within one tolerance, 1 within two, else 0.
     pub item: u8,
     pub gates: Vec<String>,
-    /// Failures at an intensity where people need a step too (reported, not gated).
     pub beyond_human: Vec<String>,
     pub static_margin: f32,
     pub min_margin: f32,
     pub peak_ratio: f32,
     pub worst_joint: Option<String>,
-    /// Largest sustained torque over the continuous rating (for the shift index).
     pub sustained_effort: f32,
 }
 
@@ -157,13 +110,11 @@ pub struct ScenarioResult {
     pub id: &'static str,
     pub name_ko: &'static str,
     pub holdout: bool,
-    /// `None` when the base cannot do the scenario (a step on wheels).
     pub skipped: Option<String>,
     pub phases: Vec<PhaseResult>,
     pub score: f32,
     pub gated: bool,
     pub gates: Vec<String>,
-    /// Every phase item at least 1 and no gate (the held-out pass rule).
     pub passed: bool,
     pub weights_from: &'static str,
 }
@@ -172,12 +123,10 @@ fn cause_set(c: &[Cause]) -> Vec<Cause> {
     c.to_vec()
 }
 
-/// Ten per cent of the body mass, the heavier load of the research's lifting and carrying studies.
 fn load10(body: &Body) -> f32 {
     0.10 * body.mass_kg()
 }
 
-/// A lift of `kg` with one arm, or two when one cannot (as the world does it).
 fn lift_posture(body: &Body, kg: f32, slope: f32) -> Posture {
     let two = !body.solve(&Posture { slope_deg: slope, ..Posture::arm_lift(kg, false, 0.0) }, &FeedForward::default(), 1e3).feasible;
     Posture { slope_deg: slope, ..Posture::arm_lift(kg, two, 0.0) }
@@ -187,15 +136,10 @@ fn phase(id: &str, subsystem: &'static str, weight: f32, posture: Posture, cause
     PhaseSpec { id: id.into(), subsystem, weight, posture, causes: cause_set(causes), ladder: None, imposed: false }
 }
 
-/// The development scenarios (research §3.1, S1–S4 and S6; S5 needs a
-/// frequency response this simulator does not measure, S7 is [`shift_index`],
-/// S8 is [`holdout`]).
 pub fn library(body: &Body) -> Vec<ScenarioSpec> {
     let load = load10(body);
     let walk = body.legged();
     let mut out = Vec::new();
-    // S1: lifting on a 10° slope. Mini-BESTest sensory : anticipatory = 6 : 6; segments
-    // sensory side head/chest/foot equal, lifting side REBA maxima.
     out.push(ScenarioSpec {
         id: "S1",
         name_ko: "경사 위 들기",
@@ -208,7 +152,6 @@ pub fn library(body: &Body) -> Vec<ScenarioSpec> {
             phase("lift", "anticipatory", 0.5, lift_posture(body, load, 10.0), &[Cause::ArmLift, Cause::Slope]),
         ],
     });
-    // S2: a front load up a 17 cm step (the BESTest step). BESTest APA 18 : gait 21.
     out.push(ScenarioSpec {
         id: "S2",
         name_ko: "앞 짐 들고 턱 오르기",
@@ -221,7 +164,6 @@ pub fn library(body: &Body) -> Vec<ScenarioSpec> {
             phase("step", "anticipatory", 0.462, Posture { source: Source::StepUp, step_m: 0.17, single_support: walk, ..Posture::quiet(load) }, &[Cause::CarryFront, Cause::StepUp]),
         ],
     });
-    // S3: reach forward on one leg. BESTest limits 21 : APA 18.
     out.push(ScenarioSpec {
         id: "S3",
         name_ko: "한 발로 서서 앞으로 뻗기",
@@ -234,8 +176,6 @@ pub fn library(body: &Body) -> Vec<ScenarioSpec> {
             phase("reach", "limits", 0.538, Posture { source: Source::ArmRaise, arm_elev_deg: [90.0, 0.0], elbow_deg: [0.0, 10.0], single_support: true, ..Posture::quiet(0.0) }, &[Cause::FootLift, Cause::ArmRaise]),
         ],
     });
-    // S4: braking with a front load, a ladder of decelerations (Krašna 2021 pulses).
-    // Mini-BESTest reactive 6 : gait 10; the ladder takes its worst rung (NIOSH CLI floor).
     let mut s4 = vec![phase("carry", "gait", 0.625, Posture { source: Source::CarryFront, ..Posture::quiet(load) }, &[Cause::CarryFront])];
     for a in [0.5f32, 1.0, 1.5, 2.5] {
         let mut p = phase(&format!("brake_{a:.1}"), "reactive", 0.375, Posture { source: Source::Accel, accel_mps2: -a, ..Posture::quiet(load) }, &[Cause::CarryFront, Cause::Brake]);
@@ -252,8 +192,6 @@ pub fn library(body: &Body) -> Vec<ScenarioSpec> {
         holdout: false,
         phases: s4,
     });
-    // S6: strike on a slope, then start off. Brief-BESTest APA 6 : sensory 3.
-    // The start is the robot's own: its drive planner picks the acceleration.
     let start = if walk {
         Posture { source: Source::FootLift, single_support: true, slope_deg: 10.0, ..Posture::quiet(0.0) }
     } else {
@@ -276,20 +214,13 @@ pub fn library(body: &Body) -> Vec<ScenarioSpec> {
     out
 }
 
-/// Shortest ramp to cruise speed of the world's drive (`world_sim::ACCEL_TIME_S`).
 pub const PLANNER_MIN_RAMP_S: f32 = 0.5;
 
-/// Ranges of the held-out scenarios. None of them contains a condition the
-/// development scenarios use (slope 10°, step 17 cm, braking 0.5 / 1.0 /
-/// 1.5 / 2.5 m/s², load 10% of the body mass); a test checks it.
 pub const HOLDOUT_SLOPE_DEG: (f32, f32) = (12.0, 18.0);
 pub const HOLDOUT_STEP_M: (f32, f32) = (0.12, 0.16);
 pub const HOLDOUT_BRAKE: [(f32, f32); 2] = [(0.75, 0.95), (1.7, 2.2)];
 pub const HOLDOUT_LOAD_FRAC: [(f32, f32); 2] = [(0.05, 0.08), (0.12, 0.15)];
 
-/// Held-out scenarios for one evaluation seed: random combinations of two or
-/// three causes inside [`HOLDOUT_SLOPE_DEG`] and friends (DARPA's surprise
-/// task; research §4 rules 1–4). Scored pass / fail, never tuned against.
 pub fn holdout(body: &Body, seed: u64, count: usize) -> Vec<ScenarioSpec> {
     let mut s = seed ^ 0x9E37_79B9_7F4A_7C15;
     let mut next = move || {
@@ -320,33 +251,20 @@ pub fn holdout(body: &Body, seed: u64, count: usize) -> Vec<ScenarioSpec> {
     out
 }
 
-/// References of the composite and dynamic cells that the single-cause table
-/// (`balance::reference`) does not have. Derivations in the research doc.
 pub fn composite_reference(source: Source, target: Segment, axis: &str, accel: f32) -> Option<(f32, f32, &'static str)> {
     match (source, target, axis) {
-        // Share of the limit of stability a deceleration (braking pushes the CoM
-        // forward) or an acceleration (backward) uses: human LOS 6.25° forward,
-        // 4.45° backward (Jbabdi 2008); people take a step at about 93% of it
-        // (de Kam 2017 thresholds 1.0 / 0.7 m/s², cited by Krašna 2021).
         (Source::Accel, Segment::Foot, "los_frac") => {
             let lim = if accel < 0.0 { 6.25f32 } else { 4.45 }.to_radians().tan();
             let v = (accel.abs() / G) / lim;
             Some((v, 0.3 * v.max(0.05), "LOS 6.25°/4.45° (Jbabdi 2008), 내딛기 문턱 1.0/0.7 m/s² (de Kam 2017 via Krašna 2021) — 유도"))
         }
-        // Peak sideways pelvis acceleration of the weight shift before a step:
-        // 0.044 ± 0.018 g (L5 IMU, 32 adults of 69 years, Schlenstedt 2018).
         (Source::FootLift, Segment::Belly, "pelvis_lat_acc") => Some((0.43, 0.18, "보행 시작 골반 좌우 가속 0.044 ± 0.018 g (Schlenstedt 2018)")),
-        // A predictable disturbance: anticipation cuts the backward CoP peak from
-        // 60 ± 14 to 28 ± 3.6 mm (Santos, Kanekar & Aruin 2010) → dip ratio 0.47.
         (_, Segment::Foot, "ff_dip_ratio") => Some((0.47, 0.14, "예측 가능한 교란의 CoP 최대 28/60 mm (Santos 2010) — 유도")),
-        // Free-style lifting on a slope raises the L5/S1 moment 6.8% over flat
-        // ground (Mirka & Shin 2004, n = 13; SD not given, tolerance chosen as ±5%).
         (Source::ArmLift, Segment::Belly, "slope_moment_ratio") => Some((1.068, 0.05, "경사 들기 L5/S1 모멘트 +6.8% (Mirka & Shin 2004) — 허용폭 선택")),
         _ => None,
     }
 }
 
-/// A cell with a reference is a likeness cell of the shared judge (`crate::bench::judge`); one without is recorded.
 fn scored(c: &mut Cell) {
     if let (Some(reference), Some(tolerance)) = (c.reference, c.tolerance) {
         let v = crate::bench::judge(Some(c.value), crate::bench::Rule::Like { reference, tolerance });
@@ -355,8 +273,6 @@ fn scored(c: &mut Cell) {
     }
 }
 
-/// The cells of one state: the quasi-static couplings with their references,
-/// and the dynamic cells of the transition into it.
 pub fn cells(body: &Body, post: &Posture, r: &BalanceReport, d: Option<&DynDigest>) -> Vec<Cell> {
     let ctx = r.ref_ctx(body.mass_kg());
     let mut out: Vec<Cell> = r
@@ -376,7 +292,6 @@ pub fn cells(body: &Body, post: &Posture, r: &BalanceReport, d: Option<&DynDiges
         out.push(cell);
     };
     if let Some(d) = d {
-        // Hof's b_min is the smallest margin of the extrapolated CoM: the dynamic minimum compares with it.
         add(Segment::Foot, "margin", d.min_margin);
         add(Segment::Head, "tilt_deg", d.head_pitch_max_deg);
         if post.single_support {
@@ -384,7 +299,6 @@ pub fn cells(body: &Body, post: &Posture, r: &BalanceReport, d: Option<&DynDiges
         }
     }
     if post.accel_mps2 != 0.0 {
-        // Share of the support's edge distance the inertial ZMP shift uses.
         let s = r.support;
         let edge = if post.accel_mps2 < 0.0 { s[1] - r.com[0] } else { r.com[0] - s[0] };
         add(Segment::Foot, "los_frac", r.com[2] * post.accel_mps2.abs() / G / edge.max(1e-3));
@@ -396,7 +310,6 @@ fn seg_index(s: Segment) -> usize {
     SEGMENTS.iter().position(|x| *x == s).unwrap_or(0)
 }
 
-/// Scores one phase from its cells and gates.
 pub fn score_phase(spec: &PhaseSpec, seg_w: &[f32; 7], cells: Vec<Cell>, r: &BalanceReport, d: Option<&DynDigest>) -> PhaseResult {
     let mut sums = [0.0f32; 7];
     let mut counts = [0u32; 7];
@@ -412,9 +325,6 @@ pub fn score_phase(spec: &PhaseSpec, seg_w: &[f32; 7], cells: Vec<Cell>, r: &Bal
     let seg_scores: [Option<f32>; 7] = std::array::from_fn(|i| (counts[i] > 0).then(|| sums[i] / counts[i] as f32));
     let (num, den) = (0..7).filter_map(|i| seg_scores[i].map(|s| (seg_w[i] * s, seg_w[i]))).fold((0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
     let mut gates = Vec::new();
-    // Where the human reference itself needs a step (an acceleration past
-    // the limit of stability: 100% of people stepped at 2.5 m/s² braking,
-    // Krašna 2021), a robot that needs one too is not failing a human task.
     let human_steps = spec.imposed && cells.iter().any(|c| c.axis == "los_frac" && c.reference.map_or(false, |v| v >= 1.0));
     let mut beyond = Vec::new();
     if !r.feasible {
@@ -466,9 +376,6 @@ pub fn score_phase(spec: &PhaseSpec, seg_w: &[f32; 7], cells: Vec<Cell>, r: &Bal
     }
 }
 
-/// Evaluates a scenario: each phase is simulated from the previous one with
-/// the given feed-forward (the controller's own setting, the same for every
-/// scenario), scored, and the phases combined.
 pub fn evaluate(body: &Body, spec: &ScenarioSpec, ff: &FeedForward) -> ScenarioResult {
     let cfg = DynCfg::default();
     if spec.needs_legs && !body.legged() {
@@ -483,7 +390,6 @@ pub fn evaluate(body: &Body, spec: &ScenarioSpec, ff: &FeedForward) -> ScenarioR
         let roll = simulate(body, &prev, &p, ff, grip, &cfg);
         let digest = roll.digest();
         let mut cs = cells(body, &p, &report, Some(&digest));
-        // Anticipation's share: the same move without the feed-forward.
         if ff.enabled {
             let off = simulate(body, &prev, &p, &FeedForward { enabled: false, gain: 1.0 }, grip, &cfg);
             let (dip_ff, dip_off) = (digest.static_margin - digest.min_margin, off.static_margin - off.min_margin);
@@ -494,7 +400,6 @@ pub fn evaluate(body: &Body, spec: &ScenarioSpec, ff: &FeedForward) -> ScenarioR
                 cs.push(c);
             }
         }
-        // Lifting on a slope against the same lift on flat ground (relative cell).
         if p.source == Source::ArmLift && p.slope_deg.abs() >= 3.0 {
             let flat = Posture { slope_deg: 0.0, ..p };
             let f = simulate(body, &Posture { slope_deg: 0.0, ..prev }, &flat, ff, grip, &cfg);
@@ -516,7 +421,6 @@ pub fn evaluate(body: &Body, spec: &ScenarioSpec, ff: &FeedForward) -> ScenarioR
     combine(spec, phases)
 }
 
-/// Combines phase results: ladders take their worst rung, then subsystem weights.
 pub fn combine(spec: &ScenarioSpec, phases: Vec<PhaseResult>) -> ScenarioResult {
     let mut parts: Vec<(f32, f32)> = Vec::new();
     let mut ladders: std::collections::BTreeMap<&'static str, (f32, f32)> = std::collections::BTreeMap::new();
@@ -538,14 +442,6 @@ pub fn combine(spec: &ScenarioSpec, phases: Vec<PhaseResult>) -> ScenarioResult 
     ScenarioResult { id: spec.id, name_ko: spec.name_ko, holdout: spec.holdout, skipped: None, phases, score, gated, gates, passed, weights_from: spec.weights_from }
 }
 
-/// The NIOSH sequential lifting index (Waters, Lu & Occhipinti 2007) over
-/// scenarios done one after another in a 240-minute block: `LI` is a
-/// scenario's peak torque over the peak rating (short exposure), `LImax` its
-/// sustained torque over the continuous rating (long exposure, the thermal
-/// side), `TF` its share of the block. `SLI = LI₁ + (LImax₁ − LI₁)·K`,
-/// `K = Σ LImaxᵢ·TFᵢ / LImax₁`, task 1 the one with the largest `LImax`.
-/// Above 1 the robot cannot keep the shift up. (The mapping of LI and LImax
-/// onto torque ratios is this project's adaptation.)
 pub fn shift_index(results: &[(&ScenarioResult, f32)]) -> Option<f32> {
     let mut tasks: Vec<(f32, f32, f32)> = results
         .iter()
@@ -565,10 +461,6 @@ pub fn shift_index(results: &[(&ScenarioResult, f32)]) -> Option<f32> {
     Some(li1 + (lmax1 - li1) * k)
 }
 
-/// The development scenario phases a world posture counts as: same source and
-/// every cause of the phase present.
-/// Within a scenario the closest phase wins (the ladder rung nearest in
-/// acceleration, slope and step).
 pub fn matching_phases<'a>(lib: &'a [ScenarioSpec], post: &Posture) -> Vec<(&'a ScenarioSpec, &'a PhaseSpec)> {
     let have = causes_of(post);
     let dist = |p: &PhaseSpec| (p.posture.accel_mps2 - post.accel_mps2).abs() + (p.posture.slope_deg - post.slope_deg).abs() / 10.0 + (p.posture.step_m - post.step_m).abs() * 10.0;
@@ -597,7 +489,6 @@ mod tests {
         for s in library(&b) {
             let w: f32 = s.seg_w.iter().sum();
             assert!((w - 1.0).abs() < 2e-3, "{}: {w}", s.id);
-            // A ladder counts once (its rungs share one weight).
             let mut ladders = std::collections::BTreeMap::new();
             let mut total = 0.0f32;
             for p in &s.phases {
@@ -619,7 +510,6 @@ mod tests {
     #[test]
     fn braking_uses_the_forward_limit_and_starting_the_narrower_backward_one() {
         let (b, s) = (composite_reference(Source::Accel, Segment::Foot, "los_frac", -1.0).unwrap(), composite_reference(Source::Accel, Segment::Foot, "los_frac", 1.0).unwrap());
-        // 1 m/s² braking is 93% of the human forward limit (de Kam's single-step threshold).
         assert!((b.0 - 0.931).abs() < 0.005, "{}", b.0);
         assert!(s.0 > b.0, "the same acceleration uses more of the backward limit");
     }

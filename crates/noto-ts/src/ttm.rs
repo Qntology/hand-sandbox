@@ -1,14 +1,3 @@
-//! Granite TTM-R3 (TinyTimeMixer) forecaster on candle.
-//!
-//! Copied from endmill-sandbox `src/ml/ttm.rs` (same author, Apache-2.0). Only
-//! the three calls into that project's `ml` module were replaced by the local
-//! helpers in `io.rs`; the model code is unchanged. It reads `config.json` and
-//! `model.safetensors` from the `granite-timeseries-ttm-r3/52-16-dec-52-r3`
-//! folder of `ibm-granite/granite-timeseries-ttm-r3`.
-//!
-//! Unsupported configuration options are rejected in [`TtmForecaster::validate`]
-//! instead of being run with wrong results.
-
 use candle_core::{Device, IndexOp, Module, Result, Tensor, D};
 use candle_nn::{LayerNorm, Linear, VarBuilder};
 use serde::Deserialize;
@@ -1212,7 +1201,6 @@ impl TtmForecaster {
         self.config.context_length
     }
 
-    /// The device the weights live on (where the forecasts run).
     pub fn device(&self) -> &Device {
         match &self.kind {
             Kind::Plain(p) => &p.device,

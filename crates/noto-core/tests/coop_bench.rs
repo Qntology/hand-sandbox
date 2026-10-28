@@ -1,10 +1,3 @@
-//! The cooperation benchmark (`noto_core::coopbench`) for the named presets
-//! on legs, wheels and tracks. The lines this prints (`[KX]` cells, `[KX-SUM]`
-//! scenarios, `[KX-WHY]` each member's share and reasons) are the record of
-//! how a team's load split and limits compare with people carrying together;
-//! the assertions check the scoring machinery, the statics' own laws and the
-//! rule that keeps the references out of the engine, never a score threshold.
-
 use noto_core::act::cocarry::{self, Carrier, CarryOpts, Load};
 use noto_core::actbench::Layer;
 use noto_core::balance::Body;
@@ -87,11 +80,6 @@ fn the_same_engine_gives_the_same_answer() {
 
 #[test]
 fn the_statics_hold_their_own_laws() {
-    // Consistency of the engine (not references): the shares carry the whole
-    // weight; on level ground two carriers of a symmetric log split it evenly;
-    // on a slope with the CoM above the grip line the lower carrier takes more,
-    // the more the higher the CoM (the direction of HSE L23 para 150, an
-    // engine input); a pair carries what one alone cannot.
     for plan in PLANS {
         let b = Body::new(&BodyPlan::named(plan).unwrap(), BaseKind::HumanFoot, FingerCount::Five);
         let m = sized_kg(&b);
@@ -114,9 +102,6 @@ fn the_statics_hold_their_own_laws() {
 
 #[test]
 fn the_engine_never_names_a_cooperation_benchmark_source() {
-    // The cooperative-carry model cites its own inputs (HSE L23, ISO/TR 12295,
-    // Network Rail, rigid-body statics), never a source the cooperation
-    // benchmark scores with.
     let files = [
         ("kin.rs", include_str!("../src/kin.rs")),
         ("act/mod.rs", include_str!("../src/act/mod.rs")),

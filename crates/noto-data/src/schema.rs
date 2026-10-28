@@ -1,10 +1,3 @@
-//! Arrow schemas of the Lance tables. Tables that the simulator fills today
-//! come first; planned tables are defined here so the data model is fixed
-//! before their producers exist.
-//!
-//! Vectors are stored as one column per axis rather than nested lists, which
-//! keeps the tables easy to query from Lance and from Python.
-
 use std::sync::Arc;
 
 use lancedb::arrow::arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -34,23 +27,17 @@ fn bool_field(name: &str) -> Field {
     Field::new(name, DataType::Boolean, false)
 }
 
-/// One row per synthetic grasp episode.
-///
-/// `layers` lists the layers recorded for the episode, comma-separated, so a
-/// reader can tell which columns are real and which are placeholders.
 pub fn samples_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         str_field("sample_id"),
         str_field("label"),
         str_field("material"),
         Field::new("seed", DataType::Int64, false),
-        // Hand configuration.
         i32_field("finger_count"),
         i32_field("joint_segments"),
         str_field("base_kind"),
         str_field("joint_kinds"),
         str_field("actuation"),
-        // Object: size, mass and mass properties.
         f32_field("size_w_m"),
         f32_field("size_h_m"),
         f32_field("size_d_m"),
@@ -62,14 +49,12 @@ pub fn samples_schema() -> SchemaRef {
         f32_field("com_x_m"),
         f32_field("com_y_m"),
         f32_field("com_z_m"),
-        // Object pose (6DoF). Only translation is modelled so far.
         f32_field("object_x_m"),
         f32_field("object_y_m"),
         f32_field("object_z_m"),
         f32_field("object_roll_rad"),
         f32_field("object_pitch_rad"),
         f32_field("object_yaw_rad"),
-        // Grasp outcome.
         str_field("grasp_type"),
         i32_field("finger_contacts"),
         i32_field("contacts_total"),
@@ -82,7 +67,6 @@ pub fn samples_schema() -> SchemaRef {
     ]))
 }
 
-/// One row per contact. `source_finger` is -1 for the palm.
 pub fn contacts_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         str_field("sample_id"),
@@ -99,7 +83,6 @@ pub fn contacts_schema() -> SchemaRef {
     ]))
 }
 
-/// One row per joint of every finger.
 pub fn joint_states_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         str_field("sample_id"),
@@ -117,7 +100,6 @@ pub fn joint_states_schema() -> SchemaRef {
     ]))
 }
 
-/// Planned: one row per surface sample point of the hand and the object.
 pub fn point_cloud_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         str_field("sample_id"),
@@ -132,8 +114,6 @@ pub fn point_cloud_schema() -> SchemaRef {
     ]))
 }
 
-/// Planned: one row per rendered view. Image-sized payloads are stored as
-/// binary blobs so Lance can keep them out of the scan path.
 pub fn vision_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         str_field("sample_id"),
@@ -148,7 +128,6 @@ pub fn vision_schema() -> SchemaRef {
     ]))
 }
 
-/// Planned: one row per fingertip per sample, flattened taxel grid.
 pub fn tactile_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         str_field("sample_id"),
@@ -159,7 +138,6 @@ pub fn tactile_schema() -> SchemaRef {
     ]))
 }
 
-/// SigLIP2 embeddings of rendered views, searchable with a Lance vector index.
 pub fn embeddings_schema(dim: i32) -> SchemaRef {
     Arc::new(Schema::new(vec![
         str_field("sample_id"),
@@ -176,8 +154,6 @@ pub fn embeddings_schema(dim: i32) -> SchemaRef {
     ]))
 }
 
-/// Logistics vocabulary: each row is one object label used for zero-shot
-/// classification and as a default payload.
 pub fn dictionary_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         str_field("id"),

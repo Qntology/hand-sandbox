@@ -1,33 +1,3 @@
-//! ML track 3 on a real mask model: Segment Anything (SAM ViT-B, Kirillov et
-//! al. 2023, arXiv 2304.02643) or MobileSAM (the same prompt encoder and mask
-//! decoder behind a TinyViT-5M image encoder, Zhang et al. 2023, arXiv
-//! 2306.14289), from `candle-transformers`, behind the same [`MaskTracker`]
-//! interface as the region-growing stand-in.
-//!
-//! The SAM 3.1 checkpoint the plan named (`avencera/sam3.1-mlx-bf16`) is an
-//! MLX layout that does not run here; SAM and MobileSAM use the same "point
-//! prompt in, mask with a quality score out" contract and run on every candle
-//! backend (CPU, CUDA, ROCm, Vulkan, Metal).
-//!
-//! How the work is laid out on the device (the logis-center multimodal rules,
-//! applied to masks):
-//!
-//! * The image encoder is the expensive part: a ViT (or TinyViT) over a
-//!   1024 x 1024 input. It runs once per keyframe; [`MaskTracker::prepare`]
-//!   encodes the keyframes the tracker will see next in batches, as many per
-//!   pass as the device's [`noto_ml::BatchPolicy`] allows (`NOTO_SAM_BATCH`
-//!   overrides). Embeddings stay on the device in a small cache keyed by a
-//!   hash of the image (logis-center `vision_cache`).
-//! * The prompt encoder and the mask decoder are cheap. All queries of one
-//!   keyframe (tracks to follow and new prompts) go through one decoder call;
-//!   the decoder repeats the image embedding per query itself.
-//! * Only the chosen low-resolution (256 x 256) logits of each query leave the
-//!   device; the mask is sampled from them at the tracker's working size.
-//!
-//! Weights are not shipped. `lmz/candle-sam` on Hugging Face has both files
-//! under the names below; put them in `models/sam` or point `SAM_DIR` at them.
-//! Without a file the runtime keeps the region-growing tracker.
-
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -43,31 +13,20 @@ use candle_transformers::models::segment_anything::tiny_vit::{tiny_vit_5m, TinyV
 use crate::frame::{DepthMap, Mask, Rgb};
 use crate::track::{MaskTracker, PointPrompt, TrackedMask};
 
-/// Side of SAM's square input, pixels.
 pub const IMAGE_SIZE: usize = 1024;
-/// Side of the image embedding grid (1024 / 16).
 pub const EMBED_SIDE: usize = 64;
-/// Side of the decoder's low-resolution mask logits.
 pub const LOW_RES: usize = 256;
 const PROMPT_DIM: usize = 256;
-/// Environment variable with the folder of the weights.
 pub const DIR_ENV: &str = "SAM_DIR";
-/// Folder the caller loads from when [`DIR_ENV`] is not set.
 pub const DEFAULT_DIR: &str = "models/sam";
-/// MobileSAM weights (`lmz/candle-sam`), about 40 MB. Preferred: the encoder
-/// fits next to SigLIP2 and TIPS on a 4 GB GPU.
 pub const TINY_FILE: &str = "mobile_sam-tiny-vitt.safetensors";
-/// SAM ViT-B weights (`lmz/candle-sam`), about 375 MB. Used when it is the
-/// only file, or when `NOTO_SAM=vit_b`.
 pub const VIT_B_FILE: &str = "sam_vit_b_01ec64.safetensors";
-/// Overrides the images per encoder pass.
 pub const BATCH_ENV: &str = "NOTO_SAM_BATCH";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SamVariant {
     MobileSam,
     VitB,
-    /// A small ViT encoder for tests with random weights; same decoder.
     TestVit { dim: usize, depth: usize, heads: usize },
 }
 
@@ -95,30 +54,23 @@ impl Encoder {
     }
 }
 
-/// The three SAM parts on one device.
 pub struct SamModel {
     variant: SamVariant,
     encoder: Encoder,
     prompt: PromptEncoder,
     decoder: MaskDecoder,
-    /// Dense positional encoding of the embedding grid, computed once.
     image_pe: Tensor,
     mean: Tensor,
     std: Tensor,
     device: Device,
 }
 
-/// One decoded query: the best of SAM's three masks.
 pub struct Decoded {
-    /// `LOW_RES x LOW_RES` logits, row-major, over the padded 1024 input.
     pub logits: Vec<f32>,
-    /// SAM's predicted IoU of that mask.
     pub iou_pred: f32,
 }
 
 impl SamModel {
-    /// The weights file in `dir` and its variant. MobileSAM wins unless
-    /// `NOTO_SAM=vit_b` and the ViT-B file is there.
     pub fn find_weights(dir: &Path) -> Option<(PathBuf, SamVariant)> {
         let tiny = dir.join(TINY_FILE);
         let vit = dir.join(VIT_B_FILE);
@@ -139,18 +91,14 @@ impl SamModel {
                 dir.display()
             );
         };
-        // SAFETY: the file is only read, and the mapping lives as long as the model.
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[&file], DType::F32, device)? };
         Self::from_var_builder(variant, vb, device).with_context(|| format!("loading {}", file.display()))
     }
 
-    /// Builds the model from any `VarBuilder` rooted at the checkpoint
-    /// (`image_encoder.*`, `prompt_encoder.*`, `mask_decoder.*`).
     pub fn from_var_builder(variant: SamVariant, vb: VarBuilder, device: &Device) -> Result<SamModel> {
         let enc = vb.pp("image_encoder");
         let encoder = match variant {
             SamVariant::MobileSam => Encoder::Tiny(Box::new(tiny_vit_5m(enc)?)),
-            // segment-anything `build_sam_vit_b`: 768 wide, 12 blocks, 12 heads, global attention in blocks 2, 5, 8, 11.
             SamVariant::VitB => Encoder::Vit(Box::new(ImageEncoderViT::new(IMAGE_SIZE, 16, 3, 768, 12, 12, PROMPT_DIM, true, true, true, 14, &[2, 5, 8, 11], enc)?)),
             SamVariant::TestVit { dim, depth, heads } => {
                 Encoder::Vit(Box::new(ImageEncoderViT::new(IMAGE_SIZE, 16, 3, dim, depth, heads, PROMPT_DIM, true, true, true, 14, &[depth.saturating_sub(1)], enc)?))
@@ -159,7 +107,6 @@ impl SamModel {
         let prompt = PromptEncoder::new(PROMPT_DIM, (EMBED_SIDE, EMBED_SIDE), (IMAGE_SIZE, IMAGE_SIZE), 16, vb.pp("prompt_encoder"))?;
         let decoder = MaskDecoder::new(PROMPT_DIM, 3, 3, 256, vb.pp("mask_decoder"))?;
         let image_pe = prompt.get_dense_pe()?;
-        // segment-anything `Sam.pixel_mean` / `pixel_std` (0..255 RGB).
         let mean = Tensor::new(&[123.675f32, 116.28, 103.53], device)?.reshape((3, 1, 1))?;
         let std = Tensor::new(&[58.395f32, 57.12, 57.375], device)?.reshape((3, 1, 1))?;
         Ok(SamModel { variant, encoder, prompt, decoder, image_pe, mean, std, device: device.clone() })
@@ -173,13 +120,10 @@ impl SamModel {
         &self.device
     }
 
-    /// Frame pixels to model input pixels (`ResizeLongestSide`).
     pub fn scale(width: u32, height: u32) -> f32 {
         IMAGE_SIZE as f32 / width.max(height).max(1) as f32
     }
 
-    /// `(3, 1024, 1024)`: resized so the long side is 1024, normalised, padded
-    /// at the bottom and right with zeros, as `Sam.preprocess` does.
     fn input(&self, rgb: &Rgb) -> Result<Tensor> {
         let s = Self::scale(rgb.width, rgb.height);
         let (w, h) = (((rgb.width as f32 * s).round() as u32).clamp(1, IMAGE_SIZE as u32), ((rgb.height as f32 * s).round() as u32).clamp(1, IMAGE_SIZE as u32));
@@ -196,7 +140,6 @@ impl SamModel {
         Ok(t.pad_with_zeros(1, 0, IMAGE_SIZE - h as usize)?.pad_with_zeros(2, 0, IMAGE_SIZE - w as usize)?)
     }
 
-    /// Images per encoder pass on this device.
     pub fn encoder_rows(&self) -> usize {
         std::env::var(BATCH_ENV)
             .ok()
@@ -205,7 +148,6 @@ impl SamModel {
             .unwrap_or_else(|| noto_ml::BatchPolicy::for_device(&self.device).image_rows(EMBED_SIDE * EMBED_SIDE))
     }
 
-    /// Image embeddings `(1, 256, 64, 64)` per frame, encoded in batches.
     pub fn encode_batch(&self, frames: &[&Rgb]) -> Result<Vec<Tensor>> {
         let mut out = Vec::with_capacity(frames.len());
         for chunk in frames.chunks(self.encoder_rows()) {
@@ -219,9 +161,6 @@ impl SamModel {
         Ok(out)
     }
 
-    /// Decodes one positive point per query (frame pixels) against one image
-    /// embedding in a single decoder call. Returns the best of the three
-    /// multimask outputs of each query, by predicted IoU.
     pub fn decode(&self, embedding: &Tensor, width: u32, height: u32, points: &[(f32, f32)]) -> Result<Vec<Decoded>> {
         if points.is_empty() {
             return Ok(Vec::new());
@@ -246,10 +185,6 @@ impl SamModel {
     }
 }
 
-/// The mask of `logits` (over the padded 1024 input) at `w x h` working
-/// pixels of a `frame_w x frame_h` keyframe, each working pixel `k` keyframe
-/// pixels wide. Bilinear in the logits, positive is inside: the same as SAM's
-/// postprocessing (upsample to 1024, crop, resize) sampled at pixel centres.
 pub fn sample_mask(logits: &[f32], frame_w: u32, frame_h: u32, k: u32) -> Mask {
     let k = k.max(1);
     let (w, h) = ((frame_w / k).max(1), (frame_h / k).max(1));
@@ -274,16 +209,12 @@ pub fn sample_mask(logits: &[f32], frame_w: u32, frame_h: u32, k: u32) -> Mask {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SamCfg {
-    /// Working resolution divisor, as the region tracker's.
     pub downscale: u32,
-    /// Smallest predicted IoU a mask needs to be kept.
     pub min_iou_pred: f32,
     pub min_area_frac: f32,
     pub max_area_frac: f32,
     pub max_tracks: usize,
-    /// Keyframes a track may be followed from its own centroid without a prompt.
     pub max_misses: u32,
-    /// Image embeddings kept on the device.
     pub cache_frames: usize,
 }
 
@@ -297,7 +228,6 @@ struct Live {
     id: u32,
     label: String,
     mask: Mask,
-    /// Centroid in working pixels.
     cx: f32,
     cy: f32,
     age: u32,
@@ -309,9 +239,6 @@ enum Query {
     New { prompt: usize },
 }
 
-/// [`MaskTracker`] on SAM: a track is followed into the next keyframe by
-/// prompting SAM with a fresh point of its label near it, or with its own
-/// last centroid; prompts that do not land on a track start new ones.
 pub struct SamTracker {
     model: Arc<SamModel>,
     pub cfg: SamCfg,
@@ -321,7 +248,6 @@ pub struct SamTracker {
     order: VecDeque<u64>,
 }
 
-/// FNV-1a over the size and the pixels.
 fn image_key(rgb: &Rgb) -> u64 {
     let h = noto_ml::parallel::fnv1a(noto_ml::parallel::FNV_OFFSET, &rgb.width.to_le_bytes());
     let h = noto_ml::parallel::fnv1a(h, &rgb.height.to_le_bytes());
@@ -354,7 +280,6 @@ impl SamTracker {
         Ok(e)
     }
 
-    /// Embeddings on the device right now (for the UI and tests).
     pub fn cached_frames(&self) -> usize {
         self.cache.len()
     }
@@ -400,7 +325,6 @@ impl MaskTracker for SamTracker {
     fn prepare(&mut self, frames: &[&Rgb]) -> Result<()> {
         let mut seen = std::collections::HashSet::new();
         let missing: Vec<(u64, &Rgb)> = frames.iter().map(|f| (image_key(f), *f)).filter(|(k, _)| !self.cache.contains_key(k) && seen.insert(*k)).collect();
-        // Never encode more than the cache keeps: the rest would be evicted before use.
         let missing = &missing[..missing.len().min(self.cfg.cache_frames.max(1))];
         if missing.is_empty() {
             return Ok(());
@@ -511,8 +435,6 @@ mod tests {
 
     #[test]
     fn mask_sampling_follows_the_resize_and_the_padding() {
-        // Logits positive in the low-res box that covers keyframe x in [96, 192), y in [64, 128)
-        // of a 384x256 frame (scale 1024/384, low-res is a quarter of the input).
         let s = SamModel::scale(384, 256) * LOW_RES as f32 / IMAGE_SIZE as f32;
         let mut logits = vec![-5.0f32; LOW_RES * LOW_RES];
         for y in 0..LOW_RES {
@@ -528,7 +450,6 @@ mod tests {
         let b = m.bbox().unwrap();
         assert!((b[0] as i32 - 48).abs() <= 1 && (b[2] as i32 - 95).abs() <= 1, "{b:?}");
         assert!((b[1] as i32 - 32).abs() <= 1 && (b[3] as i32 - 63).abs() <= 1, "{b:?}");
-        // The padded bottom of the 1024 input (rows below 683) never maps into the frame.
         assert!(!m.get(0, 127));
     }
 
@@ -557,7 +478,6 @@ mod tests {
     #[test]
     fn the_tracker_encodes_each_keyframe_once() {
         let mut t = SamTracker::new(Arc::new(test_model()));
-        // Random weights give arbitrary masks; accept them all so the bookkeeping runs.
         t.cfg = SamCfg { min_iou_pred: f32::MIN, min_area_frac: 0.0, max_area_frac: 1.0, ..SamCfg::default() };
         let (a, b) = (frame(96, 64, 0), frame(96, 64, 30));
         t.prepare(&[&a, &b, &a]).unwrap();

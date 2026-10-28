@@ -1,17 +1,3 @@
-//! SAM's mask decoder, taken from `candle-transformers` 0.11.0
-//! (`models/segment_anything/mask_decoder.rs`, MIT OR Apache-2.0, the
-//! Hugging Face candle authors) with one change: the token rows that feed the
-//! IoU head and the hypernetwork MLPs are made contiguous before their
-//! matrix products.
-//!
-//! Why: `hs.i((.., k))` is a strided view (row stride `tokens x 256`). The CPU
-//! matmul accepts it, the CUDA backend refuses it ("matmul is only supported
-//! for contiguous tensors"), found by `tests/gpu_backend.rs` on an RTX 3050.
-//! The values are the same; only the layout changes. The weights' names are
-//! the upstream ones, so the `mask_decoder.*` tensors of a SAM checkpoint load
-//! unchanged. The two-way transformer and `LayerNorm2d` are reused from
-//! `candle-transformers` as they are.
-
 use candle_core::{IndexOp, Module, Result, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::segment_anything::transformer::TwoWayTransformer;
@@ -74,8 +60,6 @@ impl MaskDecoder {
         Ok(MaskDecoder { iou_token, mask_tokens, iou_prediction_head, output_upscaling_conv1, output_upscaling_ln, output_upscaling_conv2, num_mask_tokens, output_hypernetworks_mlps, transformer })
     }
 
-    /// `(masks, iou)` for every prompt: `(n, 3, 256, 256)` and `(n, 3)` with
-    /// `multimask_output`, else the single-mask output.
     pub fn forward(&self, image_embeddings: &Tensor, image_pe: &Tensor, sparse: &Tensor, dense: &Tensor, multimask_output: bool) -> Result<(Tensor, Tensor)> {
         let (masks, iou_pred) = self.predict_masks(image_embeddings, image_pe, sparse, dense)?;
         if multimask_output {
@@ -90,13 +74,11 @@ impl MaskDecoder {
         let (d1, d2) = output_tokens.dims2()?;
         let output_tokens = output_tokens.unsqueeze(0)?.expand((sparse.dim(0)?, d1, d2))?;
         let tokens = Tensor::cat(&[&output_tokens, sparse], 1)?;
-        // The image data, repeated once per prompt.
         let src = repeat_interleave(image_embeddings, tokens.dim(0)?, 0)?;
         let src = src.broadcast_add(dense)?;
         let pos_src = repeat_interleave(image_pe, tokens.dim(0)?, 0)?;
         let (b, c, h, w) = src.dims4()?;
         let (hs, src) = self.transformer.forward(&src, &pos_src, &tokens)?;
-        // The change against upstream: contiguous rows before the linear layers.
         let iou_token_out = hs.i((.., 0))?.contiguous()?;
         let mask_tokens_out = hs.i((.., 1..1 + self.num_mask_tokens))?.contiguous()?;
         let src = src.transpose(1, 2)?.reshape((b, c, h, w))?;
@@ -115,7 +97,6 @@ impl MaskDecoder {
     }
 }
 
-/// `torch.repeat_interleave` along `dim`.
 fn repeat_interleave(img: &Tensor, repeats: usize, dim: usize) -> Result<Tensor> {
     let img = img.unsqueeze(dim + 1)?;
     let mut dims = img.dims().to_vec();

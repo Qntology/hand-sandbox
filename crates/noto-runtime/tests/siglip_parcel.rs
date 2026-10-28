@@ -1,13 +1,3 @@
-//! How far the real SigLIP2 recogniser picks a parcel out of the head
-//! camera's view, with the tile grids the runtime uses. Needs the weights
-//! (`SIGLIP2_DIR`) and, to finish in reasonable time, a GPU build:
-//!
-//!     cargo test -p noto-runtime --features cuda --test siglip_parcel -- --ignored --nocapture
-//!
-//! Prints `[SIGLIP]` lines: per distance and head tilt, the best parcel
-//! candidate's score and how far its position is from the parcel. A record,
-//! not a benchmark: nothing is scored or tuned on it.
-
 use std::path::PathBuf;
 use std::sync::Arc;
 

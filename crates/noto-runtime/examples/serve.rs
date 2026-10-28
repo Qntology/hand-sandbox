@@ -1,17 +1,3 @@
-//! A small development server: the real world runtime behind the UI, in a
-//! browser, without Tauri.
-//!
-//!     cargo run --release -p noto-runtime --example serve [port] [ui_dir]
-//!
-//! It serves `ui/` and answers `POST /invoke/<command>` with the same JSON the
-//! Tauri commands return. A shim script is added to `index.html` so that
-//! `window.__TAURI__.core.invoke` exists: the eleven world commands go to this
-//! server, and the older hand/vision commands fall back to the UI's browser
-//! mock (they need the Tauri build to be real).
-//!
-//! It listens on 127.0.0.1 only and has no authentication. It is for looking at
-//! the simulator on your own machine, not for serving anyone else.
-
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -64,7 +50,6 @@ fn respond(s: &mut TcpStream, status: &str, ctype: &str, body: &[u8]) {
     let _ = s.write_all(body);
 }
 
-/// `/js/main.js` to `<ui>/js/main.js`; anything that climbs out of `ui` is refused.
 fn safe_path(ui: &Path, url_path: &str) -> Option<PathBuf> {
     let rel = url_path.split('?').next().unwrap_or("").trim_start_matches('/');
     let rel = if rel.is_empty() { "index.html" } else { rel };
@@ -137,8 +122,6 @@ fn handle(mut s: TcpStream, ui: &Path, rt: &Mutex<Runtime>) {
     }
 }
 
-/// The test records written since the last call, into the Lance store
-/// (`LANCE_DIR`, default `data/lance`), as the Tauri app does.
 fn mirror(rt: &Mutex<Runtime>) -> Result<Value, String> {
     let (batch, stats) = {
         let mut r = rt.lock().map_err(|_| "월드 잠금이 깨졌습니다".to_string())?;

@@ -1,6 +1,3 @@
-//! Application state shared by the commands: the selected compute device and
-//! the lazily loaded SigLIP2 engine.
-
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -9,15 +6,12 @@ use anyhow::{Context, Result};
 use noto_ml::{probe_backends, Anchors, Backend, BackendStatus, Dictionary, Selection, Siglip2};
 use noto_runtime::{Runtime, RuntimeConfig};
 
-/// Logistics dictionary compiled into the app.
 pub const DICTIONARY_JSON: &str = include_str!("../../data/logistics_dictionary.json");
 pub const MODEL_FOLDER: &str = "siglip2-base-patch16-naflex";
 pub const TTM_FOLDER: &str = "granite-timeseries-ttm-r3";
 pub const TTM_SUBFOLDER: &str = "52-16-dec-52-r3";
-/// Word dictionary of the world commands (logis-center `bias.json` node format).
 pub const WORLD_LEXICON_JSON: &str = include_str!("../../data/world_lexicon.json");
 
-/// A loaded SigLIP2 model with the dictionary embedded as text anchors.
 pub struct VisionEngine {
     pub model: Arc<Siglip2>,
     pub anchors: Anchors,
@@ -28,17 +22,12 @@ pub struct VisionEngine {
 
 pub struct AppState {
     device: Mutex<(Backend, usize)>,
-    /// How the start-up device was chosen (`NOTO_DEVICE`, first GPU, CPU fallback).
     startup: Selection,
     probed: OnceLock<Vec<BackendStatus>>,
     vision: Mutex<Option<Arc<VisionEngine>>>,
-    /// The simulated world and robot. Built on the first world command.
     world: Mutex<Option<Runtime>>,
-    /// Model downloads (`models`).
     pub downloads: Arc<crate::models::Downloads>,
-    /// All four models are loaded on the selected device and attached to the world.
     models_ready: AtomicBool,
-    /// The model being loaded now, and why the last load failed.
     loading: Mutex<Option<String>>,
     load_error: Mutex<Option<String>>,
     live_devices: Mutex<std::collections::BTreeMap<String, String>>,
@@ -46,8 +35,6 @@ pub struct AppState {
 
 impl AppState {
     pub fn new() -> Self {
-        // The first GPU this build has and that opens, unless NOTO_DEVICE says otherwise
-        // (logis-center `new_gpu_device`). The probe leaves the device in the cache.
         let startup = noto_ml::preferred();
         AppState {
             device: Mutex::new((startup.backend, startup.ordinal)),
@@ -63,8 +50,6 @@ impl AppState {
         }
     }
 
-    /// Whether the world may run: every model downloaded and loaded. The world
-    /// commands call this first, so nothing runs on a stand-in.
     pub fn require_models(&self) -> Result<(), String> {
         if self.models_ready() {
             Ok(())
@@ -101,10 +86,6 @@ impl AppState {
         }
     }
 
-    /// The device the models go on: the selected one, unless that is the CPU
-    /// while this build has a GPU that opens — then the first such GPU (the
-    /// start-up order), which becomes the selection. `NOTO_DEVICE=cpu` keeps
-    /// the CPU. Returns whether the selection moved.
     pub fn prefer_gpu(&self) -> bool {
         let (backend, _) = self.selected();
         if backend != Backend::Cpu || std::env::var(noto_ml::device::DEVICE_ENV).is_ok_and(|v| v.trim().eq_ignore_ascii_case("cpu")) {
@@ -117,7 +98,6 @@ impl AppState {
         self.select(picked.backend, picked.ordinal).is_ok()
     }
 
-    /// Where each loaded model runs, by model id (set when they are loaded).
     pub fn live_devices(&self) -> std::collections::BTreeMap<String, String> {
         self.live_devices.lock().map(|d| d.clone()).unwrap_or_default()
     }
@@ -128,13 +108,10 @@ impl AppState {
         }
     }
 
-    /// Forgets the loaded SigLIP2 (its files are about to go).
     pub fn drop_vision(&self) {
         *self.vision.lock().expect("vision lock") = None;
     }
 
-    /// Runs `f` on the world runtime, building it first if needed. The lock is
-    /// held for the whole call, so calls take turns.
     pub fn with_world<T>(&self, f: impl FnOnce(&mut Runtime) -> Result<T, String>) -> Result<T, String> {
         let mut slot = self.world.lock().map_err(|_| "월드 잠금이 깨졌습니다. 앱을 다시 시작하세요".to_string())?;
         if slot.is_none() {
@@ -143,7 +120,6 @@ impl AppState {
         f(slot.as_mut().expect("just built"))
     }
 
-    /// Backends compiled in and whether each one opens on this machine. Probed once.
     pub fn backends(&self) -> &[BackendStatus] {
         self.probed.get_or_init(probe_backends)
     }
@@ -156,14 +132,11 @@ impl AppState {
         &self.startup
     }
 
-    /// The selected device, from the shared cache (one handle per backend).
     pub fn device(&self) -> Result<candle_core::Device> {
         let (backend, ordinal) = self.selected();
         backend.device(ordinal)
     }
 
-    /// Selects a device. The vision engine reloads on the next classification,
-    /// and the world waits until the models are loaded again on this device.
     pub fn select(&self, backend: Backend, ordinal: usize) -> Result<()> {
         if !backend.compiled() {
             anyhow::bail!("{} is not compiled into this build", backend.name());
@@ -179,7 +152,6 @@ impl AppState {
         Ok(())
     }
 
-    /// Returns the vision engine, loading it when missing or when the device changed.
     pub fn vision_engine(&self) -> Result<Arc<VisionEngine>> {
         let (backend, ordinal) = self.selected();
         let mut slot = self.vision.lock().expect("vision lock");
@@ -207,8 +179,6 @@ impl AppState {
     }
 }
 
-/// Where the SDS ledgers and the hash-chained logs of the world are kept:
-/// `data/runtime` at the project root, or `RUNTIME_DIR`.
 pub fn runtime_dir() -> PathBuf {
     if let Ok(p) = std::env::var("RUNTIME_DIR") {
         return PathBuf::from(p);
@@ -216,9 +186,6 @@ pub fn runtime_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("data").join("runtime")
 }
 
-/// A runtime that keeps its files under [`runtime_dir`]. If that folder cannot
-/// be used (read-only install, say) it runs with memory only, and says so in
-/// its log.
 fn build_runtime() -> Result<Runtime, String> {
     let dir = runtime_dir();
     match Runtime::new(RuntimeConfig::default(), WORLD_LEXICON_JSON, Some(&dir)) {
@@ -231,8 +198,6 @@ fn build_runtime() -> Result<Runtime, String> {
     }
 }
 
-/// Folder with the SigLIP2 files. `SIGLIP2_DIR` wins; otherwise `models/` next
-/// to the project root, which is where `cargo tauri dev` runs from.
 pub fn model_dir() -> Result<PathBuf> {
     if let Ok(p) = std::env::var("SIGLIP2_DIR") {
         return Ok(PathBuf::from(p));
@@ -241,9 +206,6 @@ pub fn model_dir() -> Result<PathBuf> {
     Ok(root.join("models").join(MODEL_FOLDER))
 }
 
-/// Folder with the Granite TTM files (`config.json` and the safetensors).
-/// `TTM_DIR` wins; otherwise `models/granite-timeseries-ttm-r3`, or its
-/// `52-16-dec-52-r3` subfolder when the files were downloaded with that layout.
 pub fn ttm_dir() -> PathBuf {
     if let Ok(p) = std::env::var("TTM_DIR") {
         return PathBuf::from(p);
@@ -256,9 +218,6 @@ pub fn ttm_dir() -> PathBuf {
     base
 }
 
-/// Where downloaded TTM files go: `TTM_DIR`, else the folder that already has
-/// a `config.json`, else the `52-16-dec-52-r3` subfolder (the branch the files
-/// come from).
 pub fn ttm_download_dir() -> PathBuf {
     if let Ok(p) = std::env::var("TTM_DIR") {
         return PathBuf::from(p);
@@ -271,8 +230,6 @@ pub fn ttm_download_dir() -> PathBuf {
     }
 }
 
-/// Folder with the TIPSv2-B/14 DPT files (`model.safetensors`, `config.json`).
-/// `TIPS_DIR` wins; otherwise `models/tipsv2-b14-dpt`.
 pub fn tips_dir() -> PathBuf {
     if let Ok(p) = std::env::var("TIPS_DIR") {
         return PathBuf::from(p);
@@ -280,8 +237,6 @@ pub fn tips_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("models").join("tipsv2-b14-dpt")
 }
 
-/// Folder with the SAM weights (`mobile_sam-tiny-vitt.safetensors` or
-/// `sam_vit_b_01ec64.safetensors`). `SAM_DIR` wins; otherwise `models/sam`.
 pub fn sam_dir() -> PathBuf {
     if let Ok(p) = std::env::var(noto_vision::sam::DIR_ENV) {
         return PathBuf::from(p);
@@ -289,12 +244,10 @@ pub fn sam_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("models").join("sam")
 }
 
-/// Where the embedded phrase vectors of the world's recogniser are kept between runs.
 pub fn bank_dir() -> PathBuf {
     runtime_dir().join("bank")
 }
 
-/// Default Lance store: `data/lance` at the project root, or `LANCE_DIR`.
 pub fn default_store_dir() -> PathBuf {
     if let Ok(p) = std::env::var("LANCE_DIR") {
         return PathBuf::from(p);

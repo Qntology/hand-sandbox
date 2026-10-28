@@ -1,19 +1,11 @@
-//! Quantities: "3개", "두 개", "삼 개", "열두 개", "2 logs", "하나".
-//!
-//! The number words come from the lexicon ([`QuantityTable`]); this file only
-//! knows how they combine.
-
 use crate::lexicon::QuantityTable;
 use crate::tails::peel;
 
-/// Largest quantity a command may ask for.
 pub const MAX_QUANTITY: u32 = 99;
 
-/// A quantity read from the token stream.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Quantity {
     pub value: u32,
-    /// Index of the first token and one past the last token it uses.
     pub start: usize,
     pub end: usize,
 }
@@ -23,8 +15,6 @@ impl QuantityTable {
         self.counters.iter().any(|c| c == word)
     }
 
-    /// Native-Korean number: a unit (한, 두, 세 ...), a tens word (열, 스물 ...)
-    /// or tens followed by a unit (열두).
     fn parse_native(&self, word: &str) -> Option<u32> {
         if let Some(v) = self.native_units.get(word) {
             return Some(*v);
@@ -42,7 +32,6 @@ impl QuantityTable {
         None
     }
 
-    /// Sino-Korean number up to 99: 삼, 십, 십오, 이십, 이십오.
     fn parse_sino(&self, word: &str) -> Option<u32> {
         if let Some(v) = self.sino_digits.get(word) {
             return Some(*v);
@@ -57,7 +46,6 @@ impl QuantityTable {
         None
     }
 
-    /// Digits or a listed English word.
     fn parse_plain(&self, word: &str) -> Option<u32> {
         if !word.is_empty() && word.chars().all(|c| c.is_ascii_digit()) && word.len() <= 4 {
             return word.parse().ok();
@@ -65,22 +53,18 @@ impl QuantityTable {
         self.words.get(word).copied()
     }
 
-    /// A number that may stand alone without a counter.
     fn parse_free(&self, word: &str) -> Option<u32> {
         self.parse_plain(word).or_else(|| self.parse_native(word))
     }
 
-    /// A number that is only believed in front of a counter (adds Sino-Korean).
     fn parse_counted(&self, word: &str) -> Option<u32> {
         self.parse_free(word).or_else(|| self.parse_sino(word))
     }
 
-    /// Reads a quantity that starts at token `i`, if there is one.
     pub fn read(&self, tokens: &[String], i: usize) -> Option<Quantity> {
         let word = tokens.get(i)?;
         for reading in peel(word) {
             let stem = reading.stem.as_str();
-            // 1. attached counter: "3개", "두개", "삼개"
             for counter in &self.counters {
                 if let Some(num) = stem.strip_suffix(counter.as_str()) {
                     if !num.is_empty() {
@@ -90,7 +74,6 @@ impl QuantityTable {
                     }
                 }
             }
-            // 2. number then a counter token: "3 개", "두 개를", "삼 개의"
             if let Some(v) = self.parse_counted(stem) {
                 if let Some(next) = tokens.get(i + 1) {
                     if peel(next).iter().any(|r| self.is_counter(&r.stem)) {
@@ -98,7 +81,6 @@ impl QuantityTable {
                     }
                 }
             }
-            // 3. a number that can stand alone: "2", "하나", "two"
             if let Some(v) = self.parse_free(stem) {
                 return Some(Quantity { value: v, start: i, end: i + 1 });
             }
@@ -155,7 +137,6 @@ mod tests {
         assert_eq!(read("삼 개", 0), Some((3, 0, 2)));
         assert_eq!(read("이십오개", 0), Some((25, 0, 1)));
         assert_eq!(read("십 개", 0), Some((10, 0, 2)));
-        // "이" and "오" alone are not quantities ("이" is a particle, "오" is "come")
         assert_eq!(read("이 나무", 0), None);
         assert_eq!(read("오 나무", 0), None);
     }

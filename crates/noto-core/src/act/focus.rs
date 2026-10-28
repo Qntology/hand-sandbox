@@ -1,9 +1,3 @@
-//! What the eight focus views show at one instant: the hand's shape and its
-//! finger joints, each foot's sole and the leg joints, the waist, the neck,
-//! the wheels and the tracks. Built from one solved instant (`kin`) and what
-//! the action knew then (grip, object, slip), so a keyframe can be drawn part
-//! by part long after the world has moved on.
-
 use serde::Serialize;
 
 use crate::balance::Body;
@@ -18,7 +12,6 @@ use crate::sim::{closure_angles, finger_joint_torques, top_grasp};
 use super::drive::DriveState;
 use super::{ActEvent, ActKind, ActSample, Grip, Part};
 
-/// A joint for a focus view.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct JointView {
     pub name: String,
@@ -38,7 +31,6 @@ impl JointView {
     }
 }
 
-/// One finger joint.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct FingerJointView {
     pub finger: String,
@@ -48,8 +40,6 @@ pub struct FingerJointView {
     pub max_nm: f32,
 }
 
-/// The working hand: finger polylines in the hand frame (`sim`: z along the
-/// palm, y toward the palm side), the object, the grip.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct HandView {
     pub closure: f32,
@@ -57,19 +47,11 @@ pub struct HandView {
     pub thumbs: Vec<bool>,
     pub palm: [f32; 2],
     pub grip: Option<Grip>,
-    /// The object's half sizes in the hand frame (`None` when the hand is empty).
     pub object_half: Option<[f32; 3]>,
     pub object_kg: Option<f32>,
-    /// Palm centre in the base frame and its height above the ground.
     pub palm_at: [f32; 3],
-    /// Force on the hand from the object or the world, N (base frame).
     pub force_n: [f32; 3],
-    /// Each touching finger's pad on the object (hand frame): the contact
-    /// point and face normal, normal and tangential force, the pad's friction,
-    /// its limit-surface use, stick ratio and slip state (`contact`).
     pub contacts: Vec<FingerContact>,
-    /// The object's centre in the hand frame where the fingers closed on it
-    /// (`sim::top_grasp`: its far face at the knuckle line), when there is one.
     pub object_center: Option<[f32; 3]>,
 }
 
@@ -79,26 +61,16 @@ pub struct FootView {
     pub in_air: bool,
     pub normal_n: f32,
     pub shear_n: f32,
-    /// Centre of pressure and the sole `[x0, x1, y0, y1]` in the base frame.
     pub cop: [f32; 2],
     pub rect: [f32; 4],
-    /// Shear over normal at this foot, and the ground's friction under it
-    /// (this step's drawn friction when the action drew one, else the mean).
     pub rcof: f32,
     pub mu: f32,
-    /// The ground's mean friction (what the map says).
     pub mu_mean: f32,
-    /// Shear across, N, and the toe joint's dorsiflexion, degrees.
     pub shear_y_n: f32,
     pub toe_deg: f32,
-    /// The rear foot has rolled up about the toe hinge (heel off).
     pub heel_off: bool,
-    /// The friction cone used (shear over `μ·N`, the whole foot) and whether a loaded patch slides.
     pub cone_use: f32,
     pub slipping: bool,
-    /// The sole's four patches (heel, midfoot, metatarsal heads, toes) at
-    /// this instant with the friction above: load, peak pressure, shear,
-    /// cone use, slip (`contact::sole_contact`).
     pub sole: Option<SoleContact>,
 }
 
@@ -124,7 +96,6 @@ pub struct TrackView {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct NeckView {
     pub joint: JointView,
-    /// Camera pitch below horizontal, degrees (trunk plus neck).
     pub camera_pitch_deg: f32,
 }
 
@@ -141,7 +112,6 @@ pub struct BodyView {
     pub limiting: Option<String>,
 }
 
-/// Every focus view of one instant.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct FocusFrame {
     pub t: f32,
@@ -150,7 +120,6 @@ pub struct FocusFrame {
     pub phase: Option<&'static str>,
     pub event: Option<String>,
     pub event_ok: Option<bool>,
-    /// The parts this instant is about (an event's, or the action's).
     pub parts: Vec<&'static str>,
     pub hand: HandView,
     pub hand_joints: Vec<FingerJointView>,
@@ -163,7 +132,6 @@ pub struct FocusFrame {
     pub body: BodyView,
 }
 
-/// What the focus frame is built from.
 pub struct FocusCtx<'a> {
     pub body: &'a Body,
     pub hand: &'a Hand,
@@ -171,19 +139,12 @@ pub struct FocusCtx<'a> {
     pub sample: Option<&'a ActSample>,
     pub action: Option<ActKind>,
     pub event: Option<&'a ActEvent>,
-    /// Friction under the base (feet, wheels or tracks).
     pub ground_mu: f32,
     pub drive: Option<DriveState>,
-    /// The handled object's half sizes and mass, when there is one.
     pub object: Option<([f32; 3], f32)>,
-    /// The friction drawn for the step under the feet now (a walk), when the
-    /// action drew one; the views show it instead of the mean `ground_mu`.
     pub step_mu: Option<f32>,
 }
 
-/// The parts an action moves, for the views to open on: only those the form
-/// has (no hand without a manipulator, no waist without a humanoid torso, no
-/// neck without a pan-tilt).
 pub fn parts_of(kind: ActKind, morph: &Morphology) -> Vec<Part> {
     let base = if morph.legged() { vec![Part::Foot, Part::FootJoints] } else { vec![Part::Wheel, Part::Track] };
     let mut v = match kind {
@@ -207,15 +168,12 @@ pub fn parts_of(kind: ActKind, morph: &Morphology) -> Vec<Part> {
     v
 }
 
-/// Builds the focus frame of one instant.
 pub fn frame(ctx: &FocusCtx) -> FocusFrame {
     let r = ctx.report;
     let body = ctx.body;
     let closure = ctx.sample.map_or(r.pose.closure, |s| s.pose.closure);
     let grip = ctx.sample.and_then(|s| s.grip);
     let force = ctx.sample.map_or([0.0; 3], |s| s.loads.hand_force[0]);
-    // Fingers in the hand frame (the configured hand's, or a gripper's two jaws): on an object they stop where
-    // they touch it (`sim::top_grasp`), else at the closure.
     let working = body.working_hand(ctx.hand);
     let act = working.config.joints.actuation;
     let closed = ctx.object.filter(|_| body.has_manipulator()).map(|(h, _)| top_grasp(&working, [2.0 * h[0], 2.0 * h[1], 2.0 * h[2]]));
@@ -224,7 +182,6 @@ pub fn frame(ctx: &FocusCtx) -> FocusFrame {
     let mut thumbs = Vec::new();
     let mut hand_joints = Vec::new();
     let share = grip.map_or(0.0, |g| (g.grip_n / working.fingers.len().max(1) as f32).max(0.0));
-    // A form without a manipulator has no hand to draw.
     let hand_fingers = if body.has_manipulator() { &working.fingers[..] } else { &[] };
     for (fi, f) in hand_fingers.iter().enumerate() {
         let angles = match &closed {
@@ -234,7 +191,6 @@ pub fn frame(ctx: &FocusCtx) -> FocusFrame {
         };
         fingers.push(f.points(&angles).iter().map(|p| [p.x, p.y, p.z]).collect());
         thumbs.push(f.is_thumb);
-        // Contact statics: each joint holds what the pad's force on the finger asks of it, `τ = −Jᵀ·F`.
         let pad = contacts.iter().find(|c| c.finger as usize == fi);
         let at = closed.as_ref().and_then(|tg| tg.contacts.iter().filter(|c| c.finger == fi).max_by(|a, b| a.max_n.total_cmp(&b.max_n)));
         let statics: Option<Vec<f32>> = match (pad, at) {
@@ -245,7 +201,6 @@ pub fn frame(ctx: &FocusCtx) -> FocusFrame {
             }
             _ => None,
         };
-        // Without pad detail (an older sample): the finger's share of the squeeze at its lever.
         let lever_tip: f32 = f.segments.iter().sum::<f32>() * 0.8;
         for (k, (j, a)) in f.joints.iter().zip(&angles).enumerate() {
             let tau = match (&statics, grip) {
@@ -274,7 +229,6 @@ pub fn frame(ctx: &FocusCtx) -> FocusFrame {
         contacts,
         object_center: closed.as_ref().map(|tg| [tg.center.x, tg.center.y, tg.center.z]),
     };
-    // The soles with the friction under them now: the step's drawn one when there is one.
     let mu_now = ctx.step_mu.unwrap_or(ctx.ground_mu);
     let sole_model = body.legged.then(|| SoleModel::of(body));
     let foot = r
@@ -374,7 +328,6 @@ mod tests {
         cfg.base = BaseKind::HumanFoot;
         let hand = cfg.build().unwrap();
         let size = [0.15f32; 3];
-        // The 2.4 kg log takes both hands (`act::grasp::top_grasp_ok`); the view shows the working hand's pads.
         let ro = grasp(&GraspInput::front(&body, &hand, ItemMaterial::Wood, 2.4, size, Surface::Gravel, true, 0.0, 0.0, 3));
         let s = ro.samples.iter().find(|s| s.phase == "lift").unwrap();
         let r = kin::solve(&body, &s.pose, &s.loads);
@@ -383,10 +336,8 @@ mod tests {
         assert_eq!(f.hand.contacts.len(), g.contacts as usize);
         assert!(f.hand.contacts.iter().all(|c| c.fn_n > 0.0 && c.cone_use < 1.0 && c.stick > 0.0), "{:?}", f.hand.contacts);
         assert!(f.hand.object_center.is_some());
-        // The finger joints hold the pad's force by the contact statics: the touching fingers' knuckles carry torque.
         let touched: Vec<String> = f.hand.contacts.iter().map(|c| hand.fingers[c.finger as usize].name.clone()).collect();
         assert!(f.hand_joints.iter().filter(|j| touched.contains(&j.finger) && j.joint == 0).all(|j| j.torque_nm > 0.0));
-        // A walking stance: the foot view shows the step's drawn friction, the mean beside it, and the sole's patches.
         let walk = crate::act::gait::walk(&body, Surface::Firm.props(), None, 0.0, 0.0, 0.9, 4, 1).0;
         let st = walk.samples.iter().find(|x| x.phase == "single_support").unwrap();
         let r = kin::solve(&body, &st.pose, &st.loads);

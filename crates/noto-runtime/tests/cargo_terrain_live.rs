@@ -1,11 +1,3 @@
-//! v0.5 behaviour end to end: setting carried items down by command, the
-//! cargo decision (round trips, breaking a stone the arms cannot lift), the
-//! two resets, the rugged map's hidden targets, and the live recording that a
-//! command starts from the play loop.
-//!
-//! The recogniser is the stand-in (the renderer's ground truth, no noise);
-//! these tests show the pieces fit, not how a real model would perform.
-
 use noto_core::{BaseKind, BodyPlan, NotoConfig, Tier};
 use noto_quest::State;
 use noto_sds::{Scope, Track};
@@ -15,8 +7,6 @@ use world_sim::{ItemKind, TerrainKind};
 
 const LEXICON: &str = include_str!("../../../data/world_lexicon.json");
 
-/// The robot walks, so its hands reach the items on the ground (a wheeled
-/// body of these presets pushes them instead: `scenarios.rs`).
 fn runtime_with(cfg: RuntimeConfig) -> Runtime {
     let cfg = RuntimeConfig { noto: NotoConfig { base: BaseKind::HumanFoot, ..cfg.noto }, ..cfg };
     Runtime::new(cfg, LEXICON, None).expect("runtime")
@@ -44,24 +34,20 @@ fn assert_done(rt: &Runtime, q: &noto_quest::Quest) {
 
 #[test]
 fn carried_items_are_set_down_by_command_here_or_at_a_place() {
-    // Pro legs: two logs (4.8 kg) are within their continuous knee limit (the mid legs' is 3.4 kg).
     let mut rt = runtime_with(RuntimeConfig { seed: 7, noise: NoiseCfg::none(), body: BodyPlan::named("pro").unwrap(), ..RuntimeConfig::default() });
     let q = run_command(&mut rt, "원목 2개 캐줘", 30_000);
     assert_done(&rt, &q);
     assert_eq!(rt.world().carried_count(ItemKind::Log), 2);
-    // One log down where the robot stands: it lies on the ground, pickable again.
     let drops_before = rt.world().drops.len();
     let q = run_command(&mut rt, "원목 1개 내려놔", 5_000);
     assert_done(&rt, &q);
     assert_eq!(rt.world().carried_count(ItemKind::Log), 1);
     assert_eq!(rt.world().drops.len(), drops_before + 1, "the log lies on the ground");
     assert!(q.result.as_ref().unwrap().summary.contains("내려놓았습니다"));
-    // The rest onto the base camp's pile.
     let q = run_command(&mut rt, "베이스캠프에 다 내려놔", 30_000);
     assert_done(&rt, &q);
     assert!(rt.world().agent.carried.is_empty());
     assert_eq!(rt.world().waypoint_by_key("base_camp").unwrap().stock_of(ItemKind::Log), 1.0);
-    // Nothing left: the quest says so.
     let q = run_command(&mut rt, "다 내려놔", 2_000);
     assert_eq!(q.state, State::Failed);
     assert_eq!(q.failure.as_ref().unwrap().code, "nothing_to_drop");
@@ -77,7 +63,6 @@ fn the_ground_reaches_the_physics_status_and_the_sds() {
     assert_eq!(v["ground"]["id"], "gravel", "the robot ends on the warehouse pad");
     assert!(v["joints"].as_array().unwrap().iter().any(|j| j["life_used"].as_f64().unwrap() > 0.0), "{}", v["joints"]);
     assert!(v["load"]["capacity_here_kg"].as_f64().unwrap() <= v["load"]["capacity_kg"].as_f64().unwrap() + 1e-3);
-    // Travelling and mining were scored as effects scenarios on their grounds.
     let sds = rt.sds();
     let n = |track: Track, scope: &str, axis: &str| sds.exact_baseline(&Scope::new(track, scope, ""), axis).map_or(0, |b| b.2);
     assert!(n(Track::Balance, "fx:slip", "utilisation") > 0, "the friction picture of every move");
@@ -123,7 +108,6 @@ fn a_stone_too_heavy_for_budget_arms_is_broken_and_carried_in_parts() {
     assert!(log.contains("쪼개서"), "the cargo decision said why:\n{log}");
     let stock = rt.world().waypoint_by_key("base_camp").unwrap().stock_of(ItemKind::Stone);
     assert!((stock - 1.0).abs() < 1e-3, "one whole stone's worth arrived in pieces: {stock}");
-    // A log cannot be broken: the same arms still fail on it, as before.
     let mut rt = runtime_with(RuntimeConfig { seed: 7, noise: NoiseCfg::none(), body: BodyPlan { arm: Tier::Budget, ..BodyPlan::default() }, ..RuntimeConfig::default() });
     let q = run_command(&mut rt, "원목 1개를 창고로 가져와", 30_000);
     assert_eq!(q.state, State::Failed);
@@ -177,7 +161,6 @@ fn a_typed_command_records_the_three_rows_in_the_live_world() {
     let v = rt.api_command_submit_rec("원목 1개를 창고로 가져와", true).unwrap();
     assert_eq!(v["ok"], true);
     assert_eq!(v["recording"], true, "{v}");
-    // A second command while recording waits its turn.
     let q2 = rt.api_command_submit_rec("돌 1개를 베이스캠프로 가져와", true).unwrap();
     assert_eq!(q2["queued"], 1, "{q2}");
     let mut phases = vec![];
@@ -189,20 +172,17 @@ fn a_typed_command_records_the_three_rows_in_the_live_world() {
             phases.push(p.clone());
         }
         if s["test"]["id"].as_str().is_some_and(|id| !id.ends_with("-t1")) {
-            break; // the queued command started its own recording
+            break;
         }
         guard += 1;
         assert!(guard < 3000, "the recording does not end: {phases:?}");
     }
     assert!(phases.starts_with(&["game".to_string(), "perceive".to_string(), "decide".to_string()]), "{phases:?}");
-    // The live world is the game pass's end state: the log is in the warehouse,
-    // and the copy the ML pass ran in did not leak back.
     let wh = rt.world().waypoint_by_key("warehouse").unwrap().stock_of(ItemKind::Log);
     assert_eq!(wh, 1.0, "{}", quest_log(&rt));
     let first = rt.quests().iter().find(|q| q.title.contains("원목")).expect("the game quest is in the live book");
     assert_eq!(first.state, State::Done);
     assert!(rt.live_running(), "the queued command is being recorded now");
-    // Stop clears the recording and the queue at once.
     let st = rt.api_command_submit_rec("멈춰", true).unwrap();
     assert_eq!(st["stopped"], true);
     assert!(!rt.live_running());

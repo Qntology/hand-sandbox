@@ -1,14 +1,3 @@
-//! The cross-area "uncanniness" report (`noto_core::bench`, research
-//! `docs/research/uncanny.md`): every area noto-core can run (`AX` actions,
-//! `FX` environment effects, `NN` composite N:N; later areas register in
-//! `bench::core_areas`) on one shared matrix of robots, each cell's deviation
-//! from its reference in tolerances, and how even that deviation is across
-//! the areas. The lines this prints (`[UX]` per area, `[UX-CELL]` its
-//! farthest cells, `[UX-SUM]` the spread and the next work item) are a
-//! record; the assertions check the machinery, never a deviation threshold.
-//! The runtime's camera and vision areas join in
-//! `noto-runtime/tests/uncanny_runtime.rs`.
-
 use noto_core::bench::{core_areas, forms, summarize, ux_lines, BenchScenario, Summary};
 
 #[test]
@@ -19,7 +8,6 @@ fn cross_area_deviation_report() {
         let scenarios: Vec<BenchScenario> = (area.run)(&forms);
         assert!(!scenarios.is_empty(), "{}", area.id);
         assert!(scenarios.iter().all(|s| s.area == area.id), "{}", area.id);
-        // Every cell carries its robot, and a judged cell's z and score agree with the shared judge.
         for s in &scenarios {
             for c in &s.cells {
                 assert_eq!(c.form, s.form);

@@ -1,25 +1,3 @@
-//! The score-dynamics store: per-scope online statistics in ledger files.
-//!
-//! Logic follows logis-center `score_dynamics.rs` (original) and its adapted
-//! copy in endmill-sandbox `src/sds.rs`:
-//! * writes go to the global, primary and secondary scope of a track;
-//! * reads back off secondary -> primary -> global and only trust a scope
-//!   once it has the track's minimum observation count;
-//! * each process run writes its own run file and is merged into the ledger on
-//!   close, so a crash loses at most the current run's tail;
-//! * a ledger whose recipe string differs from [`SDS_RECIPE`] is discarded;
-//! * ledgers are written to a temporary file and renamed (logis-center
-//!   `write_atomic`), which endmill-sandbox did not do;
-//! * a ledger over the size cap drops its least observed scopes first;
-//! * run files and ledgers carry the engine revision their observations came
-//!   from ([`OpenOptions`]); a reader may set aside ledgers of another one;
-//! * a track may forbid backing off across secondaries or primaries
-//!   ([`ScopePolicy`]), so model modes or robot forms never pool.
-//!
-//! The store never decides anything on its own. Callers ask for a learned
-//! value and fall back to their fixed default when the answer is `None`
-//! (cold start), exactly like the original.
-
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -30,13 +8,11 @@ use crate::scope::{ring_for_key, Ledger, Scope, Track};
 use crate::stats::{decay_shape, ConfusionStat, GateStat, ScopeStat, Welford};
 
 pub const SDS_RECIPE: &str = "noto-sds-v1:welford+ring/hier-write/ledger-split/calib-shrink/atomic";
-/// The same recipe under the project's former name; ledgers written before the rename stay readable.
 const SDS_RECIPE_LEGACY: &str = "hand-sds-v1:welford+ring/hier-write/ledger-split/calib-shrink/atomic";
 
 const AUTO_FLUSH_EVERY: u32 = 8;
 const AUTO_FLUSH_MIN_GAP_MS: u128 = 5_000;
 const DEFAULT_CAP_BYTES: usize = 2 * 1024 * 1024;
-/// Pseudo-observations pulling a calibration factor toward 1.0.
 const CALIBRATION_SHRINK_K: f64 = 5.0;
 
 pub fn now_ms() -> i64 {
@@ -46,8 +22,6 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Writes through a temporary file and renames it over the target, so a crash
-/// never leaves a half-written ledger.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
@@ -67,55 +41,39 @@ pub struct SdsFile {
     pub updated_at: i64,
     #[serde(default)]
     pub scopes: HashMap<String, ScopeStat>,
-    /// Every engine revision whose observations are in the ledger
-    /// ([`UNSTAMPED`] for runs that set none), sorted.
     #[serde(default)]
     pub engine_revs: Vec<String>,
 }
 
-/// The revision of observations written without one (ledgers from before the stamp).
 pub const UNSTAMPED: &str = "unstamped";
 
-/// What to do with a ledger that holds observations of another engine revision.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OtherRevs {
-    /// Load it and keep merging (the revisions are listed in the ledger).
     #[default]
     Keep,
-    /// Move it aside (`<ledger>.rev-<ms>.json`, nothing is deleted) and start
-    /// that ledger empty, so no read sees another engine's observations.
     SetAside,
 }
 
-/// How [`SdsStore::open_with`] opens a ledger directory.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OpenOptions {
-    /// Stamped into the run files and the ledgers (`""`: unstamped).
     pub engine_rev: String,
     pub other_revs: OtherRevs,
 }
 
 impl OpenOptions {
-    /// Stamp the observations with `rev`, keep ledgers of other revisions.
     pub fn stamped(rev: &str) -> OpenOptions {
         OpenOptions { engine_rev: rev.into(), other_revs: OtherRevs::Keep }
     }
 
-    /// Stamp with `rev` and read only observations of that revision.
     pub fn only(rev: &str) -> OpenOptions {
         OpenOptions { engine_rev: rev.into(), other_revs: OtherRevs::SetAside }
     }
 }
 
-/// Whether reads may pool a scope with its siblings when it is thin
-/// (`secondary -> primary -> global`). The default pools both, as the
-/// logis-center store does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScopePolicy {
-    /// A named secondary may back off to its primary (pooling every secondary).
     pub pool_secondaries: bool,
-    /// A named primary may back off to the global scope (pooling every primary).
     pub pool_primaries: bool,
 }
 
@@ -127,9 +85,7 @@ impl Default for ScopePolicy {
 
 impl ScopePolicy {
     pub const POOLED: ScopePolicy = ScopePolicy { pool_secondaries: true, pool_primaries: true };
-    /// A named secondary answers alone (a model mode, a robot form never pools with another).
     pub const KEEP_SECONDARIES: ScopePolicy = ScopePolicy { pool_secondaries: false, pool_primaries: true };
-    /// The most specific named level answers alone.
     pub const EXACT: ScopePolicy = ScopePolicy { pool_secondaries: false, pool_primaries: false };
 }
 
@@ -142,7 +98,6 @@ struct RunFile {
     updated_at: i64,
     observations: u64,
     scopes: HashMap<String, ScopeStat>,
-    /// The engine revision the run's observations came from (`""`: unstamped).
     #[serde(default)]
     engine_rev: String,
 }
@@ -162,7 +117,6 @@ pub struct LedgerStatus {
     pub scopes: usize,
     pub observations: u64,
     pub run_observations: u64,
-    /// Engine revisions of the observations in the ledger (and the open run).
     #[serde(default)]
     pub engine_revs: Vec<String>,
 }
@@ -199,65 +153,46 @@ pub struct ConfusionStatus {
     pub mean_margin: f64,
 }
 
-/// A value tracked against a reference (see [`SdsStore::record_reference`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReferenceReport {
-    /// Scope key that answered (secondary, primary or global).
     pub scope: String,
     pub n: u64,
     pub mean: f64,
     pub sd: f64,
-    /// Mean deviation from the reference in tolerance units.
     pub mean_dev: f64,
-    /// Same over the ring of recent observations.
     pub recent_dev: f64,
-    /// Share of observations inside the reference band.
     pub in_band_rate: f64,
-    /// Mean of the references the observations were compared with, and of their tolerances.
     #[serde(default)]
     pub mean_ref: f64,
     #[serde(default)]
     pub mean_tol: f64,
-    /// Mean |deviation| and root mean square deviation in tolerance units:
-    /// unlike the signed mean, +z and -z do not cancel. `None` for
-    /// observations recorded before these axes existed.
     #[serde(default)]
     pub mean_abs_dev: Option<f64>,
     #[serde(default)]
     pub rms_dev: Option<f64>,
 }
 
-/// One reference axis in an [`AreaReport`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AreaAxis {
-    /// The primary scope key it was read at (it pools every secondary).
     pub scope: String,
     pub axis: String,
     pub n: u64,
-    /// Signed mean deviation in tolerances.
     pub mean_dev: f64,
     pub mean_abs_dev: Option<f64>,
     pub rms_dev: Option<f64>,
     pub in_band_rate: Option<f64>,
 }
 
-/// Every reference axis under a track and primary prefix, pooled by
-/// observation count: the live counterpart of the benchmarks' per-area
-/// deviation (`noto_core::bench::Summary`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AreaReport {
     pub track: String,
     pub prefix: String,
     pub axes: Vec<AreaAxis>,
-    /// Observations over every axis.
     pub n: u64,
-    /// Count-weighted over the axes that have them.
     pub mean_abs_dev: Option<f64>,
     pub rms_dev: Option<f64>,
     pub in_band_rate: Option<f64>,
-    /// Axes recorded before |dev| and dev^2 were (their signed mean only).
     pub legacy_axes: usize,
-    /// The axis farthest from its reference (by mean |dev|, or |mean dev| for a legacy axis).
     pub worst: Option<AreaAxis>,
 }
 
@@ -295,7 +230,6 @@ pub struct SdsStore {
 }
 
 impl SdsStore {
-    /// A store that lives only in memory (tests, mock backends).
     pub fn memory() -> Self {
         let mut s = SdsStore {
             dir: None,
@@ -316,14 +250,10 @@ impl SdsStore {
         s
     }
 
-    /// Opens (and creates) a ledger directory. A missing, unreadable or
-    /// recipe-mismatched ledger starts empty and says why in the log.
     pub fn open(dir: &Path) -> Self {
         SdsStore::open_with(dir, OpenOptions::default())
     }
 
-    /// [`open`](Self::open) with an engine revision stamp and what to do with
-    /// ledgers of another revision.
     pub fn open_with(dir: &Path, opts: OpenOptions) -> Self {
         let mut store = SdsStore::memory();
         store.dir = Some(dir.to_path_buf());
@@ -343,7 +273,6 @@ impl SdsStore {
                         if f.engine_revs.is_empty() && !f.scopes.is_empty() {
                             f.engine_revs.push(UNSTAMPED.into());
                         }
-                        // Compared with the stamp this store writes (`unstamped` for no revision).
                         let own = store.stamp();
                         let foreign = f.engine_revs.iter().any(|r| *r != own);
                         if foreign && opts.other_revs == OtherRevs::SetAside {
@@ -389,7 +318,6 @@ impl SdsStore {
         self.cap_bytes = cap;
     }
 
-    /// The engine revision this store stamps on its observations (`""`: none).
     pub fn engine_rev(&self) -> &str {
         &self.engine_rev
     }
@@ -398,7 +326,6 @@ impl SdsStore {
         self.engine_rev = rev.into();
     }
 
-    /// Engine revisions of a ledger's observations, the open run's included.
     pub fn engine_revs(&self, l: Ledger) -> Vec<String> {
         let mut v = self.bases.get(&l).map(|b| b.engine_revs.clone()).unwrap_or_default();
         if self.runs.get(&l).is_some_and(|r| r.observations > 0) {
@@ -417,7 +344,6 @@ impl SdsStore {
         }
     }
 
-    /// Sets how reads of a track back off ([`ScopePolicy`]); the default pools.
     pub fn set_policy(&mut self, track: Track, policy: ScopePolicy) {
         self.policies.insert(track, policy);
     }
@@ -426,9 +352,6 @@ impl SdsStore {
         self.policies.get(&track).copied().unwrap_or_default()
     }
 
-    /// The scope keys a read may use, most specific first, with the
-    /// observations each needs. The default policy keeps the original order
-    /// exactly (secondary, primary, global, each with its minimum).
     fn levels(&self, scope: &Scope) -> Vec<(String, u64)> {
         let (m2, m1, mg) = scope.track.min_obs();
         let mut v = vec![(scope.key_secondary(), m2), (scope.key_primary(), m1), (scope.key_global(), mg)];
@@ -451,8 +374,6 @@ impl SdsStore {
         }
         self.log.push(line);
     }
-
-    // ----- writing -----
 
     fn open_run(&mut self, l: Ledger, label: &str) -> &mut RunBuf {
         let dir = self.dir.clone();
@@ -490,7 +411,6 @@ impl SdsStore {
         }
     }
 
-    /// Records one value of a named axis (a score, a duration, an error).
     pub fn record_baseline(&mut self, scope: &Scope, axis: &str, value: f64) {
         if !value.is_finite() {
             return;
@@ -501,7 +421,6 @@ impl SdsStore {
         });
     }
 
-    /// Records measured / predicted for an axis (clamped to 0.05..20).
     pub fn record_calibration(&mut self, scope: &Scope, axis: &str, measured: f64, predicted: f64) {
         if !measured.is_finite() || !predicted.is_finite() || predicted.abs() < 1e-9 {
             return;
@@ -513,7 +432,6 @@ impl SdsStore {
         });
     }
 
-    /// Records the decay shape of a score list (how clear the winner was).
     pub fn record_decay(&mut self, scope: &Scope, axis: &str, scores: &[f32]) {
         let Some(shape) = decay_shape(scores) else { return };
         let a = axis.to_string();
@@ -526,7 +444,6 @@ impl SdsStore {
         });
     }
 
-    /// Records that `winner` was chosen over `loser` with a margin.
     pub fn record_confusion(&mut self, scope: &Scope, winner: &str, loser: &str, margin: f64) {
         if winner.is_empty() || loser.is_empty() || winner == loser {
             return;
@@ -551,7 +468,6 @@ impl SdsStore {
         });
     }
 
-    /// Records whether a prediction agreed with what later turned out true.
     pub fn record_agreement(&mut self, scope: &Scope, axis: &str, agreed: bool) {
         let a = axis.to_string();
         self.with_scopes(scope, move |s, ring| {
@@ -559,15 +475,6 @@ impl SdsStore {
         });
     }
 
-    /// Records a value next to a reference value from the literature or a
-    /// physical formula. Three things go into one observation: the value
-    /// itself (`axis`), its deviation in tolerance units (`axis:dev`, that is
-    /// `(value - reference) / tolerance`) and whether it stayed inside the band
-    /// (`axis:in_band`, an agreement). The deviation's magnitude and square
-    /// (`axis:absdev`, `axis:dev2`) go in beside it, so a report can say how
-    /// far off the values are and not only on which side.
-    /// [`reference_report`](Self::reference_report) and
-    /// [`area_report`](Self::area_report) read them back.
     pub fn record_reference(&mut self, scope: &Scope, axis: &str, value: f64, reference: f64, tolerance: f64) {
         if !value.is_finite() || !reference.is_finite() || !tolerance.is_finite() || tolerance <= 0.0 {
             return;
@@ -580,7 +487,6 @@ impl SdsStore {
             s.baseline.entry(ad.clone()).or_default().push(dev, ring);
             s.baseline.entry(aa.clone()).or_default().push(dev.abs(), ring);
             s.baseline.entry(a2.clone()).or_default().push(dev * dev, ring);
-            // The reference can depend on the situation (a load, a slope); keep its mean too.
             s.baseline.entry(ar.clone()).or_default().push(reference, ring);
             s.baseline.entry(at.clone()).or_default().push(tolerance, ring);
             s.agreement.entry(ab.clone()).or_default().push(if dev.abs() <= 1.0 { 1.0 } else { 0.0 }, ring);
@@ -597,7 +503,6 @@ impl SdsStore {
         });
     }
 
-    /// Records gate outcomes: `(gate id, severity, blocked, sole blocker)`.
     pub fn record_gates(&mut self, scope: &Scope, items: &[(String, u8, bool, bool)]) {
         if items.is_empty() {
             return;
@@ -618,8 +523,6 @@ impl SdsStore {
         });
     }
 
-    // ----- reading -----
-
     fn merged_scope(&self, l: Ledger, key: &str) -> Option<ScopeStat> {
         let base = self.bases.get(&l).and_then(|f| f.scopes.get(key).cloned());
         let run = self.runs.get(&l).and_then(|r| r.scopes.get(key).cloned());
@@ -634,8 +537,6 @@ impl SdsStore {
         }
     }
 
-    /// Backoff: the first of secondary, primary, global whose statistic has at
-    /// least the track's minimum observation count. Also names the scope used.
     fn resolve<T, F: Fn(&ScopeStat) -> Option<(T, u64)>>(&self, scope: &Scope, pick: F) -> Option<(T, String)> {
         let l = scope.track.ledger();
         for (key, need) in self.levels(scope) {
@@ -653,24 +554,18 @@ impl SdsStore {
         None
     }
 
-    /// Learned `(mean, sd, n)` of an axis, or `None` while the data is thin.
     pub fn adaptive_baseline(&self, scope: &Scope, axis: &str) -> Option<(f64, f64, u64)> {
         self.resolve(scope, |st| st.baseline.get(axis).map(|w| ((w.mean, w.sd(), w.n), w.n))).map(|v| v.0)
     }
 
-    /// Same as [`adaptive_baseline`](Self::adaptive_baseline) plus the scope key that answered.
     pub fn adaptive_baseline_scoped(&self, scope: &Scope, axis: &str) -> Option<((f64, f64, u64), String)> {
         self.resolve(scope, |st| st.baseline.get(axis).map(|w| ((w.mean, w.sd(), w.n), w.n)))
     }
 
-    /// `(recent mean, overall mean, drift z)` of an axis.
     pub fn adaptive_recent(&self, scope: &Scope, axis: &str) -> Option<(f64, f64, f64)> {
         self.resolve(scope, |st| st.baseline.get(axis).map(|w| ((w.recent_mean(), w.mean, w.drift_z()), w.n))).map(|v| v.0)
     }
 
-    /// Learned ratio measured/predicted, shrunk toward 1 with few observations
-    /// and re-centred on the recent mean when it drifted (|z| > 2).
-    /// Returns `(factor, n, drift_z, scope key)`.
     pub fn calibration_factor(&self, scope: &Scope, axis: &str) -> Option<(f64, u64, f64, String)> {
         self.resolve(scope, |st| {
             st.calibration.get(axis).map(|w| {
@@ -683,7 +578,6 @@ impl SdsStore {
         .map(|((f, n, d), key)| (f, n, d, key))
     }
 
-    /// Smoothed probability of `to` following `from` (add-one smoothing).
     pub fn transition_prior(&self, scope: &Scope, from: &str, to: &str) -> Option<f64> {
         let l = scope.track.ledger();
         for (key, need) in self.levels(scope).into_iter().take(2) {
@@ -700,22 +594,18 @@ impl SdsStore {
         None
     }
 
-    /// `(rate, n)` of agreements recorded for an axis.
     pub fn agreement_rate(&self, scope: &Scope, axis: &str) -> Option<(f64, u64)> {
         self.resolve(scope, |st| st.agreement.get(axis).map(|w| ((w.mean, w.n), w.n))).map(|v| v.0)
     }
 
-    /// Same as [`agreement_rate`](Self::agreement_rate) plus the scope key that answered.
     pub fn agreement_rate_scoped(&self, scope: &Scope, axis: &str) -> Option<((f64, u64), String)> {
         self.resolve(scope, |st| st.agreement.get(axis).map(|w| ((w.mean, w.n), w.n)))
     }
 
-    /// `(mean margin, sd, n)` of the winner margin of an axis.
     pub fn adaptive_decay(&self, scope: &Scope, axis: &str) -> Option<(f64, f64, u64)> {
         self.resolve(scope, |st| st.decay.get(axis).map(|d| ((d.margin.mean, d.margin.sd(), d.margin.n), d.margin.n))).map(|v| v.0)
     }
 
-    /// Share of all recorded confusions that this pair accounts for, and its count.
     pub fn confusion_share(&self, scope: &Scope, a: &str, b: &str) -> Option<(f64, u64)> {
         let (x, y) = if a <= b { (a, b) } else { (b, a) };
         let key = format!("{}|{}", x, y);
@@ -726,8 +616,6 @@ impl SdsStore {
         .map(|v| v.0)
     }
 
-    /// What [`record_reference`](Self::record_reference) collected for an axis,
-    /// from the first scope level with enough observations.
     pub fn reference_report(&self, scope: &Scope, axis: &str) -> Option<ReferenceReport> {
         self.resolve(scope, |st| reference_of(st, axis).map(|r| {
             let n = r.n;
@@ -736,15 +624,12 @@ impl SdsStore {
         .map(|(r, scope_key)| ReferenceReport { scope: scope_key, ..r })
     }
 
-    /// `(mean, sd, n)` of a baseline axis at exactly one scope (no backoff).
-    /// For tables that show each scope on its own; decisions use the backoff.
     pub fn exact_baseline(&self, scope: &Scope, axis: &str) -> Option<(f64, f64, u64)> {
         let key = if scope.secondary.is_empty() { scope.key_primary() } else { scope.key_secondary() };
         let st = self.merged_scope(scope.track.ledger(), &key)?;
         st.baseline.get(axis).filter(|w| w.n > 0).map(|w| (w.mean, w.sd(), w.n))
     }
 
-    /// [`reference_report`](Self::reference_report) at exactly one scope (no backoff, any count).
     pub fn exact_reference(&self, scope: &Scope, axis: &str) -> Option<ReferenceReport> {
         let key = if scope.secondary.is_empty() { scope.key_primary() } else { scope.key_secondary() };
         let st = self.merged_scope(scope.track.ledger(), &key)?;
@@ -752,9 +637,6 @@ impl SdsStore {
         reference_of(&st, axis).map(|r| ReferenceReport { scope: key, ..r })
     }
 
-    /// Every reference axis of a track whose primary starts with `prefix`
-    /// (`""`: the whole track), read at the primary scopes (each pools its
-    /// secondaries, so nothing is counted twice) and pooled by count.
     pub fn area_report(&self, track: Track, prefix: &str) -> AreaReport {
         let l = track.ledger();
         let head = format!("{}|", track.as_str());
@@ -765,7 +647,6 @@ impl SdsStore {
         }
         keys.retain(|k| {
             let Some(rest) = k.strip_prefix(&head) else { return false };
-            // A primary key: `track|primary|` with a named primary.
             match rest.split_once('|') {
                 Some((p, s)) => !p.is_empty() && s.is_empty() && p.starts_with(&prefix),
                 None => false,
@@ -817,7 +698,6 @@ impl SdsStore {
         }
     }
 
-    /// Past mean squared error of a forecasting method (see `noto-ts` fusion).
     pub fn fusion_mse(&self, scope: &Scope, method: &str) -> Option<(f64, u64)> {
         self.adaptive_baseline(scope, &format!("fusion_mse:{}", method)).map(|(m, _, n)| (m, n))
     }
@@ -848,7 +728,6 @@ impl SdsStore {
         out
     }
 
-    /// Baseline axes with a name prefix, from the first scope level that has any.
     pub fn axes_of(&self, scope: &Scope, prefix: &str) -> Vec<AxisStatus> {
         let l = scope.track.ledger();
         for (key, _) in self.levels(scope) {
@@ -869,9 +748,6 @@ impl SdsStore {
         Vec::new()
     }
 
-    // ----- persistence -----
-
-    /// Writes run files and ledgers. Returns a short line per file written.
     pub fn flush(&mut self) -> Vec<String> {
         let Some(dir) = self.dir.clone() else { return Vec::new() };
         let mut lines = Vec::new();
@@ -939,7 +815,6 @@ impl SdsStore {
         lines
     }
 
-    /// Flushes, then folds the open run buffers into the ledgers.
     pub fn close_runs(&mut self) {
         self.flush();
         let revs: Vec<(Ledger, Vec<String>)> = Ledger::ALL.iter().map(|l| (*l, self.engine_revs(*l))).collect();
@@ -961,7 +836,6 @@ impl SdsStore {
         self.flush();
     }
 
-    /// Deletes everything and returns to the cold-start state.
     pub fn purge(&mut self) {
         self.bases.clear();
         self.runs.clear();
@@ -1053,7 +927,6 @@ impl SdsStore {
         }
     }
 
-    /// Number of scopes held for a track (ledger plus open run).
     pub fn scope_count(&self, track: Track) -> usize {
         let prefix = format!("{}|", track.as_str());
         let l = track.ledger();
@@ -1072,7 +945,6 @@ fn fresh_file() -> SdsFile {
     SdsFile { recipe: SDS_RECIPE.into(), updated_at: now_ms(), scopes: HashMap::new(), engine_revs: Vec::new() }
 }
 
-/// What [`SdsStore::record_reference`] collected for an axis in one scope (scope key left empty).
 fn reference_of(st: &ScopeStat, axis: &str) -> Option<ReferenceReport> {
     let v = st.baseline.get(axis)?;
     let d = st.baseline.get(&format!("{axis}:dev"))?;
@@ -1144,7 +1016,6 @@ mod tests {
         feed(&mut s, &near, "score", 25, 0.70);
         feed(&mut s, &far, "score", 3, 0.30);
         let (m_far, _, _) = s.adaptive_baseline(&far, "score").unwrap();
-        // The far scope has 3 observations, so the primary (28 pooled) answers.
         assert!(m_far > 0.6, "pooled mean {m_far}");
         let (m_near, _, n) = s.adaptive_baseline(&near, "score").unwrap();
         assert_eq!(n, 25);
@@ -1167,7 +1038,6 @@ mod tests {
         }
         let (f100, _, _, _) = s.calibration_factor(&sc, "mine_time").unwrap();
         assert!(f100 > f4 && f100 < 1.5 && f100 > 1.45, "{f100}");
-        // Degenerate predictions are ignored.
         let before = s.calibration_factor(&sc, "mine_time").unwrap().1;
         s.record_calibration(&sc, "mine_time", 1.0, 0.0);
         s.record_calibration(&sc, "mine_time", f64::NAN, 1.0);
@@ -1203,7 +1073,6 @@ mod tests {
         }
         s.record_confusion(&sc, "tree", "tree", 0.1);
         s.record_confusion(&sc, "", "tree", 0.1);
-        // Global scope of the vision track needs 30 observations: give it 20 more.
         for _ in 0..20 {
             s.record_confusion(&sc, "tree", "boulder", 0.05);
         }
@@ -1230,7 +1099,6 @@ mod tests {
         }
         s.record_transition(&sc, "locate", "locate");
         let p = s.transition_prior(&sc, "locate", "approach").unwrap();
-        // (3 + 1) / (4 + 2 outs + 1)
         assert!((p - 4.0 / 7.0).abs() < 1e-9, "{p}");
         assert!(s.transition_prior(&sc, "mine", "collect").is_none());
         s.record_transition(&sc, "", "x");
@@ -1372,7 +1240,6 @@ mod tests {
         write_atomic(&path, b"{\"a\":2}").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"a\":2}");
         assert!(!dir.join("a.json.tmp").exists());
-        // Writing into a missing directory fails and leaves nothing behind.
         assert!(write_atomic(&dir.join("missing").join("b.json"), b"x").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1396,7 +1263,6 @@ mod tests {
     fn reference_axes_report_deviation_and_band_share() {
         let mut s = SdsStore::memory();
         let scope = Scope::new(Track::Balance, "arm_raise>belly", "flat");
-        // Reference 2.0 ± 0.5: values 2.0, 2.25 and 3.0 are 0, 0.5 and 2 tolerances off.
         for _ in 0..4 {
             for v in [2.0, 2.25, 3.0] {
                 s.record_reference(&scope, "comp_deg", v, 2.0, 0.5);
@@ -1408,10 +1274,8 @@ mod tests {
         assert!((r.mean_dev - (0.0 + 0.5 + 2.0) / 3.0).abs() < 1e-9, "{r:?}");
         assert!((r.in_band_rate - 2.0 / 3.0).abs() < 1e-9);
         assert!((r.mean_ref - 2.0).abs() < 1e-12 && (r.mean_tol - 0.5).abs() < 1e-12);
-        // A bad tolerance is ignored rather than dividing by zero.
         s.record_reference(&scope, "comp_deg", 9.0, 2.0, 0.0);
         assert_eq!(s.reference_report(&scope, "comp_deg").unwrap().n, 12);
-        // The new tracks land in their own ledgers.
         assert!(s.status(10).ledgers.iter().any(|l| l.ledger == "body" && l.observations > 0));
         assert_eq!(Track::Depth.ledger(), Ledger::Ml);
     }
@@ -1420,7 +1284,6 @@ mod tests {
     fn reference_reports_say_how_far_and_not_only_which_side() {
         let mut s = SdsStore::memory();
         let scope = Scope::new(Track::Act, "grasp:ts", "log");
-        // Reference 1.0 ± 0.5: +2 and −2 tolerances cancel in the signed mean.
         for _ in 0..4 {
             s.record_reference(&scope, "preload_s", 2.0, 1.0, 0.5);
             s.record_reference(&scope, "preload_s", 0.0, 1.0, 0.5);
@@ -1436,17 +1299,14 @@ mod tests {
     #[test]
     fn the_area_report_pools_every_reference_axis_of_a_prefix_once() {
         let mut s = SdsStore::memory();
-        // Two secondaries under one primary: read at the primary, nothing counted twice.
         for item in ["log", "stone"] {
             for v in [1.0, 3.0] {
                 s.record_reference(&Scope::new(Track::Act, "grasp:ts", item), "preload_s", v, 1.0, 1.0);
             }
         }
-        // Another primary under the prefix, |dev| 4 three times.
         for _ in 0..3 {
             s.record_reference(&Scope::new(Track::Act, "grasp>part", "reach"), "trunk_deg", 5.0, 1.0, 1.0);
         }
-        // A primary outside the prefix, and an axis recorded before |dev| existed.
         s.record_reference(&Scope::new(Track::Act, "nn:grasp", "foot"), "margin", 9.0, 0.0, 1.0);
         for _ in 0..2 {
             s.record_baseline(&Scope::new(Track::Act, "grasp:old", ""), "x:dev", -0.5);
@@ -1455,9 +1315,7 @@ mod tests {
         assert_eq!(r.axes.len(), 3, "{:?}", r.axes);
         assert_eq!(r.n, 4 + 3 + 2);
         assert_eq!(r.legacy_axes, 1);
-        // |dev|: preload 0,0,2,2 (mean 1, n 4), trunk 4 (n 3) → (4·1 + 3·4) / 7.
         assert!((r.mean_abs_dev.unwrap() - 16.0 / 7.0).abs() < 1e-9, "{r:?}");
-        // dev²: preload 0,0,4,4 (mean 2), trunk 16 → √((4·2 + 3·16) / 7).
         assert!((r.rms_dev.unwrap() - (56.0f64 / 7.0).sqrt()).abs() < 1e-9);
         assert_eq!(r.worst.as_ref().map(|a| a.axis.as_str()), Some("trunk_deg"));
         assert_eq!(s.area_report(Track::Act, "").axes.len(), 4, "the whole track");
@@ -1471,15 +1329,12 @@ mod tests {
         let stand_in = Scope::new(Track::Locate, "parcel", "stand_in");
         feed(&mut s, &stand_in, "peak", 30, 0.9);
         feed(&mut s, &real, "peak", 3, 0.1);
-        // Pooled (the default): the thin real-model scope answers with the stand-in's statistics.
         let (m, _, _) = s.adaptive_baseline(&real, "peak").unwrap();
         assert!(m > 0.7, "{m}");
         s.set_policy(Track::Locate, ScopePolicy::KEEP_SECONDARIES);
         assert!(s.adaptive_baseline(&real, "peak").is_none(), "the real model waits for its own observations");
         assert_eq!(s.adaptive_baseline_scoped(&stand_in, "peak").unwrap().1, "locate|parcel|stand_in");
-        // A scope without a secondary may still use its primary.
         assert!(s.adaptive_baseline(&Scope::new(Track::Locate, "parcel", ""), "peak").is_some());
-        // Exact: a thin primary does not back off to the global scope either.
         let tips = Scope::new(Track::Depth, "tips", "");
         feed(&mut s, &Scope::new(Track::Depth, "stand_in", ""), "scale", 25, 1.25);
         feed(&mut s, &tips, "scale", 2, 0.9);
@@ -1503,7 +1358,6 @@ mod tests {
         assert_eq!(ledger.engine_revs, vec!["r1".to_string()]);
         let run = std::fs::read_dir(dir.join("runs").join("task")).unwrap().next().unwrap().unwrap().path();
         assert!(std::fs::read_to_string(run).unwrap().contains("\"engine_rev\": \"r1\""));
-        // Another revision keeps the old observations by default and lists both.
         {
             let mut s = SdsStore::open_with(&dir, OpenOptions::stamped("r2"));
             assert!(s.adaptive_baseline(&Scope::new(Track::Forecast, "x", ""), "a").is_some());
@@ -1512,14 +1366,12 @@ mod tests {
             assert!(s.status(1).ledgers.iter().any(|l| l.ledger == "task" && l.engine_revs.len() == 2));
             s.close_runs();
         }
-        // Reading only r2: the mixed ledger is set aside (kept on disk), the store starts empty.
         let s = SdsStore::open_with(&dir, OpenOptions::only("r2"));
         assert!(s.adaptive_baseline(&Scope::new(Track::Forecast, "x", ""), "a").is_none());
         assert!(s.log_lines().iter().any(|l| l.contains("다른 엔진 개정")), "{:?}", s.log_lines());
         let aside: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().starts_with("task.rev-")).collect();
         assert_eq!(aside.len(), 1);
         drop(s);
-        // A ledger written before the stamp counts as unstamped.
         let legacy = tmpdir("rev_legacy");
         std::fs::create_dir_all(&legacy).unwrap();
         let mut old = fresh_file();
@@ -1531,7 +1383,6 @@ mod tests {
         let s = SdsStore::open_with(&legacy, OpenOptions::stamped("r2"));
         assert_eq!(s.engine_revs(Ledger::Task), vec![UNSTAMPED.to_string()]);
         drop(s);
-        // An unstamped reader that keeps only its own revision keeps the unstamped ledger.
         let s = SdsStore::open_with(&legacy, OpenOptions::only(""));
         assert!(s.adaptive_baseline(&Scope::new(Track::Forecast, "", ""), "a").is_none(), "one observation is below the minimum");
         assert_eq!(s.engine_revs(Ledger::Task), vec![UNSTAMPED.to_string()]);

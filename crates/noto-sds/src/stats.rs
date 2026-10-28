@@ -1,14 +1,7 @@
-//! Online statistics used by the score-dynamics store.
-//!
-//! Ported from logis-center `score_dynamics.rs` (original) via the adapted copy
-//! in endmill-sandbox `src/sds.rs`: Welford mean/variance plus a short ring of
-//! recent values, and the "decay shape" summary of a sorted score list.
-
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-/// Welford running mean and variance plus a ring of the latest values.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Welford {
     pub n: u64,
@@ -38,7 +31,6 @@ impl Welford {
         }
     }
 
-    /// Sample variance (n - 1); 0 below two observations.
     pub fn variance(&self) -> f64 {
         if self.n < 2 {
             0.0
@@ -51,7 +43,6 @@ impl Welford {
         self.variance().max(0.0).sqrt()
     }
 
-    /// Mean of the ring, or the overall mean when the ring is empty.
     pub fn recent_mean(&self) -> f64 {
         if self.ring.is_empty() {
             return self.mean;
@@ -59,7 +50,6 @@ impl Welford {
         self.ring.iter().sum::<f64>() / self.ring.len() as f64
     }
 
-    /// How many standard deviations the recent mean sits from the overall mean.
     pub fn drift_z(&self) -> f64 {
         let sd = self.sd();
         if sd <= 0.0 || self.ring.is_empty() {
@@ -68,7 +58,6 @@ impl Welford {
         (self.recent_mean() - self.mean) / sd
     }
 
-    /// Chan's parallel update; the ring keeps the newest values of both.
     pub fn merge(&mut self, other: &Welford, ring_len: usize) {
         if other.n == 0 {
             return;
@@ -89,7 +78,6 @@ impl Welford {
     }
 }
 
-/// Shape of a descending score list: how clearly the top item stands out.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct DecayShape {
     pub n: usize,
@@ -143,7 +131,6 @@ pub struct DecayStat {
     pub entropy_norm: Welford,
 }
 
-/// How often two labels were confused with each other (pair key `a|b`, a <= b).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ConfusionStat {
     pub ties: u64,
@@ -152,12 +139,10 @@ pub struct ConfusionStat {
     pub margin: Welford,
 }
 
-/// Pass/block counts of one gate.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GateStat {
     pub evaluated: u64,
     pub blocked: u64,
-    /// Times this gate was the only one that blocked.
     pub sole: u64,
     #[serde(default)]
     pub severity: Welford,
@@ -220,8 +205,6 @@ impl ScopeStat {
         self.updated_at = now_ms;
     }
 
-    /// Total observations, used to decide which scopes to drop first when a
-    /// ledger exceeds its size cap.
     pub fn observations(&self) -> u64 {
         self.baseline.values().map(|w| w.n).sum::<u64>()
             + self.calibration.values().map(|w| w.n).sum::<u64>()
@@ -282,7 +265,6 @@ mod tests {
         assert!((wa.mean - all.mean).abs() < 1e-12);
         assert!((wa.sd() - all.sd()).abs() < 1e-12);
         assert_eq!(wa.ring, all.ring);
-        // Merging an empty one changes nothing; merging into empty copies.
         let before = wa.clone();
         wa.merge(&Welford::default(), 6);
         assert_eq!(wa, before);

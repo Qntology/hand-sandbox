@@ -1,15 +1,3 @@
-//! Site benchmark [SX]: the generated houses, stairs, shelves, tables and
-//! lighting scored against references the generator never reads (research
-//! `docs/research/sites.md` §3, group B), plus an A/B of the search prior.
-//!
-//! The engine (`site.rs`, `fixture.rs`) takes its numbers from building codes
-//! and catalogues (group A: IRC, 주택건설기준 제16조, Uline, Cisco-Eagle aisle
-//! guide, EN 12464-1); this file scores the result with other sources (UK
-//! Approved Document K, an Australian builders' survey, a second Korean
-//! statute, rack-clearance listings, the revised lifting equation, Korean and
-//! US workplace lighting rules). A miss is printed as a miss: no engine
-//! constant is moved toward these numbers.
-
 use noto_core::{BaseKind, FingerCount, NotoConfig};
 use world_sim::explore::{self, Coverage, Eye};
 use world_sim::fixture::FixtureKind;
@@ -36,7 +24,6 @@ fn cell(name: &'static str, value: f32, rule: Rule, cite: &'static str) -> Cell 
     Cell { name, value, rule, cite }
 }
 
-/// 100 inside the band; outside, falling linearly with the distance (a band's width, or the limit itself).
 fn score(c: &Cell) -> Option<f32> {
     let x = c.value;
     Some(match c.rule {
@@ -144,7 +131,6 @@ fn stairs_shelves_tables_and_light_against_other_sources() {
     ];
     let a = print_scenario("S1-stairs", "현관 계단 (8 시드의 모든 집)", &s1);
 
-    // Room above a parcel on a deck: the deck pitch less the deck and the parcel.
     let parcel_h_mm = ItemKind::Parcel.spec().piece_size_m(1.0)[1] * 1000.0;
     let clearance = min(&deck_pitch) - world_sim::fixture::SHELF_DECK_MM as f32 - parcel_h_mm;
     let vm = mean(&slot_heights.iter().map(|y| 1.0 - 0.003 * (y * 100.0 - 75.0).abs()).collect::<Vec<_>>());
@@ -165,16 +151,9 @@ fn stairs_shelves_tables_and_light_against_other_sources() {
     ];
     let c = print_scenario("S3-light", "물류센터 작업면 조도 (설계값)", &s3);
     assert!(a.is_finite() && b.is_finite() && c.is_finite());
-    // The engine's own sources hold (group A, checked here so a change shows up).
     assert!(r_max <= 180.0 && t_min >= 260.0 && clearance > 0.0);
 }
 
-/// Planner-level search: from the base camp, look from viewpoint after
-/// viewpoint (`explore::next_viewpoint_with`, a full turn at each) and note
-/// when each parcel's cell is first covered. Parcels count as seen within
-/// 3 m, the runtime's small-item range. Walls do not occlude the planner's
-/// viewshed (terrain only), so this measures where the search goes, not what
-/// the camera would resolve.
 fn search(w: &World, prior: Option<&[f32]>, budget_s: f32) -> Vec<Option<f32>> {
     const SMALL_ITEM_SEE_M: f32 = 3.0;
     const VFOV_DEG: f32 = 50.0;
@@ -209,7 +188,6 @@ fn search(w: &World, prior: Option<&[f32]>, budget_s: f32) -> Vec<Option<f32>> {
 
 #[test]
 fn the_search_prior_reaches_the_parcels_sooner() {
-    // 240 s: the runtime's locate timeout for one target.
     const BUDGET_S: f32 = 240.0;
     let mut rows: Vec<(&str, f32, f32)> = Vec::new();
     for (label, site, use_prior) in [("open_map", false, false), ("site_no_prior", true, false), ("site_prior", true, true)] {

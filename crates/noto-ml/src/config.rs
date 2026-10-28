@@ -1,6 +1,3 @@
-//! SigLIP2 model configuration. Defaults match `google/siglip2-base-patch16-naflex`
-//! and are overridden by `config.json` when the file has the fields.
-
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -12,8 +9,6 @@ pub struct Siglip2Config {
     pub vision_layers: usize,
     pub vision_heads: usize,
     pub patch_size: usize,
-    /// Largest number of patches per image (NaFlex). Also the length of the
-    /// learned position table, which must be a square.
     pub max_patches: usize,
     pub vision_eps: f64,
     pub text_hidden: usize,
@@ -21,7 +16,6 @@ pub struct Siglip2Config {
     pub text_layers: usize,
     pub text_heads: usize,
     pub text_vocab: usize,
-    /// Text is padded or truncated to this many tokens.
     pub text_max_len: usize,
     pub text_pad_id: u32,
     pub text_eps: f64,
@@ -50,7 +44,6 @@ impl Default for Siglip2Config {
 }
 
 impl Siglip2Config {
-    /// Reads a Hugging Face `config.json`. Missing fields keep their defaults.
     pub fn from_file(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("reading {}", path.display()))?;
@@ -87,7 +80,6 @@ impl Siglip2Config {
         })
     }
 
-    /// Side of the square position table (256 -> 16).
     pub fn position_side(&self) -> usize {
         (self.max_patches as f64).sqrt().round().max(1.0) as usize
     }

@@ -1,27 +1,3 @@
-//! The ML logic's pipeline as the runtime drives it: one keyframe in, depth,
-//! semantic points, tracked masks and the target observation out.
-//!
-//! The models live in `noto-vision`. Two of them need weights this repository
-//! does not ship (TIPSv2 DPT, SigLIP2). Without weights the runtime plugs in a
-//! stand-in that is honest about being one: it reads the renderer's ground
-//! truth of the keyframe and spoils it the way the real model would be wrong
-//! (depth clamped at 10 m, an unknown scale, patch-wise errors; semantic heat
-//! on a coarse patch grid with noise and look-alike confusion). Its mode name
-//! says `stand-in`. The mask tracker has no stand-in of that kind: the
-//! region-growing tracker sees only the image and the depth map.
-//!
-//! Ground truth is also used to score the ML tracks (depth error, location
-//! error, mask IoU, true range). Those numbers go to evaluation columns and
-//! SDS evaluation axes only; the decision never reads them.
-//!
-//! v1.0 ([`MlFixCfg`], `docs/research/ml-ab.md`) changes what the real models'
-//! outputs go through, never the stand-ins': the depth model is fitted to the
-//! ground the camera sees from its known height and pitch
-//! (`noto_vision::align`), a drop's range also comes from the row where its
-//! mask meets the ground, and a semantic point becomes a tracker prompt only
-//! when it passes the threshold fitted for its label on rendered frames
-//! (`noto_vision::calib`, `data/ml_calib.json`).
-
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use anyhow::Result;
@@ -35,49 +11,27 @@ use world_sim::render::unpack_id;
 use world_sim::rng::Rng;
 use world_sim::{Frame, ObjectClass, VisibleObject, World};
 
-/// TIPSv2 DPT cannot report depth beyond this, metres.
 pub const TIPS_MAX_DEPTH_M: f32 = 10.0;
-/// Scale error of the depth stand-in: an indoor-trained model on an outdoor
-/// voxel scene has some unknown metric scale. The value is chosen, not
-/// measured; triangulation is what finds it (the SDS `depth` scale axis).
 pub const STANDIN_DEPTH_SCALE: f32 = 0.8;
 
-/// The per-label calibration of the real locators, fitted offline on rendered
-/// frames by the A/B harness (`tests/ml_ab.rs`) and read here as data.
 pub const ML_CALIB_JSON: &str = include_str!("../../../data/ml_calib.json");
 
-/// What v1.0 changes on the real models' path. The stand-ins never use it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MlFixCfg {
-    /// Fit the depth model to the ground seen from the eye height and pitch
-    /// (`noto_vision::align`); `None` keeps the model's own metres.
     #[serde(default)]
     pub align: Option<AlignCfg>,
-    /// Range a drop (an item lying on the ground) from its mask's contact row
-    /// too, blended with the depth by inverse variance.
     #[serde(default)]
     pub contact_range: bool,
-    /// How well the robot knows its camera's pitch, degrees (1σ), for the
-    /// contact range. ESTIMATE: the joint chain plus the head IMU after shake;
-    /// the gyro's own drift over a keyframe interval is far smaller.
     #[serde(default = "default_pitch_sigma")]
     pub pitch_sigma_deg: f32,
-    /// Least relative 1σ of the aligned depth at a target (the ground's own
-    /// residual after the fit says nothing about the object's).
     #[serde(default = "default_depth_rel_sigma")]
     pub depth_rel_sigma: f32,
-    /// A semantic point needs its label's calibrated threshold
-    /// ([`CalibTable`] of the locator's mode) to become a prompt.
     #[serde(default)]
     pub calibrated_gate: bool,
-    /// How the SigLIP2 locator scores patches when it is attached.
     #[serde(default)]
     pub locate: LocateCfg,
-    /// Prompt templates and the background set for the tile recogniser too.
     #[serde(default)]
     pub scan_prompting: bool,
-    /// Map the tile recogniser's scores through its per-label Platt fits
-    /// (`data/ml_calib.json`, mode `embedding`).
     #[serde(default)]
     pub scan_calibrated: bool,
 }
@@ -91,7 +45,6 @@ fn default_depth_rel_sigma() -> f32 {
 }
 
 impl MlFixCfg {
-    /// Everything as it was before v1.0 (the A/B harness's baseline arm).
     pub fn legacy() -> MlFixCfg {
         MlFixCfg {
             align: None,
@@ -105,10 +58,6 @@ impl MlFixCfg {
         }
     }
 
-    /// The v1.0 path: ground alignment, contact range, calibrated gate, and
-    /// the locator scoring the shipped calibration was fitted for (its table's
-    /// mode, `data/ml_calib.json`; the contrast scoring with the lexicon's
-    /// background classes when no table is shipped).
     pub fn v1(prompting: &VisionPrompting) -> MlFixCfg {
         let shipped = CalibTable::parse(ML_CALIB_JSON).unwrap_or_default();
         let locate = shipped
@@ -135,8 +84,6 @@ impl Default for MlFixCfg {
     }
 }
 
-/// Ground truth of a keyframe at half resolution, for the stand-ins and the
-/// evaluation columns.
 #[derive(Clone, Debug)]
 pub struct KeyTruth {
     pub width: u32,
@@ -144,9 +91,7 @@ pub struct KeyTruth {
     pub ids: Vec<u32>,
     pub depth: Vec<f32>,
     pub objects: Vec<VisibleObject>,
-    /// Ground position of every visible entity: (entity, label, x, z).
     pub positions: Vec<(String, String, f32, f32)>,
-    /// Size of the keyframe the truth was taken from.
     pub src_width: u32,
     pub src_height: u32,
 }
@@ -184,7 +129,6 @@ impl KeyTruth {
         DepthMap { width: self.width, height: self.height, kind: DepthKind::Metric, data: self.depth.clone() }
     }
 
-    /// Entity under the most pixels of a mask (same half resolution).
     pub fn entity_under(&self, mask: &Mask) -> Option<(u32, f32)> {
         let mut count: HashMap<u32, u32> = HashMap::new();
         for y in 0..mask.height.min(self.height) {
@@ -198,7 +142,6 @@ impl KeyTruth {
         Some((raw, n as f32 / mask.area().max(1) as f32))
     }
 
-    /// IoU of a mask with the true pixels of entity `raw`.
     pub fn iou(&self, mask: &Mask, raw: u32) -> f32 {
         let (mut inter, mut uni) = (0u32, 0u32);
         for y in 0..self.height.min(mask.height) {
@@ -223,33 +166,16 @@ fn gauss(rng: &mut Rng) -> f32 {
     (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
 }
 
-/// Error model of a depth model against the renderer: `ln(pred/true) = a +
-/// b·ln(true) + η + ε`, with η drawn once per keyframe and ε per model patch,
-/// the model's ceiling, what it answers where the truth is sky, and how far
-/// it smears depth edges. Fitted by the A/B harness (`tests/ml_ab.rs`,
-/// `[MLAB] depth/errmodel`) on rendered keyframes; it describes the real
-/// model's errors, it is not a choice.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DepthErrModel {
     pub a: f32,
     pub b: f32,
-    /// SD of the per-keyframe offset η.
     pub frame_sd: f32,
-    /// SD of the per-patch residual ε.
     pub patch_sd: f32,
-    /// The model's answer where the truth is sky, metres (`INFINITY`: the
-    /// far/unknown mark of the ground-aligned path).
     pub sky_m: f32,
-    /// The farthest answer, metres (the bin ceiling of the raw model).
     pub cap_m: f32,
-    /// True depth from which the model mostly answers "far/unknown"
-    /// (`INFINITY`: the saturated pixels of the ground-aligned path), metres;
-    /// `INFINITY` when it always answers.
     #[serde(default = "never_unknown")]
     pub unknown_beyond_m: f32,
-    /// Box-blur radius of the log depth, pixels of the half-size truth.
-    /// ESTIMATE: about half a TIPS patch (14 px of the 504 px input is 5 px
-    /// of the 192 px truth); DPT's output is smooth over about one patch.
     pub blur_px: u32,
 }
 
@@ -258,26 +184,13 @@ fn never_unknown() -> f32 {
 }
 
 impl DepthErrModel {
-    /// TIPSv2 DPT (`google/tipsv2-b14-dpt`, 504 x 336 input, readout GELU
-    /// tanh) as it answers on this renderer, truth up to 10 m
-    /// (`[MLAB] depth/errmodel_raw`, `docs/research/ml-ab.md`).
     pub const TIPS_RAW: DepthErrModel = DepthErrModel { a: 0.0, b: 0.0, frame_sd: 0.0, patch_sd: 0.0, sky_m: TIPS_MAX_DEPTH_M, cap_m: TIPS_MAX_DEPTH_M, unknown_beyond_m: f32::INFINITY, blur_px: 3 };
-    /// The same model after the v1.0 ground alignment, i.e. the depth the
-    /// v1.0 path hands to the tracker and the decision
-    /// (`[MLAB] depth/errmodel_ground`, fit seeds).
     pub const TIPS_GROUND: DepthErrModel = DepthErrModel { a: 0.0, b: 0.0, frame_sd: 0.0, patch_sd: 0.0, sky_m: f32::INFINITY, cap_m: f32::INFINITY, unknown_beyond_m: f32::INFINITY, blur_px: 3 };
 }
 
-/// Depth stand-in shaped like TIPSv2 DPT's output (research report: ground
-/// truth clamped to 10 m and seen through the model's patch grid). With an
-/// error model ([`DepthStandIn::honest`]) it is spoiled the way the real
-/// model was measured to be wrong instead.
 pub struct DepthStandIn {
     rng: Rng,
-    /// Multiplicative error per 14-pixel patch (one standard deviation).
     pub patch_sd: f32,
-    /// The measured error model; `None` is the chosen one of before v1.0
-    /// (one scale of 0.8 and `patch_sd`).
     pub err: Option<DepthErrModel>,
 }
 
@@ -286,8 +199,6 @@ impl DepthStandIn {
         DepthStandIn { rng: Rng::new(seed ^ 0xDE97), patch_sd: 0.06, err: None }
     }
 
-    /// The stand-in with the error model measured on the real TIPSv2 DPT as
-    /// the v1.0 path uses it (after the ground alignment).
     pub fn honest(seed: u64) -> DepthStandIn {
         DepthStandIn { err: Some(DepthErrModel::TIPS_GROUND), ..DepthStandIn::new(seed) }
     }
@@ -296,14 +207,12 @@ impl DepthStandIn {
         if let Some(m) = self.err {
             return self.run_measured(truth, &m);
         }
-        // Patch grid of a 504x336 input is 36x24; on the half-resolution truth that is about 5 px per patch.
         let (pw, ph) = (36u32, 24u32);
         let errs: Vec<f32> = (0..pw * ph).map(|_| (self.patch_sd * gauss(&mut self.rng)).exp()).collect();
         let mut data = Vec::with_capacity(truth.depth.len());
         for y in 0..truth.height {
             for x in 0..truth.width {
                 let d = truth.depth[(y * truth.width + x) as usize];
-                // NYU has no sky: an indoor model reports its far limit there.
                 let d = if d.is_finite() { d } else { TIPS_MAX_DEPTH_M };
                 let e = errs[((y * ph / truth.height).min(ph - 1) * pw + (x * pw / truth.width).min(pw - 1)) as usize];
                 data.push((d * STANDIN_DEPTH_SCALE * e).clamp(1e-3, TIPS_MAX_DEPTH_M));
@@ -317,7 +226,6 @@ impl DepthStandIn {
         let eta = m.frame_sd * gauss(&mut self.rng);
         let errs: Vec<f32> = (0..pw * ph).map(|_| m.patch_sd * gauss(&mut self.rng)).collect();
         let (w, h) = (truth.width, truth.height);
-        // Log depth first, so the blur mixes ratios rather than metres.
         let mut ln: Vec<f32> = Vec::with_capacity(truth.depth.len());
         for y in 0..h {
             for x in 0..w {
@@ -332,15 +240,12 @@ impl DepthStandIn {
                 });
             }
         }
-        // Unknown (sky) pixels stay unknown: the blur only mixes finite ones.
         let ln = box_blur(&ln, w, h, m.blur_px);
         let data = ln.into_iter().map(|l| if l.is_finite() { l.exp().clamp(1e-3, m.cap_m) } else { f32::INFINITY }).collect();
         DepthMap { width: w, height: h, kind: DepthKind::Metric, data }
     }
 }
 
-/// Separable box blur of a `w x h` map with radius `r` (edges clamp; values
-/// that are not finite stay and are left out of their neighbours' means).
 fn box_blur(v: &[f32], w: u32, h: u32, r: u32) -> Vec<f32> {
     if r == 0 {
         return v.to_vec();
@@ -372,50 +277,25 @@ fn box_blur(v: &[f32], w: u32, h: u32, r: u32) -> Vec<f32> {
     pass(&pass(v, true), false)
 }
 
-/// Outcome model of a semantic locator after its calibrated gate, measured
-/// on rendered keyframes by the A/B harness (`[MLAB] locate/errmodel`). What
-/// matters downstream is whether a point becomes a tracker prompt and whether
-/// it lies on the object, so the model gives exactly those rates:
-///
-/// * a label in view gets a passing point on its object with probability
-///   `σ(hit_a·ln(pixels) + hit_b)`;
-/// * otherwise its point passes the gate somewhere else with `pass_miss`;
-/// * a label not in view gets a passing point with `pass_absent`;
-/// * a passing point scores (the calibrated probability the label is in
-///   view) from `score_pass`, a blocked one from `score_block`, either side
-///   of `gate_p`.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LocateErrModel {
     pub hit_a: f32,
     pub hit_b: f32,
     pub pass_miss: f32,
     pub pass_absent: f32,
-    /// (mean, SD).
     pub score_pass: (f32, f32),
     pub score_block: (f32, f32),
-    /// The probability the real locator's calibrated gate stands for (the
-    /// mean over labels of the Platt probability at each label's threshold):
-    /// a point of the honest stand-in becomes a prompt from this score on, as
-    /// the real one does from its threshold.
     pub gate_p: f32,
 }
 
 impl LocateErrModel {
-    /// SigLIP2 dense heat on the v1.0 path (the shipped scoring and
-    /// calibrated gate) on this renderer, fit seeds of `docs/research/ml-ab.md`.
     pub const SIGLIP_MEASURED: LocateErrModel = LocateErrModel { hit_a: 0.0, hit_b: 0.0, pass_miss: 0.0, pass_absent: 0.0, score_pass: (0.6, 0.1), score_block: (0.1, 0.1), gate_p: 0.5 };
 }
 
-/// Semantic-location stand-in shaped like SigLIP2 dense heat (a coarse patch
-/// grid, soft scores, noise, and heat leaking to look-alike labels). With an
-/// outcome model ([`LocateStandIn::honest`]) its peaks land and score the way
-/// the real locator's were measured to.
 pub struct LocateStandIn {
     rng: Rng,
     pub noise_sd: f32,
-    /// Share of a label's heat that also shows up on its look-alike.
     pub confusion: f32,
-    /// The measured outcome model; `None` is the chosen one of before v1.0.
     pub err: Option<LocateErrModel>,
 }
 
@@ -424,7 +304,6 @@ impl LocateStandIn {
         LocateStandIn { rng: Rng::new(seed ^ 0x51C1), noise_sd: 0.04, confusion: 0.35, err: None }
     }
 
-    /// The stand-in with the outcome model measured on the real SigLIP2.
     pub fn honest(seed: u64) -> LocateStandIn {
         LocateStandIn { err: Some(LocateErrModel::SIGLIP_MEASURED), ..LocateStandIn::new(seed) }
     }
@@ -433,7 +312,6 @@ impl LocateStandIn {
         if let Some(m) = self.err {
             return self.run_measured(truth, labels, &m);
         }
-        // A 384x256 frame through NaFlex at 256 patches is about 19 x 13 patches.
         let (cols, rows) = (19u32, 13u32);
         let mut frac: BTreeMap<String, Vec<f32>> = BTreeMap::new();
         let label_of: HashMap<u32, String> = truth
@@ -486,7 +364,6 @@ impl LocateStandIn {
     fn run_measured(&mut self, truth: &KeyTruth, labels: &[LabelPrompt], m: &LocateErrModel) -> Vec<SemanticPoint> {
         let (cols, rows) = (19u32, 13u32);
         let n = (cols * rows) as usize;
-        // The cell of an object's box centre on the locator's grid.
         let cell_of = |o: &VisibleObject| {
             let (cx, cy) = ((o.bbox[0] + o.bbox[2]) as f32 * 0.5, (o.bbox[1] + o.bbox[3]) as f32 * 0.5);
             let gx = ((cx / truth.src_width.max(1) as f32) * cols as f32).clamp(0.0, cols as f32 - 1.0) as u32;
@@ -499,7 +376,6 @@ impl LocateStandIn {
         let heats: Vec<(String, Heat, f32)> = labels
             .iter()
             .map(|l| {
-                // The label's largest visible object, if any.
                 let own = truth.objects.iter().filter(|o| vision_label(o) == l.id).max_by_key(|o| o.pixels);
                 let u = self.rng.next_f32();
                 let random_cell = self.rng.below(n as u32) as usize;
@@ -517,7 +393,6 @@ impl LocateStandIn {
                     None if u < m.pass_absent => (random_cell, pass(&mut self.rng)),
                     None => (random_cell, block(&mut self.rng)),
                 };
-                // The rest of the grid stays below the peak.
                 let values: Vec<f32> = (0..n).map(|i| if i == cell { score } else { score * (0.2 + 0.6 * self.rng.next_f32()) }).collect();
                 (l.id.clone(), Heat { cols, rows, values }, score)
             })
@@ -526,9 +401,6 @@ impl LocateStandIn {
     }
 }
 
-/// The dictionary's vision label of a visible object. The world's kind ids
-/// are the dictionary's ids (`iron_ore_node` for an iron node, `iron_ore` for
-/// a dropped piece).
 pub fn vision_label(o: &VisibleObject) -> String {
     o.label.clone()
 }
@@ -543,10 +415,8 @@ pub enum LocateEngine {
     StandIn(LocateStandIn),
 }
 
-/// What the ML tracks made of one keyframe.
 pub struct MlFrame {
     pub depth: DepthMap,
-    /// The ground alignment of the model's depth, when it was fitted.
     pub align: Option<AlignFit>,
     pub depth_metrics: Option<DepthMetrics>,
     pub points: Vec<SemanticPoint>,
@@ -564,12 +434,9 @@ pub struct TargetObs {
     pub label: String,
     pub cx: f32,
     pub cy: f32,
-    /// World heading of the mask centroid, radians.
     pub heading: f32,
     pub rel_bearing_deg: f32,
-    /// Ground range from the depth model at the mask, metres.
     pub depth_range_m: Option<f32>,
-    /// 1σ of that range when the v1.0 path knows it, metres.
     pub range_sigma_m: Option<f32>,
     pub score: f32,
 }
@@ -579,23 +446,15 @@ pub struct MlPipeline {
     pub locate: LocateEngine,
     pub tracker: Box<dyn MaskTracker>,
     labels: Vec<LabelPrompt>,
-    /// Vision label to resource id (`iron_ore_node` → `iron_ore`).
     link: HashMap<String, String>,
-    /// Labels of items lying on the ground (the contact range applies).
     drops: std::collections::HashSet<String>,
-    /// What v1.0 changes on the real models' path.
     pub fix: MlFixCfg,
-    /// The lexicon's prompt templates and background phrases.
     pub prompting: VisionPrompting,
-    /// Per-label calibration of the real locators, one table per mode.
     pub calib: Vec<CalibTable>,
-    /// Depth and semantic points that [`MlPipeline::prefetch`] computed in
-    /// batches, by image hash, waiting for [`MlPipeline::analyse`].
     pre: HashMap<u64, Prefetched>,
     pre_order: VecDeque<u64>,
 }
 
-/// Most keyframes whose batched results wait for `analyse`.
 pub const PREFETCH_MAX: usize = 32;
 
 #[derive(Default)]
@@ -604,7 +463,6 @@ struct Prefetched {
     points: Option<Vec<SemanticPoint>>,
 }
 
-/// FNV-1a over the size and the pixels of a keyframe.
 pub fn frame_key(rgb: &Rgb) -> u64 {
     use noto_ml::parallel::{fnv1a, FNV_OFFSET};
     let h = fnv1a(fnv1a(FNV_OFFSET, &rgb.width.to_le_bytes()), &rgb.height.to_le_bytes());
@@ -640,10 +498,6 @@ impl MlPipeline {
         }
     }
 
-    /// Swaps both stand-ins for the ones whose errors were measured on the
-    /// real models ([`DepthStandIn::honest`], [`LocateStandIn::honest`]),
-    /// keeping any real model that is attached. Their modes say `measured`,
-    /// so their SDS statistics stay apart from the chosen stand-ins'.
     pub fn use_honest_stand_ins(&mut self, seed: u64) {
         if let DepthEngine::StandIn(_) = self.depth {
             self.depth = DepthEngine::StandIn(DepthStandIn::honest(seed));
@@ -653,18 +507,14 @@ impl MlPipeline {
         }
     }
 
-    /// The labels the locator is asked about (sources and drops), as prompts.
     pub fn labels(&self) -> &[LabelPrompt] {
         &self.labels
     }
 
-    /// Whether a label is an item lying on the ground.
     pub fn is_drop(&self, label: &str) -> bool {
         self.drops.contains(label)
     }
 
-    /// The calibration of the current locator's mode, when the v1.0 gate is on
-    /// and the locator is a real model.
     pub fn calib_table(&self) -> Option<&CalibTable> {
         if !self.fix.calibrated_gate || matches!(self.locate, LocateEngine::StandIn(_)) {
             return None;
@@ -673,11 +523,7 @@ impl MlPipeline {
         self.calib.iter().find(|t| t.mode == mode)
     }
 
-    /// Whether a semantic point passes its label's calibrated threshold (true
-    /// when there is no calibration for it). The table says which statistic
-    /// it was fitted on: the pooled presence or the heat peak.
     pub fn passes_calibration(&self, p: &SemanticPoint) -> bool {
-        // The honest stand-in's score is already the calibrated probability.
         if let LocateEngine::StandIn(LocateStandIn { err: Some(m), .. }) = &self.locate {
             return p.score >= m.gate_p;
         }
@@ -691,13 +537,6 @@ impl MlPipeline {
         stat >= c.threshold
     }
 
-    /// Runs the stages that batch (depth, semantic location, the mask
-    /// model's image encoder) for keyframes [`MlPipeline::analyse`] will see
-    /// next: one batched call per model instead of one call per keyframe, on
-    /// whatever device each model was loaded to. Tracking itself stays
-    /// sequential because each keyframe's prompts depend on the last one's
-    /// tracks. The stand-ins need the ground truth and cost nothing, so they
-    /// are left to `analyse`. Returns how many keyframes were computed.
     pub fn prefetch(&mut self, frames: &[&Rgb]) -> Result<usize> {
         let mut seen = std::collections::HashSet::new();
         let todo: Vec<(u64, &Rgb)> = frames
@@ -738,14 +577,10 @@ impl MlPipeline {
         Ok(todo.len())
     }
 
-    /// Keyframes waiting with prefetched results.
     pub fn prefetched(&self) -> usize {
         self.pre.len()
     }
 
-    /// The depth track's mode; the ground-aligned path is named apart
-    /// (`+ground`) so its SDS statistics (the learned scale above all) never
-    /// mix with the raw model's.
     pub fn depth_mode(&self) -> String {
         match &self.depth {
             DepthEngine::Model(m) if self.fix.align.is_some() => format!("{}+ground", m.mode()),
@@ -767,7 +602,6 @@ impl MlPipeline {
         self.tracker.mode().to_string()
     }
 
-    /// Device each model runs on (`cpu` for the stand-ins).
     pub fn depth_device(&self) -> String {
         match &self.depth {
             DepthEngine::Model(m) => m.device(),
@@ -786,21 +620,14 @@ impl MlPipeline {
         self.tracker.reset();
     }
 
-    /// Source labels (nodes in the world) that yield `resource`.
     pub fn source_labels_for(&self, resource: &str) -> Vec<String> {
         self.labels.iter().filter(|l| self.link.get(&l.id).map_or(false, |r| r == resource) && l.id != resource).map(|l| l.id.clone()).collect()
     }
 
-    /// Runs the tracks on one keyframe. `wanted` are the labels the decision
-    /// is after; `floor` maps a label to the score below which its semantic
-    /// point is not used as a prompt (the SDS-learned floor, or a default).
     pub fn analyse(&mut self, rgb: &Rgb, intr: &Intrinsics, pose: &Pose, truth: Option<&KeyTruth>, wanted: &[String], floor: &dyn Fn(&str) -> f32, prefer_track: Option<u32>) -> Result<MlFrame> {
         self.analyse_with(rgb, intr, pose, truth, wanted, floor, prefer_track, None)
     }
 
-    /// [`MlPipeline::analyse`] with the robot's map: `height` gives the ground
-    /// height at a point of the believed frame relative to the ground under
-    /// the camera, so the ground alignment and the contact range follow hills.
     #[allow(clippy::too_many_arguments)]
     pub fn analyse_with(
         &mut self,
@@ -822,7 +649,6 @@ impl MlPipeline {
             (_, DepthEngine::StandIn(s), Some(t)) => s.run(t),
             (_, DepthEngine::StandIn(_), None) => anyhow::bail!("깊이 대역 모델에는 정답 버퍼가 필요합니다"),
         };
-        // The model's metres put on the ground's (v1.0; real models only).
         let align = match (&self.depth, &self.fix.align) {
             (DepthEngine::Model(m), Some(cfg)) => noto_vision::ground_align(&mut depth, intr, pose, height, m.max_depth_m(), cfg),
             _ => None,
@@ -852,9 +678,6 @@ impl MlPipeline {
             let mut range = d.map(|d| intr.ground_range(pose.yaw, t.cx, t.cy, d));
             let mut sigma = None;
             if model_depth && (self.fix.align.is_some() || self.fix.contact_range) {
-                // The aligned depth's spread: the ground's own residual after the
-                // fit, at least `depth_rel_sigma` (what the ground cannot show of
-                // an object), or half the range when there was no fit.
                 let rel = align.map_or(0.5, |f| f.median_rel_err.max(self.fix.depth_rel_sigma));
                 sigma = range.map(|r| rel * r);
                 if self.fix.contact_range && self.drops.contains(&t.label) {
@@ -881,7 +704,6 @@ impl MlPipeline {
                 score: t.score,
             }
         });
-        // Evaluation against the renderer (never read by the decision).
         let (mut depth_m, mut loc_err, mut iou, mut range_true, mut entity) = (None, None, None, None, None);
         if let Some(t) = truth {
             depth_m = depth_metrics(&depth, &t.depth_map(), 24.0, false);
@@ -915,8 +737,6 @@ impl MlPipeline {
     }
 }
 
-/// The depth map in colour with the target's mask outlined and the semantic
-/// peaks marked: the picture of timeline row 2.
 pub fn overlay(f: &MlFrame, src_w: u32, src_h: u32, wanted: &[String]) -> Rgb {
     let mut img = f.depth.colorize();
     let (w, h) = (img.width, img.height);
@@ -960,7 +780,6 @@ mod tests {
 
     const LEX: &str = include_str!("../../../data/world_lexicon.json");
 
-    /// A 96 x 64 half-size truth: depth rising with the row from 1 m, sky above row 8.
     fn truth_with(objects: Vec<VisibleObject>) -> KeyTruth {
         let (w, h) = (96u32, 64u32);
         let mut depth = Vec::new();
@@ -990,11 +809,9 @@ mod tests {
                 assert!(p.is_infinite(), "sky stays unknown");
             }
         }
-        // A blur keeps finite pixels finite and sky unknown; a ceiling caps.
         let mut s = DepthStandIn { err: Some(DepthErrModel { blur_px: 2, cap_m: 4.0, sky_m: 10.0, ..m }), ..DepthStandIn::new(3) };
         let d = s.run(&t);
         assert!(d.data.iter().all(|v| v.is_finite() && *v <= 4.0 + 1e-6));
-        // Past its range the model answers "unknown", like the saturated aligned TIPS.
         let mut s = DepthStandIn { err: Some(DepthErrModel { unknown_beyond_m: 5.0, ..m }), ..DepthStandIn::new(3) };
         let d = s.run(&t);
         for (p, q) in d.data.iter().zip(&t.depth) {
@@ -1012,34 +829,28 @@ mod tests {
         assert_eq!(pipe.depth_mode(), "stand-in(tipsv2-measured)");
         let labels: Vec<LabelPrompt> = pipe.labels().iter().filter(|l| l.id == "parcel").cloned().collect();
         let t = truth_with(vec![object("parcel", 400, [100, 80, 120, 100])]);
-        // Always a passing point on the object; never a passing one when absent.
         let sure = LocateErrModel { hit_a: 0.0, hit_b: 50.0, pass_miss: 0.0, pass_absent: 0.0, score_pass: (0.9, 0.0), score_block: (0.1, 0.0), gate_p: 0.5 };
         let mut s = LocateStandIn { err: Some(sure), ..LocateStandIn::new(2) };
         for _ in 0..5 {
             let p = s.run(&t, &labels);
             let p = p.iter().find(|p| p.label == "parcel").unwrap();
             assert!((p.score - 0.9).abs() < 1e-6 && (p.presence - 0.9).abs() < 1e-6);
-            // The peak cell holds the box centre (110, 90) of the 192 x 128 keyframe.
             assert!((p.px - 110.0).abs() <= 192.0 / 19.0 && (p.py - 90.0).abs() <= 128.0 / 13.0, "{} {}", p.px, p.py);
         }
         let p = s.run(&truth_with(Vec::new()), &labels);
         assert!((p[0].score - 0.1).abs() < 1e-6, "absent: blocked");
-        // Never on the object and never passing elsewhere: blocked.
         let never = LocateErrModel { hit_b: -50.0, ..sure };
         let mut s = LocateStandIn { err: Some(never), ..LocateStandIn::new(2) };
         assert!((s.run(&t, &labels)[0].score - 0.1).abs() < 1e-6);
-        // Passing points of an absent label at the measured rate, scores either side of the gate.
         let phantom = LocateErrModel { pass_absent: 0.3, score_pass: (0.4, 0.3), score_block: (0.6, 0.3), ..sure };
         let mut s = LocateStandIn { err: Some(phantom), ..LocateStandIn::new(4) };
         let empty = truth_with(Vec::new());
         let passed = (0..1000).filter(|_| s.run(&empty, &labels)[0].score >= 0.5).count();
         assert!((250..350).contains(&passed), "{passed} of 1000");
-        // Hits follow the logistic in ln(pixels): about half at 400 pixels for (1, -ln 400).
         let half = LocateErrModel { hit_a: 1.0, hit_b: -(400f32).ln(), ..sure };
         let mut s = LocateStandIn { err: Some(half), ..LocateStandIn::new(9) };
         let hits = (0..400).filter(|_| (s.run(&t, &labels)[0].score - 0.9).abs() < 1e-6).count();
         assert!((150..250).contains(&hits), "{hits} of 400");
-        // The honest stand-in is gated at its own gate probability.
         pipe.locate = LocateEngine::StandIn(LocateStandIn { err: Some(sure), ..LocateStandIn::new(1) });
         assert!(pipe.passes_calibration(&point("parcel", 0.5, 0.5)) && !pipe.passes_calibration(&point("parcel", 0.49, 0.9)));
     }
@@ -1067,7 +878,6 @@ mod tests {
         t.labels.insert("parcel".into(), LabelCalib { threshold: 0.3, platt: None, positives: 1, negatives: 1, precision: None, recall: None });
         pipe.calib = vec![t];
         let low = point("parcel", 0.5, 0.5);
-        // The stand-in is never gated by a real model's table.
         assert!(pipe.passes_calibration(&low));
         pipe.locate = LocateEngine::Model(Box::new(Fixed));
         assert!(!pipe.passes_calibration(&low), "0.25 < 0.3");
@@ -1085,10 +895,8 @@ mod tests {
         let v = MlFixCfg::v1(&p);
         assert!(v.align.is_some() && v.contact_range && v.calibrated_gate && v.scan_calibrated);
         assert_eq!(v.locate.background, p.background);
-        // Serialised settings without the new fields read back as the defaults.
         let back: MlFixCfg = serde_json::from_str("{}").unwrap();
         assert!(back.align.is_none() && (back.pitch_sigma_deg - 0.5).abs() < 1e-6);
-        // The shipped calibration parses.
         assert!(CalibTable::parse(ML_CALIB_JSON).is_ok());
     }
 }

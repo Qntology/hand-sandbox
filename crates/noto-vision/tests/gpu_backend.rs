@@ -1,13 +1,3 @@
-//! GPU backend parity (features `cuda`, `rocm`, `vulkan`, `metal`): the models
-//! of the ML logic (SigLIP2 vision and text towers, TIPSv2 DPT depth, SAM mask
-//! encoder and decoder) run with the same random weights on the CPU and on
-//! the GPU this build opens first (`noto_ml::preferred`), batched as the
-//! runtime batches them, and the results are compared. Step 07 of
-//! `test_runner.bat` runs this and keeps the `[GPU]` lines (largest error per
-//! model). It checks numbers, not speed.
-//!
-//! The physics and the game logic never run here: they are CPU code for every
-//! backend and must give the same results everywhere (steps 02-06).
 #![cfg(any(feature = "cuda", feature = "rocm", feature = "vulkan", feature = "metal"))]
 
 use std::collections::HashMap;
@@ -32,7 +22,6 @@ fn gpu() -> Device {
     d
 }
 
-/// The weights a CPU model was built with, copied to `dev`.
 fn weights_on(vm: &VarMap, dev: &Device) -> HashMap<String, Tensor> {
     vm.data().lock().unwrap().iter().map(|(k, v)| (k.clone(), v.as_tensor().to_device(dev).unwrap())).collect()
 }
@@ -123,7 +112,6 @@ fn tips_depth_batch_matches_the_cpu() {
     let refs: Vec<&Rgb> = frames.iter().collect();
     let (a, b) = (cpu.predict_batch(&refs).unwrap(), g.predict_batch(&refs).unwrap());
     let e = a.iter().zip(&b).map(|(x, y)| worst(&x.data, &y.data)).fold(0.0, f32::max);
-    // One frame alone on the GPU gives the batched row.
     let one = g.predict(&frames[1]).unwrap();
     let e_row = worst(&one.data, &b[1].data);
     println!("[GPU] tips depth · batch vs cpu {e:.2e} · single vs batched row {e_row:.2e}");
@@ -136,8 +124,6 @@ fn sam_encoder_and_decoder_match_the_cpu() {
     let vm = VarMap::new();
     let variant = SamVariant::TestVit { dim: 32, depth: 2, heads: 2 };
     let cpu = SamModel::from_var_builder(variant, VarBuilder::from_varmap(&vm, DType::F32, &Device::Cpu), &Device::Cpu).unwrap();
-    // SAM's LayerNorm2d reads its weights with a zero default: without this the
-    // encoder output would be all zeros and the comparison would prove nothing.
     for (name, var) in vm.data().lock().unwrap().iter() {
         if name.ends_with("weight") && var.as_tensor().abs().unwrap().max_all().unwrap().to_scalar::<f32>().unwrap() == 0.0 {
             let shape = var.as_tensor().dims().to_vec();
@@ -157,7 +143,6 @@ fn sam_encoder_and_decoder_match_the_cpu() {
     let e_iou = qa.iter().zip(&qb).map(|(x, y)| (x.iou_pred - y.iou_pred).abs()).fold(0.0, f32::max);
     println!("[GPU] sam · encoder {e_enc:.2e} · decoder logits {e_dec:.2e} · iou {e_iou:.2e} · {} images per encoder pass", g.encoder_rows());
     assert!(e_enc < 1e-3 && e_dec < 2e-3 && e_iou < 1e-3);
-    // The tracker on the GPU runs end to end on the prepared embeddings.
     let mut t = SamTracker::new(Arc::new(g));
     t.prepare(&refs).unwrap();
     let p = PointPrompt { label: "x".into(), px: 60.0, py: 50.0, score: 0.9 };

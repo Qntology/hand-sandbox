@@ -1,12 +1,5 @@
-//! Joint kinds, joint limits and actuation options for one finger joint.
-
 use serde::{Deserialize, Serialize};
 
-/// Degrees of freedom a joint offers.
-///
-/// * `Hinge`     — flexion only (1 DoF), like a PIP or DIP knuckle.
-/// * `Universal` — flexion plus abduction (2 DoF), like an MCP knuckle.
-/// * `Ball`      — flexion, abduction and roll about the segment (3 DoF).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JointKind {
@@ -35,12 +28,6 @@ impl JointKind {
     }
 }
 
-/// How the flexion of the joints in one finger is driven.
-///
-/// * `Direct`  — every joint has its own actuator.
-/// * `Coupled` — one actuator drives the proximal joint and each distal joint
-///   follows the joint before it at `ratio` (tendon-style coupling). A
-///   ratio near 0.67 mirrors the usual PIP-to-DIP relation of the human hand.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum Actuation {
@@ -48,20 +35,14 @@ pub enum Actuation {
     Coupled { ratio: f32 },
 }
 
-/// Limits and drive capability of one joint. Angles are in radians.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct JointSpec {
     pub kind: JointKind,
-    /// Flexion range (min, max).
     pub flex_min: f32,
     pub flex_max: f32,
-    /// Half-range of abduction (only used when the kind has abduction).
     pub abd_limit: f32,
-    /// Half-range of roll (only used by `Ball`).
     pub roll_limit: f32,
-    /// Maximum angular speed of the drive, rad/s.
     pub max_speed: f32,
-    /// Maximum drive torque, N·m.
     pub max_torque: f32,
 }
 
@@ -71,7 +52,6 @@ impl JointSpec {
     }
 }
 
-/// Angles of one joint. Unused axes stay at zero.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct JointAngles {
     pub flex: f32,

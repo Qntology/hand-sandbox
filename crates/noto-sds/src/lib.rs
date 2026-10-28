@@ -1,14 +1,3 @@
-//! Score Dynamics Store and audit log.
-//!
-//! * [`SdsStore`]: per-scope online statistics with backoff, calibration and
-//!   atomic ledger files (port of logis-center `score_dynamics.rs`).
-//! * [`AuditLog`]: a hash-chained JSONL log that the UI can tail.
-//! * [`TestDb`]: the rows behind the statistics (quest runs, ML keyframes,
-//!   balance effort) and the success table per quest step.
-//!
-//! Nothing in this crate decides anything. Callers ask for a learned value and
-//! use their fixed default when the answer is `None`.
-
 pub mod audit;
 pub mod records;
 pub mod scope;

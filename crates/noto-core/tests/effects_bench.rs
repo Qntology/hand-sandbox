@@ -1,10 +1,3 @@
-//! The environment N:N benchmark of the five body effects
-//! (`noto_core::effects`) for the named presets on legs, wheels and tracks.
-//! The lines this prints (`[FX]` cells, `[FX-SUM]` scenarios, `[FX-HELD]`
-//! held-out) are the record of how far the engine is from the measurements;
-//! the assertions check the scoring machinery and the rules that keep the
-//! references from becoming tuning targets, never a score threshold.
-
 use noto_core::balance::Body;
 use noto_core::effects::{evaluate, holdout, library, Effect, FxResult, Rule};
 use noto_core::parts::BodyPlan;
@@ -12,11 +5,8 @@ use noto_core::{BaseKind, FingerCount};
 
 const PLANS: [&str; 4] = ["budget", "mid", "pro", "pro_arms"];
 const BASES: [BaseKind; 3] = [BaseKind::HumanFoot, BaseKind::Wheel, BaseKind::Track];
-/// The evaluation seed of the held-out draws (research §5: draw new ones per
-/// release, never tune against them).
 const HOLDOUT_SEED: u64 = 20261024;
 
-/// Three decimals, or scientific notation for the small numbers (wear per hour).
 fn num(v: f32) -> String {
     if v != 0.0 && v.abs() < 0.01 {
         format!("{v:.2e}")
@@ -73,12 +63,10 @@ fn environment_effects_against_the_measurements() {
                 assert!(r.score.is_finite() && (0.0..=100.0).contains(&r.score), "{} {}", r.id, r.score);
                 if r.skipped.is_none() {
                     assert!(r.cells.iter().all(|c| c.value.map_or(true, f32::is_finite)), "{}", r.id);
-                    // Every effect is asked about in every scenario.
                     for e in Effect::ALL {
                         assert!(r.cells.iter().any(|c| c.effect == e), "{} lacks {}", r.id, e.id());
                     }
                 }
-                // The same engine and scenario give the same answer.
                 assert_eq!(evaluate(&body, &s).score, r.score);
             }
         }
@@ -109,11 +97,8 @@ fn held_out_draws_are_counted_not_tuned() {
 
 #[test]
 fn the_engine_never_names_a_benchmark_source() {
-    // The model files may cite where their own numbers come from, but never a
-    // source the benchmark scores against (research §5): a constant set from
-    // the reference would make the score say nothing.
     let balance = include_str!("../src/balance.rs");
-    let controller = balance.split("/// Context the references depend on.").next().unwrap();
+    let controller = balance.split("pub struct RefCtx {").next().unwrap();
     let files = [
         ("balance.rs (controller part)", controller),
         ("dynamics.rs", include_str!("../src/dynamics.rs")),

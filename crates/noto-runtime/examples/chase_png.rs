@@ -1,7 +1,3 @@
-//! Writes the third-person (chase) view of a fresh world to PNG files, with
-//! the joint markers of the overlay drawn in, for checking the joint
-//! dynamics by eye: `cargo run -p noto-runtime --example chase_png -- <out_dir> [preset] [command]`.
-
 use std::path::PathBuf;
 
 use noto_core::BodyPlan;

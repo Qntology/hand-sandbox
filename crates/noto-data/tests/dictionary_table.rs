@@ -1,5 +1,3 @@
-//! Loads the shipped logistics dictionary into a Lance table.
-
 use noto_data::{dictionary_batch, LanceStore};
 
 #[tokio::test]

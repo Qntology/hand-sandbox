@@ -1,34 +1,3 @@
-//! The action N:N benchmark: the four actions — grasp & release, push,
-//! walk, bend — played out by `crate::act` for a robot, and every answer
-//! compared with a measurement from a source the engine does not use
-//! (`docs/research/actions.md` §5–§7). It is a reference-score test, not a
-//! timing run.
-//!
-//! Each scenario is scored in four layers, the same ones the SDS keeps live:
-//!
-//! 1. **outcome** — how often the action succeeds over a fixed set of draws
-//!    (Monte Carlo seeds 0..n; the draws are the engine's own scatter of
-//!    friction, aim and slips), and why it fails;
-//! 2. **time series** — the phases' timing and the shape of the force and
-//!    angle trajectories (grip leading load, the vertical ground reaction of a
-//!    step, when the bend's peak moment comes);
-//! 3. **part** — each part's posture and load at the action's key instant
-//!    (trunk, hip and knee at the bottom of a floor reach);
-//! 4. **coupling** — what one part's action asks of another (N:N): the grasp's
-//!    ZMP margin at the feet, the push's traction at the wheels, the step's
-//!    friction at the sole.
-//!
-//! Scoring is `effects`': a likeness cell `100 − 10·|z|`, an "at least" cell
-//! full above its floor, gates first (a robot that cannot do the action at
-//! all scores 0 and says why), a cell the engine does not model scores 0 and
-//! says "미구현", raw cells are reported only. Layers weigh the same; the
-//! scenario is the mean of its scored layers.
-//!
-//! What keeps it from being tuned to: the engine files never name a scoring
-//! source (a test scans them), every scenario runs the same engine with the
-//! same parameters, and the held-out draws (`holdout`) use items, grounds and
-//! loads the development scenarios do not.
-
 use serde::Serialize;
 
 use crate::act::drive;
@@ -43,7 +12,6 @@ use crate::hand::{Hand, NotoConfig};
 use crate::parts::Segment;
 use crate::surface::{Surface, SurfaceProps};
 
-/// The four actions the benchmark asks about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Act4 {
@@ -108,9 +76,7 @@ impl Layer {
 pub struct AxCell {
     pub layer: Layer,
     pub axis: &'static str,
-    /// The body part the cell is about (`act::Part` id), if one.
     pub part: Option<&'static str>,
-    /// `None`: the engine does not model this.
     pub value: Option<f32>,
     pub rule: Rule,
     pub cite: &'static str,
@@ -119,7 +85,6 @@ pub struct AxCell {
     pub gate: Option<String>,
 }
 
-/// The object a grasp, a push or a bend handles.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct Obj {
     pub material: ItemMaterial,
@@ -133,18 +98,13 @@ pub struct AxScenario {
     pub name_ko: &'static str,
     pub action: Act4,
     pub obj: Option<Obj>,
-    /// The ground: a world ground id, or a laboratory floor with its friction.
     pub ground: Surface,
-    /// Friction under the base when it differs from the ground's own (a contaminated floor), and what the controller believes.
     pub mu_actual: Option<f32>,
     pub mu_belief: Option<f32>,
     pub slope_deg: f32,
-    /// Cargo in the bay, as a share of the body mass.
     pub cargo_frac: f32,
-    /// Turns of a push path (degrees) at the planned radius.
     pub turns: &'static [f32],
     pub push_m: f32,
-    /// Monte Carlo draws.
     pub trials: u32,
     pub holdout: bool,
 }
@@ -157,92 +117,58 @@ pub struct AxResult {
     pub holdout: bool,
     pub skipped: Option<String>,
     pub cells: Vec<AxCell>,
-    /// Mean cell score per layer (`Layer::ALL` order).
     pub layer_scores: [Option<f32>; 4],
     pub score: f32,
     pub gates: Vec<String>,
-    /// No gate and every scored cell within two tolerances (the held-out rule).
     pub passed: bool,
-    /// The success rate over the draws and the failure codes counted.
     pub success_rate: f32,
     pub failures: Vec<(String, u32)>,
-    /// The first reason the engine gave for each failure code.
     pub reasons: Vec<(String, String)>,
 }
 
-// ----- references (benchmark side only; the engine never reads these) -----
-
-/// Single, known objects grasped by robots: 93% (8 known objects), 93% (dense
-/// clutter, 288 attempts), 96% (unseen objects, 580k attempts), 98% (single
-/// objects of the heap study): mean and SD across the four.
 pub const GRASP_SUCCESS: (f32, f32) = (0.95, 0.024);
 pub const CITE_GRASP_SUCCESS: &str = "로봇 파지 성공률 93% (Dex-Net 2.0, Mahler 2017) · 93% (GPD, ten Pas 2017) · 96% (QT-Opt, Kalashnikov 2018) · 98% (Dex-Net 4.0 단일 물체, Mahler 2019) — 평균 ± SD";
-/// Human precision lift of a small object: preload 230 ± 91 ms, loading 214 ±
-/// 51 ms, grip leads load by 26 ± 17 ms, hold safety margin 0.53 ± 0.06.
 pub const PRELOAD_S: (f32, f32) = (0.230, 0.091);
 pub const LOADING_S: (f32, f32) = (0.214, 0.051);
 pub const GF_LEAD_S: (f32, f32) = (0.026, 0.017);
 pub const SAFETY_MARGIN: (f32, f32) = (0.53, 0.06);
 pub const GF_LF_CORR: (f32, f32) = (0.92, 0.05);
 pub const CITE_GUILLERY: &str = "사람 정밀 들기: 예압 230±91 ms, 하중기 214±51 ms, 쥠이 하중보다 26±17 ms 앞섬, 쥠–하중 r 0.92, 유지 안전 여유 0.53±0.06 (Guillery 2013, n = 18)";
-/// Placement error of a learned pick-and-place on unknown objects: 5.9 (1.1) mm.
 pub const PLACE_ERR_MM: (f32, f32) = (5.9, 1.1);
 pub const CITE_PLACE: &str = "놓기 위치 오차 5.9 (1.1) mm, 처음 보는 물체 (Berscheid 2020)";
-/// Freestyle floor lift at the peak moment: torso 56.1 (13.0)° from vertical,
-/// hip flexion 106.6 (9.2)°, knee flexion 78.5 (13.5)°; the peak comes 0.321
-/// (0.122) s into the lift (n = 43).
 pub const LIFT_TRUNK_DEG: (f32, f32) = (56.1, 13.0);
 pub const LIFT_HIP_DEG: (f32, f32) = (106.6, 9.2);
 pub const LIFT_KNEE_DEG: (f32, f32) = (78.5, 13.5);
 pub const LIFT_PEAK_T_S: (f32, f32) = (0.321, 0.122);
 pub const CITE_FLOOR_LIFT: &str = "바닥 들기(자유 자세) 최대 모멘트 때 몸통 56.1 (13.0)°, 고관절 굴곡 106.6 (9.2)°, 무릎 굴곡 78.5 (13.5)°, 들기 시작 후 0.321 (0.122) s (Menzer & Reiser 2005, n = 43)";
-/// Initial push force half of men accept, 133 N; typical hand forces 133–267 N.
 pub const PUSH_FORCE_N: (f32, f32) = (133.0, 67.0);
 pub const CITE_PUSH: &str = "초기 미는 힘 남성 50% 수용 133 N (Liberty Mutual 표, Steele 2014 인용), 전형적 손 힘 133–267 N → 허용폭 (267−133)/2";
-/// Share of unexpected exposures to a 0.164 ACOF floor that ended in a slip: 38% (n = 31).
 pub const LAB_ACOF: f32 = 0.164;
 pub const SLIP_FRACTION: (f32, f32) = (0.38, 0.087);
 pub const CITE_SLIP: &str = "글리세롤 바닥(ACOF 0.149–0.179) 예고 없는 노출의 38%가 미끄러짐 (Beschorner 2016, n = 31)";
-/// Share of first unexpected walking slips that ended in a fall, young adults:
-/// 0.19 (n = 35; tolerance the binomial standard error).
 pub const FALL_GIVEN_SLIP: (f32, f32) = (0.19, 0.066);
 pub const CITE_FALL: &str = "예고 없는 첫 보행 미끄러짐의 넘어짐 비율 젊은 성인 0.19 (Pai 2010, n = 35; 허용폭 이항 표준오차)";
-/// Slip distance of young adults' heel on an oily floor: 4.25 (0.87) cm (n = 14).
 pub const SLIP_DIST_CM: (f32, f32) = (4.25, 0.87);
 pub const CITE_SLIP_DIST: &str = "기름 바닥 젊은 성인 발뒤꿈치 미끄럼 거리 4.25 (0.87) cm (Lockhart 2003 표 4, n = 14) — 다리 길이로 무차원화";
 
-/// Adult leg length the dimensionless comparisons assume for people, metres (est).
 pub const HUMAN_LEG_M: f32 = 0.88;
-/// Barefoot walking at 1.1 / 1.4 / 1.7 m/s (n = 30): vertical ground reaction
-/// first peak, valley and second peak (BW, mean ± SD), and the stance share
-/// of the stride (the men's and the women's rows pooled). Compared at the
-/// robot's Froude number on a [`HUMAN_LEG_M`] leg (held at the ends).
 pub const GRF_SPEEDS_MPS: [f32; 3] = [1.1, 1.4, 1.7];
 pub const GRF_F1: [(f32, f32); 3] = [(1.17, 0.44), (1.37, 0.42), (1.52, 0.53)];
 pub const GRF_VALLEY: [(f32, f32); 3] = [(0.86, 0.22), (0.76, 0.23), (0.62, 0.26)];
 pub const GRF_F2: [(f32, f32); 3] = [(1.10, 0.23), (1.08, 0.18), (1.09, 0.16)];
 pub const STANCE_SHARE: [(f32, f32); 3] = [(0.600, 0.031), (0.571, 0.039), (0.547, 0.038)];
 pub const CITE_GRF: &str = "맨발 보행 1.1/1.4/1.7 m/s 수직 반력 첫 봉우리 1.17±0.44/1.37±0.42/1.52±0.53, 골 0.86±0.22/0.76±0.23/0.62±0.26, 둘째 봉우리 1.10±0.23/1.08±0.18/1.09±0.16 BW, 입각 59.9–60.2/56.8–57.3/54.3–55.0% (Wang 2017, n = 30) — 다리 0.88 m 프루드 수로 맞춤";
-/// Mean loading rate from heel contact to the first peak, barefoot at 1.3 m/s: 7.96 ± 1.79 BW/s (n = 10).
 pub const LOADING_RATE_BW_S: (f32, f32) = (7.96, 1.79);
 pub const CITE_LOADING: &str = "맨발 1.3 m/s 첫 봉우리까지 평균 부하율 7.96 ± 1.79 BW/s (Zhang 2013, n = 10) — √(g/ℓ) 단위로 무차원화";
-/// Heel-strike transient, barefoot: 0.48 BW at 30.2 BW/s (least-squares means
-/// ± s.e. over 50 steps; the tolerance is the s.e. × √50, derived).
 pub const IMPACT_BW: (f32, f32) = (0.48, 0.141);
 pub const IMPACT_RATE_BW_S: (f32, f32) = (30.2, 17.0);
 pub const CITE_IMPACT: &str = "맨발 보행 충격 봉우리 0.48 BW, 부하율 30.2 BW/s (Wallace 2018, 50걸음 최소제곱 평균; 허용폭은 표준오차 × √50, 유도)";
-/// Walking heel impact, barefoot at about 1.3 m/s (n = 12, inter-subject SD):
-/// time to the impact peak 17.5 (3.6) ms, heel vertical speed at contact 0.57
-/// (0.12) m/s, effective mass 11.1 (2.8)% of the body.
 pub const IMPACT_PEAK_MS: (f32, f32) = (17.5, 3.6);
 pub const HEEL_SPEED_MPS: (f32, f32) = (0.57, 0.12);
 pub const IMPACT_MASS_SHARE: (f32, f32) = (0.111, 0.028);
 pub const CITE_HEEL: &str = "맨발 보행 충격 봉우리까지 17.5 (3.6) ms, 접지 순간 뒤꿈치 수직 속도 0.57 (0.12) m/s, 유효 질량 체중의 11.1 (2.8)% (Baines 2018, n = 12) — 시간·속도는 다리 길이로 무차원화";
-/// Drawbar pull of a smooth rigid wheel (r 130 mm, 130 N) on dry sand at slip 0.1 / 0.3 / 0.7, digitised (ten repeats, spread shown only as box plots).
 pub const SAND_DP_W: [(f32, f32); 3] = [(0.1, 0.050), (0.3, 0.138), (0.7, 0.192)];
 pub const CITE_SAND_DP: &str = "마른 모래 매끈한 강체 바퀴 (r 130 mm, 130 N) 견인력/하중 0.050 @0.1 · 0.138 @0.3 · 0.192 @0.7 미끄럼 (Agarwal 2019 그림 12a 판독, 10회 반복 상자 그림뿐) — 표준편차 수치가 없어 기록만";
-
-// ----- scenarios -----
 
 const LOG: Obj = Obj { material: ItemMaterial::Wood, mass_kg: 2.4, size_m: 0.15 };
 const STONE: Obj = Obj { material: ItemMaterial::Stone, mass_kg: 2.6, size_m: 0.10 };
@@ -253,7 +179,6 @@ fn scen(id: &'static str, name_ko: &'static str, action: Act4, obj: Option<Obj>,
     AxScenario { id, name_ko, action, obj, ground, mu_actual: None, mu_belief: None, slope_deg: 0.0, cargo_frac: 0.0, turns: &[], push_m: 0.0, trials: 60, holdout: false }
 }
 
-/// The development scenarios (research §6).
 pub fn library() -> Vec<AxScenario> {
     vec![
         scen("G1", "자갈 위 원목 집어 적재함에", Act4::GraspRelease, Some(LOG), Surface::Gravel),
@@ -263,7 +188,6 @@ pub fn library() -> Vec<AxScenario> {
         AxScenario { push_m: 3.0, ..scen("P1", "자갈 위 돌 3 m 곧게 밀기", Act4::Push, Some(STONE), Surface::Gravel) },
         AxScenario { push_m: 3.0, turns: &[45.0, -45.0], ..scen("P2", "흙 위 원목 밀며 두 번 꺾기", Act4::Push, Some(LOG), Surface::Dirt) },
         AxScenario { push_m: 2.0, ..scen("P3", "마른 모래 위 철광석 밀기", Act4::Push, Some(ORE), Surface::Sand) },
-        // Moving about: walking on legs, driving on wheels or tracks, over the same grounds.
         AxScenario { trials: 30, ..scen("W1", "단단한 바닥 이동", Act4::Walk, None, Surface::Firm) },
         AxScenario { trials: 30, slope_deg: 8.0, ..scen("W2", "젖은 모래 8° 오르기", Act4::Walk, None, Surface::WetSand) },
         AxScenario { trials: 30, mu_actual: Some(LAB_ACOF), mu_belief: Some(Surface::Firm.props().mu_foot), ..scen("W3", "예고 없는 오염 바닥", Act4::Walk, None, Surface::Firm) },
@@ -275,13 +199,10 @@ pub fn library() -> Vec<AxScenario> {
     ]
 }
 
-/// Grounds, objects and loads the held-out draws use; none is a development condition (a test checks it).
 pub const HOLDOUT_GROUNDS: [Surface; 3] = [Surface::Grass, Surface::WetSand, Surface::Dirt];
 pub const HOLDOUT_AMOUNTS: [f32; 2] = [0.5, 0.75];
 pub const HOLDOUT_CARGO: (f32, f32) = (0.03, 0.07);
 
-/// Held-out scenarios for one evaluation seed: broken pieces of the items on
-/// other grounds with a little cargo. Counted pass / fail, never tuned against.
 pub fn holdout(seed: u64, count: usize) -> Vec<AxScenario> {
     let mut s = seed ^ 0x6A09_E667_F3BC_C908;
     let mut next = move || {
@@ -308,9 +229,6 @@ pub fn holdout(seed: u64, count: usize) -> Vec<AxScenario> {
         .collect()
 }
 
-// ----- scoring -----
-
-/// The shared judge (`crate::bench::judge`); the gate is worded as this benchmark prints it.
 fn judge(c: &mut AxCell) {
     let v = crate::bench::judge(c.value, c.rule.into());
     c.z = v.z;
@@ -339,13 +257,11 @@ fn finish(s: &AxScenario, cells: Vec<AxCell>, success_rate: f32, failures: Vec<(
         mean(&sc)
     });
     let scored: Vec<f32> = layer_scores.iter().flatten().copied().collect();
-    // Nothing to compare with is no score, not a full one.
     let score = if skipped.is_some() || !gates.is_empty() { 0.0 } else { mean(&scored).unwrap_or(0.0) };
     let within = cells.iter().all(|c| c.score.is_none() || c.z.map_or(c.score.unwrap_or(0.0) > 0.0, |z| z.abs() <= 2.0));
     AxResult { id: s.id, name_ko: s.name_ko, action: s.action, holdout: s.holdout, skipped, passed: gates.is_empty() && within && !scored.is_empty(), gates, layer_scores, score, cells, success_rate, failures, reasons: vec![] }
 }
 
-/// The first reason of each failure code over a set of rollouts.
 fn reasons_of(runs: &[crate::act::ActRollout]) -> Vec<(String, String)> {
     let mut v: Vec<(String, String)> = Vec::new();
     for r in runs {
@@ -369,26 +285,22 @@ fn count_codes(codes: &[Option<&'static str>]) -> Vec<(String, u32)> {
     v
 }
 
-/// The hand the robot has, as `NotoConfig::preset` builds it for the body's finger count and base.
 pub fn hand_of(body: &Body) -> Hand {
     let mut cfg = NotoConfig::preset(body.fingers);
     cfg.base = body.base;
     cfg.build().expect("preset hands build")
 }
 
-/// Why a pick from above is refused: two hands do not hold even the object's weight (`grasp::top_hands`).
 pub fn refused_ko(th: &g::TopHands) -> String {
     format!("두 손으로도 무게를 못 버팀 (한 손 {:.0} N × 2 < 무게 {:.0} N, 손가락 {}개 닿음): 집지 않음", th.hold_n, th.weight_n, th.touching)
 }
 
-/// The aim error the benchmark's robot has: a stereo head 1.05 m from an object at its feet (D435 law) and a 5 mm arm.
 fn aim_sigma(body: &Body) -> f32 {
     let depth = crate::act::material::stereo_depth_sigma(1.09, 424.0, 0.05, 0.08);
     let arm = if body.arm.shoulder.backdrivable { 0.005 } else { 0.010 };
     (depth * depth + arm * arm).sqrt()
 }
 
-/// Runs one scenario on a robot.
 pub fn evaluate(body: &Body, s: &AxScenario) -> AxResult {
     match s.action {
         Act4::GraspRelease => eval_grasp(body, s),
@@ -402,9 +314,6 @@ fn eval_grasp(body: &Body, s: &AxScenario) -> AxResult {
     let o = s.obj.expect("a grasp scenario has an object");
     let hand = hand_of(body);
     let cargo = s.cargo_frac * body.mass_kg();
-    // One hand when it holds the object with its safety factor, else both, and none when two hands do not
-    // hold even its weight: the contacts the rollout holds with (`top_hands`; the world's grasp table still
-    // reads the v0.9 `grasp::capacity`).
     let th = g::top_hands(&hand, [o.size_m; 3], o.mass_kg, crate::act::material::pad_on(o.material).mean);
     if th.hands == 0 {
         return finish(s, vec![], 0.0, vec![], Some(refused_ko(&th)));
@@ -420,7 +329,6 @@ fn eval_grasp(body: &Body, s: &AxScenario) -> AxResult {
     let reach = runs.iter().any(|r| r.outcome.code == Some("reach_ground"));
     let m = |k: &str| mean(&ok.iter().filter_map(|r| r.metric(k)).collect::<Vec<_>>());
     let mut cells = Vec::new();
-    // Outcome.
     if reach {
         cells.push(cell(Layer::Outcome, "reach_ground", Some("waist"), Some(1.0), Rule::AtMost { limit: 0.0 }, "바닥의 물체에 손이 닿아야 집을 수 있음 (기하·관절 범위)"));
     }
@@ -429,7 +337,6 @@ fn eval_grasp(body: &Body, s: &AxScenario) -> AxResult {
     cells.push(cell(Layer::Outcome, "miss_rate", Some("hand"), Some(rate_of("grasp_missed")), Rule::Raw, ""));
     cells.push(cell(Layer::Outcome, "slip_rate", Some("hand"), Some(rate_of("grasp_slip")), Rule::Raw, ""));
     cells.push(cell(Layer::Outcome, "overload_rate", Some("hand_joints"), Some(rate_of("lift_overload")), Rule::Raw, ""));
-    // Time series.
     cells.push(cell(Layer::TimeSeries, "preload_s", Some("hand"), m("preload_s"), like(PRELOAD_S), CITE_GUILLERY));
     cells.push(cell(Layer::TimeSeries, "loading_s", Some("hand"), m("loading_s"), like(LOADING_S), CITE_GUILLERY));
     cells.push(cell(Layer::TimeSeries, "gf_lead_s", Some("hand"), m("gf_lead_s"), like(GF_LEAD_S), CITE_GUILLERY));
@@ -437,17 +344,14 @@ fn eval_grasp(body: &Body, s: &AxScenario) -> AxResult {
     cells.push(cell(Layer::TimeSeries, "safety_margin", Some("hand"), m("safety_margin"), like(SAFETY_MARGIN), CITE_GUILLERY));
     cells.push(cell(Layer::TimeSeries, "duration_s", None, m("duration_s"), Rule::Raw, ""));
     cells.push(cell(Layer::TimeSeries, "lift_s", None, m("lift_s"), Rule::Raw, ""));
-    // The release of each successful grasp: where it lands.
     let place: Vec<f32> = (0..ok.len().min(30) as u64)
         .map(|seed| g::release(&ReleaseInput { body, material: o.material, mass_kg: o.mass_kg, size_m: [o.size_m; 3], ground: s.ground, surface_z_m: 0.0, cargo_kg: cargo, aim_sigma_m: aim_sigma(body), seed }))
         .filter_map(|r| r.metric("place_err_m"))
         .map(|e| e * 1000.0)
         .collect();
     cells.push(cell(Layer::TimeSeries, "place_err_mm", Some("hand"), mean(&place), like(PLACE_ERR_MM), CITE_PLACE));
-    // Part: the bottom of the bend that reached the object (the engine's own plan: in front, or a wide squat over a load it cannot hold there).
     let plan = reach::plan_or_straddle(body, &ReachGoal::ground_object(o.size_m, o.mass_kg, two, cargo), 0.5 * o.size_m);
     part_cells(body, &plan, &mut cells);
-    // Coupling: the feet's margin while the hands lift, the neck's camera pitch.
     let margin = m("min_margin");
     let mr = reference(Source::ArmLift, Segment::Foot, "margin", &RefCtx::default());
     match mr {
@@ -458,7 +362,6 @@ fn eval_grasp(body: &Body, s: &AxScenario) -> AxResult {
     AxResult { reasons: reasons_of(&runs), ..finish(s, cells, rate, failures, None) }
 }
 
-/// The trunk, hip and knee at the bottom of a floor reach against the human's (legs only for the hip and knee).
 fn part_cells(body: &Body, plan: &reach::ReachPlan, cells: &mut Vec<AxCell>) {
     let ok = plan.ok;
     let r = &plan.loaded;
@@ -492,7 +395,6 @@ fn eval_bend(body: &Body, s: &AxScenario) -> AxResult {
     }
     cells.push(cell(Layer::Outcome, "lowest_palm_m", Some("hand"), Some(plan.lowest_palm_z), Rule::Raw, ""));
     part_cells(body, &plan, &mut cells);
-    // When the bend's peak moment comes: the rise's samples of one grasp.
     let r = g::grasp(&GraspInput::front(body, &hand, o.material, o.mass_kg, [o.size_m; 3], s.ground, two, cargo, 0.0, 1));
     let peak_t = (|| {
         let lift: Vec<&crate::act::ActSample> = r.samples.iter().filter(|x| x.phase == "lift").collect();
@@ -507,7 +409,6 @@ fn eval_bend(body: &Body, s: &AxScenario) -> AxResult {
     cells.push(cell(Layer::TimeSeries, "peak_moment_t_s", Some("waist"), plan.ok.then_some(peak_t).flatten(), like(LIFT_PEAK_T_S), CITE_FLOOR_LIFT));
     cells.push(cell(Layer::TimeSeries, "descend_s", None, plan.ok.then_some(plan.descend_s), Rule::Raw, ""));
     cells.push(cell(Layer::TimeSeries, "rise_s", None, plan.ok.then_some(plan.rise_s), Rule::Raw, ""));
-    // Coupling: the bend at the feet (margin) and at the camera (pitch).
     let mr = reference(Source::ArmLift, Segment::Foot, "margin", &RefCtx::default());
     let margin = plan.ok.then_some(plan.loaded.margin);
     match mr {
@@ -544,7 +445,6 @@ fn eval_push(body: &Body, s: &AxScenario) -> AxResult {
     cells.push(cell(Layer::TimeSeries, "push_peak_n", Some("wheel"), m("push_peak_n"), Rule::Raw, ""));
     cells.push(cell(Layer::TimeSeries, "duration_s", None, m("duration_s"), Rule::Raw, ""));
     cells.push(cell(Layer::TimeSeries, "contact_impact_n", Some("wheel"), m("contact_impact_n"), Rule::Raw, ""));
-    // Part: the largest push the drive and the ground give at the bumper (traction less the rolling resistance).
     let props: SurfaceProps = *s.ground.props();
     let m_tot = body.mass_kg() + cargo;
     let mu = crate::surface::available_mu(body.base, &props);
@@ -552,16 +452,12 @@ fn eval_push(body: &Body, s: &AxScenario) -> AxResult {
     let cap = (mu * m_tot * G).min(body.chassis.drive_force_n) - crr * m_tot * G;
     cells.push(cell(Layer::Part, "max_push_n", Some("wheel"), Some(cap.max(0.0)), Rule::AtLeast { reference: PUSH_FORCE_N.0, tolerance: PUSH_FORCE_N.1 }, CITE_PUSH));
     cells.push(cell(Layer::Part, "stable_radius_m", Some("wheel"), m("stable_radius_m"), Rule::Raw, ""));
-    // Coupling: the push at the bumper loads the drive (slip) and moves the ZMP back.
     cells.push(cell(Layer::Coupling, "bumper>wheel:slip_max", Some("wheel"), m("slip_max"), Rule::Raw, ""));
     let st = crate::act::drive::state(body, &props, s.slope_deg, 0.0, cargo, m("push_peak_n").unwrap_or(0.0));
     cells.push(cell(Layer::Coupling, "bumper>wheel:front_share", Some("wheel"), Some(st.front_n / (st.front_n + st.rear_n).max(1e-3)), Rule::Raw, ""));
     AxResult { reasons: reasons_of(&runs), ..finish(s, cells, rate, failures, None) }
 }
 
-/// The stance foot's vertical force over every whole stance of a walk: per
-/// stance, (seconds from its landing, force over the weight). The samples are
-/// solved again; a stance cut by the walk's start or end is left out.
 fn stances(body: &Body, r: &crate::act::ActRollout, weight_n: f32) -> Vec<Vec<(f32, f32)>> {
     let mut out = Vec::new();
     for (s, name) in [(0usize, "foot_r"), (1, "foot_l")] {
@@ -571,9 +467,6 @@ fn stances(body: &Body, r: &crate::act::ActRollout, weight_n: f32) -> Vec<Vec<(f
                 let k = crate::kin::solve_fast(body, &x.pose, &x.loads);
                 cur.push((x.t, k.contact(name).map_or(0.0, |c| c.normal_n) / weight_n));
             } else if !cur.is_empty() {
-                // A stance that starts already loaded began before the walk did;
-                // the unloaded instant at lift-off (the swing foot still at
-                // height 0) is not stance.
                 let last = cur.iter().rposition(|p| p.1 > 0.01);
                 if let (true, Some(last)) = (cur[0].1 < 0.5, last) {
                     let t0 = cur[0].0;
@@ -586,8 +479,6 @@ fn stances(body: &Body, r: &crate::act::ActRollout, weight_n: f32) -> Vec<Vec<(f
     out
 }
 
-/// A stance's vertical force shape: first peak, valley and second peak (BW),
-/// the time to the first peak and the stance's duration (s).
 fn grf_shape(st: &[(f32, f32)], dt: f32) -> Option<(f32, f32, f32, f32, f32)> {
     let dur = st.last()?.0 + dt;
     let part = |a: f32, b: f32| st.iter().filter(move |(t, _)| *t >= a * dur && *t <= b * dur).map(|p| p.1);
@@ -598,7 +489,6 @@ fn grf_shape(st: &[(f32, f32)], dt: f32) -> Option<(f32, f32, f32, f32, f32)> {
     (f1.is_finite() && valley.is_finite() && f2.is_finite()).then_some((f1, valley, f2, t1.max(dt), dur))
 }
 
-/// A reference over walking speed at the robot's Froude number on a human leg (held at the table's ends).
 fn at_froude(table: &[(f32, f32); 3], froude: f32) -> (f32, f32) {
     let fr = GRF_SPEEDS_MPS.map(|v| v * v / (G * HUMAN_LEG_M));
     if froude <= fr[0] {
@@ -612,7 +502,6 @@ fn at_froude(table: &[(f32, f32); 3], froude: f32) -> (f32, f32) {
     (table[i].0 + (table[i + 1].0 - table[i].0) * u, table[i].1 + (table[i + 1].1 - table[i].1) * u)
 }
 
-/// A rate per second in units of √(g/ℓ), a time in units of √(ℓ/g), a speed in units of √(g·ℓ): dynamic similarity.
 fn per_dimless_t(x_per_s: f32, leg_m: f32) -> f32 {
     x_per_s * (leg_m / G).sqrt()
 }
@@ -625,7 +514,6 @@ fn dimless_v(mps: f32, leg_m: f32) -> f32 {
     mps / (G * leg_m).sqrt()
 }
 
-/// A human (mean, SD) carried into dimensionless units by `f`.
 fn human(r: (f32, f32), f: fn(f32, f32) -> f32) -> Rule {
     Rule::Like { reference: f(r.0, HUMAN_LEG_M), tolerance: f(r.1, HUMAN_LEG_M) }
 }
@@ -650,7 +538,6 @@ fn eval_walk(body: &Body, s: &AxScenario) -> AxResult {
         falls += st.iter().filter(|x| x.fell).count() as u32;
         slides.extend(st.iter().filter(|x| x.slipped).map(|x| x.slide_m));
         if seed < 2 {
-            // The force shape of every whole stance (the steps repeat; two walks are plenty).
             shapes.extend(stances(body, &r, weight).iter().filter_map(|x| grf_shape(x, crate::act::SAMPLE_S)));
         }
         runs.push(r);
@@ -661,20 +548,15 @@ fn eval_walk(body: &Body, s: &AxScenario) -> AxResult {
     let shape = |f: fn(&(f32, f32, f32, f32, f32)) -> f32| mean(&shapes.iter().map(f).collect::<Vec<_>>());
     let froude = m("froude").unwrap_or(0.0);
     let mut cells = Vec::new();
-    // Outcome.
     cells.push(cell(Layer::Outcome, "trial_no_fall_rate", Some("foot"), Some(rate), Rule::Raw, ""));
     cells.push(cell(Layer::Outcome, "slip_per_step", Some("foot"), Some(slipped_steps as f32 / steps.max(1) as f32), Rule::Raw, ""));
     if s.mu_actual.is_some() {
-        // An unexpected slippery floor, first exposures (the first step on it): the share that slip, and of those the share that fall.
         let first: Vec<gait::StepStat> = (0..s.trials as u64).filter_map(|seed| gait::walk(body, &props, s.mu_belief, 0.0, cargo, speed, 1, 1000 + seed).1.into_iter().next()).collect();
         let slipped: Vec<&gait::StepStat> = first.iter().filter(|x| x.slipped).collect();
         cells.push(cell(Layer::Outcome, "slip_fraction", Some("foot"), Some(slipped.len() as f32 / first.len().max(1) as f32), like(SLIP_FRACTION), CITE_SLIP));
         let fell = (!slipped.is_empty()).then(|| slipped.iter().filter(|x| x.fell).count() as f32 / slipped.len() as f32);
         cells.push(cell(Layer::Outcome, "fall_given_slip", Some("foot"), fell, if fell.is_some() { like(FALL_GIVEN_SLIP) } else { Rule::Raw }, CITE_FALL));
     }
-    // Time series: the stance foot's vertical force, its loading, the heel-strike
-    // transient. A walk that falls before one whole stance has no force shape
-    // to compare (recorded empty, not scored).
     let scored = |r: Rule| if shapes.is_empty() { Rule::Raw } else { r };
     cells.push(cell(Layer::TimeSeries, "grf_f1_bw", Some("foot"), shape(|x| x.0), scored(like(at_froude(&GRF_F1, froude))), CITE_GRF));
     cells.push(cell(Layer::TimeSeries, "grf_valley_bw", Some("foot"), shape(|x| x.1), scored(like(at_froude(&GRF_VALLEY, froude))), CITE_GRF));
@@ -687,23 +569,17 @@ fn eval_walk(body: &Body, s: &AxScenario) -> AxResult {
     cells.push(cell(Layer::TimeSeries, "impact_peak_t", Some("foot"), m("impact_ms").map(|ms| dimless_t(0.5e-3 * ms, leg)), human((IMPACT_PEAK_MS.0 * 1e-3, IMPACT_PEAK_MS.1 * 1e-3), dimless_t), CITE_HEEL));
     cells.push(cell(Layer::TimeSeries, "relative_step", Some("foot"), m("relative_step"), Rule::Raw, ""));
     cells.push(cell(Layer::TimeSeries, "froude", None, Some(froude), Rule::Raw, ""));
-    // Part: how the leg lands.
     cells.push(cell(Layer::Part, "touchdown_speed", Some("foot_joints"), m("touchdown_mps").map(|v| dimless_v(v, leg)), human(HEEL_SPEED_MPS, dimless_v), CITE_HEEL));
     cells.push(cell(Layer::Part, "impact_mass_share", Some("foot_joints"), m("impact_mass_kg").map(|k| k / body.mass_kg()), like(IMPACT_MASS_SHARE), CITE_HEEL));
-    // Coupling: what the ground and the gait ask of the sole, and a slip of the foot.
     cells.push(cell(Layer::Coupling, "foot>sole:rcof", Some("foot"), m("rcof"), Rule::Raw, ""));
     cells.push(cell(Layer::Coupling, "speed_over_cmd", Some("foot_joints"), m("speed_mps").zip(m("speed_cmd_mps")).map(|(a, b)| a / b.max(1e-3)), Rule::Raw, ""));
     if s.mu_actual.is_some() {
-        // How far a slipping foot slides (none recorded when no step slipped).
         let rule = if slides.is_empty() { Rule::Raw } else { human((SLIP_DIST_CM.0 / 100.0, SLIP_DIST_CM.1 / 100.0), |d, l| d / l) };
         cells.push(cell(Layer::Coupling, "slip>foot:slide_per_leg", Some("foot"), mean(&slides).map(|d| d / leg), rule, CITE_SLIP_DIST));
     }
     AxResult { reasons: reasons_of(&runs), ..finish(s, cells, rate, failures, None) }
 }
 
-/// Moving about on wheels or tracks: the drive's slip and loads at the start,
-/// the cruise and the stop over the scenario's ground, slope and cargo
-/// (`act::drive`), with the accelerations planned for the ground it believes.
 fn eval_drive(body: &Body, s: &AxScenario) -> AxResult {
     let mut props: SurfaceProps = *s.ground.props();
     if let Some(mu) = s.mu_actual {
@@ -732,7 +608,6 @@ fn eval_drive(body: &Body, s: &AxScenario) -> AxResult {
         cells.push(cell(Layer::Part, "track_pressure_max_kpa", Some("track"), Some(p[0].max(p[1])), Rule::Raw, ""));
     }
     if s.ground == Surface::Sand && s.slope_deg == 0.0 {
-        // Traction over slip on dry sand, recorded beside a rigid wheel's (no spread to score with).
         for (axis, slip) in [("dp_w@0.1", 0.1), ("dp_w@0.3", 0.3), ("dp_w@0.7", 0.7)] {
             cells.push(cell(Layer::Part, axis, Some(part), Some(drive::drawbar_over_weight(body, &props, slip)), Rule::Raw, CITE_SAND_DP));
         }

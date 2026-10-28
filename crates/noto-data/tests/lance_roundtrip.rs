@@ -1,6 +1,3 @@
-//! Writes simulated episodes to a LanceDB store and reads the row counts back
-//! after reopening it.
-
 use noto_data::{random_scene, simulate_scene, LanceStore};
 
 #[tokio::test]

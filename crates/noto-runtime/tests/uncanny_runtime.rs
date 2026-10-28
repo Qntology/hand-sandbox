@@ -1,11 +1,3 @@
-//! The cross-area "uncanniness" report with every area: noto-core's (`AX`,
-//! `FX`, `NN`, and what registers in `noto_core::bench::core_areas`) on the
-//! shared robot matrix, and the runtime's head camera (`CAM`) and spatial
-//! memory (`VX`), whose cells are the camera and vision benches' own
-//! (`camvx`). Same line format as `noto-core/tests/uncanny_report.rs`
-//! (`[UX]`, `[UX-CELL]`, `[UX-SUM]`, research `docs/research/uncanny.md`);
-//! a record, never a threshold.
-
 mod camvx;
 
 use noto_core::bench::{core_areas, forms, spread, summarize, ux_lines, Summary};

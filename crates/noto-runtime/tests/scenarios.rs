@@ -1,10 +1,3 @@
-//! End-to-end scenarios: a typed command, a quest, a world, the gates, the logs.
-//!
-//! The recogniser here is the stand-in (the renderer's ground truth plus
-//! injected errors). These tests show that the pieces fit and that the gates
-//! behave consistently under a made-up error model; they say nothing about how
-//! a real SigLIP2 would perform.
-
 use noto_core::{BaseKind, NotoConfig};
 use noto_quest::{State, StepKind};
 use noto_runtime::{FrameView, GateCfg, NoiseCfg, Runtime, RuntimeConfig};
@@ -12,9 +5,6 @@ use world_sim::{ItemKind, NodeKind};
 
 const LEXICON: &str = include_str!("../../../data/world_lexicon.json");
 
-/// The robot of these scenarios walks, so its hands reach the ground: with
-/// the arm and shoulder height of the presets a wheeled body cannot bend down
-/// to an item and pushes it instead (`a_wheeled_body_pushes_what_it_cannot_reach`).
 fn legged(cfg: RuntimeConfig) -> RuntimeConfig {
     RuntimeConfig { noto: NotoConfig { base: BaseKind::HumanFoot, ..cfg.noto }, ..cfg }
 }
@@ -35,7 +25,6 @@ fn quest_log(rt: &Runtime) -> String {
     rt.log_tail(0, 5000, None).0.iter().filter(|l| matches!(l.cat.as_str(), "quest" | "search")).map(|l| format!("[{}] {}", l.cat, l.msg)).collect::<Vec<_>>().join("\n")
 }
 
-/// Submits, runs to the end, and returns the finished quest.
 fn run_command(rt: &mut Runtime, text: &str, max_ticks: u64) -> noto_quest::Quest {
     let s = rt.submit(text);
     assert!(s.ok, "{text}: {:?} {:?}", s.error_code, s.error);
@@ -69,8 +58,6 @@ fn a_typed_korean_command_is_carried_out_to_the_warehouse() {
     assert!(q.steps.iter().all(|s| s.state == State::Done && s.progress == 1.0));
     let kinds: Vec<StepKind> = q.steps.iter().map(|s| s.kind).collect();
     assert_eq!(kinds.last(), Some(&StepKind::Deliver));
-    // The quest itself produced composite N:N states (carrying while braking at
-    // the end of each move), scored with the research weights as they happened.
     let nn = rt.api_call("nn_status", &serde_json::Value::Null).unwrap();
     let scen = nn["scenarios"].as_array().unwrap();
     assert!(scen.iter().any(|s| s["scenario"] == "S4"), "carry + brake was scored: {nn}");
@@ -89,7 +76,6 @@ fn english_commands_work_through_the_same_dictionary() {
 
 #[test]
 fn a_shortfall_sends_the_robot_back_to_search_for_more() {
-    // A boulder drops two stones; three are asked for.
     let mut rt = runtime(7, NoiseCfg::none());
     let q = run_command(&mut rt, "돌 3개를 베이스캠프로 가져와", 40_000);
     assert_done(&rt, &q);
@@ -119,9 +105,6 @@ fn collecting_without_a_destination_keeps_the_items_in_hand() {
 
 #[test]
 fn a_wheeled_body_pushes_what_it_cannot_reach() {
-    // Shoulder 1.00 m, arm 0.42 m and no waist pitch: the palm stops about
-    // 0.65 m above the ground, so the wheeled robot moves the log with its
-    // bumper, and a collection with nowhere to push to cannot be done.
     let wheeled = || Runtime::new(RuntimeConfig { seed: 7, noise: NoiseCfg::none(), ..RuntimeConfig::default() }, LEXICON, None).expect("runtime");
     let mut rt = wheeled();
     assert_eq!(rt.world().hand.base.kind, BaseKind::Wheel);
@@ -140,9 +123,6 @@ fn a_wheeled_body_pushes_what_it_cannot_reach() {
 
 #[test]
 fn a_wheeled_body_with_a_torso_lift_picks_the_log_up_from_the_floor() {
-    // The same quest on the wheeled preset with a torso lift and the pro waist
-    // pitch: the carriage slides down the mast and the trunk leans over the
-    // bumper, so the hands take the log instead of the bumper pushing it.
     let cfg = RuntimeConfig { seed: 7, noise: NoiseCfg::none(), body: noto_core::BodyPlan::named("wheel_lift").unwrap(), ..RuntimeConfig::default() };
     let mut rt = Runtime::new(cfg, LEXICON, None).expect("runtime");
     assert_eq!(rt.world().hand.base.kind, BaseKind::Wheel);
@@ -151,7 +131,6 @@ fn a_wheeled_body_with_a_torso_lift_picks_the_log_up_from_the_floor() {
     assert_eq!(rt.world().carried_count(ItemKind::Log), 1, "the log is in the bay");
     let log = quest_log(&rt);
     assert!(!log.contains("범퍼로 밀어"), "{log}");
-    // The pick lowered the torso: the grasp's bend says so.
     let world_log = rt.log_tail(0, 5000, None).0.iter().filter(|l| l.cat == "world").map(|l| l.msg.clone()).collect::<Vec<_>>().join("\n");
     assert!(world_log.contains("몸통을 내리"), "{world_log}");
 }
@@ -208,7 +187,6 @@ fn stop_cancels_the_running_quest_and_the_queue() {
         assert_eq!(q.failure.as_ref().unwrap().code, "cancelled");
     }
     assert!(!rt.world().busy() && !rt.busy());
-    // and it can be given work again
     let q = run_command(&mut rt, "원목 1개를 창고로 가져와", 30_000);
     assert_done(&rt, &q);
 }
@@ -230,9 +208,6 @@ fn a_resource_that_does_not_exist_ends_in_a_search_timeout() {
 
 #[test]
 fn a_load_that_does_not_fit_is_carried_in_round_trips() {
-    // Before v0.5 this quest failed: the bay held iron ore up to about one
-    // stone below the limit, so the second stone did not fit. Now the cargo
-    // decision carries the first stone to the warehouse and comes back.
     let mut rt = runtime(7, NoiseCfg::none());
     let cap = rt.world().capacity_kg();
     let n = ((cap - 1.0) / ItemKind::IronOre.spec().mass_kg).floor();
@@ -244,7 +219,6 @@ fn a_load_that_does_not_fit_is_carried_in_round_trips() {
     let r = q.result.as_ref().unwrap();
     assert!(r.trips >= 2, "a round trip was made: {r:?}");
     assert!(r.summary.contains("왕복"), "{}", r.summary);
-    // The ore is not this quest's cargo: it stays aboard.
     assert!((rt.world().carried_amount(ItemKind::IronOre) - n).abs() < 1e-4);
     assert!(quest_log(&rt).contains("왕복 1회차"));
 }
@@ -253,9 +227,6 @@ fn a_load_that_does_not_fit_is_carried_in_round_trips() {
 fn a_bay_full_of_other_cargo_is_reported_with_a_hint_to_set_it_down() {
     let mut rt = runtime(7, NoiseCfg::none());
     let cap = rt.world().capacity_kg();
-    // Ore and coal up to less than a coal lump below the limit. A stone does
-    // not fit, a trip would not help (the cargo is not the quest's), and
-    // breaking the stone to squeeze it beside someone else's cargo is not done.
     let (iron, coal) = (ItemKind::IronOre.spec().mass_kg, ItemKind::Coal.spec().mass_kg);
     let n = (cap / iron).floor();
     let m = ((cap - n * iron) / coal).floor();
@@ -279,7 +250,6 @@ fn the_same_seed_gives_the_same_run() {
     assert_eq!(run(), run());
 }
 
-/// What a batch of commands cost with the gates on or off.
 struct Batch {
     done: usize,
     runs: usize,
@@ -318,7 +288,6 @@ fn under_injected_errors_the_gates_cut_wasted_work() {
     let seeds: Vec<u64> = (1..=12).map(|i| i * 2 + 1).collect();
     let on = batch(true, &seeds);
     let off = batch(false, &seeds);
-    // `cargo run --release -p noto-runtime --example gate_ab` prints the same comparison.
     eprintln!(
         "gates on : {}/{} done, wasted {}, ticks {}, precision raw {:.2} -> gated {:.2}, recall raw {:.2} -> gated {:.2}",
         on.done, on.runs, on.wasted, on.ticks, on.raw_precision, on.gated_precision, on.raw_recall, on.gated_recall
@@ -328,10 +297,6 @@ fn under_injected_errors_the_gates_cut_wasted_work() {
         off.done, off.runs, off.wasted, off.ticks, off.raw_precision, off.gated_precision, off.raw_recall, off.gated_recall
     );
     assert_eq!(on.done, on.runs, "every run finishes with the gates on");
-    // The look pattern (v0.7) takes about half the scans the camera used to,
-    // so fewer phantoms and look-alikes reach the gates: 3–4 wasted actions here
-    // with the gates off. With the camera always on, exact odometry and no
-    // parcels (v0.6's setting) the same batch still wastes 7 off and 0 on.
     assert!(off.wasted >= 2, "the injected errors must cost something without gates, got {}", off.wasted);
     assert!(on.wasted * 2 <= off.wasted, "gates on wasted {} vs off {}", on.wasted, off.wasted);
     assert!(on.gated_precision > on.raw_precision + 0.05, "gated {:.2} vs raw {:.2}", on.gated_precision, on.raw_precision);
@@ -341,7 +306,6 @@ fn under_injected_errors_the_gates_cut_wasted_work() {
 
 #[test]
 fn touching_things_teaches_the_sds_what_to_trust() {
-    // With heavy confusion and no gates the robot is wrong often; the SDS records each touch.
     let cfg = RuntimeConfig {
         seed: 7,
         noise: NoiseCfg { seed: 4, score_sd: 0.05, confusion_rate: 0.5, false_positive_rate: 0.3, miss_rate: 0.0 },
@@ -410,8 +374,6 @@ fn a_manual_scan_gives_a_frame_with_boxes_a_body_status_and_a_forecast_series() 
 
 #[test]
 fn a_parcel_seen_faintly_from_afar_is_walked_to_and_looked_down_at() {
-    // A strict score floor: a parcel a few pixels wide 5 m away does not pass it,
-    // the same parcel filling the view from 1.2 m with the head pitched down does.
     let cfg = RuntimeConfig {
         seed: 7,
         noise: NoiseCfg::none(),

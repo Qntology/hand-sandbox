@@ -1,6 +1,3 @@
-//! Runs the grasp simulation for a scene and turns the result into Arrow rows
-//! for the `samples`, `contacts` and `joint_states` tables.
-
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -10,15 +7,12 @@ use lancedb::arrow::arrow_array::{ArrayRef, BooleanArray, Float32Array, Int32Arr
 use crate::scene::SceneSpec;
 use crate::schema::{contacts_schema, joint_states_schema, samples_schema};
 
-/// Layers the current simulator fills for every episode.
 pub const RECORDED_LAYERS: &str = "joint_states,contacts,object_pose,friction,mass_properties";
 
-/// Rows for the three tables written per episode.
 pub struct SampleRows {
     pub samples: RecordBatch,
     pub contacts: RecordBatch,
     pub joint_states: RecordBatch,
-    /// Whether the simulated grasp held the object.
     pub stable: bool,
 }
 
@@ -54,7 +48,6 @@ fn grasp_type_name(t: GraspType) -> &'static str {
     }
 }
 
-/// Simulates the scene and returns its rows.
 pub fn simulate_scene(scene: &SceneSpec) -> Result<SampleRows> {
     let hand = scene.hand.build()?;
     let outcome = grasp(&hand, &scene.payload, &scene.setup);
@@ -70,13 +63,12 @@ fn sample_batch(scene: &SceneSpec, hand: &Hand, r: &GraspResult) -> Result<Recor
     let p = &scene.payload;
     let [w, h, d] = p.size_m;
     let m = p.mass_kg;
-    // Solid box about its centre: I_xx = m/12 (h² + d²), and cyclic.
     let inertia = [
         m / 12.0 * (h * h + d * d),
         m / 12.0 * (w * w + d * d),
         m / 12.0 * (w * w + h * h),
     ];
-    let object_y = h * 0.5; // resting on the palm plane
+    let object_y = h * 0.5;
     let finger_contacts = r
         .contacts
         .iter()
@@ -107,11 +99,9 @@ fn sample_batch(scene: &SceneSpec, hand: &Hand, r: &GraspResult) -> Result<Recor
         Arc::new(Float32Array::from(vec![inertia[0]])),
         Arc::new(Float32Array::from(vec![inertia[1]])),
         Arc::new(Float32Array::from(vec![inertia[2]])),
-        // Centre of mass: the geometric centre of the box.
         Arc::new(Float32Array::from(vec![0.0f32])),
         Arc::new(Float32Array::from(vec![0.0f32])),
         Arc::new(Float32Array::from(vec![0.0f32])),
-        // Object pose: translation only; roll, pitch and yaw stay at zero.
         Arc::new(Float32Array::from(vec![0.0f32])),
         Arc::new(Float32Array::from(vec![object_y])),
         Arc::new(Float32Array::from(vec![scene.setup.z_offset])),

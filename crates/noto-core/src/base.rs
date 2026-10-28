@@ -1,24 +1,13 @@
-//! Locomotion bases ("feet") for the logistics robot and a simple drive model.
-//!
-//! The numbers in [`BaseKind::spec`] are modelling assumptions for early
-//! development, not measured values. Their sources and the open items are
-//! listed in `data/README.md`.
-
 use serde::{Deserialize, Serialize};
 
-/// Time a base needs to climb one obstacle it can pass, seconds.
 const STEP_TIME_S: f32 = 0.5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BaseKind {
-    /// Four-wheel differential drive.
     Wheel,
-    /// Mecanum (omni-directional) wheels, can move sideways.
     Mecanum,
-    /// Tracked crawler, as on a small tractor or skid-steer.
     Track,
-    /// Bipedal human-style foot.
     HumanFoot,
 }
 
@@ -91,37 +80,22 @@ impl BaseKind {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BaseSpec {
     pub kind: BaseKind,
-    /// Top speed on flat ground, m/s.
     pub max_speed_mps: f32,
-    /// Steepest slope the base can climb, degrees.
     pub max_slope_deg: f32,
-    /// Tallest step or stair edge the base can climb, metres.
     pub max_step_m: f32,
-    /// Can translate sideways without turning.
     pub holonomic: bool,
-    /// Average drive power at cruise, watts.
     pub power_w: f32,
-    /// Ground footprint along the direction of travel, metres.
     pub footprint_m: f32,
-    /// Continuous drive force over the robot's mass, m/s² (set from the body;
-    /// `None` on a bare base, whose climb is then limited by friction only).
     #[serde(default)]
     pub drive_accel_mps2: Option<f32>,
-    /// Robot mass with its cargo, kg (set from the body; `None` on a bare base,
-    /// whose wheels then cost what they cost on firm ground).
     #[serde(default)]
     pub mass_kg: Option<f32>,
-    /// CoM height while walking, metres (set from the body for legs; `None`:
-    /// the gait is not known and the ground does not change the speed).
     #[serde(default)]
     pub walk_com_z_m: Option<f32>,
-    /// Sole length of a walking base, metres (set from the body for legs:
-    /// where the centre of pressure rolls; `None`: the gait's nominal foot).
     #[serde(default)]
     pub walk_foot_m: Option<f32>,
 }
 
-/// One piece of a route for the drive model.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Terrain {
@@ -133,14 +107,12 @@ pub enum Terrain {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DriveReport {
     pub passable: bool,
-    /// Index of the first route segment the base could not pass.
     pub failed_at: Option<usize>,
     pub distance_m: f32,
     pub time_s: f32,
     pub energy_j: f32,
 }
 
-/// Drives `spec` over `course` and reports whether every segment is passable.
 pub fn simulate_drive(spec: &BaseSpec, course: &[Terrain]) -> DriveReport {
     let mut distance = 0.0;
     let mut time = 0.0;
@@ -156,7 +128,6 @@ pub fn simulate_drive(spec: &BaseSpec, course: &[Terrain]) -> DriveReport {
                 if deg > spec.max_slope_deg {
                     true
                 } else {
-                    // The base slows down as the slope approaches its limit.
                     let factor = 1.0 - 0.5 * (deg / spec.max_slope_deg);
                     distance += length_m;
                     time += length_m / (spec.max_speed_mps * factor);

@@ -1,9 +1,3 @@
-//! The path the UI takes: a part preset chosen in the panel goes through the
-//! runtime's JSON API (`body_plan_set`, `world_new` with `body`) into the
-//! world's body, and from there into the joint dynamics, the third-person
-//! overlay and the SDS. Each step is checked against the preset's datasheet
-//! actuators, so a preset that silently does not reach the physics fails here.
-
 use noto_core::parts::{BodyPlan, Tier};
 use noto_sds::{Scope, Track};
 use noto_runtime::{Runtime, RuntimeConfig};
@@ -32,7 +26,6 @@ fn a_preset_from_the_ui_reaches_the_joint_dynamics_and_the_overlay() {
         assert_eq!(neck["peak_nm"].as_f64().unwrap() as f32, BodyPlan::uniform(tier).head_preset().neck.peak_nm, "{preset}");
         println!("[PRESET] api {preset}: shoulder {} N·m, neck {} N·m in the overlay", shoulder.peak_nm, neck["peak_nm"]);
     }
-    // `world_new` with a body (what the world panel sends) does the same.
     rt.api_call("world_new", &json!({"seed": 3, "size": 48, "body": {"head": "mid", "chest": "mid", "belly": "pro", "arm": "budget", "leg": "mid"}})).unwrap();
     assert_eq!(rt.world().body.belly.tier, Tier::Pro);
     assert!(rt.world().body_pose().unwrap().joints.iter().any(|j| j.name == "waist_pitch" && j.kind == "sim"), "a pro belly has a driven waist pitch");
@@ -41,14 +34,11 @@ fn a_preset_from_the_ui_reaches_the_joint_dynamics_and_the_overlay() {
 #[test]
 fn a_quest_records_the_joint_dynamics_in_the_sds() {
     let mut rt = runtime();
-    // On legs: the hands reach the log, so the lift is a posture change.
     rt.api_world_new(7, 64, None, Some("human_foot")).unwrap();
     rt.api_command_submit("원목 1개를 창고로 가져와").unwrap();
     for _ in 0..60 {
         rt.api_sim_step(40).unwrap();
     }
-    // Asked of the store itself: the status lists only the 80 most observed
-    // axes, and a posture change is one sample (v0.7's tracks outnumber it).
     let n = rt.sds().exact_baseline(&Scope::new(Track::Effort, "dynamics", ""), "min_margin").map_or(0, |b| b.2);
     assert!(n > 0, "dynamics scopes in the SDS");
     let m = rt.world().motion.as_ref().expect("the world simulated a posture change");

@@ -1,23 +1,3 @@
-//! Sites: houses whose front door is reached by a porch, a stair of real
-//! risers and a ramp, and a logistics centre with shelving aisles and packing
-//! tables around the warehouse waypoint. Parcels lie where couriers and
-//! warehouses leave them (a porch landing beside the door, a shelf deck, a
-//! table top) instead of anywhere in the open.
-//!
-//! The site is made in two steps around the terrain. [`plan`] chooses where
-//! the buildings go before the heightfield exists, so their ground can be
-//! flattened by the terrain's own flat zones (smoothly blended, no cliffs).
-//! [`build`] then stamps them: a porch, a house floor and every stair tread is
-//! a curb (`terrain::CurbKind`), so the drive model's step rule decides who
-//! climbs them (legs climb a 15–18 cm riser, wheels and tracks do not); a
-//! ramp is a run of curbs the route planner joins as a slope; walls, shelves
-//! and tables are [`Fixture`]s that block their cells.
-//!
-//! Numbers and their sources are in `docs/research/sites.md` (table A, the
-//! engine inputs); numbers marked est are estimates. The search prior
-//! ([`Site::prior`]) points at the places the robot is told about (porches,
-//! the logistics centre), never at the parcels.
-
 use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
@@ -29,82 +9,41 @@ use crate::rng::Rng;
 use crate::snapshot::{FixtureView, HouseView, RampView, SiteView, StairView, WarehouseView, ZoneView};
 use crate::terrain::{cell_center, seg_dist, CurbKind, FlatZone, Terrain, CELL_M};
 
-/// A house's facade (along the front) and depth, cells (est: a small
-/// single-storey house, 5 × 4 m, sized to the 32 m map).
 pub const HOUSE_W_CELLS: i32 = 10;
 pub const HOUSE_D_CELLS: i32 = 8;
-/// Door opening, cells: 1.0 m for the 914 mm door slab (`fixture::HOUSE_DOOR_W_MM`).
 pub const DOOR_CELLS: i32 = 2;
-/// Porch landing along the facade and out from it, cells: 2.0 × 1.0 m, at
-/// least as wide as the door and deeper than the 914 mm (36 in) landing an
-/// exterior door needs (IRC R311.3).
 pub const PORCH_W_CELLS: i32 = 4;
 pub const PORCH_D_CELLS: i32 = 2;
-/// Stair width, cells: 1.0 m, wider than the 900 mm of an outdoor stair in a
-/// Korean housing complex (주택건설기준 등에 관한 규정 제16조).
 pub const STAIR_W_CELLS: i32 = 2;
-/// Highest riser, millimetres: 180 mm for the common stairs of a Korean
-/// housing complex (제16조), the strictest of it, IRC R311.7.5.1 (196 mm) and
-/// the Korean outdoor stair (200 mm).
 pub const RISER_MAX_MM: u16 = 180;
-/// Lowest riser, millimetres (est: neither code sets a minimum).
 pub const RISER_MIN_MM: u16 = 150;
-/// A stair tread is one cell deep, millimetres: deeper than the 254 mm of IRC
-/// R311.7.5.2 and the 260 mm of 제16조 (the 0.5 m grid sets it).
 pub const TREAD_MM: u16 = 500;
-/// Fewest and most risers up to a porch (est: no source on Korean or US entry steps).
 pub const RISERS_MIN: u8 = 2;
 pub const RISERS_MAX: u8 = 3;
-/// Run per rise of a porch ramp (est: the usual 1:12 accessibility ramp,
-/// not in the research pack; it gives 4.2 cm per cell, a 4.8° slope).
 pub const RAMP_RUN_PER_RISE: f32 = 12.0;
-/// The logistics centre, cells (est: a 9 × 7 m single-bay shed).
 pub const WAREHOUSE_W_CELLS: i32 = 18;
 pub const WAREHOUSE_D_CELLS: i32 = 14;
-/// Smallest logistics centre still built, cells (est: the receiving zone and one shelf row).
 const WAREHOUSE_MIN_CELLS: (i32, i32) = (10, 8);
-/// The logistics centre's door, cells (`fixture::WAREHOUSE_DOOR_W_MM`, 2.5 m).
 pub const WAREHOUSE_DOOR_CELLS: i32 = 5;
-/// The warehouse waypoint stands this many cells inside the door (est: in the receiving zone).
 pub const WAYPOINT_INSIDE_CELLS: i32 = 4;
-/// Depth of the receiving zone inside the door, cells (est).
 pub const RECEIVING_CELLS: i32 = 6;
-/// Picking aisle between shelf rows, cells: 1.0 m, the pedestrian picking
-/// aisle of the Cisco-Eagle aisle-width guide (≥ 1.0 m).
 pub const AISLE_CELLS: i32 = 2;
-/// Cells of one shelving unit along its row (`fixture::SHELF_WIDTH_MM`, 1829 mm in 2.0 m).
 pub const SHELF_UNIT_CELLS: i32 = 4;
-/// Parcels go on shelf decks up to this height, metres: the top of the
-/// fastest-lift shelf band of the distribution-centre pick study of table A
-/// (63.5–116.2 cm); the top deck (1.68 m) is above what the robots reach.
 pub const SLOT_TOP_M: f32 = 1.162;
-/// Maintained illuminance of the task zones, lux (EN 12464-1:2021 as
-/// tabulated in the Glamox logistics guide): rack storage floor 150, packing 300.
 pub const RACK_FLOOR_LX: f32 = 150.0;
 pub const PACKING_LX: f32 = 300.0;
-/// Search prior weights of the places the robot is told about (est): around a
-/// porch, and inside the logistics centre; every other cell weighs 1.
 pub const PRIOR_PORCH: f32 = 4.0;
 pub const PRIOR_WAREHOUSE: f32 = 3.0;
-/// Cells around a porch the prior covers (est: two steps).
 const PRIOR_PORCH_RING: i32 = 4;
-/// Houses keep this far from the waypoints, metres (est: off their flat 3.5 m zones).
 const KEEP_WAYPOINT_M: f32 = 4.5;
-/// Flat-zone circles that cover a reserved rectangle are at most this far apart, metres.
 const ZONE_SPACING_M: f32 = 2.0;
-/// Salt of the site's own random stream (the world's and the parcels' stay as they were).
 const SITE_SALT: u64 = 0x517E_5EED_4A11_C0DE;
 
-/// What sites a world has (`WorldConfig::site`). Missing fields take the
-/// standard site's values, so `{}` in a config file is the standard site.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SiteCfg {
-    /// Houses wanted (fewer are built when they do not fit on the map).
     pub houses: u8,
-    /// A logistics centre around the warehouse waypoint.
     pub warehouse: bool,
-    /// A ramp beside every porch, so wheels and tracks reach the door.
     pub ramps: bool,
 }
 
@@ -114,7 +53,6 @@ impl Default for SiteCfg {
     }
 }
 
-/// Which way a building's front faces (from inside to outside).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Facing {
@@ -127,7 +65,6 @@ pub enum Facing {
 impl Facing {
     pub const ALL: [Facing; 4] = [Facing::PlusX, Facing::PlusZ, Facing::MinusX, Facing::MinusZ];
 
-    /// The outward step in cells (x, z).
     pub fn dir(self) -> (i32, i32) {
         match self {
             Facing::PlusX => (1, 0),
@@ -137,7 +74,6 @@ impl Facing {
         }
     }
 
-    /// Heading, degrees: 0 = +x, 90 = +z (the world's).
     pub fn yaw_deg(self) -> f32 {
         match self {
             Facing::PlusX => 0.0,
@@ -147,23 +83,18 @@ impl Facing {
         }
     }
 
-    /// Along the facade: the outward step turned a quarter.
     fn along(self) -> (i32, i32) {
         let (x, z) = self.dir();
         (-z, x)
     }
 }
 
-/// What an item rests on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "on", rename_all = "snake_case")]
 pub enum Support {
-    /// The terrain (and any curb) of its cell.
     #[default]
     Ground,
-    /// A house's porch landing (`level` 0) or a stair tread (`level` 1 is the one below the landing).
     Step { house: u32, level: u8 },
-    /// Deck `level` (0 = the lowest) of a shelving unit.
     Shelf { fixture: u32, level: u8 },
     Table { fixture: u32 },
 }
@@ -184,20 +115,16 @@ impl Support {
     }
 }
 
-/// A place where the world puts a parcel.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Slot {
     pub support: Support,
     pub x: f32,
     pub z: f32,
-    /// Height of the surface an item rests on, metres (world y).
     pub y_m: f32,
     pub owner: Owner,
-    /// Where the robot stands to see and reach it (an aisle cell, a porch cell).
     pub stand: Cell,
 }
 
-/// An inclusive cell rectangle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rect {
     pub x0: i32,
@@ -224,12 +151,10 @@ impl Rect {
         (self.z0..=self.z1).flat_map(move |z| (self.x0..=self.x1).map(move |x| (x, z)))
     }
 
-    /// Corners in metres: x0, z0, x1, z1.
     pub fn metres(&self) -> [f32; 4] {
         [self.x0 as f32 * CELL_M, self.z0 as f32 * CELL_M, (self.x1 + 1) as f32 * CELL_M, (self.z1 + 1) as f32 * CELL_M]
     }
 
-    /// Distance from a point to the rectangle, metres (0 inside).
     fn dist_m(&self, p: (f32, f32)) -> f32 {
         let m = self.metres();
         let dx = (m[0] - p.0).max(0.0).max(p.0 - m[2]);
@@ -238,29 +163,22 @@ impl Rect {
     }
 }
 
-/// What a site keeps clear of: the waypoints, the curb wall and the way between the waypoints.
 #[derive(Clone, Debug)]
 pub struct Keep {
     pub base: (f32, f32),
     pub warehouse: (f32, f32),
     pub wall_cx: usize,
-    /// The way a wheel takes between the waypoints (through the gap in the curb wall).
     pub way: Vec<(f32, f32)>,
     pub way_m: f32,
 }
 
-/// A house laid out in its own frame: `u` along the facade, `v` out of the
-/// front wall (the body at `v ≤ 0`, the porch at `v = 1, 2`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct HousePlan {
-    /// The cell at `u = 0, v = 0`.
     origin: (i32, i32),
     front: Facing,
-    /// Door and porch at the far end of the facade (the frame mirrored along `u`).
     flip: bool,
     risers: u8,
     riser_cm: u8,
-    /// Ramp cells (0: no ramp).
     ramp: u8,
 }
 
@@ -276,7 +194,6 @@ impl HousePlan {
         self.risers * self.riser_cm
     }
 
-    /// Everything the house uses, the cells in front of its stair and its ramp included.
     fn bounds(&self) -> Rect {
         let n = self.risers as i32;
         let u1 = (HOUSE_W_CELLS - 1).max(PORCH_W_CELLS + self.ramp as i32);
@@ -294,12 +211,10 @@ impl HousePlan {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct WarehousePlan {
     rect: Rect,
-    /// The waypoint's cell.
     waypoint: (i32, i32),
     door_z: (i32, i32),
 }
 
-/// Where a site's buildings go, chosen before the terrain is made.
 #[derive(Clone, Debug)]
 pub struct SitePlan {
     pub cfg: SiteCfg,
@@ -308,9 +223,6 @@ pub struct SitePlan {
 }
 
 impl SitePlan {
-    /// Flat ground under every building and around it: circles of the
-    /// terrain's flat zones covering each reserved rectangle (inside a zone the
-    /// heightfield is level, and it blends back into the hills around it).
     pub fn zones(&self) -> Vec<FlatZone> {
         let mut out = Vec::new();
         for r in self.reserved() {
@@ -328,7 +240,6 @@ impl SitePlan {
         out
     }
 
-    /// The rectangles the site keeps for itself (a cell of clearance around each building's parts).
     pub fn reserved(&self) -> Vec<Rect> {
         let mut v: Vec<Rect> = self.houses.iter().map(|h| h.bounds().grow(1)).collect();
         if let Some(w) = &self.warehouse {
@@ -342,15 +253,6 @@ impl SitePlan {
     }
 }
 
-/// Chooses where the houses and the logistics centre go on a `cells`-square
-/// map: the logistics centre around the warehouse waypoint, its door toward
-/// the way in; then one house after another at a place, facing and porch side
-/// that keeps clear of everything in `keep`, the buildings already placed and
-/// the map edge. Every such placement is tried; the ones that pack tightest
-/// against the edge and the other buildings (the most blocked cells around
-/// their clearance ring, a contact-point packing rule) leave the most room for
-/// the next house, and the site's own random stream picks one of those. The
-/// world's draws stay as they were.
 pub fn plan(seed: u64, cells: usize, cfg: &SiteCfg, keep: &Keep) -> SitePlan {
     let n = cells as i32;
     let mut rng = Rng::new(seed ^ SITE_SALT);
@@ -361,13 +263,11 @@ pub fn plan(seed: u64, cells: usize, cfg: &SiteCfg, keep: &Keep) -> SitePlan {
     }
     let mut houses = Vec::new();
     for _ in 0..cfg.houses {
-        // The house's own draws come first, so the number of places that fit never shifts the stream.
         let risers = RISERS_MIN + rng.below((RISERS_MAX - RISERS_MIN + 1) as u32) as u8;
         let riser_mm = RISER_MIN_MM + rng.below((RISER_MAX_MM - RISER_MIN_MM) as u32 / 10 + 1) as u16 * 10;
         let pick = rng.next_u64();
         let riser_cm = (riser_mm / 10) as u8;
         let floor_cm = risers as f32 * riser_cm as f32;
-        // Rise per ramp cell at most a cell's run over RAMP_RUN_PER_RISE; the porch is the ramp's top.
         let ramp = if cfg.ramps { ((floor_cm / (CELL_M * 100.0 / RAMP_RUN_PER_RISE)).ceil() as i32 - 1).max(1) as u8 } else { 0 };
         let mut best: Vec<HousePlan> = Vec::new();
         let mut best_contact = -1i32;
@@ -402,12 +302,9 @@ pub fn plan(seed: u64, cells: usize, cfg: &SiteCfg, keep: &Keep) -> SitePlan {
     SitePlan { cfg: *cfg, houses, warehouse }
 }
 
-/// Which cells a house's reserved rectangle may cover, with a summed-area
-/// table so a rectangle is checked in constant time.
 struct FreeMap {
     n: i32,
     blocked: Vec<bool>,
-    /// `sum[(z + 1) * (n + 1) + x + 1]`: blocked cells in `[0, x] × [0, z]`.
     sum: Vec<i32>,
 }
 
@@ -447,7 +344,6 @@ impl FreeMap {
         self.sum[z1 * w + x1] - self.sum[z0 * w + x1] - self.sum[z1 * w + x0] + self.sum[z0 * w + x0] == 0
     }
 
-    /// Blocked cells on the ring just outside `r`.
     fn contact(&self, r: &Rect) -> i32 {
         let ring = r.grow(1);
         let mut c = 0;
@@ -472,7 +368,6 @@ impl FreeMap {
 
 fn plan_warehouse(n: i32, keep: &Keep) -> Option<WarehousePlan> {
     let (wx, wz) = ((keep.warehouse.0 / CELL_M) as i32, (keep.warehouse.1 / CELL_M) as i32);
-    // The door in the wall toward the base camp's side (-x), the waypoint in the receiving zone inside it.
     let x0 = wx - WAYPOINT_INSIDE_CELLS;
     let x1 = (x0 + WAREHOUSE_W_CELLS - 1).min(n - 2);
     let z0 = (wz - WAREHOUSE_D_CELLS / 2).max(1);
@@ -485,10 +380,6 @@ fn plan_warehouse(n: i32, keep: &Keep) -> Option<WarehousePlan> {
     Some(WarehousePlan { rect: Rect { x0, z0, x1, z1 }, waypoint: (wx, wz), door_z })
 }
 
-/// Whether a house's reserved rectangle may cover cell `(x, z)`: off the map's
-/// outermost ring, the curb wall and two cells either side of it, the base
-/// camp's surroundings (and the warehouse's when it has no building), and the
-/// way between the waypoints.
 fn cell_free(x: i32, z: i32, n: i32, keep: &Keep, warehouse: bool) -> bool {
     if x < 1 || z < 1 || x > n - 2 || z > n - 2 {
         return false;
@@ -500,38 +391,29 @@ fn cell_free(x: i32, z: i32, n: i32, keep: &Keep, warehouse: bool) -> bool {
     if r.dist_m(keep.base) < KEEP_WAYPOINT_M || (!warehouse && r.dist_m(keep.warehouse) < KEEP_WAYPOINT_M) {
         return false;
     }
-    // A cell centre is within 0.36 m of any point of its cell.
     let (px, pz) = cell_center(x as usize, z as usize);
     keep.way.windows(2).all(|s| seg_dist(px, pz, s[0], s[1]) > keep.way_m + 0.36)
 }
 
-/// A house on the map.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct House {
     pub id: u32,
-    /// The body, walls included.
     pub rect: Rect,
     pub front: Facing,
-    /// Floor and porch height above the ground, centimetres.
     pub floor_cm: u8,
     pub risers: u8,
     pub riser_mm: u16,
     pub tread_mm: u16,
     pub door: Vec<Cell>,
     pub porch: Vec<Cell>,
-    /// Stair treads from the one below the landing down.
     pub treads: Vec<Vec<Cell>>,
-    /// Ramp cells from the porch down (empty without a ramp).
     pub ramp: Vec<Cell>,
-    /// Cells in front of the stair's first riser and at the ramp's foot.
     pub stair_foot: Vec<Cell>,
     pub ramp_foot: Vec<Cell>,
-    /// Whether a walking robot gets from the base camp onto the porch, and a wheeled one.
     pub reachable_legs: bool,
     pub reachable_wheels: bool,
 }
 
-/// The logistics centre.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Warehouse {
     pub rect: Rect,
@@ -539,25 +421,19 @@ pub struct Warehouse {
     pub door_facing: Facing,
     pub shelves: Vec<u32>,
     pub tables: Vec<u32>,
-    /// The picking aisles' cells (beside a shelf).
     pub aisles: Vec<Cell>,
     pub receiving: Rect,
 }
 
-/// Everything a site put on the map.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Site {
     pub cfg: SiteCfg,
     pub houses: Vec<House>,
     pub warehouse: Option<Warehouse>,
-    /// Where parcels can lie.
     pub slots: Vec<Slot>,
-    /// The cells the site keeps for itself (no nodes, no loose parcels).
     pub reserved: Vec<Rect>,
 }
 
-/// Stamps a planned site into the terrain: floors, porches, stairs and ramps
-/// as curbs, a concrete floor, and the fixtures (ids from `next_id`).
 pub fn build(plan: &SitePlan, t: &mut Terrain, next_id: &mut u32) -> (Site, Vec<Fixture>) {
     let mut fixtures = Vec::new();
     let mut slots = Vec::new();
@@ -609,7 +485,6 @@ pub fn build(plan: &SitePlan, t: &mut Terrain, next_id: &mut u32) -> (Site, Vec<
                 porch.push(c);
             }
         }
-        // Tread k (1 = below the landing) stands (n - k) risers high.
         let mut treads = Vec::new();
         for k in 1..n {
             let mut row = Vec::new();
@@ -621,7 +496,6 @@ pub fn build(plan: &SitePlan, t: &mut Terrain, next_id: &mut u32) -> (Site, Vec<
             treads.push(row);
         }
         let stair_foot: Vec<Cell> = (1..=STAIR_W_CELLS).map(|u| cell(h.at(u, PORCH_D_CELLS + n))).collect();
-        // Ramp cell j (1 = beside the porch) at floor·(L + 1 − j)/(L + 1): even rises from the ground to the porch.
         let l = h.ramp as i32;
         let mut ramp = Vec::new();
         for j in 1..=l {
@@ -651,7 +525,6 @@ pub fn build(plan: &SitePlan, t: &mut Terrain, next_id: &mut u32) -> (Site, Vec<
         push(FixtureKind::Wall { height_mm: wall_mm, thick_mm: (fixture::WALL_THICK_M * 1000.0) as u16 }, walls, yaw, base);
         push(FixtureKind::Door { width_mm: fixture::HOUSE_DOOR_W_MM, height_mm: fixture::HOUSE_DOOR_H_MM, wall_height_mm: wall_mm }, door.clone(), yaw, base);
         push(FixtureKind::Roof { height_mm: wall_mm }, body.cells().map(cell).collect(), yaw, base);
-        // Parcels on the landing beside the door, against the wall and at the front edge.
         for u in [0, PORCH_W_CELLS - 1] {
             for v in 1..=PORCH_D_CELLS {
                 let c = cell(h.at(u, v));
@@ -708,9 +581,7 @@ pub fn build(plan: &SitePlan, t: &mut Terrain, next_id: &mut u32) -> (Site, Vec<
         push(FixtureKind::Roof { height_mm: wall_mm }, r.cells().map(cell).collect(), door_yaw);
         let inner = Rect { x0: r.x0 + 1, z0: r.z0 + 1, x1: r.x1 - 1, z1: r.z1 - 1 };
         let receiving = Rect { x0: inner.x0, z0: inner.z0, x1: (inner.x0 + RECEIVING_CELLS - 1).min(inner.x1), z1: inner.z1 };
-        // The waypoint's pile fills its own cell and the one on its -x side (`render::pile_slots`).
         let keep_free = |c: (i32, i32)| (c.1 >= w.door_z.0 - 1 && c.1 <= w.door_z.1 + 1) || c == w.waypoint || c == (w.waypoint.0 - 1, w.waypoint.1);
-        // Packing tables against the side walls of the receiving zone, 3 × 2 cells, used from the room.
         let mut tables = Vec::new();
         for (zs, facing) in [((inner.z0, inner.z0 + 1), Facing::PlusZ), ((inner.z1 - 1, inner.z1), Facing::MinusZ)] {
             let rect = Rect { x0: inner.x0 + 1, z0: zs.0, x1: (inner.x0 + 3).min(receiving.x1), z1: zs.1 };
@@ -723,7 +594,6 @@ pub fn build(plan: &SitePlan, t: &mut Terrain, next_id: &mut u32) -> (Site, Vec<
             for c in cells {
                 let stand = ((c.0 as i32 + dx) as usize, (c.1 as i32 + dz) as usize);
                 if rect.contains(stand) {
-                    // The inner cell of a two-deep table: reached across the outer one.
                     let s2 = ((stand.0 as i32 + dx) as usize, (stand.1 as i32 + dz) as usize);
                     let (x, z) = cell_center(c.0, c.1);
                     slots.push(Slot { support: Support::Table { fixture: id }, x, z, y_m: fixture::TABLE_TOP_MM as f32 / 1000.0, owner, stand: s2 });
@@ -734,7 +604,6 @@ pub fn build(plan: &SitePlan, t: &mut Terrain, next_id: &mut u32) -> (Site, Vec<
             }
             tables.push(id);
         }
-        // Shelf rows along x beyond a cross aisle, back to back between picking aisles.
         let sx0 = receiving.x1 + 2;
         let sx1 = inner.x1 - 1;
         let units = ((sx1 - sx0 + 1) / SHELF_UNIT_CELLS).max(0);
@@ -791,10 +660,6 @@ pub fn build(plan: &SitePlan, t: &mut Terrain, next_id: &mut u32) -> (Site, Vec<
     (site, fixtures)
 }
 
-/// Up to `n` distinct slots for parcels: each one at a site drawn evenly
-/// among the houses and the logistics centre that still have a free slot,
-/// then a free slot there drawn evenly (so most parcels wait at houses, as
-/// most deliveries do, and the warehouse's many shelf slots do not swamp them).
 pub fn choose_slots<'a>(site: &'a Site, n: usize, rng: &mut Rng) -> Vec<&'a Slot> {
     let mut owners: Vec<Owner> = Vec::new();
     for s in &site.slots {
@@ -819,7 +684,6 @@ pub fn choose_slots<'a>(site: &'a Site, n: usize, rng: &mut Rng) -> Vec<&'a Slot
 }
 
 impl Site {
-    /// Whether a cell is the site's (a building, its porch, stair, ramp and a cell around them).
     pub fn is_reserved(&self, c: Cell) -> bool {
         self.reserved.iter().any(|r| r.contains(c))
     }
@@ -828,10 +692,6 @@ impl Site {
         self.houses.iter().find(|h| h.id == id)
     }
 
-    /// Height of the surface a support offers, metres (world y): a porch
-    /// landing (`level` 0) or the stair tread `level` risers below it, a
-    /// shelf deck, a table top. `None` for the ground (its height is its
-    /// cell's) and for a support this site does not have.
     pub fn support_top_m(&self, fixtures: &[Fixture], s: Support) -> Option<f32> {
         let fixture = |id: u32| fixtures.iter().find(|f| f.id == id);
         match s {
@@ -851,14 +711,10 @@ impl Site {
         }
     }
 
-    /// Whether a cell lies inside a building (under a roof).
     pub fn indoor(&self, c: Cell) -> bool {
         self.houses.iter().any(|h| h.rect.contains(c)) || self.warehouse.as_ref().is_some_and(|w| w.rect.contains(c))
     }
 
-    /// Search prior per cell (row by row): where the robot is told parcels
-    /// are kept, from the site's structures alone — around each reachable
-    /// porch, and inside the logistics centre; 1 everywhere else.
     pub fn prior(&self, t: &Terrain) -> Vec<f32> {
         let mut w = vec![1.0f32; t.w * t.d];
         for h in self.houses.iter().filter(|h| h.reachable_legs || h.reachable_wheels) {
@@ -883,7 +739,6 @@ impl Site {
         w
     }
 
-    /// The site for the UI and the logs (metres, world frame).
     pub fn view(&self, fixtures: &[Fixture], t: &Terrain) -> SiteView {
         let at = |c: &Cell| {
             let (x, z) = cell_center(c.0, c.1);
@@ -999,7 +854,6 @@ mod tests {
                 assert!(!rs[i].overlaps(&rs[j]), "{:?} {:?}", rs[i], rs[j]);
             }
         }
-        // The zones cover every reserved cell's centre.
         let zones = a.zones();
         for r in &rs {
             for (x, z) in r.cells() {
@@ -1017,7 +871,6 @@ mod tests {
                 let r = h.riser_cm as u16 * 10;
                 assert!((RISER_MIN_MM..=RISER_MAX_MM).contains(&r), "{r}");
                 assert!((RISERS_MIN..=RISERS_MAX).contains(&h.risers));
-                // Even ramp rises of at most a cell's run over 12 (plus the centimetre rounding).
                 let per = h.floor_cm() as f32 / (h.ramp as f32 + 1.0);
                 assert!(per <= CELL_M * 100.0 / RAMP_RUN_PER_RISE + 1e-3, "{per} cm per cell");
             }

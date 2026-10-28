@@ -1,18 +1,3 @@
-//! The cooperation benchmark [KX]: two to four robots carrying a log, a rock
-//! or a stretcher-like load together on level ground, a slope and stairs,
-//! legs and wheels mixed, and one of them letting go (`act::cocarry`), every
-//! answer that has a measured counterpart compared with a source the engine
-//! does not use (`docs/research/coop.md` §5–§6).
-//!
-//! Cells and scoring are the collision benchmark's (`collbench`): four layers,
-//! likeness `100 − 10·|z|`, "at least" full above its floor, raw cells
-//! reported only. Human team-handling studies measure people, not robots: what
-//! carries over is a ratio (a team's share of its members' summed capacity,
-//! the lower carrier's load over the upper's), never an absolute force. The
-//! engine's statics (shares summing to the weight, the lower carrier taking
-//! more on a slope) are asserted by the module's unit tests and
-//! `tests/coop_bench.rs`, not scored.
-
 use serde::Serialize;
 
 use crate::act::cocarry::{self, Carrier, CarryOpts, CoCarry, GripKind, Load, TeamRule};
@@ -25,68 +10,37 @@ use crate::effects::Rule;
 use crate::hand::FingerCount;
 use crate::surface::Surface;
 
-// ----- references (benchmark side only; the engine never reads these) -----
-
-/// Maximal team lifting strength over the members' summed individual
-/// strength: all-male teams 87.3%, all-female 91.1%, mixed 80.2%, about flat
-/// over teams of two to four (floor-to-knuckle weight bar, soldiers). Mean and
-/// SD of the three.
 pub const TEAM_STRENGTH: (f32, f32) = (0.862, 0.056);
 pub const CITE_TEAM: &str = "팀 최대 들기 힘 / 개인 합: 남성 87.3%, 여성 91.1%, 혼성 80.2%, 2–4명에서 거의 같음 (Sharp, Rice, Nindl & Williamson 1997) — 세 값의 평균 ± SD";
-/// A stair chair carried down stairs (180 mm rise, 305 mm run): the leader's
-/// (lower carrier's) L4/L5 compression averaged 37% above the follower's; and
-/// in two-person lifting the partners' spinal-load asymmetry was smaller than
-/// their load asymmetry. So the lower carrier's hand load over the upper's
-/// is at least 1.37; the tolerance is the excess itself (derived).
 pub const STAIR_LOWER_OVER_UPPER: (f32, f32) = (1.37, 0.37);
 pub const STAIR_RISE_RUN_M: (f32, f32) = (0.180, 0.305);
 pub const CITE_STAIR: &str = "계단(180/305 mm)으로 의자형 들것을 내릴 때 아래쪽(앞장선) 사람의 L4/L5 압박이 37% 큼 (Lavender 2000) · 두 사람 들기에서 척추 하중 차이는 짐 무게 차이보다 작음 (Dennis & Barrett 2003) → 아래/위 손 하중 비 ≥ 1.37 (허용폭은 초과분 0.37, 유도)";
-/// Two quadrupeds of about 15 kg each carried 11.2 kg together: 74.67% of one robot's mass.
 pub const QUAD_PAIR_PAYLOAD: f32 = 0.7467;
 pub const CITE_QUAD: &str = "사족 로봇 두 대(각 약 15 kg)가 함께 11.2 kg 운반: 한 대 질량의 74.67% (Sambhus 2026) — 몸 구조가 달라 기록만";
-/// Paired walking with an 8 kg, 1.5 m stretcher-like object: when the gaits
-/// locked, in phase (pace) 40.9% of the time and half a step apart (trot) 36.4%.
 pub const PACE_TROT_SHARE: (f32, f32) = (0.409, 0.364);
 pub const CITE_PHASE: &str = "막대형 물체를 함께 들고 걸을 때 동기화된 걸음의 40.9%가 같은 위상, 36.4%가 반대 위상 (Lanini 2017) — 엔진은 위상을 고르지 않아 두 경우의 하중 변동을 기록만";
 
-// ----- scenario inputs (est where the source does not give them) -----
-
-/// Grip spacing along a carried log, metres (est: two robots at the ends of a 2 m log).
 pub const LOG_GRIP_M: f32 = 1.6;
 pub const LOG_LEN_M: f32 = 2.0;
 pub const LOG_DIA_M: f32 = 0.15;
-/// A slope two carriers walk up, degrees (est: a steep path).
 pub const SLOPE_DEG: f32 = 10.0;
-/// A stair chair: handles 1.0 m apart along the slope, the seated CoM 0.35 m above their line (est).
 pub const CHAIR_GRIP_M: f32 = 1.0;
 pub const CHAIR_COM_UP_M: f32 = 0.35;
-/// Diameter of the chair's handles the fingers close round, metres (est).
 pub const CHAIR_HANDLE_M: f32 = 0.04;
-/// A rock lifted by three around it, metres (est); grips on a 0.3 m circle.
 pub const ROCK_SIZE_M: f32 = 0.5;
 pub const ROCK_GRIP_R_M: f32 = 0.3;
-/// Load over the weakest member's continuous capacity: a pair succeeds where one robot fails (est).
 pub const LOAD_OVER_CAP: f32 = 1.4;
 
-/// What a [KX] scenario plays out.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KxKind {
-    /// Two carriers, a log held from under its ends, on level ground.
     LevelPair,
-    /// The same two up a [`SLOPE_DEG`] slope.
     SlopePair,
-    /// Two carriers with a stair chair on stairs of the source's pitch.
     StairChair,
-    /// A legged and a wheeled carrier on level ground.
     Mixed,
-    /// Three around a rock.
     RockThree,
-    /// Four along a long log.
     LineFour,
-    /// The level pair, the upper-numbered carrier lets go.
     LetGo,
-    /// The level pair counted by the older, conservative team rule.
     Conservative,
 }
 
@@ -97,7 +51,6 @@ pub struct KxScenario {
     pub kind: KxKind,
 }
 
-/// The [KX] scenarios.
 pub fn library() -> Vec<KxScenario> {
     let s = |id, name_ko, kind| KxScenario { id, name_ko, kind };
     vec![
@@ -112,12 +65,10 @@ pub fn library() -> Vec<KxScenario> {
     ]
 }
 
-/// One member's continuous capacity for a shared carry on firm level ground, kg (`cocarry::member_capacity_kg`).
 pub fn member_kg(body: &Body) -> f32 {
     cocarry::member_capacity_kg(body, Surface::Firm, 0.0, cocarry::carry_hand_z(body))
 }
 
-/// A load sized for `body`: [`LOAD_OVER_CAP`] times its continuous capacity on firm ground.
 pub fn sized_kg(body: &Body) -> f32 {
     LOAD_OVER_CAP * member_kg(body).max(0.1)
 }
@@ -130,7 +81,6 @@ fn base_part(body: &Body) -> &'static str {
     }
 }
 
-/// Two carriers `along` apart along x, the second `dz` higher.
 fn pair<'a>(a: &'a Body, b: &'a Body, along: f32, dz: f32, slope_deg: f32) -> Vec<Carrier<'a>> {
     let mut c0 = Carrier::at(a, 0.0, 0.0, 0.0, Surface::Firm);
     let mut c1 = Carrier::at(b, along, 0.0, dz, Surface::Firm);
@@ -139,7 +89,6 @@ fn pair<'a>(a: &'a Body, b: &'a Body, along: f32, dz: f32, slope_deg: f32) -> Ve
     vec![c0, c1]
 }
 
-/// The cells every carry scenario shares: outcome, each member's share and checks.
 fn carry_cells(cc: &CoCarry, load: &Load, cells: &mut Vec<BenchCell>, part: &'static str) {
     cells.push(raw(Layer::Outcome, "team_ok", Some("hand"), Some(if cc.ok { 1.0 } else { 0.0 })));
     cells.push(raw(Layer::Outcome, "load_over_limit", Some("hand"), Some(load.mass_kg / cc.limit_kg.max(1e-3))));
@@ -160,15 +109,11 @@ fn carry_notes(cc: &CoCarry) -> Vec<String> {
     v
 }
 
-/// The team's effective limit over the members' summed capacity (the rule and
-/// the weakest member together); `None` when the members hold nothing at all
-/// (arms that cannot hold even themselves at the carry pose continuously).
 fn team_factor(cc: &CoCarry) -> Option<f32> {
     let sum: f32 = cc.members.iter().map(|m| m.capacity_kg).sum();
     (sum > 1e-3).then(|| cc.limit_kg / sum)
 }
 
-/// Runs one [KX] scenario with every member built like `body` (K4 pairs it with a wheeled partner).
 pub fn evaluate(body: &Body, s: &KxScenario) -> BenchResult {
     let opts = CarryOpts::default();
     let part = base_part(body);
@@ -228,7 +173,6 @@ pub fn evaluate(body: &Body, s: &KxScenario) -> BenchResult {
             let legs = Body::new(&body.plan, BaseKind::HumanFoot, FingerCount::Five);
             let m = LOAD_OVER_CAP * member_kg(&legs).min(member_kg(&wheel)).max(0.1);
             let log = Load::log(m, LOG_LEN_M, LOG_DIA_M, true);
-            // Each holds at its own hand height: the log tilts between them.
             let cs = pair(&legs, &wheel, LOG_GRIP_M, 0.0, 0.0);
             let cc = cocarry::share(&log, &cs, &opts);
             carry_cells(&cc, &log, &mut cells, part);

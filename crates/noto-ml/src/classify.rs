@@ -1,6 +1,3 @@
-//! Zero-shot logistics classification with a word dictionary. Each dictionary
-//! entry becomes a text prompt; SigLIP2 scores the image against every prompt.
-
 use anyhow::Result;
 use image::DynamicImage;
 use serde::{Deserialize, Serialize};
@@ -19,11 +16,9 @@ pub struct DictEntry {
     pub source: String,
 }
 
-/// The logistics word dictionary (`data/logistics_dictionary.json`).
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct Dictionary {
     pub version: u32,
-    /// Prompt template with one `{}` placeholder for the English label.
     pub template: String,
     pub entries: Vec<DictEntry>,
 }
@@ -38,7 +33,6 @@ impl Dictionary {
     }
 }
 
-/// Text embeddings of every dictionary prompt, in dictionary order.
 pub struct Anchors {
     pub embeddings: Vec<Vec<f32>>,
 }
@@ -69,7 +63,6 @@ pub struct Prediction {
     pub graspable: bool,
 }
 
-/// Top `top_k` dictionary entries for `image`, highest score first.
 pub fn classify(
     model: &Siglip2,
     anchors: &Anchors,
@@ -82,7 +75,6 @@ pub fn classify(
     Ok(rank(&scores, dict, top_k))
 }
 
-/// Sorts entries by score and keeps the top `top_k`.
 pub fn rank(scores: &[f32], dict: &Dictionary, top_k: usize) -> Vec<Prediction> {
     let mut order: Vec<usize> = (0..dict.entries.len()).collect();
     order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));

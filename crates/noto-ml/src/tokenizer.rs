@@ -1,6 +1,3 @@
-//! Tokenizer wrapper: canonicalizes text the way the reference project does
-//! (lowercase, punctuation to spaces), then pads or truncates to a fixed length.
-
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
@@ -23,8 +20,6 @@ impl TextTokenizer {
         })
     }
 
-    /// Lowercases, turns every non-alphanumeric character into a space and
-    /// collapses runs of spaces.
     pub fn canonicalize(text: &str) -> String {
         text.chars()
             .map(|c| {
@@ -40,7 +35,6 @@ impl TextTokenizer {
             .join(" ")
     }
 
-    /// Ids and mask for every text, flattened to `(texts.len() * max_len)`.
     pub fn encode(&self, texts: &[&str]) -> Result<(Vec<u32>, Vec<f32>)> {
         let mut ids_out = Vec::with_capacity(texts.len() * self.max_len);
         let mut mask_out = Vec::with_capacity(texts.len() * self.max_len);

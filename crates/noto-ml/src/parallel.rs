@@ -1,23 +1,3 @@
-//! Parallel embedding: a phrase bank that embeds every dictionary phrase once
-//! (deduplicated, batched, cached, checkpointed to disk) and a tile pipeline
-//! that embeds many crops of a frame in batched forward passes.
-//!
-//! The shape follows the logis-center embedding stack:
-//!
-//! * duplicates are removed before any forward pass;
-//! * phrases are sorted by length and cut into micro-batches whose size is a
-//!   function of the length only, so a phrase embeds the same way whichever
-//!   other phrases ride in the same call;
-//! * results are cached under a *space id* (model fingerprint + forward tag),
-//!   so a different checkpoint never reads another checkpoint's vectors;
-//! * zero or non-finite vectors are refused instead of cached, because a cached
-//!   zero vector would silently remove that phrase from every later score;
-//! * new vectors are appended to a checksummed file, and a torn tail is
-//!   dropped on restore without losing the intact records before it.
-//!
-//! Nothing here depends on model weights: the bank works with any
-//! [`TextEmbedder`], so tests use a deterministic stand-in.
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -31,7 +11,6 @@ use crate::model::Siglip2;
 
 pub const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 
-/// FNV-1a 64. A fixed hash, so values agree across processes and platforms.
 pub fn fnv1a(mut h: u64, bytes: &[u8]) -> u64 {
     for &b in bytes {
         h ^= b as u64;
@@ -40,30 +19,21 @@ pub fn fnv1a(mut h: u64, bytes: &[u8]) -> u64 {
     h
 }
 
-/// Cache space for one model checkpoint and one forward path.
 pub fn space_id(fingerprint: u64, forward_tag: &str) -> u64 {
     let h = fnv1a(FNV_OFFSET, &fingerprint.to_le_bytes());
     fnv1a(h, forward_tag.as_bytes())
 }
 
-/// Tag of the batched text forward. Raise it whenever a change alters the
-/// numbers a text embeds to.
 pub const FORWARD_TAG_TEXT: &str = "noto-ml/siglip2-text/batched/v1";
 
-/// A vector is cacheable when it has numbers, all finite, and is not all zero.
 pub fn is_cacheable(v: &[f32]) -> bool {
     !v.is_empty() && v.iter().all(|x| x.is_finite()) && v.iter().any(|&x| x != 0.0)
 }
 
-/// Micro-batch sizing. The row count depends only on the text length.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BatchOpts {
-    /// Largest number of texts in one forward pass.
     pub max_rows: usize,
-    /// Largest `rows * length` product in one forward pass.
     pub token_budget: usize,
-    /// Most entries the bank keeps in memory. Beyond this, new vectors are
-    /// returned to the caller but not stored.
     pub max_entries: usize,
 }
 
@@ -74,26 +44,19 @@ impl Default for BatchOpts {
 }
 
 impl BatchOpts {
-    /// Rows for texts of `len` tokens (or characters, as a proxy).
     pub fn rows_for(&self, len: usize) -> usize {
         (self.token_budget / len.max(1)).min(self.max_rows).max(1)
     }
 }
 
-/// Anything that turns phrases into unit-length vectors.
 pub trait TextEmbedder {
     fn embedding_dim(&self) -> usize;
-    /// Identifies the model. Vectors cached under one fingerprint are never
-    /// returned for another.
     fn fingerprint(&self) -> u64;
-    /// Embeds `texts` in one batch, in input order.
     fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
 }
 
-/// Anything that turns image crops into unit-length vectors.
 pub trait ImageEmbedder {
     fn embedding_dim(&self) -> usize;
-    /// Embeds `images`; output order matches input order.
     fn embed_images_batch(&self, images: &[DynamicImage]) -> Result<Vec<Vec<f32>>>;
 }
 
@@ -122,23 +85,18 @@ impl ImageEmbedder for Siglip2 {
     }
 }
 
-/// What one `embed` call did.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BankRun {
     pub requested: usize,
     pub unique: usize,
-    /// Unique phrases already in memory (or restored from disk).
     pub cached: usize,
     pub computed: usize,
     pub micro_batches: usize,
-    /// Vectors that came back from disk on this call.
     pub restored: usize,
-    /// Computed vectors that did not fit under `max_entries`.
     pub not_stored: usize,
     pub elapsed_ms: f64,
 }
 
-/// Counters over the whole life of a bank.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BankStats {
     pub entries: usize,
@@ -158,19 +116,16 @@ struct Inner {
     disk_repaired: u64,
 }
 
-/// Phrase vectors, deduplicated and cached per model.
 pub struct PhraseBank {
     inner: Mutex<Inner>,
     dir: Option<PathBuf>,
 }
 
 impl PhraseBank {
-    /// A bank that lives in memory only.
     pub fn memory() -> Self {
         PhraseBank { inner: Mutex::new(Inner::default()), dir: None }
     }
 
-    /// A bank that checkpoints new vectors under `dir`, one file per space.
     pub fn open(dir: impl Into<PathBuf>) -> Self {
         PhraseBank { inner: Mutex::new(Inner::default()), dir: Some(dir.into()) }
     }
@@ -183,12 +138,10 @@ impl PhraseBank {
         self.dir.as_ref().map(|d| d.join(format!("{space:016x}.bin")))
     }
 
-    /// Phrases are keyed by their trimmed text with runs of whitespace collapsed.
     pub fn key_of(text: &str) -> String {
         text.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
-    /// Embeds `texts` and returns one vector per input, in input order.
     pub fn embed(
         &self,
         embedder: &dyn TextEmbedder,
@@ -200,7 +153,6 @@ impl PhraseBank {
         let dim = embedder.embedding_dim();
         let mut run = BankRun { requested: texts.len(), ..Default::default() };
 
-        // 1. Deduplicate while keeping first-seen order.
         let mut unique: Vec<String> = Vec::new();
         let mut slot: HashMap<String, usize> = HashMap::new();
         let mut order: Vec<usize> = Vec::with_capacity(texts.len());
@@ -215,7 +167,6 @@ impl PhraseBank {
         }
         run.unique = unique.len();
 
-        // 2. Restore the space from disk once, then look everything up.
         run.restored = self.restore(space, dim);
         let mut vectors: Vec<Option<Arc<[f32]>>> = vec![None; unique.len()];
         {
@@ -239,15 +190,11 @@ impl PhraseBank {
         }
         run.cached = vectors.iter().filter(|v| v.is_some()).count();
 
-        // 3. Compute the missing phrases: shortest first, micro-batches sized by length.
         let mut missing: Vec<usize> = (0..unique.len()).filter(|&i| vectors[i].is_none()).collect();
         missing.sort_by_key(|&i| (unique[i].chars().count(), i));
         let mut fresh: Vec<(String, Arc<[f32]>)> = Vec::new();
         let mut at = 0;
         while at < missing.len() {
-            // Lengths ascend, so the row budget only shrinks as a batch grows:
-            // a candidate joins while the batch (with it) still fits the budget
-            // set by the candidate's own length.
             let mut end = at + 1;
             while end < missing.len()
                 && end - at + 1 <= opts.rows_for(unique[missing[end]].chars().count())
@@ -279,7 +226,6 @@ impl PhraseBank {
         }
         run.computed = fresh.len();
 
-        // 4. Store and checkpoint the new vectors.
         if !fresh.is_empty() {
             let mut stored: Vec<(String, Arc<[f32]>)> = Vec::new();
             {
@@ -296,7 +242,6 @@ impl PhraseBank {
                 }
             }
             if let Some(path) = self.path_of(space) {
-                // A failed checkpoint only costs a recompute next start.
                 let _ = append_records(&path, &stored);
             }
         }
@@ -309,7 +254,6 @@ impl PhraseBank {
         Ok((out, run))
     }
 
-    /// Reads this space's file once. Returns how many vectors it brought back.
     fn restore(&self, space: u64, dim: usize) -> usize {
         {
             let mut g = self.lock();
@@ -325,7 +269,6 @@ impl PhraseBank {
         let (records, good_len, broken) = read_records(&path);
         let mut repaired = false;
         if broken {
-            // Keep the intact prefix: rewrite the file without the torn tail.
             repaired = rewrite_prefix(&path, good_len).is_ok();
         }
         let mut g = self.lock();
@@ -355,7 +298,6 @@ impl PhraseBank {
         }
     }
 
-    /// Whether every phrase is already cached for `embedder`.
     pub fn all_cached(&self, embedder: &dyn TextEmbedder, texts: &[String]) -> bool {
         let space = space_id(embedder.fingerprint(), FORWARD_TAG_TEXT);
         self.restore(space, embedder.embedding_dim());
@@ -366,7 +308,6 @@ impl PhraseBank {
         }
     }
 
-    /// Drops every cached vector and deletes the checkpoint files.
     pub fn clear(&self) {
         let mut g = self.lock();
         g.spaces.clear();
@@ -383,13 +324,6 @@ impl PhraseBank {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Checkpoint file: append-only, one checksummed record per phrase.
-//   head:   magic "HPHR" u32 | version u32 | 0 u64
-//   record: text length u32 | text UTF-8 | dim u32 | f32 * dim | checksum u64
-// The checksum is FNV-1a over the text bytes and the vector bytes.
-// ---------------------------------------------------------------------------
 
 const DISK_MAGIC: u32 = 0x4850_4852;
 const DISK_VERSION: u32 = 1;
@@ -426,8 +360,6 @@ fn encode_records(items: &[(String, Arc<[f32]>)]) -> Vec<u8> {
     buf
 }
 
-/// Intact records of a checkpoint file, the byte length of the intact prefix,
-/// and whether anything after that prefix was damaged or cut off.
 pub fn read_records(path: &Path) -> (Vec<(String, Vec<f32>)>, usize, bool) {
     let buf = match std::fs::read(path) {
         Ok(b) => b,
@@ -508,7 +440,6 @@ fn append_records(path: &Path, items: &[(String, Arc<[f32]>)]) -> std::io::Resul
     f.write_all(&buf)
 }
 
-/// Keeps only the first `len` bytes of the file (atomically, via a temp file).
 fn rewrite_prefix(path: &Path, len: usize) -> std::io::Result<()> {
     let buf = std::fs::read(path)?;
     let keep = if len >= DISK_HEAD { buf[..len.min(buf.len())].to_vec() } else { disk_head() };
@@ -517,18 +448,12 @@ fn rewrite_prefix(path: &Path, len: usize) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-// ---------------------------------------------------------------------------
-// Frame tiles
-// ---------------------------------------------------------------------------
-
-/// A rectangle of a frame, in pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tile {
     pub x: u32,
     pub y: u32,
     pub w: u32,
     pub h: u32,
-    /// Which layout level produced this tile: 0 is the whole frame.
     pub level: u8,
 }
 
@@ -542,9 +467,6 @@ impl Tile {
     }
 }
 
-/// Tiles for a frame: the whole frame first, then one grid per entry of
-/// `grids` (`(columns, rows)`), each tile grown by `overlap` (a fraction of
-/// its size) on every side and clamped to the frame.
 pub fn tile_layout(width: u32, height: u32, grids: &[(u32, u32)], overlap: f32) -> Vec<Tile> {
     let mut tiles = vec![Tile { x: 0, y: 0, w: width, h: height, level: 0 }];
     for (level, &(cols, rows)) in grids.iter().enumerate() {
@@ -570,7 +492,6 @@ pub fn tile_layout(width: u32, height: u32, grids: &[(u32, u32)], overlap: f32) 
     tiles
 }
 
-/// Crops every tile out of `image`, in parallel.
 pub fn crop_tiles(image: &DynamicImage, tiles: &[Tile]) -> Vec<DynamicImage> {
     let (iw, ih) = image.dimensions();
     tiles
@@ -583,8 +504,6 @@ pub fn crop_tiles(image: &DynamicImage, tiles: &[Tile]) -> Vec<DynamicImage> {
         .collect()
 }
 
-/// Embeds all tiles of all `frames` through one embedder call, so the
-/// embedder can batch across frames. Returns the per-frame tile vectors.
 pub fn embed_frame_tiles(
     embedder: &dyn ImageEmbedder,
     frames: &[(&DynamicImage, &[Tile])],
@@ -604,13 +523,6 @@ pub fn embed_frame_tiles(
         .collect())
 }
 
-// ---------------------------------------------------------------------------
-// Scoring
-// ---------------------------------------------------------------------------
-
-/// Cosine similarity between every row of `rows` and every vector of
-/// `columns`, row-major `rows.len() x columns.len()`. Vectors are assumed to be
-/// unit length, so this is a dot product. Rows are scored in parallel.
 pub fn cosine_matrix(rows: &[Vec<f32>], columns: &[Arc<[f32]>]) -> Vec<f32> {
     let n = columns.len();
     let mut out = vec![0.0f32; rows.len() * n];
@@ -627,7 +539,6 @@ pub(crate) mod testing {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Deterministic stand-in: a unit vector derived from the text hash.
     pub struct HashEmbedder {
         pub dim: usize,
         pub fingerprint: u64,
@@ -827,7 +738,7 @@ mod tests {
 
         let file = std::fs::read_dir(&dir).unwrap().flatten().next().unwrap().path();
         let mut bytes = std::fs::read(&file).unwrap();
-        bytes.truncate(bytes.len() - 5); // cut the last record in the middle
+        bytes.truncate(bytes.len() - 5);
         std::fs::write(&file, &bytes).unwrap();
 
         let e2 = HashEmbedder::new(8, 7);
@@ -836,7 +747,6 @@ mod tests {
         assert_eq!(run.restored, 2);
         assert_eq!(run.computed, 1, "only the damaged record is recomputed");
         assert_eq!(again.stats().disk_repaired, 1);
-        // The repaired file now holds all three records and no damage.
         let (recs, _, broken) = read_records(&file);
         assert_eq!(recs.len(), 3);
         assert!(!broken);
@@ -852,7 +762,7 @@ mod tests {
         drop(bank);
         let file = std::fs::read_dir(&dir).unwrap().flatten().next().unwrap().path();
         let mut bytes = std::fs::read(&file).unwrap();
-        let last = bytes.len() - 12; // inside the last vector
+        let last = bytes.len() - 12;
         bytes[last] ^= 0xFF;
         std::fs::write(&file, &bytes).unwrap();
         let (recs, _, broken) = read_records(&file);
@@ -894,9 +804,7 @@ mod tests {
             assert!(t.x + t.w <= 384 && t.y + t.h <= 256, "{t:?}");
             assert!(t.w >= 4 && t.h >= 4);
         }
-        // Neighbouring tiles overlap.
         assert!(tiles[1].x + tiles[1].w > tiles[2].x);
-        // A 1x1 grid adds nothing beyond the whole frame.
         assert_eq!(tile_layout(100, 100, &[(1, 1)], 0.0).len(), 1);
     }
 

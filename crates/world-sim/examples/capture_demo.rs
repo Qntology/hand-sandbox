@@ -1,5 +1,3 @@
-//! Writes a first-person WebP screenshot, a top-down map and prints timings.
-//! Usage: cargo run --release -p world-sim --example capture_demo -- <out_dir> [seed]
 use std::time::Instant;
 
 use noto_core::{BaseKind, FingerCount, NotoConfig};
@@ -11,7 +9,6 @@ fn main() {
     let mut noto = NotoConfig::preset(FingerCount::Five);
     noto.base = BaseKind::Track;
     let mut w = World::new(WorldConfig { seed, cells: 64, noto, ..WorldConfig::default() }).unwrap();
-    // Look at the nearest node.
     let n = w
         .nodes
         .iter()

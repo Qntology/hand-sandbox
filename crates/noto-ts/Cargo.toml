@@ -7,7 +7,6 @@ description = "Time-series forecasting for score histories: Granite TTM-R3 on ca
 
 [features]
 default = ["granite"]
-# Granite TTM-R3 forecaster (needs candle). Without it only the statistical predictors are built.
 granite = ["dep:candle-core", "dep:candle-nn"]
 
 [dependencies]

@@ -1,9 +1,5 @@
-//! The synthetic data layers the dataset is planned around, and how far each
-//! one is from being recorded by the current simulator.
-
 use serde::{Deserialize, Serialize};
 
-/// Top-level grouping used by the plan (vision, tactile, material).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Group {
@@ -12,15 +8,11 @@ pub enum Group {
     MaterialDynamics,
 }
 
-/// Where a layer stands in the simulator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Readiness {
-    /// Recorded by the current simulator.
     Now,
-    /// Needs a small extension of existing geometry or kinematics.
     Next,
-    /// Needs a renderer or a sensor model that does not exist yet.
     Planned,
 }
 
@@ -81,7 +73,6 @@ impl Layer {
         }
     }
 
-    /// Lance table that stores this layer.
     pub fn table(self) -> &'static str {
         match self {
             Layer::Rgb | Layer::Depth | Layer::Segmentation => "vision",
@@ -93,7 +84,6 @@ impl Layer {
         }
     }
 
-    /// Name shown in the plan, following the Korean source list.
     pub fn name_ko(self) -> &'static str {
         match self {
             Layer::Rgb => "RGB 이미지 (조명·그림자·질감 도메인 무작위화)",
@@ -110,7 +100,6 @@ impl Layer {
         }
     }
 
-    /// What the current code does for this layer, or what is missing.
     pub fn status_note(self) -> &'static str {
         match self {
             Layer::Rgb => "렌더러 필요. 조명·그림자·텍스처 무작위화 포함",

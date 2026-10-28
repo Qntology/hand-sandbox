@@ -1,15 +1,3 @@
-//! The model files the app does not run without: SigLIP2 (recognition and the
-//! command embedder), Granite TTM-R3 (forecasts), TIPSv2-B/14 DPT (depth) and
-//! MobileSAM (masks).
-//!
-//! Each model comes from one pinned Hugging Face commit. A file streams to
-//! `<name>.part` (an interrupted download resumes with an HTTP range), is
-//! checked against the size and SHA-256 listed for that commit, and only then
-//! takes its final name, so a half-written file never looks like a model. The
-//! UI polls [`models_catalog`] for progress; [`models_activate`] loads all
-//! four onto the selected device, and the world commands refuse to run until
-//! it has ([`AppState::require_models`]).
-
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -31,18 +19,14 @@ type App<'a> = State<'a, Arc<AppState>>;
 pub struct FileSpec {
     pub name: &'static str,
     pub bytes: u64,
-    /// SHA-256 of the file at [`ModelSpec::revision`] (the LFS object id for
-    /// the weights; hashed here for the small JSON files).
     pub sha256: &'static str,
 }
 
 pub struct ModelSpec {
     pub id: &'static str,
     pub label: &'static str,
-    /// What the simulator uses it for.
     pub role_ko: &'static str,
     pub repo: &'static str,
-    /// The commit the files are read from: a branch can move, a commit cannot.
     pub revision: &'static str,
     pub license: &'static str,
     pub files: &'static [FileSpec],
@@ -67,7 +51,6 @@ pub const MODELS: [ModelSpec; 4] = [
         label: "Granite TTM-R3 (52-16)",
         role_ko: "시계열 예측 (정밀도 게이트)",
         repo: "ibm-granite/granite-timeseries-ttm-r3",
-        // Branch 52-16-dec-52-r3: 52 points of context, 16 of forecast.
         revision: "7d99b7e35b3dc18f9db3b2b73cc9699dea6c9508",
         license: "Apache-2.0",
         files: &[
@@ -102,7 +85,6 @@ pub fn spec(id: &str) -> Option<&'static ModelSpec> {
     MODELS.iter().find(|m| m.id == id)
 }
 
-/// Where a model's files go (and are read from).
 pub fn folder(id: &str) -> PathBuf {
     match id {
         "siglip2" => model_dir().unwrap_or_default(),
@@ -116,7 +98,6 @@ fn part_path(dir: &Path, f: &FileSpec) -> PathBuf {
     dir.join(format!("{}.part", f.name))
 }
 
-/// Bytes of a file on disk and whether it is complete (final name, listed size).
 fn file_state(dir: &Path, f: &FileSpec) -> (u64, bool) {
     if fs::metadata(dir.join(f.name)).is_ok_and(|m| m.len() == f.bytes) {
         return (f.bytes, true);
@@ -124,8 +105,6 @@ fn file_state(dir: &Path, f: &FileSpec) -> (u64, bool) {
     (fs::metadata(part_path(dir, f)).map_or(0, |m| m.len().min(f.bytes)), false)
 }
 
-/// Whether the loader will find the model. SAM also takes the ViT-B file
-/// when that is what the folder has.
 pub fn present(m: &ModelSpec) -> bool {
     match m.id {
         "sam" => noto_vision::SamModel::find_weights(&sam_dir()).is_some(),
@@ -133,20 +112,16 @@ pub fn present(m: &ModelSpec) -> bool {
     }
 }
 
-/// Models whose files are missing.
 pub fn missing() -> Vec<&'static ModelSpec> {
     MODELS.iter().filter(|m| !present(m)).collect()
 }
 
-/// The download in progress (or the last one), for the UI.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Progress {
     pub running: bool,
     pub model: Option<String>,
     pub file: Option<String>,
-    /// `download`, `verify`, `done`, `cancelled` or `error`.
     pub phase: String,
-    /// Bytes of the whole job: on disk now and to have at the end.
     pub done: u64,
     pub total: u64,
     pub rate_bps: f64,
@@ -183,7 +158,6 @@ impl Downloads {
 
 const CANCELLED: &str = "취소됨";
 
-/// Downloads every missing file of the models in `ids`, one file after another.
 async fn run(dl: Arc<Downloads>, ids: Vec<&'static ModelSpec>) {
     let client = match reqwest::Client::builder().user_agent(concat!("noto-sim-app/", env!("CARGO_PKG_VERSION"))).build() {
         Ok(c) => c,
@@ -241,7 +215,6 @@ async fn run(dl: Arc<Downloads>, ids: Vec<&'static ModelSpec>) {
     });
 }
 
-/// Download rate, smoothed over about two seconds.
 struct Meter {
     t: Instant,
     last: u64,
@@ -266,8 +239,6 @@ impl Meter {
     }
 }
 
-/// One file: resume the `.part`, stream the rest, check the size and the
-/// hash, take the final name. `on_bytes` gets the bytes of this file on disk.
 async fn fetch(client: &reqwest::Client, dl: &Downloads, m: &ModelSpec, f: &FileSpec, dir: &Path, mut on_bytes: impl FnMut(u64)) -> Result<()> {
     fs::create_dir_all(dir).with_context(|| format!("폴더 {}를 만들 수 없습니다", dir.display()))?;
     let part = part_path(dir, f);
@@ -291,7 +262,6 @@ async fn fetch(client: &reqwest::Client, dl: &Downloads, m: &ModelSpec, f: &File
         let mut out = if have > 0 && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
             OpenOptions::new().append(true).open(&part)?
         } else {
-            // The server sent the whole file (or this is the first try): start over.
             have = 0;
             hasher = Sha256::new();
             File::create(&part)?
@@ -347,7 +317,6 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-/// What the model list in the UI shows.
 fn catalog(state: &AppState) -> Value {
     let models: Vec<Value> = MODELS
         .iter()
@@ -389,8 +358,6 @@ pub async fn models_catalog(state: App<'_>) -> Result<Value, String> {
     Ok(catalog(&state))
 }
 
-/// Starts downloading the missing files of `ids` (all models when empty) and
-/// returns at once; the UI follows [`models_catalog`].
 #[tauri::command]
 pub async fn models_download(state: App<'_>, ids: Option<Vec<String>>) -> Result<Value, String> {
     let dl = Arc::clone(&state.downloads);
@@ -413,16 +380,12 @@ pub async fn models_download(state: App<'_>, ids: Option<Vec<String>>) -> Result
     Ok(catalog(&state))
 }
 
-/// Stops the download after the chunk in flight; the `.part` stays for a resume.
 #[tauri::command]
 pub async fn models_cancel(state: App<'_>) -> Result<Value, String> {
     state.downloads.cancel.store(true, Ordering::Relaxed);
     Ok(catalog(&state))
 }
 
-/// Deletes a model's files (and an unfinished `.part`). The runtime goes back
-/// to its stand-in for that model first, and the world stops until the model
-/// is downloaded and loaded again.
 #[tauri::command]
 pub async fn models_delete(state: App<'_>, id: String) -> Result<Value, String> {
     let m = spec(&id).ok_or_else(|| format!("모르는 모델 {id}"))?;
@@ -454,7 +417,6 @@ pub async fn models_delete(state: App<'_>, id: String) -> Result<Value, String> 
                 }
             }
         }
-        // The folder goes too when nothing else is in it.
         if fs::read_dir(&dir).is_ok_and(|mut d| d.next().is_none()) {
             let _ = fs::remove_dir(&dir);
         }
@@ -466,10 +428,6 @@ pub async fn models_delete(state: App<'_>, id: String) -> Result<Value, String> 
     .map_err(|e| e.to_string())?
 }
 
-/// Loads all four models onto the selected device and attaches them to the
-/// world: SigLIP2 as the recogniser, the semantic locator and the command
-/// embedder; TTM in the forecasts; TIPS as the depth model; SAM as the mask
-/// tracker. Fails, naming the model, when a file is missing or a load fails.
 #[tauri::command]
 pub async fn models_activate(state: App<'_>) -> Result<Value, String> {
     let shared: Arc<AppState> = state.inner().clone();
@@ -486,8 +444,6 @@ pub async fn models_activate(state: App<'_>) -> Result<Value, String> {
     .map_err(|e| e.to_string())?
 }
 
-/// A note when the models run on the CPU of a PC that has an NVIDIA GPU this
-/// build cannot use (built without the `cuda` feature).
 fn gpu_hint(state: &AppState) -> Option<String> {
     let (backend, _) = state.selected();
     if backend != noto_ml::Backend::Cpu {
@@ -506,7 +462,6 @@ fn activate(state: &Arc<AppState>) -> Result<(), String> {
     if !gone.is_empty() {
         return Err(format!("모델 파일이 없습니다: {}. 먼저 받으세요", gone.iter().map(|m| m.label).collect::<Vec<_>>().join(", ")));
     }
-    // A GPU, when there is one, takes all four models.
     state.prefer_gpu();
     let step = |id: &str, f: &mut dyn FnMut() -> Result<()>| -> Result<(), String> {
         state.set_loading(Some(id));
@@ -536,7 +491,6 @@ fn activate(state: &Arc<AppState>) -> Result<(), String> {
     Ok(())
 }
 
-/// Message for a world command refused because the models are not loaded.
 pub fn not_ready_message() -> String {
     let gone = missing();
     if gone.is_empty() {
@@ -573,16 +527,11 @@ mod tests {
         assert_eq!(file_state(&dir, &f), (4, false));
         fs::write(dir.join("w.bin"), [0u8; 10]).unwrap();
         assert_eq!(file_state(&dir, &f), (10, true));
-        // A final file of the wrong size is not a model.
         fs::write(dir.join("w.bin"), [0u8; 9]).unwrap();
         assert_eq!(file_state(&dir, &f), (4, false));
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Downloads what is missing (from Hugging Face), loads all four models
-    /// on the start-up device, and runs the depth model and a scan with them.
-    /// Needs the network and about 2.2 GB of disk the first time:
-    /// `cargo test -p noto-sim-app --lib -- --ignored --nocapture all_models`.
     #[test]
     #[ignore]
     fn all_models_download_load_and_run() {
@@ -614,7 +563,6 @@ mod tests {
         let live = state.live_devices();
         println!("[MODELS] loaded on {:?} in {:.1} s · {live:?}", state.selected(), t0.elapsed().as_secs_f32());
         assert!(state.models_ready());
-        // With a GPU in the build that opens, every model is on it.
         if noto_ml::device::select(None).backend != noto_ml::Backend::Cpu && std::env::var(noto_ml::device::DEVICE_ENV).map_or(true, |v| !v.eq_ignore_ascii_case("cpu")) {
             assert!(live.values().all(|d| !d.starts_with("CPU") && d != "cpu"), "a model is not on the GPU: {live:?}");
         }

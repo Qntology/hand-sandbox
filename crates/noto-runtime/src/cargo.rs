@@ -1,24 +1,3 @@
-//! The cargo decision: what to do with a piece the robot is about to pick up.
-//!
-//! The structure follows the decision model of endmill-sandbox
-//! (`src/decision.rs`): deterministic gates, each with a value, a limit, a
-//! severity (0 pass, 1 watch, 2 over, 3 critical) and the action it asks for;
-//! the rule action is the most conservative action among the gates of the
-//! worst severity. A planning step then looks for the cheapest way that
-//! passes every gate:
-//!
-//! 1. **take** the whole piece;
-//! 2. **shuttle**: the arms and the hand could take it, but the bay is full
-//!    of this quest's cargo — carry that to the destination, come back;
-//! 3. **split**: the piece is too heavy for the arms, the hand or the empty
-//!    bay — break it (stone, coal and ore are brittle) and take the largest
-//!    part that passes, halving down to [`MIN_PIECE`];
-//! 4. **refuse**, with the gate that blocks it.
-//!
-//! Every gate value comes from the physics the world already runs (the grasp
-//! test, `Body::lift`, the drive limits for the load, the route for the
-//! loaded base); nothing here is tuned to a scenario.
-
 use noto_core::balance::{FeedForward, Source};
 use serde::Serialize;
 use world_sim::kinds::MIN_PIECE;
@@ -36,7 +15,6 @@ pub enum CargoAction {
 }
 
 impl CargoAction {
-    /// Order of caution, as endmill's `Action::conservativeness`.
     pub fn conservativeness(&self) -> u8 {
         match self {
             CargoAction::Take => 0,
@@ -83,32 +61,22 @@ impl CargoGate {
     }
 }
 
-/// What the task knows that the world does not.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CargoCtx {
-    /// Mass in the bay that belongs to this quest (what a trip would deliver), kg.
     pub quest_cargo_kg: f32,
-    /// Where a trip would go; `None` for a quest that keeps its items.
     pub destination: Option<(f32, f32)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct CargoDecision {
     pub item: String,
-    /// Items in the piece.
     pub amount: f32,
-    /// Gates of the whole piece as it lies.
     pub gates: Vec<CargoGate>,
-    /// The rule action of those gates (the most conservative of the worst).
     pub rule_action: CargoAction,
-    /// What the planning step chose.
     pub action: CargoAction,
-    /// Share of the piece to take (1 for take and shuttle).
     pub portion: f32,
-    /// Messages of the gates at severity 2 or more.
     pub reasons: Vec<String>,
     pub summary_ko: String,
-    /// Stable failure code for `Refuse` (`lift_overload`, `grasp_unstable`, `capacity_exceeded`, `route_loaded`).
     pub code: Option<&'static str>,
 }
 
@@ -116,20 +84,16 @@ fn gate(id: &'static str, label_ko: &'static str, value: f32, limit: f32, unit: 
     CargoGate { id, label_ko, value, limit, unit, severity, action, message }
 }
 
-/// The gates for taking `amount` items of the piece with `cargo_kg` already in the bay.
 fn gates_for(w: &World, d: &DropItem, amount: f32, cargo_kg: f32, ctx: &CargoCtx) -> Vec<CargoGate> {
     let spec = d.kind.spec();
     let kg = spec.mass_kg * amount;
     let split = if spec.divisible { CargoAction::Split { portion: 0.5 } } else { CargoAction::Refuse };
     let mut out = Vec::new();
-    // 1. The hands: the fingers' friction from above over the force needed (safety factor in);
-    //    a piece one hand cannot hold is held by both, sharing it.
     let g = w.grasp_for(d.kind, amount);
     let both = 2.0 * g.margin;
     let sev = if both < 1.0 { 3 } else if g.margin < 1.2 { 1 } else { 0 };
     let how = if g.stable { String::new() } else if both >= 1.0 { format!(" · 두 손이면 {both:.2}") } else { String::new() };
     out.push(gate("grip", "손 마찰", if g.stable { g.margin } else { both }, 1.0, "×", sev, if sev >= 2 { split } else { CargoAction::Take }, format!("마찰 용량 / 필요 힘 {:.2}{how} ({} {} kg)", g.margin, spec.label_ko, fmt_kg(kg))));
-    // 2. The arms and the balance while lifting (one arm, else both).
     let ff = FeedForward { enabled: w.ff_enabled, gain: w.ff_gains.get(&Source::ArmLift).copied().unwrap_or(1.0) };
     let (rep, two) = w.body.lift(kg, cargo_kg, &ff, w.grip_capacity_for(d.kind, amount));
     let worst = rep.worst().map_or(0.0, |j| j.peak_ratio);
@@ -152,7 +116,6 @@ fn gates_for(w: &World, d: &DropItem, amount: f32, cargo_kg: f32, ctx: &CargoCtx
             rep.limiting.as_ref().filter(|_| !rep.feasible).map(|l| format!(" · 한계 {l}")).unwrap_or_default()
         ),
     ));
-    // 3. The bay: what the legs or the chassis carry continuously.
     let cap = w.capacity_kg();
     let total = cargo_kg + kg;
     let foreign = (cargo_kg - ctx.quest_cargo_kg).max(0.0);
@@ -166,7 +129,6 @@ fn gates_for(w: &World, d: &DropItem, amount: f32, cargo_kg: f32, ctx: &CargoCtx
         (3, CargoAction::Refuse)
     };
     out.push(gate("capacity", "적재 한도", total, cap, "kg", sev, act, format!("실은 {} + {} kg / 한도 {} kg{}", fmt_kg(cargo_kg), fmt_kg(kg), fmt_kg(cap), if foreign > 1e-3 { format!(" (이 퀘스트와 무관한 짐 {} kg)", fmt_kg(foreign)) } else { String::new() })));
-    // 4. The way back with this load: the loaded base must still get to the destination.
     if let Some((x, z)) = ctx.destination {
         let empty = w.plan_route(Goal::Within { x, z, reach_m: 1.1 }).is_some();
         if empty {
@@ -186,7 +148,6 @@ fn fmt_kg(kg: f32) -> String {
     format!("{kg:.1}")
 }
 
-/// The rule action of a gate list: the most conservative action among the worst gates.
 pub fn rule_action(gates: &[CargoGate]) -> CargoAction {
     let worst = gates.iter().map(|g| g.severity).max().unwrap_or(0);
     if worst < 2 {
@@ -195,7 +156,6 @@ pub fn rule_action(gates: &[CargoGate]) -> CargoAction {
     gates.iter().filter(|g| g.severity == worst).map(|g| g.action).max_by_key(|a| a.conservativeness()).unwrap_or(CargoAction::Take)
 }
 
-/// Decides what to do with piece `d`.
 pub fn decide(w: &World, d: &DropItem, ctx: &CargoCtx) -> CargoDecision {
     let cargo = w.carried_kg();
     let gates = gates_for(w, d, d.amount, cargo, ctx);
@@ -209,14 +169,12 @@ pub fn decide(w: &World, d: &DropItem, ctx: &CargoCtx) -> CargoDecision {
         return out;
     }
     let passes = |gs: &[CargoGate]| gs.iter().all(|g| g.passed());
-    // The whole piece passes with an empty bay of this quest's cargo: make a trip first.
     let foreign = (cargo - ctx.quest_cargo_kg).max(0.0);
     if ctx.destination.is_some() && ctx.quest_cargo_kg > AMOUNT_EPS && passes(&gates_for(w, d, d.amount, foreign, ctx)) {
         out.action = CargoAction::Shuttle;
         out.summary_ko = format!("{name} {}개를 더 실을 수 없어 먼저 실은 짐을 운반하고 돌아옵니다", amount_text(d.amount));
         return out;
     }
-    // Too heavy for the arms, the hand or the empty bay: break it.
     let blocked_by_foreign = gates.iter().any(|g| g.id == "capacity" && g.severity >= 2 && g.action == CargoAction::Refuse);
     if spec.divisible && !blocked_by_foreign {
         let mut portion = 0.5f32;
@@ -228,7 +186,6 @@ pub fn decide(w: &World, d: &DropItem, ctx: &CargoCtx) -> CargoDecision {
                 out.summary_ko = format!("{name} {}개는 {} — 쪼개서 {:.0}%({} kg)만 들고 나릅니다", amount_text(d.amount), gates.iter().filter(|g| g.severity >= 2).map(|g| g.label_ko).collect::<Vec<_>>().join("·") + " 초과", portion * 100.0, fmt_kg(spec.mass_kg * part));
                 return out;
             }
-            // A part that would pass with an empty bay: carry this quest's cargo first.
             if ctx.destination.is_some() && ctx.quest_cargo_kg > AMOUNT_EPS && passes(&gates_for(w, d, part, foreign, ctx)) {
                 out.action = CargoAction::Shuttle;
                 out.summary_ko = format!("{name}을(를) 쪼개도 지금은 실을 자리가 없어 먼저 운반하고 돌아옵니다");
@@ -297,14 +254,12 @@ mod tests {
         let mut w = world(BodyPlan::default(), BaseKind::Track, FingerCount::Five);
         let cap = w.capacity_kg();
         let log = ItemKind::Log.spec().mass_kg;
-        // As many logs as fit: one more does not.
         let n = (cap / log).floor();
         assert!(n >= 1.0, "a tracked mid robot carries a log ({cap} kg)");
         w.agent.carried.push((ItemKind::Log, n));
         let dest = Some((w.waypoints[1].x, w.waypoints[1].z));
         let d = decide(&w, &piece(&w, ItemKind::Log, 1.0), &CargoCtx { quest_cargo_kg: n * log, destination: dest });
         assert_eq!(d.action, CargoAction::Shuttle, "{d:?}");
-        // The same bay holding someone else's cargo: nothing to deliver, so no trip.
         let d = decide(&w, &piece(&w, ItemKind::Log, 1.0), &CargoCtx { quest_cargo_kg: 0.0, destination: dest });
         assert_eq!(d.action, CargoAction::Refuse);
         assert_eq!(d.code, Some("capacity_exceeded"));

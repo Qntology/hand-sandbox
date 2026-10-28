@@ -1,16 +1,9 @@
-//! Screenshots as WebP.
-//!
-//! Lossy frames go through libwebp (the `webp` crate); the pure-Rust encoder in
-//! `image` is lossless only. A quality of 100 or more selects lossless output.
-//! Decoding uses `image`, so the round trip works without libwebp's decoder.
-
 use std::io::Cursor;
 use std::time::Instant;
 
 use image::codecs::webp::WebPEncoder;
 use image::{ExtendedColorType, ImageFormat, ImageReader};
 
-/// An encoded screenshot with the numbers worth logging.
 #[derive(Clone, Debug)]
 pub struct Encoded {
     pub bytes: Vec<u8>,
@@ -22,13 +15,11 @@ pub struct Encoded {
 }
 
 impl Encoded {
-    /// Bytes of the raw RGB frame divided by the encoded size.
     pub fn ratio(&self) -> f32 {
         (self.width as f32 * self.height as f32 * 3.0) / self.bytes.len().max(1) as f32
     }
 }
 
-/// Encodes an RGB8 frame. `quality` is 0..100; 100 or more means lossless.
 pub fn encode_webp(rgb: &[u8], width: u32, height: u32, quality: f32) -> Result<Encoded, String> {
     if rgb.len() != (width as usize) * (height as usize) * 3 {
         return Err(format!("expected {} bytes for {width}x{height} RGB, got {}", width * height * 3, rgb.len()));
@@ -58,7 +49,6 @@ pub fn encode_webp(rgb: &[u8], width: u32, height: u32, quality: f32) -> Result<
     })
 }
 
-/// Decodes a WebP file into `(width, height, rgb8)`.
 pub fn decode_webp(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
     let img = ImageReader::with_format(Cursor::new(bytes), ImageFormat::WebP)
         .decode()
@@ -68,8 +58,6 @@ pub fn decode_webp(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
     Ok((w, h, img.into_raw()))
 }
 
-/// Peak signal-to-noise ratio in dB between two same-size RGB8 buffers.
-/// Identical buffers give `f32::INFINITY`.
 pub fn psnr(a: &[u8], b: &[u8]) -> f32 {
     assert_eq!(a.len(), b.len(), "buffers must have the same size");
     let mse: f64 = a.iter().zip(b).map(|(&x, &y)| (x as f64 - y as f64).powi(2)).sum::<f64>() / a.len().max(1) as f64;

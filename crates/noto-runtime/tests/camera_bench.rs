@@ -1,21 +1,9 @@
-//! Head-camera benchmark: how the robot's camera shakes against what people's
-//! heads and other robots' chassis measured (research `docs/research/camera.md`
-//! §7, group B). None of these sources is an engine input
-//! (`the_engine_never_names_a_camera_benchmark_source` checks the engine's
-//! files), and no engine constant is set from them. The lines it prints are
-//! `[CAM]` cells and `[CAM-SUM]` scenarios, scored as the other benchmarks:
-//! `like` scores `100 − 10·|z|` against a reference and its spread, a `raw`
-//! cell is recorded only. The references and cells live in `camvx/cam.rs`
-//! (shared with the cross-area report `uncanny_runtime.rs`).
-
 mod camvx;
 
 use camvx::{cam, print_scenario};
 
 #[test]
 fn camera_benchmark_prints_its_cells() {
-    // C1: a mid wheeled base's chassis on the three grounds; C2: the heel
-    // strike on grass against a hard floor, mid legs at a walk (`camvx::cam`).
     let s1 = print_scenario("CAM", &cam::c1());
     let s2 = print_scenario("CAM", &cam::c2());
     assert!(s1.is_finite() && s2.is_finite());

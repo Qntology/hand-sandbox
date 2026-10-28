@@ -1,8 +1,3 @@
-//! The runtime: one world, one robot, one set of gates, one SDS, one log.
-//!
-//! Nothing here depends on a UI. The Tauri commands (and the dev server in
-//! `examples/serve.rs`) call these methods and turn the results into JSON.
-
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -28,7 +23,6 @@ use crate::vision::{in_view, memory_ok, DriftRate, VisionMark};
 use world_sim::world::DELIVER_REACH_M;
 use noto_sds::{Scope, Track};
 
-/// What one scan saw and decided.
 #[derive(Clone, Debug, Serialize)]
 pub struct ScanReport {
     pub seq: u64,
@@ -48,15 +42,12 @@ impl ScanReport {
         self.judged.iter().filter(|j| j.accepted)
     }
 
-    /// Mean score of the accepted detections, if any.
     pub fn confidence(&self) -> Option<f32> {
         let v: Vec<f32> = self.accepted().map(|j| j.cand.score).collect();
         (!v.is_empty()).then(|| v.iter().sum::<f32>() / v.len() as f32)
     }
 }
 
-/// Counts against the renderer's ground truth. Only the stand-in recogniser
-/// can fill these in; a real recogniser leaves them at zero.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct EvalCounters {
     pub scans: u64,
@@ -64,7 +55,6 @@ pub struct EvalCounters {
     pub raw_correct: u64,
     pub accepted_total: u64,
     pub accepted_correct: u64,
-    /// Objects in view, summed over scans.
     pub truths: u64,
     pub truths_found_raw: u64,
     pub truths_found_accepted: u64,
@@ -112,19 +102,14 @@ impl EvalCounters {
     }
 }
 
-/// What the vision schedule did over the robot's quests (the benchmark reads it).
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct VisionStats {
-    /// Seconds spent approaching something remembered, and the looks taken meanwhile.
     pub approach_s: f64,
     pub approach_looks: u32,
-    /// Looks the schedule took in all (pattern, before acting, glances), and actions on memory alone.
     pub looks: u32,
     pub blind_acts: u32,
-    /// Picks tried from the side, and in all.
     pub side_picks: u32,
     pub picks: u32,
-    /// Aim error of the picks made on memory alone and of those just looked at, metres (the record's).
     pub memory_aim_m: Vec<f32>,
     pub seen_aim_m: Vec<f32>,
 }
@@ -136,7 +121,6 @@ pub struct Submission {
     pub quest_id: Option<String>,
     pub error: Option<String>,
     pub error_code: Option<String>,
-    /// `lexical` or `lexical+embedding`.
     pub mode: String,
     pub parsed: ParsedCommand,
 }
@@ -146,7 +130,6 @@ pub struct TsView {
     pub label: String,
     pub history: Vec<f64>,
     pub forecast: Option<Forecast>,
-    /// Labels that have a history, longest first.
     pub labels: Vec<(String, usize)>,
 }
 
@@ -158,14 +141,11 @@ pub struct Detection {
     pub margin: f32,
     pub accepted: bool,
     pub blocked_by: Option<String>,
-    /// Why it was accepted or held, in Korean.
     pub reason: String,
-    /// `[x0, y0, x1, y1]` as fractions of the frame.
     pub bbox: [f32; 4],
     pub landmark: Option<u32>,
 }
 
-/// What the depth model makes of the head camera's view now (`Runtime::depth_view`).
 pub struct DepthView {
     pub tick: u64,
     pub width: u32,
@@ -174,9 +154,7 @@ pub struct DepthView {
     pub device: String,
     pub infer_ms: f32,
     pub metrics: Option<noto_vision::DepthMetrics>,
-    /// Near and far ends of the colour scale of both maps, metres.
     pub scale_m: (f32, f32),
-    /// The farthest depth the model can report (TIPS: its last bin), metres.
     pub max_depth_m: Option<f32>,
     pub rgb_webp: Vec<u8>,
     pub pred_webp: Vec<u8>,
@@ -194,25 +172,15 @@ pub struct FrameOut {
     pub lossless: bool,
     pub tick: u64,
     pub detections: Vec<Detection>,
-    /// Joint markers, CoM, ZMP and support of the third-person view (pixels).
     pub overlay: Option<Value>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameView {
-    /// The robot's first-person camera.
     Agent,
-    /// A top-down map of the surroundings.
     Top,
-    /// Third person: a chase camera `orbit_deg` around the robot, with its
-    /// links and joints as the joint dynamics move them.
     Chase { orbit_deg: i16 },
-    /// A close-up on the part an action works with: the hand, the body from
-    /// the side (waist, neck, legs), or low by the feet, wheels or tracks.
     Focus(world_sim::render::FocusCam),
-    /// Third person, isometric (`views`): orthographic from the world-fixed
-    /// diagonal `az_step` (0..3), zoomed by `zoom_pct`/100, true isometric or
-    /// 2:1 dimetric, centred on the robot through a follow in simulated time.
     Iso { az_step: u8, zoom_pct: u16, dimetric: bool },
 }
 
@@ -230,7 +198,6 @@ impl Labels for WorldLabels<'_> {
     }
 }
 
-/// Korean name of a dictionary label.
 pub fn label_ko(world: &World, label: &str) -> String {
     if let Some(k) = NodeKind::ALL.into_iter().find(|k| k.id() == label) {
         return k.spec().label_ko.to_string();
@@ -244,31 +211,18 @@ pub fn label_ko(world: &World, label: &str) -> String {
     label.to_string()
 }
 
-/// Farthest a waypoint's flag is trusted to fix the robot's position, metres (est: the flag fills a few pixels there).
 pub(crate) const RELOCALIZE_RANGE_M: f32 = 8.0;
-/// Validation gate of a fix: a sighting whose squared innovation exceeds this
-/// many times its variance (the pose's and the sighting's) is not the flag the
-/// map has there (a misread one) and is left out: the 99% point of χ² with two
-/// degrees of freedom (the validation region of Bar-Shalom & Fortmann 1988,
-/// *Tracking and Data Association*).
 const FIX_GATE_CHI2: f32 = 9.21;
 
-/// A fix of the robot's pose a flag gave, and the stretch of odometry it
-/// corrects (from the fix before it to this one).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PoseFix {
     pub dx: f32,
     pub dz: f32,
-    /// The odometer at this fix and at the one before it.
     pub odo_m: f32,
     pub prev_odo_m: f32,
 }
 
 impl PoseFix {
-    /// The share of the fix a memory seen at odometer `odo` moves by: the
-    /// drift's variance it had taken in when it was seen over the variance at
-    /// the fix (all of it for what was seen just before the fix, none for
-    /// what was seen at or before the last one).
     pub fn share(&self, odo: f32, rate: DriftRate) -> f32 {
         if odo <= self.prev_odo_m {
             return 0.0;
@@ -277,7 +231,6 @@ impl PoseFix {
         (var(odo.min(self.odo_m) - self.prev_odo_m) / var(self.odo_m - self.prev_odo_m).max(1e-12)).clamp(0.0, 1.0)
     }
 
-    /// Where a memory seen at odometer `odo` lies after the fix.
     pub fn shift(&self, x: f32, z: f32, odo: f32, rate: DriftRate) -> (f32, f32) {
         let k = self.share(odo, rate);
         (x + k * self.dx, z + k * self.dz)
@@ -290,7 +243,6 @@ fn new_world(cfg: &RuntimeConfig) -> Result<World> {
 
 pub struct Runtime {
     pub cfg: RuntimeConfig,
-    /// Composite N:N phases scored as the quests produce them.
     pub(crate) nn_live: crate::nnlive::NnLive,
     pub(crate) world: World,
     pub(crate) cam: Camera,
@@ -303,17 +255,13 @@ pub struct Runtime {
     pub(crate) quests: QuestBook,
     pub(crate) task: Option<Task>,
     pub(crate) last_scan: Option<ScanReport>,
-    /// A fix of the pose a flag gave, for the next driver step (`apply_fix`).
     pub(crate) pending_fix: Option<PoseFix>,
     scan_seq: u64,
     last_device: String,
     pub(crate) eval: EvalCounters,
     last_flush_tick: u64,
-    /// Resource the running quest is after; only its landmarks are logged loudly.
     pub(crate) focus: Option<String>,
-    /// Test records: quest runs, ML keyframes, balance effort, success table.
     pub(crate) db: noto_sds::TestDb,
-    /// `game` (the quest driver decides) or `ml` (the ML logic decides).
     pub(crate) pass: String,
     pub(crate) run_id: String,
     pub(crate) session_id: String,
@@ -323,22 +271,16 @@ pub struct Runtime {
     pub(crate) ml_task: Option<crate::mldrive::MlTask>,
     pub(crate) test: Option<crate::testrun::TestSession>,
     pub test_cfg: crate::testrun::TestCfg,
-    /// Commands typed while a live recording runs, started one after another.
     pub(crate) live_queue: std::collections::VecDeque<String>,
-    /// What the vision schedule did (`vision`).
     pub(crate) vstats: VisionStats,
-    /// The isometric view's follow of the robot (`views`).
     pub(crate) iso: crate::views::IsoFollow,
 }
 
 impl Runtime {
-    /// A runtime over a fresh world. With `data_dir` the SDS ledgers and the
-    /// audit log are kept on disk under it.
     pub fn new(cfg: RuntimeConfig, lexicon_json: &str, data_dir: Option<&Path>) -> Result<Runtime> {
         let lex = Lexicon::from_json(lexicon_json)?;
         let recognizer: Box<dyn Recognizer> = Box::new(OraclePerception::new(&lex, cfg.noise.clone(), cfg.min_pixels));
         let mut ml = crate::ml::MlPipeline::stand_in(&lex, cfg.seed);
-        // The v1.0 path for real models, with the lexicon's prompt templates and background set.
         ml.prompting = noto_search::VisionPrompting::from_lexicon_json(lexicon_json)?;
         ml.fix = crate::ml::MlFixCfg::v1(&ml.prompting);
         let parser = Parser::new(lex);
@@ -397,13 +339,10 @@ impl Runtime {
         Ok(rt)
     }
 
-    // ----- plumbing -----
-
     pub(crate) fn log(&mut self, cat: &str, level: Level, msg: impl Into<String>, data: Option<Value>) {
         self.audit.log(cat, level, msg, data.map(tidy));
     }
 
-    /// A line in the `device` category, for things the host noticed (a folder it could not use).
     pub fn note_device(&mut self, msg: &str) {
         self.log("device", Level::Warn, msg, None);
     }
@@ -448,13 +387,10 @@ impl Runtime {
         }
     }
 
-    // ----- access -----
-
     pub fn world(&self) -> &World {
         &self.world
     }
 
-    /// For scenarios and tests that need to place things.
     pub fn world_mut(&mut self) -> &mut World {
         &mut self.world
     }
@@ -491,7 +427,6 @@ impl Runtime {
         &self.eval
     }
 
-    /// What the vision schedule did so far.
     pub fn vision_stats(&self) -> &VisionStats {
         &self.vstats
     }
@@ -512,9 +447,6 @@ impl Runtime {
         self.recognizer.mode()
     }
 
-    /// The parts that still run on a stand-in instead of their model
-    /// (`recognizer`, `locate`, `depth`, `track`, `ttm`); empty when every
-    /// model is attached.
     pub fn stand_ins(&self) -> Vec<&'static str> {
         let mut out = Vec::new();
         if self.recognizer.mode() == "oracle" {
@@ -539,12 +471,10 @@ impl Runtime {
         self.task.is_some() || self.ml_task.is_some() || self.quests.current_id().is_some()
     }
 
-    /// The ML pipeline (depth, semantic location, tracking).
     pub fn ml_pipeline(&self) -> &crate::ml::MlPipeline {
         &self.ml
     }
 
-    /// The ML pipeline, to switch its models or the v1.0 fixes (`MlPipeline::fix`).
     pub fn ml_pipeline_mut(&mut self) -> &mut crate::ml::MlPipeline {
         &mut self.ml
     }
@@ -557,12 +487,10 @@ impl Runtime {
         &mut self.db
     }
 
-    /// `game` or `ml`: who decides the running quest.
     pub fn pass(&self) -> &str {
         &self.pass
     }
 
-    /// Loads TIPSv2-B/14 DPT from `dir` as the ML depth model.
     pub fn use_tips(&mut self, dir: &Path, device: &candle_core::Device) -> Result<()> {
         let t0 = Instant::now();
         let m = noto_vision::TipsDepth::load(dir, device)?;
@@ -572,8 +500,6 @@ impl Runtime {
         Ok(())
     }
 
-    /// Loads SAM (MobileSAM or ViT-B, whichever file `dir` has) as the mask
-    /// tracker. Without weights the region-growing tracker stays.
     pub fn use_sam(&mut self, dir: &Path, device: &candle_core::Device) -> Result<()> {
         let t0 = Instant::now();
         let m = noto_vision::SamModel::load(dir, device)?;
@@ -584,19 +510,15 @@ impl Runtime {
         Ok(())
     }
 
-    /// Back to the depth stand-in (no TIPS weights in use).
     pub fn use_depth_stand_in(&mut self) {
         self.ml.depth = crate::ml::DepthEngine::StandIn(crate::ml::DepthStandIn::new(self.cfg.seed));
         self.log("embed", Level::Info, "깊이: 대역 모델(stand-in)", None);
     }
 
-    /// Back to the region-growing mask tracker.
     pub fn use_region_tracker(&mut self) {
         self.ml.tracker = Box::new(noto_vision::RegionTracker::default());
         self.log("embed", Level::Info, "마스크 추적: 영역 확장(region-grow)", None);
     }
-
-    // ----- configuration -----
 
     pub fn set_gates(&mut self, gates: GateCfg) {
         self.cfg.gates = gates.clone();
@@ -610,7 +532,6 @@ impl Runtime {
         self.log("vision", Level::Info, "모의 인식기 오류 설정이 바뀜", Some(serde_json::to_value(&self.cfg.noise).unwrap_or(Value::Null)));
     }
 
-    /// Replaces the recogniser (for example with SigLIP2).
     pub fn set_recognizer(&mut self, r: Box<dyn Recognizer>) {
         let mode = r.mode().to_string();
         let scope = r.scope();
@@ -621,9 +542,6 @@ impl Runtime {
         self.log("vision", Level::Info, format!("인식기 교체: {mode}"), None);
     }
 
-    /// SigLIP2 as the recogniser, and for the command parser's embedding
-    /// fallback. The dictionary's prompts are embedded here, once; with
-    /// `bank_dir` the vectors are kept between runs.
     pub fn use_siglip(&mut self, model: Arc<noto_ml::Siglip2>, bank_dir: Option<&Path>) -> Result<()> {
         let t0 = Instant::now();
         let phrases = Arc::new(crate::embedding::BankedPhrases::new(Arc::clone(&model), bank_dir));
@@ -640,7 +558,6 @@ impl Runtime {
         Ok(())
     }
 
-    /// Lets the forecasts use Granite TTM, or stop using it.
     pub fn attach_ttm(&mut self, ttm: Option<Arc<noto_ts::ttm::TtmForecaster>>) {
         let msg = match &ttm {
             Some(t) => format!("Granite TTM 연결: 문맥 {} · 예측 {} 스텝", t.context_length(), t.prediction_length()),
@@ -654,9 +571,6 @@ impl Runtime {
         self.gates.has_ttm()
     }
 
-    /// Loads Granite TTM from `dir` (a `config.json` and the safetensors next
-    /// to it) onto `device` and lets the forecasts use it. If the files are not
-    /// there or do not fit, nothing changes and the error says why.
     pub fn load_ttm(&mut self, dir: &Path, device: &candle_core::Device) -> Result<()> {
         let t0 = Instant::now();
         let ttm = noto_ts::ttm::TtmForecaster::load(dir, device).map_err(|e| anyhow!("Granite TTM 을 {} 에서 읽지 못했습니다: {e}", dir.display()))?;
@@ -666,17 +580,11 @@ impl Runtime {
         Ok(())
     }
 
-    /// Back to the stand-in recogniser.
     pub fn use_oracle(&mut self) {
         let r = OraclePerception::new(self.parser.lexicon(), self.cfg.noise.clone(), self.cfg.min_pixels);
         self.set_recognizer(Box::new(r));
     }
 
-    /// Every stand-in spoiled the way its real model was measured to be wrong
-    /// on this renderer (v1.0, `docs/research/ml-ab.md`): the tile recogniser
-    /// ([`crate::perception::ScanErrModel::SIGLIP_MEASURED`]), the depth and the
-    /// semantic location of the ML pass (`MlPipeline::use_honest_stand_ins`).
-    /// Real models already attached stay; their SDS statistics stay apart.
     pub fn use_honest_stand_ins(&mut self) {
         let seed = self.cfg.seed;
         self.ml.use_honest_stand_ins(seed);
@@ -687,7 +595,6 @@ impl Runtime {
         }
     }
 
-    /// Lets the command parser use embeddings for words the dictionary misses.
     pub fn attach_embedder(&mut self, emb: Arc<dyn PhraseEmbedder + Send + Sync>) -> Result<()> {
         let t0 = Instant::now();
         self.parser.attach_embedder(&*emb)?;
@@ -697,13 +604,10 @@ impl Runtime {
         Ok(())
     }
 
-    /// A new world. The SDS keeps what it learned.
     pub fn reset(&mut self, seed: Option<u64>) -> Result<()> {
         self.reset_with(seed, None, None)
     }
 
-    /// A new world, optionally with another size or another hand and base.
-    /// Nothing changes if the world cannot be built.
     pub fn reset_with(&mut self, seed: Option<u64>, cells: Option<usize>, hand: Option<NotoConfig>) -> Result<()> {
         let mut next = self.cfg.clone();
         if let Some(s) = seed {
@@ -738,10 +642,6 @@ impl Runtime {
         Ok(())
     }
 
-    /// The world back to how its seed made it (nodes, empty ground and piles,
-    /// the robot at the base camp), keeping the robot's body as it is: battery
-    /// charge, joint heat and wear stay. Quests and landmarks are cleared; the
-    /// SDS keeps what it learned. Use [`Runtime::reset_body`] for the body.
     pub fn reset_world(&mut self) -> Result<()> {
         self.cancel();
         self.world.reset_world_keep_body().map_err(|e| anyhow!("월드를 되돌릴 수 없습니다: {e}"))?;
@@ -758,8 +658,6 @@ impl Runtime {
         Ok(())
     }
 
-    /// The robot's body rested: full battery, cold joints, no joint wear. The
-    /// world, the robot's place and its cargo stay; a running quest goes on.
     pub fn reset_body(&mut self) {
         let (battery, strikes) = (self.world.battery_ratio(), self.world.agent.strikes);
         let worn = self.world.most_worn().map(|(j, d)| format!(", 가장 닳은 관절 {j} 수명 {:.2}% → 0", d * 100.0)).unwrap_or_default();
@@ -767,8 +665,6 @@ impl Runtime {
         self.log("world", Level::Info, format!("신체 상태 리셋: 배터리 {:.0}% → 100%, 채취 타격 {strikes} → 0, 관절 발열 초기화{worn}", battery * 100.0), None);
     }
 
-    /// Queues a quest for a plan the UI built itself (the inventory buttons),
-    /// as `submit` does for a typed command. Returns the quest id.
     pub fn submit_plan(&mut self, plan: Plan, what: &str) -> std::result::Result<String, String> {
         let tick = self.world.tick;
         match self.quests.add(&plan, &WorldLabels(&self.world), tick) {
@@ -781,9 +677,6 @@ impl Runtime {
         }
     }
 
-    // ----- running -----
-
-    /// One world tick (0.1 s) and one driver step.
     pub fn tick(&mut self) -> Vec<TimedEvent> {
         let events = self.world.tick();
         self.log_world_events(&events);
@@ -799,7 +692,6 @@ impl Runtime {
         events
     }
 
-    /// `n` ticks. Returns the log lines written meanwhile.
     pub fn step(&mut self, n: u32) -> Vec<LogLine> {
         let before = self.audit.last_seq();
         for _ in 0..n {
@@ -808,7 +700,6 @@ impl Runtime {
         self.audit.tail(before, 500, None).0
     }
 
-    /// Runs until no quest is left or `max_ticks` passed. Returns ticks run.
     pub fn run_until_idle(&mut self, max_ticks: u64) -> u64 {
         let mut n = 0;
         while n < max_ticks && self.busy() {
@@ -818,9 +709,6 @@ impl Runtime {
         n
     }
 
-    // ----- commands -----
-
-    /// Parses a typed command and queues the quest it describes.
     pub fn submit(&mut self, text: &str) -> Submission {
         let emb = self.embedder.clone();
         let parsed = self.parser.parse(text, emb.as_deref().map(|e| e as &dyn PhraseEmbedder));
@@ -871,8 +759,6 @@ impl Runtime {
         out
     }
 
-    /// What [`Runtime::submit`] would answer, without queueing a quest (for a
-    /// command that waits for the running recording to end).
     pub fn submit_preview(&self, text: &str) -> Submission {
         let emb = self.embedder.clone();
         let parsed = self.parser.parse(text, emb.as_deref().map(|e| e as &dyn PhraseEmbedder));
@@ -884,9 +770,6 @@ impl Runtime {
         Submission { ok: parsed.plan.is_some(), stopped: false, quest_id: None, error, error_code, mode, parsed }
     }
 
-    // ----- looking -----
-
-    /// Renders what the robot sees, recognises it, judges it. Returns the report.
     pub fn scan_now(&mut self, trigger: &str) -> Result<&ScanReport> {
         let t0 = Instant::now();
         let frame = self.world.render(&self.cam);
@@ -899,8 +782,6 @@ impl Runtime {
             Vec::new()
         };
         let mut cands = std::mem::take(&mut out.candidates);
-        // The camera measures where things are from the robot; the robot puts
-        // them in its own (believed) frame, which its odometry drifts.
         for c in cands.iter_mut() {
             c.world = c.world.map(|(x, z)| self.world.belief_of(x, z));
         }
@@ -929,12 +810,10 @@ impl Runtime {
         Ok(self.last_scan.as_ref().expect("just stored"))
     }
 
-    /// The robot's believed pose (its odometry): x, z, yaw.
     pub(crate) fn me(&self) -> (f32, f32, f32) {
         self.world.believed_pose()
     }
 
-    /// Distance from the robot's believed position to a believed point.
     pub(crate) fn dist_me(&self, x: f32, z: f32) -> f32 {
         let (mx, mz, _) = self.me();
         (x - mx).hypot(z - mz)
@@ -944,34 +823,22 @@ impl Runtime {
         format!("{:?}", self.world.hand.base.kind).to_lowercase()
     }
 
-    /// How fast the robot's memories spread per metre: what the SDS learned, else its odometry's specification.
     pub(crate) fn drift_rate(&self) -> DriftRate {
         DriftRate::learned(&self.sds, &self.base_id(), self.world.body.legged())
     }
 
-    /// 1σ of the robot's own position against the map: its odometry's drift
-    /// since the last fix, at the same rate as a memory's (Smith, Self &
-    /// Cheeseman 1986, §3.2).
     pub(crate) fn pose_sigma_m(&self) -> f32 {
         let r = self.drift_rate();
         let d = self.world.odom.since_fix_m;
         ((r.per_m * d).powi(2) + r.walk_m * r.walk_m * d).sqrt()
     }
 
-    /// What the gates need to keep landmarks as memories.
     pub(crate) fn mem_ctx(&self) -> MemCtx {
         let base = self.base_id();
         let floor = self.sds.adaptive_baseline(&Scope::new(Track::Memory, &base, "obs"), "scatter_var_m2").map_or(0.0, |b| (b.0 as f32).max(0.0).sqrt());
         MemCtx { odo_m: self.world.odom.travelled_m, rate: self.drift_rate(), base, camera: world_sim::world::camera_of(self.world.body.head.sensor), obs_floor_m: floor }
     }
 
-    /// A waypoint seen where the map does not have it shows how far the
-    /// robot's belief has drifted. The surest such sighting (the nearest flag)
-    /// that passes the validation gate moves the believed pose by the Kalman
-    /// share of the difference, the drift since the last fix against the
-    /// sighting's own error (Matthies & Shafer 1987, Eqs. 9-10). The fix waits
-    /// for the start of the next driver step and moves the memories with the
-    /// pose there (`apply_fix`): what one step decides stays in one frame.
     fn relocalize_from(&mut self, judged: &[Judged]) {
         if self.pending_fix.is_some() {
             return;
@@ -1002,11 +869,6 @@ impl Runtime {
         }
     }
 
-    /// The pending fix of the pose, applied: the believed pose moves, and so
-    /// does every landmark, by the share of the drift it had taken in when it
-    /// was last seen (`PoseFix::share`): the first-order update of a landmark
-    /// whose error is correlated with the pose's (the stochastic map of Smith,
-    /// Self & Cheeseman 1986). Returns the fix, for the task's own memories.
     pub(crate) fn apply_fix(&mut self) -> Option<PoseFix> {
         let f = self.pending_fix.take()?;
         self.world.relocalize(f.dx, f.dz);
@@ -1015,9 +877,6 @@ impl Runtime {
         Some(f)
     }
 
-    /// An action in the robot's believed frame as the world's: where its body
-    /// goes when it goes where it believes that is (its odometry's drift is
-    /// in the difference). Ids (a node, a piece, a waypoint) need nothing.
     pub fn to_world(&self, a: Action) -> Action {
         match a {
             Action::MoveTo { x, z, reach_m } => {
@@ -1037,7 +896,6 @@ impl Runtime {
         }
     }
 
-    /// Notes a look (or an action taken on memory without one) for the timeline's vision lane.
     pub(crate) fn note_look(&mut self, kind: &str, what: String, sigma_before_m: Option<f32>, sigma_after_m: Option<f32>, innovation_m: Option<f32>) {
         let mark = VisionMark { tick: self.world.tick, kind: kind.to_string(), what, sigma_before_m, sigma_after_m, innovation_m };
         if let Some(rec) = self.recording.as_mut() {
@@ -1047,14 +905,10 @@ impl Runtime {
         }
     }
 
-    /// A look with the head pitched down by `tilt_deg` (the neck), to see the
-    /// ground in front of the feet; the camera goes back level after.
     pub fn scan_tilted(&mut self, trigger: &str, tilt_deg: f32) -> Result<()> {
         self.scan_gaze(trigger, 0.0, tilt_deg)
     }
 
-    /// A look with the head turned by the neck: panned `pan_deg` (to the
-    /// left positive) and pitched down `tilt_deg`; the head comes back after.
     pub fn scan_gaze(&mut self, trigger: &str, pan_deg: f32, tilt_deg: f32) -> Result<()> {
         let level = self.cam;
         self.cam.pitch_deg -= tilt_deg;
@@ -1064,12 +918,6 @@ impl Runtime {
         r
     }
 
-    /// On the way to a place of the map. Once the place is near enough for a
-    /// sighting of its flag to fix the pose (`RELOCALIZE_RANGE_M`) and in
-    /// view, the robot looks on the pattern while its pose is too unsure for
-    /// the hand to find the pile there: 2σ of the drift since the last fix
-    /// against the slack between where the move stops and the hand's reach.
-    /// With the pattern off it looks as often as on an approach. Whether it looked.
     pub(crate) fn place_look(&mut self, cd: &mut u32, x: f32, z: f32) -> bool {
         if *cd > 0 {
             *cd -= 1;
@@ -1145,8 +993,6 @@ impl Runtime {
         }
     }
 
-    // ----- views -----
-
     pub fn snapshot(&self) -> WorldSnapshot {
         self.world.snapshot()
     }
@@ -1163,7 +1009,6 @@ impl Runtime {
         self.sds.status(80)
     }
 
-    /// Score history and forecast of one label (the longest history if none is named).
     pub fn ts_view(&self, label: Option<&str>, horizon: usize) -> TsView {
         let labels = self.gates.series_labels();
         let label = label.map(String::from).or_else(|| labels.first().map(|l| l.0.clone())).unwrap_or_default();
@@ -1174,9 +1019,6 @@ impl Runtime {
         self.audit.tail(after_seq, limit, cat)
     }
 
-    /// The depth model on what the head camera sees now, next to the
-    /// renderer's depth of the same pixels: both maps on one colour scale
-    /// (the truth's), as WebP, with the metrics and the model's time.
     pub fn depth_view(&mut self, quality: f32) -> Result<DepthView> {
         let frame = self.world.render(&self.cam);
         let truth = crate::ml::KeyTruth::capture(&self.world, &frame);
@@ -1211,15 +1053,11 @@ impl Runtime {
         })
     }
 
-    /// A WebP screenshot of a view at the camera's own size.
     pub fn frame(&mut self, view: FrameView, quality: f32) -> Result<FrameOut> {
         let (w, h) = (self.cam.width as u32, self.cam.height as u32);
         self.frame_sized(view, w, h, quality)
     }
 
-    /// A WebP screenshot of a view, with the last scan's boxes for the robot's
-    /// camera. The boxes are fractions of the frame, so any size fits them.
-    /// The top view is square and uses `height` for its side.
     pub fn frame_sized(&mut self, view: FrameView, width: u32, height: u32, quality: f32) -> Result<FrameOut> {
         let mut overlay = None;
         let (frame, detections) = match view {
@@ -1282,8 +1120,6 @@ impl Runtime {
     }
 }
 
-/// Rounds every fractional number in a log payload to four decimals. Scores
-/// come from `f32`, and `0.98f32` as an `f64` prints as `0.9800000190734863`.
 pub(crate) fn tidy(v: Value) -> Value {
     match v {
         Value::Number(n) => match n.as_f64() {

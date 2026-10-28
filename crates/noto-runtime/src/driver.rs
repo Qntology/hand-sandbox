@@ -1,39 +1,3 @@
-//! Carries a quest out in the world, one tick at a time.
-//!
-//! The driver never reads the world's object list to find what it should go
-//! for. It looks (scan), keeps what the gates confirmed as landmarks, drives
-//! up to one, and then touches: a contact sensor reports the nearest node in
-//! reach, and breaking it tells which kind it really was. That outcome feeds
-//! the SDS, which is how the gates learn from mistakes.
-//!
-//! Three things it is told rather than perceives, all assumptions of this
-//! simulator: where the waypoints are (they are on the map), the terrain (a
-//! surveyed site map: routes and lines of sight are planned on it, objects
-//! are not on it), and which drops a node just released (the event says so,
-//! and they land within reach).
-//!
-//! When nothing is in sight after a full turn, the next place to look from is
-//! the reachable viewpoint that shows the most ground not seen yet
-//! (`world_sim::explore`): behind a mesa or a ridge rather than the nearest
-//! grid point. Before each pick-up the cargo decision (`crate::cargo`) says
-//! whether to take the piece, make a trip with what is aboard first, or break
-//! the piece and take part of it.
-//!
-//! The actions play their physics (`noto_core::act`), so they can fail the
-//! way the real ones do, and the driver handles it the way a careful operator
-//! would: a grasp that slips or misses is tried again (`MAX_GRASP_TRIES`), a
-//! body that cannot bring its hand down to the ground pushes the item to the
-//! destination with its bumper instead (`MAX_PUSH_TRIES` lost pushes), and a
-//! fall is waited out and the move tried again (`MAX_FALLS`).
-//!
-//! Since v0.7 everything it decides is in its believed frame (its odometry
-//! drifts, `world_sim::odometry`) and it does not look all the time
-//! (`crate::vision`): it walks and acts on memories, looks on a pattern while
-//! a memory is too unsure for the next action, glances down at a piece before
-//! the hand goes, turns to look at one it cannot see, fixes its pose from a
-//! waypoint's flag near the place it delivers to, walks on until its belief
-//! says it has arrived, and steps closer when the hand does not find the pile.
-
 use std::collections::HashMap;
 
 use noto_quest::{QuestResult, State};
@@ -50,35 +14,15 @@ use noto_search::text::eul_reul;
 use crate::cargo::{self, CargoAction, CargoCtx, CargoDecision};
 use crate::vision::{gaze_to_see, memory_ok, Memory, EYE_LEAD_S};
 
-/// Grasps of one piece the driver tries before it leaves the piece (est: an operator's retry policy).
 pub(crate) const MAX_GRASP_TRIES: u32 = 3;
-/// Pushes of one piece that may lose it before the driver leaves it (est).
 pub(crate) const MAX_PUSH_TRIES: u32 = 3;
-/// Falls in one quest before the driver gives up (est).
 pub(crate) const MAX_FALLS: u32 = 3;
-/// The hand finds a piece within this of where the robot believes it lies,
-/// metres (est: the open hand's span over the spot).
 pub(crate) const TOUCH_PIECE_M: f32 = 0.25;
-/// A side pick's spot is reached when the robot stands within this of it,
-/// metres (a cell centre is within 0.354 m of any point; the reach's own
-/// shuffle closes the rest, `SIDE_SHUFFLE_MAX_M`).
 pub(crate) const SIDE_SPOT_REACH_M: f32 = 0.36;
-/// A move to a place of the map stops this far from it, metres: the hand's
-/// reach of the pile less half a metre of slack.
 pub(crate) const PLACE_REACH_M: f32 = DELIVER_REACH_M - 0.5;
-/// How far from a faintly seen item the robot stands to look down at it,
-/// metres: the head camera (1.14 m) then sees it about 44° below level,
-/// inside the 12° mount plus the neck's 45° tilt (est).
 pub(crate) const INSPECT_STAND_M: f32 = 1.2;
-/// How far a parcel is recognised from the head camera, metres: SigLIP2 base
-/// with the 6×4 tiles picks a 0.30 m parcel out of the grass up to 3 m away
-/// with the head pitched down 30°, never at 4 m (tests/siglip_parcel.rs).
 pub(crate) const SMALL_ITEM_SEE_M: f32 = 3.0;
-/// Head tilt of the look down that sweeps the ground near the feet while
-/// searching for a small item, degrees (the probe's best view at 2–3 m).
 pub(crate) const GROUND_SWEEP_TILT_DEG: f32 = 30.0;
-/// Moves the driver adds toward a place when the planned one ended short of
-/// it in the robot's belief (est).
 pub(crate) const MAX_PLACE_FIXES: u32 = 2;
 use crate::perception::EntKind;
 use crate::precision::LmState;
@@ -103,11 +47,8 @@ pub(crate) enum MoveFor {
     Drop,
     Carry,
     Goto,
-    /// A round trip: out to the destination with the load that is aboard.
     Shuttle,
-    /// A round trip: back to where the rest is lying.
     Return,
-    /// Lining up behind a piece to push it.
     PushLineUp(u32),
 }
 
@@ -128,19 +69,16 @@ pub(crate) struct TaskTarget {
     pub resource: String,
     pub item: ItemKind,
     pub wanted: u32,
-    /// Items lifted into the bay so far (half a stone is 0.5).
     pub picked: f32,
     pub label_ko: String,
 }
 
-/// A piece being pushed to the destination: which one and how many pushes lost it.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PushJob {
     pub drop: u32,
     pub tries: u32,
 }
 
-/// Where a round trip stands.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum TripStage {
     Out,
@@ -150,7 +88,6 @@ pub(crate) enum TripStage {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Trip {
-    /// Where it stood within reach of the rest (believed), and its odometer then.
     pub back: (f32, f32),
     pub back_odo_m: f32,
     pub stage: TripStage,
@@ -176,7 +113,6 @@ pub(crate) struct Task {
     pub act: Option<Act>,
     pub done: Option<(bool, Option<String>)>,
     pub broken: Option<(String, NodeKind, Vec<String>)>,
-    /// The piece the last split broke off.
     pub split_piece: Option<u32>,
     pub started_tick: u64,
     pub started_time_s: f64,
@@ -184,7 +120,6 @@ pub(crate) struct Task {
     pub act_started_s: f64,
     pub act_predicted_s: Option<f32>,
     pub act_distance0: f32,
-    // locating
     pub locate_since_s: f64,
     pub scan_cooldown: u32,
     pub scans_here: u32,
@@ -194,61 +129,39 @@ pub(crate) struct Task {
     pub target_lm: Option<u32>,
     pub approach_tries: u32,
     pub approach_scan_cd: u32,
-    /// What the camera has looked at during this quest (terrain occludes).
     pub coverage: Coverage,
-    /// Heading to turn to after reaching a viewpoint.
     pub face_after: Option<f32>,
-    /// Faint sightings of the target already walked to and looked down at.
     pub inspected: Vec<u32>,
-    // collecting
     pub drops: Vec<u32>,
     pub drop_idx: usize,
     pub rounds: u32,
     pub pick_retry: bool,
     pub trip: Option<Trip>,
-    /// Round trips made before the last carry.
     pub trips: u32,
     pub last_cargo: Option<(u32, String)>,
-    // delivering
     pub deliver_idx: usize,
-    // setting down (drop quests)
     pub drop_items: Vec<DropTarget>,
     pub unload_idx: usize,
     pub unloaded: Vec<(String, f32)>,
     pub unload_place: Option<String>,
-    /// Times each quest step was entered (index as in the quest).
     pub attempts: Vec<u32>,
-    // result
     pub touch_ok: u32,
     pub touch_miss: u32,
     pub wasted: u32,
     pub delivered: Vec<(String, f32)>,
-    // the actions' physics
-    /// Failed grasps of the current piece.
     pub grasp_tries: u32,
     pub falls: u32,
     pub push: Option<PushJob>,
-    /// Pieces that reached the destination by pushing.
     pub pushed: Vec<(String, f32)>,
-    // memory and looking (`vision`)
-    /// Where the robot believes each piece it knows of lies (its believed frame).
     pub mem: HashMap<u32, Memory>,
-    /// Ticks to the pattern's next look while approaching.
     pub look_cd: u32,
-    /// The look just before the hand acts has been taken on this approach.
     pub pre_looked: bool,
-    /// A pick from the side is planned for this piece, facing this (believed) heading.
     pub side: Option<(u32, f32)>,
-    /// Looks the vision schedule took, and actions taken on memory alone.
     pub looks: u32,
     pub blind_acts: u32,
-    /// The last pick went on memory alone (no look at the piece from where it stood).
     pub last_pick_blind: bool,
-    /// Moves added toward the place after the planned one ended short of it (`MAX_PLACE_FIXES`).
     pub place_fixes: u32,
-    /// The hand did not find the pile once on this delivery: it looked and walked up close.
     pub deliver_retry: bool,
-    /// The piece the robot turned to so that it could look at it (once per piece).
     pub look_turn: Option<u32>,
 }
 
@@ -402,7 +315,6 @@ impl Task {
         self.side = None;
     }
 
-    /// The target lies where the world placed it (a parcel), not in a node.
     fn placed(&self) -> bool {
         !self.target().item.from_node()
     }
@@ -445,13 +357,11 @@ fn parse_id(s: &str) -> Option<u32> {
 }
 
 impl Runtime {
-    /// Starts the next pending quest, if nothing is running.
     pub(crate) fn begin_next(&mut self) {
         let Some(id) = self.quests.current_id() else { return };
         let Some(q) = self.quests.get(&id) else { return };
         let (state, plan) = (q.state, q.plan.clone());
         if state == State::Active {
-            // Active without a task can only be a leftover; end it.
             if let Some(q) = self.quests.get_mut(&id) {
                 let _ = q.fail("lost_task", "실행 정보를 잃어 중단했습니다", None);
             }
@@ -477,7 +387,6 @@ impl Runtime {
         }
     }
 
-    /// One tick of the driver. Called after the world has stepped.
     pub(crate) fn drive(&mut self, events: &[TimedEvent]) {
         if self.pass == "ml" {
             self.ml_drive(events);
@@ -532,14 +441,11 @@ impl Runtime {
                 }
             };
         }
-        // After a fall the robot gets up before anything else.
         if self.world.fallen_until.is_some_and(|f| self.world.time_s < f) {
             return Flow::Continue;
         }
         self.next_action(t)
     }
-
-    // ----- quest bookkeeping -----
 
     fn goto_phase(&mut self, t: &mut Task, to: Phase, note: &str) {
         let (from_idx, to_idx) = (t.step_of(&t.phase), t.step_of(&to));
@@ -574,8 +480,6 @@ impl Runtime {
         }
     }
 
-    // ----- deciding -----
-
     fn next_action(&mut self, t: &mut Task) -> Flow {
         match t.phase {
             Phase::Locate => self.do_locate(t),
@@ -589,9 +493,6 @@ impl Runtime {
         }
     }
 
-    /// A fix of the pose from the last step's looks: the pose and the
-    /// landmarks move (`Runtime::apply_fix`), and so do the task's memories
-    /// and the place a round trip comes back to.
     fn take_fix(&mut self, t: &mut Task) {
         let Some(f) = self.apply_fix() else { return };
         let rate = self.drift_rate();
@@ -621,7 +522,6 @@ impl Runtime {
 
     fn best_landmark(&self, t: &Task) -> Option<u32> {
         let want = &t.target().resource;
-        // A mined item comes from a node it sees; a placed one is what it sees lying there.
         let kind = if t.placed() { EntKind::Drop } else { EntKind::Source };
         let (ax, az, _) = self.me();
         self.gates
@@ -632,14 +532,10 @@ impl Runtime {
             .map(|l| l.id)
     }
 
-    /// Marks what the camera sees from here into the quest's coverage.
     pub(crate) fn mark_coverage(&self, cov: &mut Coverage) {
         self.mark_coverage_as(cov, 0.0, world_sim::explore::SEARCH_RANGE_M);
     }
 
-    /// Marks the ground the camera saw with the head pitched down `tilt_deg`,
-    /// as far as `range_m`: past that the target would not have been
-    /// recognised even in view, so that ground is still unsearched.
     pub(crate) fn mark_coverage_as(&self, cov: &mut Coverage, tilt_deg: f32, range_m: f32) {
         let mut eye = self.cam.eye(&self.world);
         eye.pitch_deg -= tilt_deg;
@@ -647,9 +543,6 @@ impl Runtime {
         cov.look(&self.world.terrain, &eye, self.world.agent.yaw, self.cam.fov_deg);
     }
 
-    /// How far the target can be recognised, and the head tilt of the sweep
-    /// that searches the ground near the feet: a small item lying on the
-    /// ground (a parcel) only within [`SMALL_ITEM_SEE_M`], with a look down.
     fn search_reach(&self, t: &Task) -> (f32, f32) {
         if t.placed() {
             (SMALL_ITEM_SEE_M, GROUND_SWEEP_TILT_DEG)
@@ -658,15 +551,11 @@ impl Runtime {
         }
     }
 
-    /// The next viewpoint for a search (see `world_sim::explore`): the
-    /// camera's level view and its look down together, as far as the target
-    /// can be recognised.
     pub(crate) fn search_viewpoint(&self, t: &Task) -> Option<Viewpoint> {
         let (range, tilt) = self.search_reach(t);
         self.viewpoint_with(&t.coverage, &t.visited, tilt, range)
     }
 
-    /// The next viewpoint with the level camera at its full range (the ML pass's search).
     pub(crate) fn search_viewpoint_for(&self, cov: &Coverage, avoid: &[(f32, f32)]) -> Option<Viewpoint> {
         self.viewpoint_with(cov, avoid, 0.0, world_sim::explore::SEARCH_RANGE_M)
     }
@@ -713,7 +602,6 @@ impl Runtime {
             }
             let (range, tilt) = self.search_reach(t);
             self.mark_coverage_as(&mut t.coverage, 0.0, range);
-            // A small item: the same heading again with the head pitched down over the ground near the feet.
             if tilt > 0.0 && self.scan_gaze("locate_down", 0.0, tilt).is_ok() {
                 self.mark_coverage_as(&mut t.coverage, tilt, range);
             }
@@ -721,7 +609,6 @@ impl Runtime {
             t.scan_cooldown = self.cfg.scan_every_ticks;
             return Flow::Continue;
         }
-        // Looked here enough: turn, or go somewhere else.
         let rot_max = ((360.0 / self.cfg.rotate_deg.max(15.0)).ceil() as u32).saturating_sub(1);
         if t.rotations < rot_max {
             let yaw = self.world.agent.yaw.to_degrees() + self.cfg.rotate_deg;
@@ -734,7 +621,6 @@ impl Runtime {
                 Err(e) => fail(e.code(), action_error_ko(&e)),
             };
         }
-        // A full turn without finding it: go where the most unseen ground is in view.
         t.visited.push((self.world.agent.x, self.world.agent.z));
         t.relocations += 1;
         if t.relocations > self.cfg.max_relocations {
@@ -765,13 +651,6 @@ impl Runtime {
         }
     }
 
-    /// Something that looked like the wanted item from afar but did not pass
-    /// the gates (a parcel a few pixels wide in a tile of grass) is checked as
-    /// a person would: walk to about [`INSPECT_STAND_M`] from it, pitch and
-    /// turn the head down at it so it fills the view, and look again. The
-    /// close look confirms it (the next step approaches it) or leaves it
-    /// unconfirmed, and the search goes on. `None` when there is nothing faint
-    /// left to check.
     fn inspect_faint(&mut self, t: &mut Task) -> Option<Flow> {
         let want = t.target().resource.clone();
         let (mx, mz, myaw) = self.me();
@@ -795,7 +674,6 @@ impl Runtime {
                 }
             };
         }
-        // Here: the head pitched down (and turned) until the spot is in the middle of the view.
         let b = (z - mz).atan2(x - mx) - myaw;
         let bearing = b.sin().atan2(b.cos()).to_degrees();
         let pan = (-bearing).clamp(-noto_core::kin::NECK_PAN_MAX_DEG, noto_core::kin::NECK_PAN_MAX_DEG);
@@ -866,9 +744,6 @@ impl Runtime {
         }
     }
 
-    /// The node the hand feels, nearest to where the target is believed to be
-    /// (the hand goes where the robot believes it is: its believed frame
-    /// carried into the world, `World::true_of`).
     fn touch_node(&self, believed: (f32, f32)) -> Option<u32> {
         let (ax, az) = (self.world.agent.x, self.world.agent.z);
         let at = self.world.true_of(believed.0, believed.1);
@@ -884,8 +759,6 @@ impl Runtime {
             .map(|n| n.id)
     }
 
-    /// The piece of `kind` the hand feels where the robot believes one lies:
-    /// within the hand's reach of the robot and `TOUCH_PIECE_M` of the spot.
     pub(crate) fn touch_piece(&self, believed: (f32, f32), kind: ItemKind) -> Option<u32> {
         let (ax, az) = (self.world.agent.x, self.world.agent.z);
         let at = self.world.true_of(believed.0, believed.1);
@@ -897,14 +770,9 @@ impl Runtime {
             .map(|d| d.id)
     }
 
-    /// Approaching an item that lies where the world placed it (a parcel):
-    /// to a spot beside it where the right hand reaches it without turning
-    /// (on the way to the destination), or in front of it. On arrival the hand
-    /// touches it where memory says (`touch_piece`) and the pick follows.
     fn approach_placed(&mut self, t: &mut Task, id: u32, at: (f32, f32), dist: f32) -> Flow {
         let item = t.target().item;
         if t.side.is_none() && dist > PICKUP_REACH_M {
-            // Facing on toward where it goes next; a side reach the body can make.
             let (mx, mz, myaw) = self.me();
             let heading = match self.waypoint_of(t) {
                 Some((_, wx, wz, _)) => (wz - at.1).atan2(wx - at.0),
@@ -914,7 +782,6 @@ impl Runtime {
             if let Some((ox, oy)) = self.world.side_reach(item, 1.0) {
                 t.side = Some((id, heading));
                 let (s, c) = heading.sin_cos();
-                // The item at (forward ox, left oy) of the robot: it stands back and to the left of it.
                 let spot = (at.0 - ox * c - oy * s, at.1 - ox * s + oy * c);
                 t.act_distance0 = self.dist_me(spot.0, spot.1);
                 t.look_cd = self.cfg.vision.look_every_ticks;
@@ -923,7 +790,6 @@ impl Runtime {
                 return match self.issue(t, Action::MoveTo { x: spot.0, z: spot.1, reach_m: SIDE_SPOT_REACH_M }, Act::Move(MoveFor::Approach(id))) {
                     Ok(()) => Flow::Continue,
                     Err(ActionError::NoPath) | Err(ActionError::UnknownTarget) => {
-                        // No way to the side spot: from in front then.
                         t.side = None;
                         self.issue_front_approach(t, id, at)
                     }
@@ -932,7 +798,6 @@ impl Runtime {
             }
         }
         if t.side.is_some() || dist <= PICKUP_REACH_M - 0.1 {
-            // Arrived: the hand feels for it (a side pick faces on first).
             self.goto_phase(t, Phase::Mine, "");
             return Flow::Continue;
         }
@@ -956,9 +821,6 @@ impl Runtime {
         }
     }
 
-    /// The hand feels for a placed item where memory says it is: found, it is
-    /// the piece to pick; not there, the memory was wrong (look again, or rule
-    /// the sighting out).
     fn touch_placed(&mut self, t: &mut Task) -> Flow {
         let Some(id) = t.target_lm else {
             self.goto_phase(t, Phase::Locate, "랜드마크를 잃음");
@@ -970,7 +832,6 @@ impl Runtime {
             t.reset_locate();
             return Flow::Continue;
         };
-        // A pick in passing: face on the way it goes next, the piece beside the right foot.
         if let Some((_, heading)) = t.side {
             let err = (heading - self.me().2 + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
             if err.abs() > 0.15 {
@@ -1051,7 +912,6 @@ impl Runtime {
                 }
             }
             None => {
-                // Nothing within reach: the position was off, or nothing is there.
                 t.approach_tries += 1;
                 let id = t.target_lm;
                 if t.approach_tries < 2 {
@@ -1083,7 +943,6 @@ impl Runtime {
         }
     }
 
-    /// Mass of this quest's items in the bay (what a trip would deliver).
     fn quest_cargo_kg(&self, t: &Task) -> f32 {
         t.targets
             .iter()
@@ -1094,7 +953,6 @@ impl Runtime {
             .sum()
     }
 
-    /// Logs a cargo decision once per piece and action, and records it in the SDS.
     fn note_cargo(&mut self, t: &mut Task, id: u32, dec: &CargoDecision) {
         let key = (id, format!("{}:{:.3}", dec.action.key(), dec.portion));
         if t.last_cargo.as_ref() == Some(&key) {
@@ -1140,17 +998,14 @@ impl Runtime {
                 t.drop_idx += 1;
                 continue;
             };
-            // Where the robot believes it lies: its memory (the piece's own place only as a last resort, when it never saw it).
             let m = *t.mem.entry(id).or_insert_with(|| {
                 let (x, z) = self.world.belief_of(d.x, d.z);
                 Memory::seen(x, z, self.world.aim_sigma_m(), self.world.odom.travelled_m, self.world.tick)
             });
-            // A pick from the side starts where the robot stands (its own shuffle closes the rest).
             let side_here = t.side.is_some_and(|(sid, _)| sid == id);
             let dist = self.dist_me(m.x, m.z);
             if dist > PICKUP_REACH_M - 0.1 && !side_here {
                 t.act_predicted_s = self.world.plan_route(Goal::Within { x: m.x, z: m.z, reach_m: 0.4 }).map(|p| p.time_s);
-                // Up to the piece; where no route ends that close (it lies on a ledge, or the memory drifted onto one), as close as the hand's reach allows.
                 let r = match self.issue(t, Action::MoveTo { x: m.x, z: m.z, reach_m: 0.4 }, Act::Move(MoveFor::Drop)) {
                     Err(ActionError::NoPath) => self.issue(t, Action::MoveTo { x: m.x, z: m.z, reach_m: PICKUP_REACH_M - 0.1 }, Act::Move(MoveFor::Drop)),
                     r => r,
@@ -1165,7 +1020,6 @@ impl Runtime {
                     Err(e) => fail(e.code(), action_error_ko(&e)),
                 };
             }
-            // A body that cannot bring its hand to the ground pushes the piece there instead (or cannot fetch it).
             if let Err(why) = self.world.reach_ground(d.kind, d.amount) {
                 if t.destination.is_none() {
                     return fail("reach_ground", format!("{name}{} 집을 수 없습니다: {why}", eul_reul(&name)));
@@ -1177,7 +1031,6 @@ impl Runtime {
                 t.push = Some(PushJob { drop: id, tries: 0 });
                 return self.push_step(t);
             }
-            // The cargo decision: take it, make a trip first, or break it.
             let ctx = CargoCtx { quest_cargo_kg: self.quest_cargo_kg(t), destination: self.waypoint_of(t).map(|(_, x, z, _)| (x, z)) };
             let dec = cargo::decide(&self.world, &d, &ctx);
             self.note_cargo(t, id, &dec);
@@ -1196,7 +1049,6 @@ impl Runtime {
                         return fail("too_many_trips", format!("{}회 왕복해도 다 나르지 못했습니다", t.trips));
                     }
                     t.trips += 1;
-                    // It comes back to where it stands now, within the hand's reach of the rest.
                     let (sx, sz, _) = self.me();
                     t.trip = Some(Trip { back: (sx, sz), back_odo_m: self.world.odom.travelled_m, stage: TripStage::Out });
                     let dest = self.waypoint_of(t).map(|w| w.3).unwrap_or_default();
@@ -1205,7 +1057,6 @@ impl Runtime {
                 }
                 CargoAction::Refuse => return fail(dec.code.unwrap_or("lift_overload"), dec.summary_ko.clone()),
             }
-            // Before the hand goes: is the memory good enough for it (2σ inside half the top face)?
             let pick = match self.pick_from_memory(t, id, d.kind, d.amount) {
                 Ok(a) => a,
                 Err(flow) => return flow,
@@ -1213,7 +1064,6 @@ impl Runtime {
             return match self.issue(t, pick, Act::Pick(id)) {
                 Ok(()) => Flow::Continue,
                 Err(ActionError::CannotReach { reason, .. }) if t.side.is_some() => {
-                    // The side reach does not hold: from in front, facing it.
                     self.log("quest", Level::Info, format!("옆으로는 못 집음 ({reason}) — 앞에서 집음"), None);
                     t.side = None;
                     Flow::Continue
@@ -1246,12 +1096,6 @@ impl Runtime {
         }
     }
 
-    /// The pick of piece `id` from what the robot remembers of it: the hand
-    /// goes where memory says, from the side (a pick in passing, the camera
-    /// cannot see there) or in front. When the memory's 2σ is wider than half
-    /// the piece's top face the robot looks first if it can see the spot from
-    /// where it stands; a side pick it cannot look for becomes a front pick
-    /// (it turns, and the turn shows it the piece).
     fn pick_from_memory(&mut self, t: &mut Task, id: u32, kind: ItemKind, amount: f32) -> Result<Action, Flow> {
         let rate = self.drift_rate();
         let odo = self.world.odom.travelled_m;
@@ -1264,7 +1108,6 @@ impl Runtime {
         let intermittent = self.cfg.vision.intermittent;
         if !intermittent || !memory_ok(sigma, tolerance, &self.cfg.vision) {
             if let Some((pan, tilt)) = gaze_to_see(&self.cam, self.world.standing_eye_m(), me, m.x, m.z) {
-                // A glance (the head turned to the spot, pitched down for the ground at the feet): it refreshes the memory from what the gates saw there.
                 let before = sigma;
                 if self.scan_gaze(if intermittent { "glance" } else { "pre_act" }, pan, tilt).is_ok() {
                     t.looks += 1;
@@ -1279,7 +1122,6 @@ impl Runtime {
                     }
                 }
             } else if intermittent && (side || t.look_turn != Some(id)) {
-                // Too unsure for a reach it cannot look at (beside the foot, behind it): turn to it, look, and pick in front.
                 self.log("quest", Level::Info, format!("기억이 흐림 (±{:.0} cm > {:.0} cm) — 돌아서 보고 앞에서 집음", 2.0 * sigma * 100.0, tolerance * 100.0), None);
                 t.side = None;
                 t.look_turn = Some(id);
@@ -1290,7 +1132,6 @@ impl Runtime {
             }
         }
         let side = side && t.side.is_some();
-        // Seen just now (a look from here found it and refreshed the memory), or on memory alone.
         let looked = m.tick == self.world.tick;
         let blind = side || !looked;
         if blind {
@@ -1306,11 +1147,6 @@ impl Runtime {
         Ok(Action::PickUp { drop: id, aim: Some((m.x, m.z)), side, memory_sigma_m: sigma })
     }
 
-    /// On the way to a remembered piece (up to it, or back to it after a
-    /// trip): the pattern's look while the memory is too unsure for the grasp
-    /// (2σ wider than half the top face) and its spot is in view; a sighting
-    /// of the piece refreshes the memory. With the pattern off it looks as
-    /// often as on an approach.
     fn piece_look(&mut self, t: &mut Task) {
         let intermittent = self.cfg.vision.intermittent;
         if intermittent {
@@ -1328,7 +1164,6 @@ impl Runtime {
         if intermittent && memory_ok(sigma, 0.5 * size[0].min(size[2]), &self.cfg.vision) {
             return;
         }
-        // The head turns to the piece when the level camera does not reach it.
         let Some((pan, tilt)) = gaze_to_see(&self.cam, self.world.standing_eye_m(), self.me(), m.x, m.z) else { return };
         t.look_cd = if intermittent { self.cfg.vision.look_every_ticks } else { self.cfg.approach_scan_every_ticks };
         if self.scan_gaze("pattern", pan, tilt).is_ok() {
@@ -1345,10 +1180,6 @@ impl Runtime {
         }
     }
 
-    /// What the last scan saw of a remembered piece: the sighting of its kind
-    /// nearest to the memory (within 3σ, at least 0.3 m) that the gates
-    /// accepted or that holds by itself (`Judged::sound`: the piece is known
-    /// to be there), fused with it.
     pub(crate) fn refresh_memory(&self, m: &Memory, kind: ItemKind, odo: f32) -> Option<(Memory, f32)> {
         let rate = self.drift_rate();
         let reach = (3.0 * m.sigma_m(odo, rate)).max(0.3);
@@ -1365,9 +1196,6 @@ impl Runtime {
         Some(m.fuse(x, z, mem.sigma_obs(depth), odo, self.world.tick, rate))
     }
 
-    /// Advances a push: line up behind the piece, face the way, push it to the
-    /// destination; when it lies there it goes onto the pile and counts as
-    /// delivered. A push that lost the piece starts over from where it lies.
     fn push_step(&mut self, t: &mut Task) -> Flow {
         let Some(job) = t.push else { return Flow::Continue };
         let Some((wid, wx, wz, place)) = self.waypoint_of(t) else { return fail("unknown_target", "목적지를 찾을 수 없습니다") };
@@ -1377,7 +1205,6 @@ impl Runtime {
             t.drop_idx += 1;
             return Flow::Continue;
         };
-        // The piece against the bumper: where it is relative to the robot is known by touch.
         let (px, pz) = self.world.belief_of(d.x, d.z);
         let mut stocked = false;
         if (px - wx).hypot(pz - wz) <= DELIVER_REACH_M {
@@ -1399,18 +1226,15 @@ impl Runtime {
                 self.progress(t, (picked / wanted as f32).min(1.0), Some(format!("{}/{wanted}개 (밀어서)", amount_text(picked))));
                 return Flow::Continue;
             }
-            // It believed the piece was there; the pile is not where it believed: push on.
         }
         let (tx, tz) = self.world.true_of(wx, wz);
         let (_, (lx, lz, yaw)) = match self.world.push_route(job.drop, tx, tz) {
             Ok(r) => r,
             Err(e) => return fail(e.code(), format!("{name}{} {place}까지 밀 수 없습니다: {}", eul_reul(&name), action_error_ko(&e))),
         };
-        // The line-up behind it, in the robot's frame.
         let (lx, lz) = self.world.belief_of(lx, lz);
         let yaw = yaw + (self.me().2 - self.world.agent.yaw);
         let off = self.dist_me(lx, lz);
-        // The nearest cell centre is within half a cell's diagonal of any point.
         if off > world_sim::world::PUSH_START_SLACK_M {
             return match self.issue(t, Action::MoveTo { x: lx, z: lz, reach_m: 0.36 }, Act::Move(MoveFor::PushLineUp(job.drop))) {
                 Ok(()) => Flow::Continue,
@@ -1431,8 +1255,6 @@ impl Runtime {
         }
     }
 
-    /// Advances a round trip: out to the destination, the quest's items onto
-    /// its pile, back to the rest. `None` when no trip is going on.
     fn trip_step(&mut self, t: &mut Task) -> Option<Flow> {
         let trip = t.trip?;
         let (wid, x, z, place) = self.waypoint_of(t)?;
@@ -1474,7 +1296,6 @@ impl Runtime {
                     return None;
                 }
                 self.progress(t, t.target().picked / t.target().wanted as f32, Some(format!("왕복 {}회차 · {name}에게 돌아가는 중", t.trips)));
-                // Where it believes the rest lies; a spot it cannot stand on (the belief drifted onto a slope) from the nearest one in reach of it.
                 let r = match self.issue(t, Action::MoveTo { x: bx, z: bz, reach_m: 0.4 }, Act::Move(MoveFor::Return)) {
                     Err(ActionError::NoPath) => self.issue(t, Action::MoveTo { x: bx, z: bz, reach_m: PICKUP_REACH_M - 0.1 }, Act::Move(MoveFor::Return)),
                     r => r,
@@ -1487,7 +1308,6 @@ impl Runtime {
         }
     }
 
-    /// The target is done: the next target, or carrying, or the end.
     fn next_target(&mut self, t: &mut Task) -> Flow {
         let k = t.cur;
         let last_collect_step = 4 * k + 3;
@@ -1555,10 +1375,6 @@ impl Runtime {
         Flow::Done
     }
 
-    /// A move to a place ended where the robot does not believe the place is
-    /// in reach: a look on the way moved its belief, or its odometer counted
-    /// the walk short of where the plan put the end. It walks the rest, as one
-    /// walks on until one sees one has arrived, a few times at most.
     fn closer_to_place(&mut self, t: &mut Task, why: MoveFor) -> Option<Flow> {
         let (_, x, z, name) = self.waypoint_of(t)?;
         let d = self.dist_me(x, z);
@@ -1569,15 +1385,11 @@ impl Runtime {
         self.log("quest", Level::Info, format!("{name}까지 아직 {d:.1} m — 마저 걸어감"), None);
         match self.issue(t, Action::MoveTo { x, z, reach_m: PLACE_REACH_M }, Act::Move(why)) {
             Ok(()) => Some(Flow::Continue),
-            // No way closer: the hand tries from here.
             Err(ActionError::NoPath) => None,
             Err(e) => Some(fail(e.code(), action_error_ko(&e))),
         }
     }
 
-    /// The hand did not find the pile where the robot believed it stood in
-    /// reach of it: it looks at the place (a sighting of the flag fixes its
-    /// belief) and walks up close, once per delivery.
     fn reach_for_place(&mut self, t: &mut Task, why: MoveFor) -> Flow {
         let Some((_, x, z, name)) = self.waypoint_of(t) else { return fail("unknown_target", "목적지를 찾을 수 없습니다") };
         t.deliver_retry = true;
@@ -1585,7 +1397,6 @@ impl Runtime {
             t.looks += 1;
             self.vstats.looks += 1;
         }
-        // The look's fix first: the place is on the map, and the walk up to it goes by the corrected pose.
         self.take_fix(t);
         self.log("quest", Level::Warn, format!("{name}에 손이 닿지 않음 — 보고 더 다가감"), None);
         let r = match self.issue(t, Action::MoveTo { x, z, reach_m: PLACE_REACH_M - 0.5 }, Act::Move(why.clone())) {
@@ -1615,7 +1426,6 @@ impl Runtime {
         }
     }
 
-    /// At the place: a walk ends, a drop quest sets its items down.
     fn after_goto(&mut self, t: &mut Task) -> Flow {
         if t.kind == "drop" {
             self.goto_phase(t, Phase::Unload, "");
@@ -1624,7 +1434,6 @@ impl Runtime {
         Flow::Done
     }
 
-    /// Sets down what a drop quest names (everything when it names nothing).
     fn do_unload(&mut self, t: &mut Task) -> Flow {
         if t.drop_items.is_empty() {
             if t.unload_idx > 0 {
@@ -1660,8 +1469,6 @@ impl Runtime {
         }
         Flow::Done
     }
-
-    // ----- while an action runs -----
 
     fn while_running(&mut self, t: &mut Task, act: &Act) {
         match act {
@@ -1713,7 +1520,6 @@ impl Runtime {
             Act::Move(MoveFor::Drop) | Act::Move(MoveFor::Return) => self.piece_look(t),
             Act::Move(MoveFor::Carry) | Act::Move(MoveFor::Goto) | Act::Move(MoveFor::Shuttle) => {
                 if let Some((_, x, z, _)) = self.waypoint_of(t) {
-                    // Near the place a look at its flag fixes where the robot believes it is.
                     if self.place_look(&mut t.look_cd, x, z) {
                         t.looks += 1;
                     }
@@ -1735,8 +1541,6 @@ impl Runtime {
         }
     }
 
-    // ----- when an action ends -----
-
     fn on_act_done(&mut self, t: &mut Task, act: Act, ok: bool, reason: Option<String>) -> Flow {
         let elapsed = self.world.time_s - t.act_started_s;
         if matches!(act, Act::Pick(_)) {
@@ -1753,7 +1557,6 @@ impl Runtime {
             if why == "cancelled" {
                 return fail("cancelled", "중지되었습니다");
             }
-            // A fall: the robot gets up (the world holds it down for a while) and the phase moves again.
             if why.starts_with("fall") {
                 t.falls += 1;
                 let ground = self.world.ground_here().id();
@@ -1766,14 +1569,12 @@ impl Runtime {
             }
             match act {
                 Act::Pick(id) => {
-                    // The hand closed on air: the memory was off by more than half the top face, so the next try looks first.
                     if why == "grasp_missed" {
                         if let (Some(m), Some(d)) = (t.mem.get_mut(&id), self.world.drop_item(id)) {
                             let size = d.kind.spec().piece_size_m(d.amount);
                             m.sigma0_m = m.sigma0_m.max(0.5 * size[0].min(size[2]));
                         }
                     }
-                    // A grasp that slipped or missed: the piece fell back; try again, then leave it.
                     t.grasp_tries += 1;
                     if t.grasp_tries < MAX_GRASP_TRIES {
                         self.log("quest", Level::Warn, format!("잡기 실패 ({why}) — 다시 잡기 {}/{MAX_GRASP_TRIES}", t.grasp_tries + 1), Some(json!({"drop": id, "code": why})));
@@ -1803,7 +1604,6 @@ impl Runtime {
                 Act::Move(MoveFor::PushLineUp(_)) => return Flow::Continue,
                 _ => {}
             }
-            // A move that fails midway (a blocked cell, for example) is retried from the top.
             return match act {
                 Act::Move(MoveFor::Approach(id)) => {
                     self.gates.note_unreachable(id);
@@ -1826,7 +1626,6 @@ impl Runtime {
             Act::Move(MoveFor::Search) => {
                 t.scan_cooldown = 0;
                 t.scans_here = 0;
-                // Look first where the planner expected the most unseen ground.
                 if let Some(yaw) = t.face_after.take() {
                     if let Err(e) = self.issue(t, Action::Turn { yaw_deg: yaw.to_degrees() }, Act::Turn) {
                         return fail(e.code(), action_error_ko(&e));
@@ -1881,7 +1680,6 @@ impl Runtime {
                 Flow::Continue
             }
             Act::Split(_) => {
-                // The broken-off piece is picked next; the rest stays in the list after it.
                 if let Some(p) = t.split_piece.take() {
                     t.drops.insert(t.drop_idx, p);
                 }
@@ -1941,7 +1739,6 @@ impl Runtime {
                 format!("접촉 확인: {} 맞음 ({}개 떨어짐)", kind.spec().label_ko, ids.len()),
                 lm.as_ref().map(|l| json!({"landmark": l.id, "label": l.label, "score": l.score, "margin": l.margin, "agreed": true})),
             );
-            // It sees them fall: where they lie goes into memory, in its believed frame.
             let sigma = self.world.aim_sigma_m();
             for &id in &ids {
                 if let Some(d) = self.world.drop_item(id) {
@@ -1968,8 +1765,6 @@ impl Runtime {
         }
         Flow::Continue
     }
-
-    // ----- ending -----
 
     fn result_of(&self, t: &Task, summary: String) -> QuestResult {
         let whole = |list: &[(String, f32)]| list.iter().map(|(k, a)| (k.clone(), (a + AMOUNT_EPS).floor() as u32)).collect::<Vec<_>>();
@@ -2054,7 +1849,6 @@ impl Runtime {
         self.flush_sds();
     }
 
-    /// Stops the running quest and drops the queue.
     pub fn cancel(&mut self) {
         if let Some(m) = self.ml_task.take() {
             self.ml_end(m, Some(("cancelled".into(), "사용자가 중지했습니다".into())));

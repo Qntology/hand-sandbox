@@ -1,5 +1,3 @@
-//! One finger as a serial chain of joints and rigid segments.
-
 use serde::{Deserialize, Serialize};
 
 use crate::joint::{JointAngles, JointSpec};
@@ -9,13 +7,9 @@ use crate::math::{Mat3, Vec3};
 pub struct FingerSpec {
     pub name: String,
     pub is_thumb: bool,
-    /// Position of the first joint in the hand frame (metres).
     pub mount: Vec3,
-    /// Fan-out of the finger about the palm normal (radians).
     pub mount_yaw: f32,
-    /// Length of each segment; one per joint, the last one ends at the tip.
     pub segments: Vec<f32>,
-    /// Joint specs, same length as `segments`.
     pub joints: Vec<JointSpec>,
 }
 
@@ -28,8 +22,6 @@ impl FingerSpec {
         self.segments.iter().sum()
     }
 
-    /// Rotation of one joint for the given angles. Axes the joint does not
-    /// have are ignored, so a `Hinge` never abducts or rolls.
     pub fn joint_rotation(spec: &JointSpec, angles: JointAngles) -> Mat3 {
         let abd = if spec.kind.has_abduction() { angles.abd } else { 0.0 };
         let roll = if spec.kind.has_roll() { angles.roll } else { 0.0 };
@@ -38,8 +30,6 @@ impl FingerSpec {
             .mul(Mat3::rot_z(roll))
     }
 
-    /// Forward kinematics: joint and tip positions in the hand frame, as
-    /// `[mount, joint 1, ..., tip]`. `angles` must have one entry per joint.
     pub fn points(&self, angles: &[JointAngles]) -> Vec<Vec3> {
         let mut pos = self.mount;
         let mut rot = Mat3::rot_y(self.mount_yaw);
@@ -54,8 +44,6 @@ impl FingerSpec {
     }
 }
 
-/// Points along the finger used for contact tests: every joint point plus
-/// the midpoint of each segment, so a thin object cannot slip between joints.
 pub fn sample_points(points: &[Vec3]) -> Vec<Vec3> {
     let mut out = Vec::with_capacity(points.len() * 2);
     for pair in points.windows(2) {
@@ -114,7 +102,6 @@ mod tests {
             ..Default::default()
         };
         let pts = f.points(&[a, JointAngles::default()]);
-        // First segment points up (+Y) after a 90 degree flexion.
         assert!((pts[1].y - 0.04).abs() < 1e-5);
         assert!(pts[1].z.abs() < 1e-5);
     }

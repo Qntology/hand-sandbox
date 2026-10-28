@@ -1,7 +1,3 @@
-//! Houses with porch stairs and ramps, a logistics centre with shelves and
-//! tables, and the parcels on them (`world_sim::site`): what the generator
-//! builds, who can get where, and what the camera sees.
-
 use std::collections::HashSet;
 
 use noto_core::{BaseKind, FingerCount, NotoConfig};
@@ -36,7 +32,6 @@ fn the_same_seed_builds_the_same_site_and_another_seed_another() {
     assert!(a.drops.iter().zip(&b.drops).all(|(x, y)| (x.id, x.x, x.z, x.support) == (y.id, y.x, y.z, y.support)));
     let c = sited(8, TerrainKind::Open, BaseKind::Wheel);
     assert_ne!(a.site.as_ref().unwrap().houses, c.site.as_ref().unwrap().houses);
-    // The base never decides the layout.
     let d = sited(7, TerrainKind::Open, BaseKind::HumanFoot);
     assert_eq!(a.fixtures, d.fixtures);
 }
@@ -53,7 +48,6 @@ fn without_a_site_the_map_has_no_structures() {
     assert!(!json.contains("site"), "the default config serialises as before: {json}");
     let back: WorldConfig = serde_json::from_str(&json).unwrap();
     assert!(back.site.is_none());
-    // `"site": {}` is the standard site; a field said overrides it.
     let with: WorldConfig = serde_json::from_str(&json.replacen('{', r#"{"site": {}, "#, 1)).unwrap();
     assert_eq!(with.site, Some(SiteCfg::default()));
     let two: WorldConfig = serde_json::from_str(&json.replacen('{', r#"{"site": {"houses": 2, "ramps": false}, "#, 1)).unwrap();
@@ -72,10 +66,8 @@ fn every_map_gets_houses_and_a_logistics_centre_around_the_warehouse_waypoint() 
             let fc = w.terrain.cell_of(flag.x, flag.z).unwrap();
             assert!(wh.rect.contains(fc), "the flag stands inside");
             assert!(!wh.shelves.is_empty() && !wh.tables.is_empty());
-            // The flag's cell and its pile's cell stay free.
             let blocked = w.blocked_cells();
             assert!(!blocked.contains(&fc) && !blocked.contains(&(fc.0 - 1, fc.1)));
-            // No node stands on a site's cell.
             for n in &w.nodes {
                 let c = w.terrain.cell_of(n.x, n.z).unwrap();
                 assert!(!s.is_reserved(c), "{terrain:?} seed {seed}: a node on the site at {c:?}");
@@ -104,12 +96,10 @@ fn the_site_never_cuts_the_way_between_the_waypoints_on_any_map_size() {
                         let c = w.terrain.cell_of(p.x, p.z).unwrap();
                         assert!(!blocked.contains(&c), "{cells} {terrain:?} seed {seed}: a fixture on the {} flag", p.key);
                     }
-                    // From the base camp (where the robot starts) to the warehouse flag: still a way if there was one.
                     let reach = |w: &World| w.plan_route(Goal::Within { x: flag.x, z: flag.z, reach_m: 1.0 }).is_some();
                     if reach(&bare) {
                         assert!(reach(&w), "{cells} {terrain:?} seed {seed} {base:?}: the site cuts the way to the warehouse");
                     }
-                    // A porch keeps parcel slots only when legs reach it.
                     for h in &s.houses {
                         let slots = s.slots.iter().any(|sl| matches!(sl.support, Support::Step { house, .. } if house == h.id));
                         assert_eq!(slots, h.reachable_legs, "{cells} {terrain:?} seed {seed}: house {}", h.id);
@@ -132,7 +122,6 @@ fn stairs_have_real_risers_legs_climb_them_and_wheels_take_the_ramp() {
             let track = sited(seed, terrain, BaseKind::Track);
             let t = &legs.terrain;
             for h in &legs.site.as_ref().unwrap().houses {
-                // The treads step down by the riser from the landing to the ground.
                 let floor = h.floor_cm as i32;
                 let rise = h.riser_mm as i32 / 10;
                 assert_eq!(floor, rise * h.risers as i32);
@@ -146,7 +135,6 @@ fn stairs_have_real_risers_legs_climb_them_and_wheels_take_the_ramp() {
                 let porch = Goal::Cell(h.porch[0]);
                 assert!(h.reachable_legs, "{terrain:?} seed {seed} house {}: legs reach no porch", h.id);
                 assert!(legs.plan_route(porch).is_some());
-                // Up the stair alone (the ramp closed): every step of the walk is one riser.
                 let mut closed = legs.blocked_cells();
                 closed.extend(h.ramp.iter().copied());
                 let top = *h.porch.iter().min_by_key(|c| nav::cell_distance_m(**c, h.stair_foot[0]).to_bits()).unwrap();
@@ -154,12 +142,8 @@ fn stairs_have_real_risers_legs_climb_them_and_wheels_take_the_ramp() {
                 let steps: Vec<f32> = p.edges.iter().map(|e| e.step_m).filter(|s| *s > 0.0).collect();
                 assert!(steps.iter().all(|s| (*s - rise as f32 / 100.0).abs() < 1e-3), "{steps:?}");
                 assert_eq!(steps.len(), h.risers as usize, "the walk climbs every riser once: {steps:?}");
-                // A wheel and a track cannot climb that stair.
                 assert!(nav::plan(&wheels.drive_spec(), t, &|x, z| closed.contains(&(x, z)), h.stair_foot[0], Goal::Cell(top)).is_none());
                 assert!(nav::plan(&track.drive_spec(), t, &|x, z| closed.contains(&(x, z)), h.stair_foot[0], Goal::Cell(top)).is_none());
-                // Wheels and tracks go up the ramp, never a riser: no step onto a tread or the
-                // landing (a track may still climb a low section of the curb wall, or a ramp's
-                // side where it is low), and the steepest edge on the ramp its 4.8°.
                 assert!(h.reachable_wheels, "{terrain:?} seed {seed} house {}: the ramp is out of a wheel's reach", h.id);
                 let stair: HashSet<_> = h.porch.iter().chain(h.treads.iter().flatten()).copied().collect();
                 for w in [&wheels, &track] {
@@ -203,7 +187,6 @@ fn doors_let_robots_in_and_routes_never_cross_walls_shelves_or_tables() {
         let wheels = sited(seed, TerrainKind::Open, BaseKind::Wheel);
         let s = legs.site.as_ref().unwrap();
         let fixtures: HashSet<_> = world_sim::fixture::blocked(&legs.fixtures).collect();
-        // Into a house through its door.
         for h in s.houses.iter().filter(|h| h.reachable_legs) {
             let inside = (h.rect.x0 as usize + 4, h.rect.z0 as usize + 3);
             let inside = if fixtures.contains(&inside) { ((h.rect.x0 + h.rect.x1) as usize / 2, (h.rect.z0 + h.rect.z1) as usize / 2) } else { inside };
@@ -211,13 +194,11 @@ fn doors_let_robots_in_and_routes_never_cross_walls_shelves_or_tables() {
             let door: HashSet<_> = h.door.iter().copied().collect();
             assert!(p.cells.iter().any(|c| door.contains(c)), "seed {seed}: into house {} not through its door", h.id);
         }
-        // Wheels into the logistics centre to its flag, through the wide door.
         let wh = s.warehouse.as_ref().unwrap();
         let flag = wheels.waypoint_by_key("warehouse").unwrap();
         let p = wheels.plan_route(Goal::Within { x: flag.x, z: flag.z, reach_m: 1.0 }).expect("a wheel reaches the warehouse flag");
         let door: HashSet<_> = wh.door.iter().copied().collect();
         assert!(p.cells.iter().any(|c| door.contains(c)), "seed {seed}: into the logistics centre not through its door");
-        // To every aisle and every slot's standing cell, never through a blocked cell nor past a blocked corner.
         for sl in &s.slots {
             let Some(p) = legs.plan_route(Goal::Cell(sl.stand)) else { panic!("seed {seed}: no way to {:?} for {:?}", sl.stand, sl.support) };
             for w in p.cells.windows(2) {
@@ -267,10 +248,8 @@ fn parcels_rest_on_porches_shelves_and_tables_and_the_camp_parcel_stays() {
                 assert!(w.support_top_m(d.support).is_some_and(|top| (top - y).abs() < 1e-4), "{:?}", d.support);
                 assert_eq!(v.support, d.support);
             }
-            // Distinct places.
             let cells: HashSet<_> = w.drops.iter().map(|d| (d.x.to_bits(), d.z.to_bits(), d.y_m.to_bits())).collect();
             assert_eq!(cells.len(), w.drops.len());
-            // Every stair tread is a support too, one riser below the next; nothing else is.
             let s = w.site.as_ref().unwrap();
             for h in &s.houses {
                 for (k, row) in h.treads.iter().enumerate() {
@@ -286,7 +265,6 @@ fn parcels_rest_on_porches_shelves_and_tables_and_the_camp_parcel_stays() {
     assert!(on.iter().all(|&n| n > 0), "{on:?}");
 }
 
-/// The camera at the slot's standing cell, turned and tilted toward the parcel.
 fn look_at(from: (f32, f32), eye_y: f32, target: [f32; 3]) -> View {
     let (dx, dy, dz) = (target[0] - from.0, target[1] - eye_y, target[2] - from.1);
     View { origin: [from.0, eye_y, from.1], yaw: dz.atan2(dx), pitch: dy.atan2(dx.hypot(dz)), roll: 0.0 }
@@ -301,7 +279,6 @@ fn every_parcel_slot_shows_from_where_the_robot_stands() {
         let slots = w.site.as_ref().unwrap().slots.clone();
         let mut next = 9000u32;
         for sl in slots {
-            // Alone on its slot (the world's own parcels lie on some of them).
             w.drops.clear();
             w.drops.push(world_sim::world::DropItem::on(next, world_sim::ItemKind::Parcel, sl.x, sl.z, sl.support, sl.y_m));
             let (sx, sz) = cell_center(sl.stand.0, sl.stand.1);
@@ -319,7 +296,6 @@ fn every_parcel_slot_shows_from_where_the_robot_stands() {
 fn the_site_renders_as_structures_and_furniture_never_as_detections() {
     let mut w = sited(4, TerrainKind::Open, BaseKind::HumanFoot);
     let s = w.site.clone().unwrap();
-    // Outside a house, at the foot of its stair, looking at its door.
     let h = &s.houses[0];
     let foot = cell_center(h.stair_foot[0].0, h.stair_foot[0].1);
     let door = cell_center(h.door[0].0, h.door[0].1);
@@ -333,7 +309,6 @@ fn the_site_renders_as_structures_and_furniture_never_as_detections() {
     assert!(structure > 1000, "the house fills the view: {structure} px");
     assert_eq!(curb, 0, "the porch and the stair are drawn as such, not as the yellow kerb");
     assert!(w.visible_objects(&f).iter().all(|o| !matches!(o.class, ObjectClass::Structure | ObjectClass::Fixture)));
-    // Inside the logistics centre, in the cross aisle, looking along the shelves.
     let wh = s.warehouse.as_ref().unwrap();
     let (ax, az) = cell_center((wh.receiving.x1 + 1) as usize, ((wh.rect.z0 + wh.rect.z1) / 2) as usize);
     w.agent.x = ax;
@@ -343,7 +318,6 @@ fn the_site_renders_as_structures_and_furniture_never_as_detections() {
     let furniture = f.ids.iter().filter(|&&v| unpack_id(v).0 == ObjectClass::Fixture).count();
     assert!(furniture > 500, "shelves in view: {furniture} px");
     assert!(w.visible_objects(&f).iter().all(|o| !matches!(o.class, ObjectClass::Structure | ObjectClass::Fixture)));
-    // The top view draws no kerb yellow on a porch.
     let top = render::render_top(&w, 128, 32.0);
     assert_eq!(top.rgb.len(), 128 * 128 * 3);
 }
@@ -356,7 +330,6 @@ fn a_raised_parcel_is_picked_only_from_its_own_level() {
     let sl = s.slots.iter().find(|sl| matches!(sl.support, Support::Step { house, .. } if house == h.id)).unwrap().clone();
     w.drops.clear();
     w.drops.push(world_sim::world::DropItem::on(800, world_sim::ItemKind::Parcel, sl.x, sl.z, sl.support, sl.y_m));
-    // From the ground in front of the porch: refused, the robot must step up.
     let foot = cell_center(h.stair_foot[0].0, h.stair_foot[0].1);
     let (dx, dz) = (sl.x - foot.0, sl.z - foot.1);
     let d = dx.hypot(dz);
@@ -368,13 +341,11 @@ fn a_raised_parcel_is_picked_only_from_its_own_level() {
             other => panic!("{other:?}"),
         }
     }
-    // Standing on the porch beside it: the pick starts.
     let (stx, stz) = cell_center(sl.stand.0, sl.stand.1);
     w.agent.x = stx;
     w.agent.z = stz;
     assert!((w.agent_ground_m() - sl.y_m).abs() < 1e-4);
     assert!(w.command(Action::pick(800)).is_ok());
-    // A shelf parcel: the reach to a deck is not modelled, so the pick is refused.
     let mut w = sited(4, TerrainKind::Open, BaseKind::HumanFoot);
     let sl = w.site.as_ref().unwrap().slots.iter().find(|sl| matches!(sl.support, Support::Shelf { .. })).unwrap().clone();
     w.drops.push(world_sim::world::DropItem::on(801, world_sim::ItemKind::Parcel, sl.x, sl.z, sl.support, sl.y_m));
@@ -395,14 +366,11 @@ fn the_search_prior_points_at_porches_and_the_logistics_centre_not_at_parcels() 
     assert!(prior[t.idx(h.porch[0].0, h.porch[0].1)] > 1.0);
     let wh = s.warehouse.as_ref().unwrap();
     assert!(prior[t.idx(wh.aisles[0].0, wh.aisles[0].1)] > 1.0);
-    // The base camp's surroundings are plain ground.
     let camp = t.cell_of(w.agent.x, w.agent.z).unwrap();
     assert_eq!(prior[t.idx(camp.0, camp.1)], 1.0);
-    // The prior does not move with the parcels.
     let mut moved = w.clone();
     moved.drops.truncate(1);
     assert_eq!(moved.search_prior().unwrap(), prior);
-    // The next viewpoint weighs what it would show: with the prior it shows more of the places.
     let cov = Coverage::new(t);
     let blocked = w.blocked_cells();
     let spec = w.drive_spec();
@@ -439,7 +407,6 @@ fn fixtures_have_the_dimensions_of_their_sources() {
     }
     let s = w.site.as_ref().unwrap();
     for h in &s.houses {
-        // The landing: at least the door's width and 914 mm deep, level with the floor.
         assert!(h.porch.len() as f32 * CELL_M * CELL_M >= 0.914 * 0.914);
         assert!(h.porch.iter().all(|c| w.terrain.curb_kind(c.0, c.1) == CurbKind::Floor && (w.terrain.curb_m(c.0, c.1) * 100.0).round() as u8 == h.floor_cm));
     }

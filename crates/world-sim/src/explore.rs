@@ -1,69 +1,32 @@
-//! Where to look from next: terrain line of sight, what the camera has
-//! covered, and the next viewpoint when the target is hidden.
-//!
-//! The robot knows the terrain (a surveyed site map, the same one its routes
-//! are planned on), not where the objects are. What it has already looked at
-//! is a coverage grid: the cells its camera could see from each pose, with the
-//! terrain occluding what lies behind a ridge or below a cliff edge and the
-//! camera's own field of view and range. When a full turn shows nothing, the
-//! next viewpoint is the reachable cell that would show the most unseen
-//! ground per second spent getting there and looking (next-best-view:
-//! Connolly 1985; frontier exploration: Yamauchi 1997). On the open map that
-//! is roughly "the next unseen patch"; on the rugged map it walks around a
-//! mesa or a ridge instead of turning on the spot.
-//!
-//! Objects (trees, boulders) do not occlude here: the planner does not know
-//! where they are, only the terrain.
-//!
-//! A per-cell prior can weigh the unseen ground ([`next_viewpoint_with`]):
-//! with a site the robot is told where parcels are kept (porches, the
-//! logistics centre, `crate::site::Site::prior`), as it is told where the
-//! waypoints are, so a look that shows a porch is worth more than one that
-//! shows open grass. The prior comes from the places, never from the parcels.
-
 use noto_core::BaseSpec;
 
 use crate::nav::{self, Cell};
 use crate::terrain::{cell_center, Terrain, CELL_M};
 
-/// How far a search look counts as covering the ground, metres (est: a
-/// 0.5 m node at 14 m is about 10 px wide on the 384 px camera, above the
-/// recogniser's 6 px floor).
 pub const SEARCH_RANGE_M: f32 = 14.0;
-/// A cell counts as seen when an object this tall standing on it would show,
-/// metres (est: a boulder is 0.6 m, a tree 1.6 m, a dropped piece 0.1 m).
 pub const TARGET_H_M: f32 = 0.3;
-/// The time a look-around costs on top of the drive, seconds (est: six 60°
-/// turns with two scans each).
 pub const LOOK_COST_S: f32 = 12.0;
-/// A viewpoint must show at least this many unseen cells (4 m²) to be worth the trip.
 pub const MIN_GAIN: usize = 16;
 const RAY_STEP_M: f32 = 0.3;
 const RAY_STEP_RAD: f32 = 0.035;
 
-/// The camera as the planner sees it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Eye {
     pub x: f32,
     pub z: f32,
-    /// Height of the camera above sea level, metres.
     pub height_m: f32,
     pub pitch_deg: f32,
-    /// Vertical field of view, degrees.
     pub vfov_deg: f32,
     pub range_m: f32,
 }
 
 impl Eye {
-    /// The robot's camera standing on cell `c` (ground plus `eye_above_m`).
     pub fn at(t: &Terrain, c: Cell, eye_above_m: f32, pitch_deg: f32, vfov_deg: f32) -> Eye {
         let (x, z) = cell_center(c.0, c.1);
         Eye { x, z, height_m: t.height_m(c.0, c.1) + t.curb_m(c.0, c.1) + eye_above_m, pitch_deg, vfov_deg, range_m: SEARCH_RANGE_M }
     }
 }
 
-/// Visits every cell index the eye can see in the heading sector `[a0, a1]`
-/// (radians, world frame: 0 = +x, π/2 = +z). A cell can be visited more than once.
 pub fn viewshed(t: &Terrain, eye: &Eye, a0: f32, a1: f32, visit: &mut dyn FnMut(usize)) {
     let span = (a1 - a0).abs().max(1e-3);
     let n = (span / RAY_STEP_RAD).ceil().max(1.0) as usize;
@@ -72,7 +35,6 @@ pub fn viewshed(t: &Terrain, eye: &Eye, a0: f32, a1: f32, visit: &mut dyn FnMut(
     for k in 0..=n {
         let a = a0 + (a1 - a0) * k as f32 / n as f32;
         let (dx, dz) = (a.cos(), a.sin());
-        // Steepest terrain seen so far along the ray (tangent of its elevation).
         let mut horizon = f32::NEG_INFINITY;
         let mut last = usize::MAX;
         let mut r = RAY_STEP_M;
@@ -82,7 +44,6 @@ pub fn viewshed(t: &Terrain, eye: &Eye, a0: f32, a1: f32, visit: &mut dyn FnMut(
             let top = if t.is_water(cx, cz) { 0.0 } else { t.height_m(cx, cz) + t.curb_m(cx, cz) };
             let low = (top - eye.height_m) / r;
             let high = (top + TARGET_H_M - eye.height_m) / r;
-            // An object here shows when its top clears the horizon and it is inside the camera's vertical band.
             if i != last && high >= horizon && low <= hi && high >= lo {
                 visit(i);
             }
@@ -93,14 +54,12 @@ pub fn viewshed(t: &Terrain, eye: &Eye, a0: f32, a1: f32, visit: &mut dyn FnMut(
     }
 }
 
-/// The cells the camera has looked at so far.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Coverage {
     w: usize,
     d: usize,
     seen: Vec<bool>,
     land: usize,
-    /// Looks marked so far.
     pub looks: u32,
 }
 
@@ -118,13 +77,11 @@ impl Coverage {
         self.seen.iter().filter(|s| **s).count()
     }
 
-    /// Share of the land cells seen (water is never searched for objects).
     pub fn land_frac(&self, t: &Terrain) -> f32 {
         let n = (0..self.seen.len()).filter(|&i| self.seen[i] && !t.is_water(i % self.w, i / self.w)).count();
         n as f32 / self.land as f32
     }
 
-    /// Marks what a camera facing `yaw` (radians) with a horizontal field of view of `hfov_deg` sees.
     pub fn look(&mut self, t: &Terrain, eye: &Eye, yaw: f32, hfov_deg: f32) {
         let h = hfov_deg.to_radians() * 0.5;
         let seen = &mut self.seen;
@@ -133,28 +90,18 @@ impl Coverage {
     }
 }
 
-/// A place to look from next.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Viewpoint {
     pub x: f32,
     pub z: f32,
     pub cell: Cell,
-    /// Unseen cells a full turn there would show.
     pub gain: usize,
-    /// Those cells weighted by the prior (`gain` without one).
     pub weighted: f32,
     pub time_s: f32,
-    /// Weighted gain per second of driving plus [`LOOK_COST_S`].
     pub score: f32,
-    /// Heading of the 45° sector with the most unseen cells, radians.
     pub face_yaw: f32,
 }
 
-/// The reachable cell that would show the most unseen ground per second.
-/// `eye_above_m`, `pitch_deg` and `vfov_deg` describe the camera and
-/// `range_m` how far it recognises what is searched for; `avoid` are
-/// points already tried (a viewpoint within 2 m of one is skipped). `None`
-/// when nothing reachable would show [`MIN_GAIN`] new cells.
 #[allow(clippy::too_many_arguments)]
 pub fn next_viewpoint(
     t: &Terrain,
@@ -171,9 +118,6 @@ pub fn next_viewpoint(
     next_viewpoint_with(t, spec, blocked, start, cov, eye_above_m, pitch_deg, vfov_deg, range_m, avoid, None)
 }
 
-/// [`next_viewpoint`] with each unseen cell weighed by `prior` (row by row,
-/// 1 = no preference): the score is the weighted gain per second, and a
-/// viewpoint still needs [`MIN_GAIN`] unseen cells.
 #[allow(clippy::too_many_arguments)]
 pub fn next_viewpoint_with(
     t: &Terrain,
@@ -231,7 +175,6 @@ pub fn next_viewpoint_with(
         }
         let score = weighted / (tt + LOOK_COST_S);
         if best.as_ref().map_or(true, |b| score > b.score) {
-            // The fullest sector, the last of equals (as `max_by_key` on the counts picked it before).
             let s = (0..8).fold(0usize, |b, i| if sectors[i] >= sectors[b] { i } else { b });
             best = Some(Viewpoint {
                 x: eye.x,
@@ -248,8 +191,6 @@ pub fn next_viewpoint_with(
     best
 }
 
-/// Whether the straight sight line from `a` (eye height above its ground)
-/// to the ground point `b` clears the terrain, with `b` raised by `target_h_m`.
 pub fn line_of_sight(t: &Terrain, a: (f32, f32), eye_above_m: f32, b: (f32, f32), target_h_m: f32) -> bool {
     let Some(ca) = t.cell_of(a.0, a.1) else { return false };
     let Some(cb) = t.cell_of(b.0, b.1) else { return false };
@@ -317,7 +258,6 @@ mod tests {
     #[test]
     fn the_next_viewpoint_goes_around_a_ridge_to_unseen_ground() {
         let mut t = flat(48);
-        // A wall across the middle with a gap at one end.
         for z in 4..48 {
             t.set_height_cm(24, z, 140);
         }
@@ -330,7 +270,6 @@ mod tests {
         let none = |_: usize, _: usize| false;
         let v = next_viewpoint(&t, &spec, &none, start, &cov, 0.5, -12.0, 50.0, SEARCH_RANGE_M, &[]).expect("unseen ground is left");
         assert!(v.gain >= MIN_GAIN && v.time_s > 0.0);
-        // Everything seen: nowhere to go.
         let mut all = Coverage::new(&t);
         all.seen.iter_mut().for_each(|s| *s = true);
         assert!(next_viewpoint(&t, &spec, &none, start, &all, 0.5, -12.0, 50.0, SEARCH_RANGE_M, &[]).is_none());

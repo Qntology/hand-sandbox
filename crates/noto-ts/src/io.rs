@@ -1,5 +1,3 @@
-//! Loading of TTM files (config.json and safetensors weights).
-
 use std::path::{Path, PathBuf};
 
 use candle_core::{DType, Device};
@@ -10,9 +8,6 @@ pub fn read_json(path: &Path) -> Result<serde_json::Value, String> {
     serde_json::from_str(&txt).map_err(|e| format!("{}: {}", path.display(), e))
 }
 
-/// Weight files of a model folder: `model.safetensors`, or the shards named by
-/// `model.safetensors.index.json`, or every `*.safetensors` file. ONNX-only
-/// folders are refused with a clear message.
 pub fn safetensor_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     if !dir.exists() {
         return Err(format!("모델 디렉터리가 없습니다: {}", dir.display()));
@@ -51,7 +46,6 @@ pub fn safetensor_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
 
 pub fn load_varbuilder(dir: &Path, device: &Device) -> Result<VarBuilder<'static>, String> {
     let files = safetensor_files(dir)?;
-    // SAFETY: the weight files are only read, and are not modified while mapped.
     unsafe { VarBuilder::from_mmaped_safetensors(&files, DType::F32, device) }.map_err(|e| e.to_string())
 }
 

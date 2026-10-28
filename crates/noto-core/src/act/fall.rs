@@ -1,58 +1,3 @@
-//! Falling over: the body turning about the edge of its support until it
-//! strikes the ground (`fall`), a felled trunk turning about its base
-//! (`rod_topple`), and whether a fallen robot gets up again (`get_up`). Pure
-//! functions: the world says where a fall starts (a tip from `collide`, a
-//! slip, an edge), this module plays it out (`docs/research/collision.md` §3).
-//!
-//! * **Turning.** The robot is `collide`'s rigid body (the presets' masses on
-//!   the pose's links, the joints held) in the vertical plane of the fall. It
-//!   turns about the support edge as an inverted pendulum: `θ̈ = m·g·l·sin θ / I`
-//!   about a held edge, the edge sliding when friction cannot hold it (wheels
-//!   roll along their travel), leaving it when the ground would have to pull,
-//!   then flying. Beyond an edge the ground is lower by the drop (an edge
-//!   fall), with the drop's vertical face between the two levels and the
-//!   step's own corner where they meet.
-//! * **Strikes.** Every corner of every link box (and the support's own edges)
-//!   is a probe; the deepest one that goes into the ground, the drop's face
-//!   or a wall strikes. The step's corner strikes the outline a link casts on
-//!   the plane (its box; a wheel's disc, a track's rounded ends) through the
-//!   face it crosses: a body driving or tipping over a step meets the edge
-//!   with its sole, its chassis' underside or a wheel's rim, and turns or
-//!   slides on it. A strike is an impulse (Newton's restitution with
-//!   Coulomb friction, the pivot still loaded: `collide::solve_impulses`)
-//!   whose force over time follows the link's contact law on that ground
-//!   (`collide::ground_pair`, `pulse`). Restitution applied to several
-//!   contacts at once is not bound to dissipate: a strike that would add
-//!   kinetic energy is taken plastic (then frictionless), and the body is set
-//!   onto a new pivot by the least change of its motion, so no strike and no
-//!   turn adds energy. A low part ahead of the support (a bumper ahead of the
-//!   wheels) catches the body: it rocks on it and settles or falls on. The
-//!   body turns about a pivot on the ground, the drop's face, a wall or the
-//!   step's corner; a second contact it presses while turning is held by
-//!   small impulses, not counted as strikes. It rests when it lies between
-//!   two contacts (then slides to a stop by their friction, or rolls on its
-//!   wheels), leans calm on a wall or the face, rocks between two without
-//!   the energy to climb over either, or stays calm while held by two; never
-//!   while still moving (out of strikes or time, the fall ends unsettled).
-//! * **Speeds.** The impact speeds of the pelvis, the head and the hands are
-//!   the speeds of their links when the body first strikes hard: a rigid
-//!   pendulum, which over-predicts a person's (who bends the knees and breaks
-//!   the fall with the arms; the benchmark says by how much).
-//! * **Lying.** Where the body comes to rest: the pose turned about the fall's
-//!   axis by the final tilt, with the CoM's displacement ([`LyingPose`]).
-//! * **Get-up.** Legs get up when a deep squat is within their joints' peaks
-//!   (est. [`GET_UP_LEGS_S`]); wheels and tracks cannot right themselves, and
-//!   the force a helper must put at the top to turn the body back is reported
-//!   (`righting_force_n`, for a cooperating robot).
-//! * **A felled trunk** is a uniform rod about its base: `θ̇² = (3g/H)(cos θ₀ − cos θ)`,
-//!   its top meets the ground at about `√(3gH)`.
-//! * **Direction.** Where physics does not say which way a person-like body
-//!   falls, the initial directions of video-captured falls give it
-//!   ([`initial_direction`]).
-//!
-//! Engine inputs only (Group A); the collision benchmark scores
-//! with other sources.
-
 use serde::Serialize;
 
 use crate::balance::{Body, G};
@@ -64,79 +9,33 @@ use crate::surface::{self, Surface};
 use super::collide::{self, ground_pair, joint_hits, pulse, rot2, shock_events, solve_impulses, Contactor, JointHit, Obstacle, PairLaw, PhysKind, PhysRollout, PivotMode, Planar, Pulse, Rigid2, Row, TipStart};
 use super::{ActEvent, ActSample, Outcome, Part, SAMPLE_S};
 
-/// Integration step of the turning body, s.
 const DT_S: f32 = 0.0005;
-/// A strike slower than this is not a link's impact, only a contact settling,
-/// m/s (est: its rebound, about half of it, rises less than a tenth of a
-/// millimetre). A contact pressed again within [`HELD_S`] of its last impulse
-/// (a corner held on a step's face while the body turns on another) closing
-/// slower than this is held, not struck: its impulse is applied but not
-/// counted as a strike. A contact the integration lets sink by [`SINK_M`]
-/// under gravity closes at `√(2·g·SINK_M)`, 0.014 m/s, well below it.
 pub const REST_MPS: f32 = 0.05;
-/// How long a contact counts as held after its last impulse, s (est: forty
-/// integration steps; a held contact sinks back within a few).
 const HELD_S: f32 = 0.02;
-/// How deep a probe goes into the ground before it counts as touching it, m
-/// (a numerical tolerance of the contact search).
 const SINK_M: f32 = 1e-5;
-/// A strike slower than this is taken as plastic: the contact stays instead of
-/// bouncing, m/s (est: the rebound of a faster one, at the robot's restitution
-/// 0.55, rises 0.14 m/s, a millimetre; below that the rigid-body contact model
-/// would only chatter, not change where the body goes).
 pub const PLASTIC_MPS: f32 = 0.25;
-/// A contact leaving the ground slower than this after a strike stays in
-/// contact (it carries the body on), m/s (the impulse solver's tolerance,
-/// est). A contact closing slower than this is never a strike.
 const STAY_MPS: f32 = 0.01;
-/// A strike at least this fast is the body landing (not a contact settling), m/s (est).
 pub const HARD_MPS: f32 = 0.5;
-/// Longest fall played out, s.
 pub const FALL_MAX_S: f32 = 4.0;
-/// Most strikes followed (est: a bound on the work; a body bouncing on its
-/// restitution settles within a few dozen): a body still moving then is not
-/// taken as settled (the fall ends unsettled, `RockEnd::Timeout`), a calm one is.
 const MAX_STRIKES: usize = 80;
-/// A body held by a contact besides the one it turns on (settles at least every
-/// [`HELD_GAP_S`]) whose kinetic energy stays below that of its mass at this
-/// speed for [`CALM_S`] is at rest, m/s (est: four integration steps of
-/// gravity; a body balanced on one contact alone is never taken at rest this way).
 const CALM_MPS: f32 = 0.02;
 const CALM_S: f32 = 0.05;
 const HELD_GAP_S: f32 = 0.005;
-/// A face's normal may lean this far out of the cone of the step's two faces
-/// (its top and its drop) for the step's corner to press on it (a numerical tolerance).
 const CONE_TOL: f32 = 0.02;
-/// Friction of a hard housing on the ground or a wall (est: hard plastic on
-/// concrete or soil 0.4–0.6; no measurement in the research).
 pub const SHELL_GROUND_MU: f32 = 0.5;
-/// Time a legged robot takes to get up from lying, s (est: the get-up the
-/// world has used since v0.6; no measured robot get-up time in the research).
 pub const GET_UP_LEGS_S: f32 = 6.0;
-/// Initial direction of video-captured falls of older adults in long-term
-/// care: forward 51, backward 74, sideways 55, straight down 19 of 199
-/// (Schonnop et al. 2013, CMAJ 185(17), Table 2).
 pub const FALL_DIR_COUNTS: [(InitialDir, u32); 4] = [(InitialDir::Forward, 51), (InitialDir::Backward, 74), (InitialDir::Sideways, 55), (InitialDir::Down, 19)];
-/// Share of sideways falls that turn to land backward (same study: 36%).
 pub const SIDEWAYS_TO_BACK: f32 = 0.36;
 
-/// Why the robot falls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FallCause {
-    /// Pushed past its balance (another robot, a person, a load).
     Pushed,
-    /// It ran into something (`collide::bump` tipped it).
     Bumped,
-    /// A foot caught on a step or a curb.
     Tripped,
-    /// A foot slipped.
     Slipped,
-    /// Something fell on it (`collide::struck_by`).
     Hit,
-    /// It went over an edge.
     Edge,
-    /// A load it could not hold (a co-carried object, a lift).
     Overload,
 }
 
@@ -166,18 +65,15 @@ impl FallCause {
     }
 }
 
-/// The way a person-like body starts to fall when nothing pushes it one way.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InitialDir {
     Forward,
     Backward,
     Sideways,
-    /// Straight down (the knees give way); it lands backward or sideways.
     Down,
 }
 
-/// The initial direction for a uniform draw `u` in [0, 1) by [`FALL_DIR_COUNTS`].
 pub fn initial_direction(u: f32) -> InitialDir {
     let total: u32 = FALL_DIR_COUNTS.iter().map(|c| c.1).sum();
     let mut acc = 0.0f32;
@@ -190,15 +86,11 @@ pub fn initial_direction(u: f32) -> InitialDir {
     InitialDir::Down
 }
 
-/// The base-frame direction (degrees) a fall of `d` goes over, `side_u` a second
-/// uniform draw for the side (left below 0.5) and for a sideways or straight
-/// down fall turning to land backward.
 pub fn direction_deg(d: InitialDir, side_u: f32) -> f32 {
     let side = if side_u < 0.5 { 90.0 } else { -90.0 };
     match d {
         InitialDir::Forward => 0.0,
         InitialDir::Backward => 180.0,
-        // Turning on its way down: part of the sideways falls land backward (half way between).
         InitialDir::Sideways => {
             if (side_u * 2.0).fract() < SIDEWAYS_TO_BACK {
                 if side > 0.0 {
@@ -214,47 +106,32 @@ pub fn direction_deg(d: InitialDir, side_u: f32) -> f32 {
     }
 }
 
-/// Where and how a fall starts.
 #[derive(Clone, Debug)]
 pub struct FallInput<'a> {
     pub body: &'a Body,
-    /// The pose when the fall starts; the joints hold it on the way down.
     pub pose: KinPose,
     pub cause: FallCause,
-    /// Horizontal direction the robot goes over, base frame, degrees (0 ahead, 90 left).
     pub dir_deg: f32,
-    /// Tilt past upright about the edge when the fall starts, degrees, and its rate, rad/s.
     pub tilt0_deg: f32,
     pub omega0: f32,
-    /// Speed of the body along `dir_deg` when the fall starts (driving off an edge), m/s.
     pub speed_mps: f32,
-    /// The edge the body turns about, from the CoM along `dir_deg` and below it
-    /// (at zero tilt), metres; `None`: the support's edge in `dir_deg`.
     pub pivot: Option<[f32; 2]>,
-    /// How much lower the ground is beyond `edge_m` from the edge (an edge fall), metres.
     pub drop_m: f32,
     pub edge_m: f32,
     pub ground: Surface,
 }
 
 impl<'a> FallInput<'a> {
-    /// A fall from where `collide` found the body going over.
     pub fn from_tip(body: &'a Body, pose: KinPose, tip: &TipStart, cause: FallCause, ground: Surface) -> FallInput<'a> {
         FallInput { body, pose, cause, dir_deg: tip.dir_deg, tilt0_deg: tip.tilt_deg, omega0: tip.omega, speed_mps: 0.0, pivot: Some(tip.pivot), drop_m: 0.0, edge_m: 0.0, ground }
     }
 
-    /// Balance lost standing: the CoM just over the support edge in `dir_deg`, turning at `omega0`.
     pub fn lost_balance(body: &'a Body, pose: KinPose, cause: FallCause, dir_deg: f32, omega0: f32, ground: Surface) -> FallInput<'a> {
         let solved = kin::solve(body, &pose, &KinLoads::default());
         let pl = Planar::of(&collide::mass_props_of(body, &solved), solved.support, dir_of(dir_deg));
         FallInput { body, pose, cause, dir_deg, tilt0_deg: pl.tip_angle(pl.ahead_m).to_degrees(), omega0, speed_mps: 0.0, pivot: None, drop_m: 0.0, edge_m: 0.0, ground }
     }
 
-    /// Over an edge `drop_m` deep at the support's edge in `dir_deg`, driving
-    /// or walking off it at `speed_mps`; at no speed (0.05 m/s or less) tipped
-    /// over it from standing at the edge: the CoM just over the support's edge
-    /// (as [`FallInput::lost_balance`]), turning slowly. A robot that merely
-    /// stands at an edge does not fall: that is no call of this.
     pub fn over_edge(body: &'a Body, pose: KinPose, dir_deg: f32, speed_mps: f32, drop_m: f32, ground: Surface) -> FallInput<'a> {
         let tilt0_deg = if speed_mps.abs() > 0.05 {
             0.5
@@ -267,55 +144,39 @@ impl<'a> FallInput<'a> {
     }
 }
 
-/// One strike of the falling body on the ground (or a wall).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Strike {
-    /// Seconds from the start of the fall.
     pub t: f32,
     pub tilt_deg: f32,
     pub link: &'static str,
     pub segment: Segment,
     pub contactor: Contactor,
-    /// Where it strikes, base frame of the upright body, metres.
     pub point: [f32; 3],
     pub wall: bool,
-    /// On the vertical face of the drop of an edge fall (not its top).
     pub face: bool,
-    /// The step's own corner (the edge of an edge fall) striking the link's face.
     pub edge: bool,
-    /// Closing speed along the ground's normal, m/s.
     pub v_n: f32,
     pub impulse_ns: f32,
-    /// The mass the ground feels, kg (`impulse / ((1 + e)·v)`).
     pub m_eff_kg: f32,
     pub peak_n: f32,
     pub contact_s: f32,
-    /// Peak deceleration of the struck point and of the trunk's middle (where an IMU sits), g.
     pub a_point_g: f32,
     pub a_trunk_g: f32,
-    /// Kinetic energy the strike takes in, J (`½·m_eff·v²`).
     pub energy_j: f32,
 }
 
-/// Where the body comes to rest: `pose` turned `tilt_deg` past upright about
-/// the horizontal axis square to `dir_deg` (the top toward `dir_deg`), with its
-/// base frame moved so its CoM is at `com` (all in the base frame of the upright body).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct LyingPose {
     pub pose: KinPose,
     pub dir_deg: f32,
     pub tilt_deg: f32,
     pub com: [f32; 3],
-    /// The CoM where the fall started.
     pub com0: [f32; 3],
-    /// The support edge the fall turned about first (on the ground), base frame.
     pub pivot0: [f32; 3],
-    /// The fall's CoM in the edge's plane at rest (u along `dir_deg` from the edge, z up).
     c_rest: [f32; 2],
 }
 
 impl LyingPose {
-    /// Where a point of the upright body (base frame) is once lying.
     pub fn place(&self, p: [f32; 3]) -> [f32; 3] {
         let d = dir_of(self.dir_deg);
         let perp = [-d[1], d[0]];
@@ -328,60 +189,40 @@ impl LyingPose {
         [self.pivot0[0] + d[0] * u + perp[0] * lat, self.pivot0[1] + d[1] * u + perp[1] * lat, z]
     }
 
-    /// Lying on the ground (more than half way over), not resting tilted on a bumper or a wall.
     pub fn down(&self) -> bool {
         self.tilt_deg.abs() >= 45.0
     }
 }
 
-/// Whether and how a fallen robot gets back up.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct GetUp {
     pub can: bool,
     pub time_s: Option<f32>,
-    /// It cannot right itself: another robot (or a person) must turn it back.
     pub needs_help: bool,
-    /// Vertical force a helper must put at the body's far end to start turning it back about the edge it lies on, N.
     pub righting_force_n: f32,
     pub why_ko: String,
 }
 
-/// A played-out fall.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Fall {
     pub rollout: PhysRollout,
     pub cause: FallCause,
     pub dir_deg: f32,
-    /// The body went down (not caught back upright).
     pub fell: bool,
-    /// Seconds from the start to the hardest strike, and to the first strike
-    /// that lands hard ([`HARD_MPS`]).
     pub t_ground_s: f32,
     pub t_first_s: f32,
     pub strikes: Vec<Strike>,
-    /// The hardest strike (largest closing speed).
     pub main: Option<Strike>,
-    /// Impact speed (down positive) of the pelvis, the head and the hands'
-    /// palms: the link's closing speed when it first strikes, or, for a link
-    /// another holds off the ground, its vertical speed at the body's first
-    /// hard strike, m/s (`None` when the body has no such link).
     pub pelvis_v: Option<f32>,
     pub head_v: Option<f32>,
     pub hand_v: Option<f32>,
-    /// The tilt over time, `(t, degrees)`.
     pub tilt: Vec<(f32, f32)>,
     pub lying: LyingPose,
     pub damage: Vec<JointHit>,
     pub get_up: GetUp,
-    /// It came to rest on its contacts. Otherwise it was still moving when
-    /// the fall's time or its strikes ran out: `lying` is where it was then,
-    /// not where it will rest.
     pub at_rest: bool,
 }
 
-// ----- the turning body -----
-
-/// A body point that may strike: its offset from the CoM in the plane at zero tilt.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Probe {
     pub q: [f32; 2],
@@ -391,7 +232,6 @@ pub(crate) struct Probe {
     pub contactor: Contactor,
 }
 
-/// The part of the robot a link's surface is.
 pub(crate) fn contactor_of(body: &Body, link: &str) -> Contactor {
     match link {
         "bumper" => Contactor::Bumper,
@@ -407,10 +247,6 @@ pub(crate) fn contactor_of(body: &Body, link: &str) -> Contactor {
     }
 }
 
-/// The probes of a solved pose in the plane of `pl`: every corner of every
-/// link box (one per plane point and link: the plane hides the side), less the
-/// round wheels and tracks and the fingers, plus the support's edges ahead and
-/// behind on the ground.
 pub(crate) fn probes(body: &Body, r: &KinReport, pl: &Planar) -> Vec<Probe> {
     let mut v: Vec<Probe> = Vec::new();
     for b in &r.boxes {
@@ -442,24 +278,18 @@ pub(crate) fn probes(body: &Body, r: &KinReport, pl: &Planar) -> Vec<Probe> {
     v
 }
 
-/// A link's outline in the plane of a fall, for the step's corner to press
-/// on: the convex polygon its box casts on the plane (a wheel's disc, a
-/// track's rounded ends), offsets from the CoM at zero tilt, counter-clockwise.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Hull {
     pub pts: Vec<[f32; 2]>,
     pub link: &'static str,
     pub segment: Segment,
     pub contactor: Contactor,
-    /// The CoM and the fall's direction in the base frame, and the link's
-    /// offset across the plane: where a point of the outline is on the body.
     origin: [f32; 3],
     dir: [f32; 2],
     lat: f32,
 }
 
 impl Hull {
-    /// Outward unit normal of the face from vertex `k` to the next.
     fn out(&self, k: usize) -> [f32; 2] {
         let (a, b) = (self.pts[k], self.pts[(k + 1) % self.pts.len()]);
         let d = [b[0] - a[0], b[1] - a[1]];
@@ -467,8 +297,6 @@ impl Hull {
         [d[1] / l, -d[0] / l]
     }
 
-    /// A point `q` (from the CoM at zero tilt) inside the outline: the face
-    /// it is nearest, how deep it is, and that face's outward normal.
     fn inside(&self, q: [f32; 2]) -> Option<(usize, f32, [f32; 2])> {
         if self.pts.len() < 3 {
             return None;
@@ -488,7 +316,6 @@ impl Hull {
         near
     }
 
-    /// The body point of an outline point (base frame of the upright body).
     fn point(&self, q: [f32; 2]) -> [f32; 3] {
         let perp = [-self.dir[1], self.dir[0]];
         [self.origin[0] + self.dir[0] * q[0] + perp[0] * self.lat, self.origin[1] + self.dir[1] * q[0] + perp[1] * self.lat, self.origin[2] + q[1]]
@@ -499,7 +326,6 @@ impl Hull {
     }
 }
 
-/// Andrew's monotone chain: the convex hull of `pts`, counter-clockwise (u right, z up).
 fn convex_hull(mut pts: Vec<[f32; 2]>) -> Vec<[f32; 2]> {
     pts.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
     pts.dedup_by(|a, b| (a[0] - b[0]).abs() < 1e-6 && (a[1] - b[1]).abs() < 1e-6);
@@ -527,12 +353,8 @@ fn convex_hull(mut pts: Vec<[f32; 2]>) -> Vec<[f32; 2]> {
     lower
 }
 
-/// Sides of the polygon a wheel's disc (and a track's rounded end) is drawn with.
 const DISC_SIDES: usize = 32;
 
-/// The outlines of a solved pose in the plane of `pl`, one per link box less
-/// the fingers: the box's corners, a wheel's disc and a track's rounded ends
-/// (a disc at each end of its straight run) as polygons.
 pub(crate) fn hulls(body: &Body, r: &KinReport, pl: &Planar) -> Vec<Hull> {
     let perp = [-pl.dir[1], pl.dir[0]];
     let mut v = Vec::new();
@@ -577,28 +399,20 @@ pub(crate) fn hulls(body: &Body, r: &KinReport, pl: &Planar) -> Vec<Hull> {
     v
 }
 
-/// What surrounds the turning body, in the frame of its first edge (u along
-/// the fall from the edge, z up from the ground there).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Scene {
     pub ground: Surface,
-    /// Beyond `edge_u` the ground is `drop_m` lower.
     pub drop_m: f32,
     pub edge_u: f32,
-    /// A wall's face at u, from z to z (an obstacle ahead), and what it is.
     pub wall: Option<([f32; 3], Obstacle)>,
-    /// Friction under the first edge (0: the wheels roll along the fall).
     pub mu_edge: f32,
-    /// The robot's base, for the friction of its feet or wheels.
     pub base: BaseKind,
 }
 
-/// The ground's outward normals: up, and the drop's face (facing along the fall).
 const UP: [f32; 2] = [0.0, 1.0];
 const FACE: [f32; 2] = [1.0, 0.0];
 
 impl Scene {
-    /// Height of the ground's top at `u`.
     fn ground_z(&self, u: f32) -> f32 {
         if self.drop_m > 0.0 && u > self.edge_u + 1e-4 {
             -self.drop_m
@@ -607,19 +421,11 @@ impl Scene {
         }
     }
 
-    /// Whether `u` is before the edge (over the upper level).
     fn upper(&self, u: f32) -> bool {
         self.drop_m <= 0.0 || u <= self.edge_u + 1e-4
     }
 
-    /// How deep a body point that moved from `prev` to `now` (u, z) is in the
-    /// ground, and the outward normal of the face it came through: the top of
-    /// the level it is over, or the drop's vertical face for a point that came
-    /// from beyond the edge below the upper level (a corner swung back under
-    /// the edge meets the face, not the top). A point already inside takes
-    /// the nearer face.
     fn ground_hit(&self, prev: [f32; 2], now: [f32; 2]) -> Option<([f32; 2], f32)> {
-        // Over the lower level, or slid down the face into the corner at its foot.
         let foot = self.drop_m > 0.0 && now[1] < -self.drop_m && self.edge_u - now[0] < TOUCH_GAP_M;
         if !self.upper(now[0]) || foot {
             let depth = -self.drop_m - now[1];
@@ -638,20 +444,14 @@ impl Scene {
         Some(if from_side || (!from_top && face < top) { (FACE, face.max(0.0)) } else { (UP, top) })
     }
 
-    /// Height of a point above the top of the level it is over (negative: in it), metres.
     fn gap_up(&self, p: [f32; 2]) -> f32 {
         p[1] - self.ground_z(p[0])
     }
 
-    /// A point over the upper level but below it: beside (or in) the drop's face.
     fn beside_face(&self, p: [f32; 2]) -> bool {
         self.drop_m > 0.0 && self.upper(p[0]) && p[1] < -TOUCH_GAP_M
     }
 
-    /// Whether a pivot at `p` against a surface of outward normal `n` still has
-    /// it there: the top of its level (not past an edge, not slid along the
-    /// lower level into the face), the drop's face between its top and its
-    /// foot, the wall's face over its height.
     fn holds(&self, p: [f32; 2], n: [f32; 2]) -> bool {
         if n[1] > 0.5 {
             self.gap_up(p) <= TOUCH_GAP_M && !self.beside_face(p)
@@ -662,9 +462,6 @@ impl Scene {
         }
     }
 
-    /// Friction of a contactor on the ground: a sole grips; a tyre or a track
-    /// holds as the first edge does (rolling along its travel while it drives,
-    /// gripping across it or held still); the housing slides.
     fn mu_of(&self, c: Contactor) -> f32 {
         match c {
             Contactor::Sole => surface::available_mu(self.base, self.ground.props()),
@@ -673,17 +470,11 @@ impl Scene {
         }
     }
 
-    /// The step's own corner (the edge of an edge fall), where its top meets its drop.
     fn corner(&self) -> Option<[f32; 2]> {
         (self.drop_m > 0.0).then_some([self.edge_u, 0.0])
     }
 }
 
-/// Where the body point at the step's corner `e` is on the face `ed` of the
-/// outline `h` of the body in `st`: the point (from the CoM at zero tilt), how
-/// far along the face (0 to 1 between its ends) and off it (negative: inside),
-/// the corner's push on the body (the face's inward normal), and the ends'
-/// tolerance along it.
 fn on_face(h: &Hull, ed: usize, e: [f32; 2], st: &Rigid2) -> ([f32; 2], f32, f32, [f32; 2], f32) {
     let q = rot2([e[0] - st.c[0], e[1] - st.c[1]], -st.th);
     let (a, b) = (h.pts[ed], h.pts[(ed + 1) % h.pts.len()]);
@@ -696,14 +487,6 @@ fn on_face(h: &Hull, ed: usize, e: [f32; 2], st: &Rigid2) -> ([f32; 2], f32, f32
     (q, along, s, [-w[0], -w[1]], 1e-3 / len2.sqrt())
 }
 
-/// The step's corner `e` turning or sliding on the face `ed` of the outline
-/// `h` of the body in `st`, `gap` off it when it was taken as the pivot (the
-/// depth it was struck at, kept rather than snapped out): the face it is on
-/// now (past an end of the face onto the next one, as a wheel's polygon rolls
-/// over the corner), the body point there, the corner's push on the body, and
-/// the gap to keep. `None` once the corner has left the face (off its ends, or
-/// more than [`TOUCH_GAP_M`] off it) or the push leaves the cone of the step's
-/// top and drop.
 fn corner_on(h: &Hull, ed: usize, e: [f32; 2], st: &Rigid2, gap: f32) -> Option<(usize, [f32; 2], [f32; 2], f32)> {
     let k = h.pts.len();
     let (q, along, s, n, tol) = on_face(h, ed, e, st);
@@ -717,9 +500,6 @@ fn corner_on(h: &Hull, ed: usize, e: [f32; 2], st: &Rigid2, gap: f32) -> Option<
     (along >= -tol && along <= 1.0 + tol && (s - gap).abs() <= TOUCH_GAP_M && s <= TOUCH_GAP_M && n[0] >= -CONE_TOL && n[1] >= -CONE_TOL).then_some((ed, q, n, gap))
 }
 
-/// The body in `st` kept on the step's corner `e` on the face `ed` of `h`
-/// against the integration's drift: moved along the face's normal back to the
-/// gap it was taken at, and with no speed into or off the face there ([`onto`]).
 fn keep_on_corner(m: f32, i: f32, st: Rigid2, h: &Hull, ed: usize, e: [f32; 2], gap: f32) -> Rigid2 {
     let (_, _, s, n, _) = on_face(h, ed, e, &st);
     let moved = Rigid2 { c: [st.c[0] - (s - gap) * n[0], st.c[1] - (s - gap) * n[1]], ..st };
@@ -727,44 +507,30 @@ fn keep_on_corner(m: f32, i: f32, st: Rigid2, h: &Hull, ed: usize, e: [f32; 2], 
     onto(m, i, moved, q2, n)
 }
 
-/// A contact of a resolved strike.
 #[derive(Clone, Copy, Debug)]
 struct Touch {
-    /// Where it is along u.
     u: f32,
-    /// How fast it leaves the ground (or the wall) after the strike, m/s.
     leave: f32,
     probe: Option<usize>,
-    /// Its offset from the CoM at zero tilt.
     q: [f32; 2],
     mu: f32,
-    /// The outward normal of what it touches (up: the ground's top); for the
-    /// step's corner on a face of the body, the corner's push on the body.
     n: [f32; 2],
-    /// The step's corner on the face `.1` of the outline `.0` (not a body point on a surface).
     corner: Option<(usize, usize)>,
 }
 
 impl Touch {
-    /// On a wall or the drop's face rather than the ground's top.
     fn vertical(&self) -> bool {
         self.n[1].abs() < 0.5
     }
 }
 
-/// One resolved strike of [`rock`].
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Hit {
     pub t: f32,
-    /// The probe that strikes (`None`: the step's corner strikes a link's face).
     pub probe: Option<usize>,
-    /// The body point struck (a probe, or the point of a link's face the step's corner meets).
     pub at: Probe,
-    /// On the scene's wall (an obstacle), not the ground.
     pub wall: bool,
-    /// The step's own corner on a face of the body.
     pub corner: bool,
-    /// The outward normal of what it strikes: up (the ground's top), the drop's face `(1, 0)`, the wall `(−1, 0)`.
     pub n: [f32; 2],
     pub before: Rigid2,
     pub after: [f32; 3],
@@ -777,40 +543,24 @@ pub(crate) struct Hit {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RockEnd {
-    /// The CoM went outward over the edge it turns about (`stop_at_over`).
     Over,
-    /// Settled on its contacts.
     Rest,
     Timeout,
 }
 
-/// The turn of a rigid body: its track, its strikes and how it ended.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Rocked {
-    /// `(t, state)` every [`SAMPLE_S`].
     pub track: Vec<(f32, Rigid2)>,
     pub hits: Vec<Hit>,
-    /// The first time the CoM went outward over the edge it turned about (the
-    /// front one forward, the rear one backward): when, the state, the edge.
     pub over: Option<(f32, Rigid2, [f32; 2])>,
     pub end: RockEnd,
-    /// Contacts held rather than struck on the way (not in `hits`).
     pub settles: usize,
-    /// It ran out of strikes ([`MAX_STRIKES`]) still moving (`end` is then `Timeout`).
     pub capped: bool,
-    /// Kinetic energy when it ended, before a body at rest is set still, J,
-    /// and the velocity then (`[v_u, v_z, ω]`).
     pub ke_end: f32,
     pub v_end: [f32; 3],
-    /// The kinetic energy set still other than a slide or roll along the ground
-    /// (a body lying on two contacts slides to a stop by their friction, or rolls on), J.
     pub ke_left: f32,
-    /// How far a body that lies on two contacts slid to a stop along the ground, metres (along u),
-    /// and the speed a body landing on its wheels rolls on with along their travel, m/s.
     pub slide_m: f32,
     pub roll_mps: f32,
-    /// Why it was taken at rest: lying between two contacts, leaning on a wall or
-    /// the face, trapped between two, calm while held, or calm out of strikes.
     pub rest: Option<&'static str>,
     pub last: Rigid2,
     pub pivot: [f32; 2],
@@ -821,36 +571,25 @@ fn add2(a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
     [a[0] + b[0], a[1] + b[1]]
 }
 
-/// Velocity of a body point at offset `r` (already turned) from the CoM.
 fn point_vel(st: &Rigid2, r: [f32; 2]) -> [f32; 2] {
     [st.v[0] + st.w * r[1], st.v[1] - st.w * r[0]]
 }
 
-/// d/dθ of `rot2(q, θ)`.
 pub(crate) fn drot(q: [f32; 2], th: f32) -> [f32; 2] {
     let (s, c) = th.sin_cos();
     [-q[0] * s + q[1] * c, -q[0] * c - q[1] * s]
 }
 
-/// The state of a body turning at `w` about the edge `q` (its offset from the
-/// CoM at zero tilt) held on the ground at the frame's origin, tilted `th`,
-/// with the whole body also moving at `speed` along u.
 pub(crate) fn about_edge(q: [f32; 2], th: f32, w: f32, speed: f32) -> Rigid2 {
     let r = rot2(q, th);
     let d = drot(q, th);
     Rigid2 { c: [-r[0], -r[1]], th, v: [-w * d[0] + speed, -w * d[1]], w }
 }
 
-/// Kinetic energy of a body of mass `m` and inertia `i` in the state `[v_u, v_z, ω]`, J.
 pub(crate) fn kinetic_j(m: f32, i: f32, s: [f32; 3]) -> f32 {
     0.5 * m * (s[0] * s[0] + s[1] * s[1]) + 0.5 * i * s[2] * s[2]
 }
 
-/// The body set onto the pivot `q` (its offset from the CoM at zero tilt)
-/// against a surface of outward normal `n`: the least change of its motion
-/// (an impulse along `n` at the pivot) that leaves the pivot no speed off or
-/// into the surface, as the turn about it takes it. A projection of the
-/// motion: it never adds energy.
 pub(crate) fn onto(m: f32, i: f32, st: Rigid2, q: [f32; 2], n: [f32; 2]) -> Rigid2 {
     let r = rot2(q, st.th);
     let i = i.max(1e-6);
@@ -860,23 +599,8 @@ pub(crate) fn onto(m: f32, i: f32, st: Rigid2, q: [f32; 2], n: [f32; 2]) -> Rigi
     Rigid2 { v: [st.v[0] + lam * n[0] / m, st.v[1] + lam * n[1] / m], w: st.w + lam * c / i, ..st }
 }
 
-/// A probe this close to the ground (or under it) and coming down when another
-/// strikes shares that strike's impulse, metres: a body landing flat meets the
-/// ground at both ends at once (est: a numerical tolerance, about ten
-/// integration steps of a corner closing at 1 m/s).
 const TOUCH_GAP_M: f32 = 0.005;
 
-/// The impulse of the body point `at` (a probe, `trig` its index; or the point
-/// of a link's face the step's corner meets) striking what pushes it along
-/// `n` (the ground's top, the drop's face or the step's corner; the scene's
-/// wall when `wall` is given) with friction `mu_k`, together with the `extra`
-/// probes touching the ground's top at the same instant and the pivot `piv`
-/// (its offset, friction and surface normal) while it is still loaded. Rows:
-/// the strike's normal and friction, each extra's, then the pivot's. Newton's
-/// restitution applied to several contacts at once (or with friction) is not
-/// bound to take energy out: when it would leave the body with more kinetic
-/// energy than it had, the strike is taken plastic, then also frictionless
-/// (the least-energy motion the contacts allow).
 #[allow(clippy::too_many_arguments)]
 fn resolve(m: f32, i: f32, st: &Rigid2, probes: &[Probe], at: &Probe, trig: Option<usize>, held: bool, mu_k: f32, n: [f32; 2], extra: &[usize], wall: Option<&Obstacle>, piv: Option<([f32; 2], f32, [f32; 2])>, sc: &Scene) -> Option<(Hit, Vec<Row>)> {
     let r_k = rot2(at.q, st.th);
@@ -886,9 +610,6 @@ fn resolve(m: f32, i: f32, st: &Rigid2, probes: &[Probe], at: &Probe, trig: Opti
         None => ground_pair(at.contactor, sc.ground),
     };
     let s0 = [st.v[0], st.v[1], st.w];
-    // `e_k` the strike's restitution; another contact closing at least
-    // PLASTIC_MPS rebounds by its own law; `plastic`: none rebounds; without
-    // `friction` the contacts slip freely.
     let rows_with = |e_k: f32, plastic: bool, friction: bool| {
         let f = if friction { 1.0 } else { 0.0 };
         let mut rows = vec![Row::normal(r_k, n, if plastic { 0.0 } else { e_k }), Row::tangent(0, r_k, t_dir, f * mu_k)];
@@ -918,8 +639,6 @@ fn resolve(m: f32, i: f32, st: &Rigid2, probes: &[Probe], at: &Probe, trig: Opti
         let rows = rows_with(e_k, plastic, friction);
         let mut imp = solve_impulses(m, i, s0, &rows);
         if !imp.found {
-            // No consistent set with the other contacts: the strike alone (another
-            // that still closes strikes in turn).
             imp = solve_impulses(m, i, s0, &rows[..2]);
             imp.lambda.resize(rows.len(), 0.0);
         }
@@ -927,9 +646,7 @@ fn resolve(m: f32, i: f32, st: &Rigid2, probes: &[Probe], at: &Probe, trig: Opti
     };
     let (first, _) = solve(law.e, false, true);
     let m_eff = (first.lambda[0] / ((1.0 + law.e) * v_n)).max(1e-4);
-    // A contact held rather than struck has no impact to play out.
     let p = if holds_contact(v_n, held) { Pulse { peak_n: 0.0, t_peak_s: 0.0, contact_s: 0.0, e: 0.0, max_defl_m: 0.0, series: vec![] } } else { pulse(&law.law, law.e, m_eff, v_n) };
-    // The motion after it: the restitution the contact law gives, none for a slow strike (the contact stays).
     let k0 = kinetic_j(m, i, s0);
     let gains = |s: [f32; 3]| kinetic_j(m, i, s) > k0 * (1.0 + 1e-4) + 1e-6;
     let mut out = solve(if v_n < PLASTIC_MPS { 0.0 } else { p.e }, false, true);
@@ -944,15 +661,10 @@ fn resolve(m: f32, i: f32, st: &Rigid2, probes: &[Probe], at: &Probe, trig: Opti
     Some((hit, rows))
 }
 
-/// An impulse closing at `v_n` on a contact `held` (pressed within [`HELD_S`])
-/// holds the contact rather than strikes it.
 fn holds_contact(v_n: f32, held: bool) -> bool {
     v_n < STAY_MPS || (held && v_n < REST_MPS)
 }
 
-/// What strikes in a step of [`rock`]: the body point, its probe (`None`: the
-/// step's corner on the face `corner` of an outline), what pushes it (`None`:
-/// the wall) and how deep it went.
 #[derive(Clone, Copy, Debug)]
 struct Cand {
     at: Probe,
@@ -962,27 +674,13 @@ struct Cand {
     depth: f32,
 }
 
-/// Turns a rigid body of mass `m` and inertia `i` (about its CoM) from `st0`
-/// about the edge `q0` (offset from the CoM at zero tilt) until it settles, it
-/// goes over that edge (`stop_at_over`), or `t_max` runs out. Probes strike
-/// the ground, the drop's face or the scene's wall, and the step's corner (an
-/// edge fall) strikes the link outlines `hulls`; after a strike the body
-/// turns about the contact that stays loaded: a body point on the ground, the
-/// drop's face or a wall, or the step's corner on a face of the body (sliding
-/// along that face or turning about the corner). It rests when it lies
-/// between two contacts, leans on a wall or the face, is trapped between two,
-/// or stays calm while held by more than one; it never rests still moving (a
-/// fall that runs out of strikes moving ends `Timeout`, `capped`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rock(m: f32, i: f32, probes: &[Probe], hulls: &[Hull], sc: &Scene, q0: [f32; 2], st0: Rigid2, stop_at_over: bool, t_max: f32) -> Rocked {
     let mut st = onto(m, i, st0, q0, UP);
     let mut piv = q0;
-    // The surface the pivot rests against (its outward normal; for the step's corner, its push).
     let mut piv_n = UP;
     let mut piv_probe: Option<usize> = probes.iter().position(|p| (p.q[0] - q0[0]).abs() < 3e-3 && (p.q[1] - q0[1]).abs() < 3e-3);
-    // The pivot is the step's corner on the face `.1` of the outline `.0`.
     let mut piv_corner: Option<(usize, usize)> = None;
-    // How far off its face the step's corner was when taken as the pivot (kept, not snapped out).
     let mut piv_gap = 0.0f32;
     let mut mu_piv = sc.mu_edge;
     let mut mode = collide::pivot_mode(m, i, &st, piv, piv_n, mu_piv, PivotMode::Stick);
@@ -1000,24 +698,15 @@ pub(crate) fn rock(m: f32, i: f32, probes: &[Probe], hulls: &[Hull], sc: &Scene,
     let wall_ob = sc.wall.map(|w| w.1);
     let corner = sc.corner();
     let calm_ke = 0.5 * m * CALM_MPS * CALM_MPS;
-    // Steps in a row the body has been calm while held, and when a contact besides the pivot last pressed.
     let mut calm = 0usize;
     let mut held_t = f32::NEG_INFINITY;
-    // When each contact (a probe, or the step's corner on a face) last took an impulse.
     let mut recent: Vec<((Option<usize>, Option<(usize, usize)>), f32)> = Vec::new();
-    // How far a body lying on two contacts slid to a stop, and the roll a wheeled one lands on.
     let mut slide_m = 0.0f32;
     let mut roll_mps = 0.0f32;
     let mut ke_left: Option<f32> = None;
-    // The middle of the body's own support (its edges are the `support` probes):
-    // a pivot ahead of it is gone over forward (+u), one behind it backward.
     let edges: Vec<f32> = probes.iter().filter(|p| p.link == "support").map(|p| p.q[0]).collect();
     let mid = if edges.is_empty() { 0.0 } else { edges.iter().sum::<f32>() / edges.len() as f32 };
     while t < t_max {
-        // A pivot rolled or slid past an edge has nothing under it; one slid
-        // along the lower level into the drop's face meets the face; one slid
-        // off a face or a wall leaves it. On the step's corner, the body point
-        // at the corner moves along the face it slides on, and the face turns.
         if mode != PivotMode::Free {
             match (piv_corner, corner) {
                 (Some((h, ed)), Some(e)) => match corner_on(&hulls[h], ed, e, &st, piv_gap) {
@@ -1043,8 +732,6 @@ pub(crate) fn rock(m: f32, i: f32, probes: &[Probe], hulls: &[Hull], sc: &Scene,
             }
         }
         if over.is_none() && mode != PivotMode::Free && piv_corner.is_none() && piv_n[1] > 0.5 {
-            // The CoM crossing the edge it turns about, outward (past the front edge
-            // forward, past the rear one backward): over; crossing inward it stands again.
             let out = if piv[0] >= mid { 1.0f32 } else { -1.0 };
             let p0 = add2(st.c, rot2(piv, st.th));
             let p1 = add2(nst.c, rot2(piv, nst.th));
@@ -1058,7 +745,6 @@ pub(crate) fn rock(m: f32, i: f32, probes: &[Probe], hulls: &[Hull], sc: &Scene,
                 }
             }
         }
-        // The deepest probe going into the ground, the drop's face or the wall.
         let mut best: Option<Cand> = None;
         let at_pivot = |q: [f32; 2]| mode != PivotMode::Free && (q[0] - piv[0]).abs() < 3e-3 && (q[1] - piv[1]).abs() < 3e-3;
         for (k, p) in probes.iter().enumerate() {
@@ -1082,8 +768,6 @@ pub(crate) fn rock(m: f32, i: f32, probes: &[Probe], hulls: &[Hull], sc: &Scene,
                 }
             }
         }
-        // The step's corner going into a link's outline: through the face it is
-        // nearest (the one it crossed), pushing along that face's inward normal.
         if let Some(e) = corner {
             let q = rot2([e[0] - nst.c[0], e[1] - nst.c[1]], -nst.th);
             let r = [e[0] - nst.c[0], e[1] - nst.c[1]];
@@ -1099,7 +783,6 @@ pub(crate) fn rock(m: f32, i: f32, probes: &[Probe], hulls: &[Hull], sc: &Scene,
                 if n[0] < -CONE_TOL || n[1] < -CONE_TOL || vel[0] * n[0] + vel[1] * n[1] >= 0.0 || depth <= SINK_M {
                     continue;
                 }
-                // Inside two overlapping outlines, the shallower is the face it is crossing.
                 if found.map_or(true, |f| depth < f.depth) {
                     found = Some(Cand { at: h.probe_at(q), probe: None, corner: Some((h_i, ed)), n: Some(n), depth });
                 }
@@ -1119,11 +802,6 @@ pub(crate) fn rock(m: f32, i: f32, probes: &[Probe], hulls: &[Hull], sc: &Scene,
             let on_top = n_k[1] > 0.5;
             let pivot_loaded = (mode != PivotMode::Free).then_some((piv, mu_piv, piv_n));
             let is_pivot = |j: usize, q: [f32; 2]| pivot_loaded.is_some() && ((Some(j) == piv_probe && piv_corner.is_none()) || ((q[0] - piv[0]).abs() < 3e-3 && (q[1] - piv[1]).abs() < 3e-3));
-            // Other probes on the ground's top at this instant share a strike on it: the
-            // lowest and the highest along u (a body landing flat meets the ground at both
-            // ends; the end it turned about stays on the ground while the other lands,
-            // rather than being swung into it). A probe leaving the ground takes no
-            // impulse: the solver leaves its row out.
             let mut extra: Vec<usize> = Vec::new();
             if on_top {
                 let u_k = st.c[0] + rot2(cand.at.q, st.th)[0];
@@ -1154,14 +832,11 @@ pub(crate) fn rock(m: f32, i: f32, probes: &[Probe], hulls: &[Hull], sc: &Scene,
                 recent.retain(|(k, _)| *k != key);
                 recent.push((key, t));
                 let s = hit.after;
-                // A contact held rather than struck: applied, not counted as a strike.
                 if holds_contact(hit.v_n, held) {
                     settles += 1;
                 } else {
                     hits.push(hit);
                 }
-                // Every contact of the strike: where it is along u, how fast it leaves after it,
-                // which probe it is, its offset from the CoM, its friction, and what it touches.
                 let u_of = |q: [f32; 2]| st.c[0] + rot2(q, st.th)[0];
                 let mut contacts = vec![Touch { u: u_of(cand.at.q), leave: rows[0].vel(s), probe: cand.probe, q: cand.at.q, mu: mu_k, n: n_k, corner: cand.corner }];
                 for (n_e, &j) in extra.iter().enumerate() {
@@ -1172,25 +847,12 @@ pub(crate) fn rock(m: f32, i: f32, probes: &[Probe], hulls: &[Hull], sc: &Scene,
                 }
                 st.v = [s[0], s[1]];
                 st.w = s[2];
-                // The contacts that stay (a slow strike, the edge it turned about, a corner it
-                // landed on) carry the body on: on two either side of the CoM it lies still, on
-                // the ground and a wall (or the drop's face) the CoM leans past it rests against
-                // that; on one, or on several to one side, it turns about the one on the CoM's
-                // side; on a wall or the face alone it turns (and slides) against that; on none
-                // it flies. A contact still closing (one the solver could not take with the
-                // strike) does not carry the body: it strikes in turn.
                 let staying: Vec<Touch> = contacts.iter().copied().filter(|c| c.leave.abs() <= STAY_MPS).collect();
                 let ground: Vec<Touch> = staying.iter().copied().filter(|c| !c.vertical()).collect();
                 let lo = ground.iter().copied().min_by(|a, b| a.u.total_cmp(&b.u));
                 let hi = ground.iter().copied().max_by(|a, b| a.u.total_cmp(&b.u));
                 let leaning = staying.iter().any(|w| w.vertical() && ground.iter().any(|c| (c.u - st.c[0]) * w.n[0] > 0.0)) && kinetic_j(m, i, s) <= calm_ke;
                 let between = matches!((lo, hi), (Some(lo), Some(hi)) if hi.u - lo.u > 0.02 && st.c[0] >= lo.u && st.c[0] <= hi.u);
-                // Lying on two contacts either side of the CoM, the turn and the fall are
-                // over: what is left is a slide along the ground, which the contacts'
-                // friction stops (the weight shared by the lever rule), or a roll on wheels
-                // along their travel, which the drive carries on. A slide or roll that
-                // would carry a contact on the upper level over the step's edge is not
-                // over: the body goes on.
                 let slide = match (lo, hi) {
                     (Some(lo), Some(hi)) if between => {
                         let up = ((st.c[0] - lo.u) / (hi.u - lo.u).max(1e-6)).clamp(0.0, 1.0);
@@ -1200,19 +862,12 @@ pub(crate) fn rock(m: f32, i: f32, probes: &[Probe], hulls: &[Hull], sc: &Scene,
                     }
                     _ => None,
                 };
-                // Rolling or sliding on its ground contacts toward the step's edge, far enough
-                // for one on the upper level to reach it: the body goes on (not at rest, not trapped).
                 let goes_over = sc.drop_m > 0.0 && s[0] > 1e-3 && !ground.is_empty() && {
                     let a = G * ground.iter().map(|c| c.mu).sum::<f32>() / ground.len() as f32;
                     let reach = if a > 1e-3 { 0.5 * s[0] * s[0] / a } else { f32::INFINITY };
                     ground.iter().any(|c| c.u <= sc.edge_u + 1e-4 && c.u + reach >= sc.edge_u - 1e-4)
                 };
                 let between = between && !goes_over;
-                // A slow strike on the far side of the CoM from a contact already on the
-                // ground: the body can only rock between the two, each change of contact taking
-                // a little of its turn, unless its energy lifts the CoM over one of them. Short
-                // of both barriers it ends lying on the two (`m·g·(|q| + r_z)`, `r` the
-                // contact's turned offset from the CoM, `|q|` its distance).
                 let ke = kinetic_j(m, i, s);
                 let trapped = on_top && !goes_over && contacts[0].leave.abs() <= STAY_MPS && {
                     let barrier = |q: [f32; 2]| m * G * ((q[0] * q[0] + q[1] * q[1]).sqrt() + rot2(q, st.th)[1]);
@@ -1228,7 +883,6 @@ pub(crate) fn rock(m: f32, i: f32, probes: &[Probe], hulls: &[Hull], sc: &Scene,
                         ke_left = Some(kinetic_j(m, i, [0.0, s[1], s[2]]));
                         if a > 1e-3 && v.abs() > 1e-4 {
                             let mut d = 0.5 * v * v.abs() / a;
-                            // Not through the drop's face behind a body on the lower level, nor into a wall ahead.
                             if sc.drop_m > 0.0 && lo.u > sc.edge_u && d < 0.0 {
                                 d = d.max(sc.edge_u - lo.u);
                             }
@@ -1252,7 +906,6 @@ pub(crate) fn rock(m: f32, i: f32, probes: &[Probe], hulls: &[Hull], sc: &Scene,
                     end = RockEnd::Rest;
                     stop = true;
                 } else if hits.len() >= MAX_STRIKES {
-                    // Out of strikes still moving: not at rest (the caller must not trust the pose).
                     ke_end = Some(ke);
                     v_end = s;
                     capped = true;
@@ -1315,7 +968,6 @@ pub(crate) fn rock(m: f32, i: f32, probes: &[Probe], hulls: &[Hull], sc: &Scene,
         if stop {
             break;
         }
-        // Calm while held by a contact besides the one it turns on: at rest.
         let ke = kinetic_j(m, i, [st.v[0], st.v[1], st.w]);
         calm = if t - held_t <= HELD_GAP_S && ke <= calm_ke { calm + 1 } else { 0 };
         if calm as f32 * DT_S >= CALM_S {
@@ -1343,9 +995,6 @@ pub(crate) fn rock(m: f32, i: f32, probes: &[Probe], hulls: &[Hull], sc: &Scene,
     Rocked { track, hits, over, end, settles, capped, ke_end, ke_left, v_end, rest, slide_m, roll_mps, last: st, pivot: piv, t }
 }
 
-// ----- the fall -----
-
-/// A horizontal direction in degrees as a unit vector of the ground plane.
 pub(crate) fn dir_of(deg: f32) -> [f32; 2] {
     let a = deg.to_radians();
     [a.cos(), a.sin()]
@@ -1362,19 +1011,16 @@ fn parts_of(seg: Segment, body: &Body) -> Vec<Part> {
     v
 }
 
-/// A fall's rigid body, its probes, its scene and its turn.
 pub(crate) struct Played {
     pub solved: KinReport,
     pub mp: collide::MassProps,
     pub pl: Planar,
     pub probes: Vec<Probe>,
-    /// The first edge, from the CoM at zero tilt.
     pub q0: [f32; 2],
     pub sc: Scene,
     pub rk: Rocked,
 }
 
-/// Turns the body of a fall from where it starts until it rests.
 pub(crate) fn play(inp: &FallInput) -> Played {
     let body = inp.body;
     let solved = kin::solve(body, &inp.pose, &KinLoads::default());
@@ -1393,13 +1039,10 @@ pub(crate) fn play(inp: &FallInput) -> Played {
     Played { solved, mp, pl, probes, q0, sc, rk }
 }
 
-/// Plays a fall out: the turn about the edge, every strike, where the body
-/// rests, what the hardest strike did to the joints, and whether it gets up.
 pub fn fall(inp: &FallInput) -> Fall {
     let body = inp.body;
     let dir = dir_of(inp.dir_deg);
     let Played { solved, mp, pl, probes: pr, q0, sc, rk } = play(inp);
-    // The strikes, with the force through each link's contact law.
     let trunk_q = solved.boxes.iter().find(|b| b.name == "trunk").map(|b| pl.to_plane(b.center));
     let mut strikes = Vec::new();
     for h in &rk.hits {
@@ -1432,11 +1075,8 @@ pub fn fall(inp: &FallInput) -> Fall {
     }
     let main_i = strikes.iter().enumerate().max_by(|a, b| a.1.v_n.total_cmp(&b.1.v_n)).map(|x| x.0);
     let main = main_i.map(|i| strikes[i].clone());
-    // The first strike that lands hard: the body meets the ground.
     let first_i = strikes.iter().position(|s| !s.wall && s.v_n >= HARD_MPS).or(main_i);
     let t_first = first_i.map(|i| strikes[i].t);
-    // A link's impact speed: how fast it closes on the ground when it first strikes; a link
-    // that never strikes (held off by another) is taken at the body's first hard strike.
     let speed_of = |names: &[&str]| -> Option<f32> {
         if let Some(s) = strikes.iter().find(|s| !s.wall && names.contains(&s.link) && s.v_n >= REST_MPS) {
             return Some(s.v_n);
@@ -1456,21 +1096,15 @@ pub fn fall(inp: &FallInput) -> Fall {
     let pelvis_v = speed_of(&["pelvis"]);
     let head_v = speed_of(&["head"]);
     let hand_v = speed_of(&["palm_r", "palm_l"]);
-    // At rest.
     let last = rk.last;
     let com0 = mp.com;
     let pivot0 = [com0[0] + dir[0] * q0[0], com0[1] + dir[1] * q0[0], 0.0];
     let lying_tilt = last.th.to_degrees();
     let mut lying = LyingPose { pose: inp.pose, dir_deg: inp.dir_deg, tilt_deg: lying_tilt, com: [0.0; 3], com0, pivot0, c_rest: last.c };
     lying.com = [pivot0[0] + dir[0] * last.c[0], pivot0[1] + dir[1] * last.c[0], last.c[1]];
-    // The tilt at which the CoM stands over the first edge.
     let th_star = q0[0].max(0.0).atan2((-q0[1]).max(1e-3));
-    // Fallen: lying, resting off its own support (leaning on a bumper or a
-    // wall), or down past an edge. A body that went over the edge and rocked
-    // back onto its support (a bumper caught it) stands again.
     let off_support = last.th.abs() > 0.5 * th_star.max(2f32.to_radians());
     let fell = lying.down() || off_support || inp.drop_m > 0.0 && last.c[0] > sc.edge_u;
-    // What the hardest strike did to the joints between the struck link and the ground.
     let damage = match (&main, main_i) {
         (Some(s), Some(i)) => {
             let th = rk.hits[i].before.th;
@@ -1482,7 +1116,6 @@ pub fn fall(inp: &FallInput) -> Fall {
         _ => vec![],
     };
     let get_up = if fell { get_up(body, &lying, &damage, &pr, &pl) } else { GetUp { can: true, time_s: Some(0.0), needs_help: false, righting_force_n: 0.0, why_ko: "넘어지지 않음".into() } };
-    // The time series.
     let mut samples = Vec::new();
     let mut tilt = Vec::new();
     for (t, st) in &rk.track {
@@ -1498,7 +1131,6 @@ pub fn fall(inp: &FallInput) -> Fall {
         let pose = if body.base == BaseKind::HumanFoot { inp.pose } else { KinPose { base_pitch_deg: -st.th.to_degrees() * dir[0], ..inp.pose } };
         samples.push(ActSample { t: *t, phase, pose, loads: KinLoads::default(), margin: 1.0 - st.th / th_star.max(1e-3), zmp: [com[0], com[1]], com, peak_ratio: 0.0, grip: None, object: None });
     }
-    // Events.
     let mut events = Vec::new();
     let start_kind = if inp.drop_m > 0.0 { "edge_fall" } else { "fall" };
     let dir_ko = dir_label_ko(inp.dir_deg);
@@ -1549,7 +1181,6 @@ pub fn fall(inp: &FallInput) -> Fall {
         ("righting_force_n", get_up.righting_force_n),
         ("com_drop_m", com0[2] - lying.com[2]),
         ("at_rest", if at_rest { 1.0 } else { 0.0 }),
-        // Lying on two contacts it slid this far to a stop; landed on its wheels it rolls on at this speed.
         ("slide_m", rk.slide_m),
         ("roll_mps", rk.roll_mps),
     ];
@@ -1569,7 +1200,6 @@ pub fn fall(inp: &FallInput) -> Fall {
     Fall { rollout, cause: inp.cause, dir_deg: inp.dir_deg, fell, t_ground_s: t_ground, t_first_s: t_first, strikes, main, pelvis_v, head_v, hand_v, tilt, lying, damage, get_up, at_rest }
 }
 
-/// A direction's Korean name.
 pub fn dir_label_ko(deg: f32) -> &'static str {
     let d = (deg.rem_euclid(360.0) + 22.5) / 45.0;
     match d as i32 % 8 {
@@ -1584,12 +1214,6 @@ pub fn dir_label_ko(deg: f32) -> &'static str {
     }
 }
 
-// ----- getting up -----
-
-/// The deepest squat the legs push up from, as a person comes up from
-/// kneeling: the hip at [`ANKLE_SQUAT_HIP_M`], its fore-aft place over the feet
-/// and the pelvis pitch searched (2 cm, 5° steps) for the best ZMP margin
-/// within every joint's range, arms forward.
 pub fn get_up_squat(body: &Body) -> Option<kin::KinReport> {
     let mut best: Option<(KinPose, f32)> = None;
     for i in 0..14 {
@@ -1606,15 +1230,9 @@ pub fn get_up_squat(body: &Body) -> Option<kin::KinReport> {
     best.map(|(p, _)| kin::solve(body, &p, &KinLoads::default()))
 }
 
-/// Hip height of the get-up squat, metres (est: the hip a little above the
-/// knee, about 0.45 of the leg; the deepest a robot squats before kneeling).
 pub const ANKLE_SQUAT_HIP_M: f32 = kin::ANKLE_H_M + 0.45 * (HIP_M - kin::ANKLE_H_M);
 
-/// Whether a fallen body gets up: legs when the get-up squat is within every
-/// joint's peak, its ZMP inside the feet, and no joint was knocked past its
-/// peak by the fall; wheels and tracks never (a helper turns them back).
 pub(crate) fn get_up(body: &Body, lying: &LyingPose, damage: &[JointHit], probes: &[Probe], pl: &Planar) -> GetUp {
-    // The vertical force at the far end that starts turning the body back about the edge it lies on.
     let th = lying.tilt_deg.to_radians();
     let far = probes.iter().map(|p| rot2([p.q[0] - pl.ahead_m, p.q[1] + pl.com_z], th)[0]).fold(0.0f32, f32::max);
     let com_u = rot2([-pl.ahead_m, pl.com_z], th)[0];
@@ -1632,24 +1250,16 @@ pub(crate) fn get_up(body: &Body, lying: &LyingPose, damage: &[JointHit], probes
     }
 }
 
-// ----- a felled trunk -----
-
-/// A uniform rod turning about its base.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct RodFall {
-    /// Time from `tilt0` to lying flat, s.
     pub t_s: f32,
-    /// Turning rate when it lies flat, rad/s, and the top's speed then, m/s.
     pub omega_end: f32,
     pub top_mps: f32,
 }
 
-/// A uniform rod `h_m` tall falling about its base from `tilt0_deg`:
-/// `θ̇² = (3g/h)(cos θ₀ − cos θ)` (energy, `I = m·h²/3` about the base).
 pub fn rod_topple(h_m: f32, tilt0_deg: f32) -> RodFall {
     let k = 3.0 * G / h_m.max(1e-3);
     let th0 = tilt0_deg.to_radians().max(1e-4);
-    // Time by the substitution-free midpoint sum over θ (the integrand is finite past the start).
     let n = 4000;
     let end = std::f32::consts::FRAC_PI_2;
     let mut t = 0.0f32;
@@ -1661,7 +1271,6 @@ pub fn rod_topple(h_m: f32, tilt0_deg: f32) -> RodFall {
     RodFall { t_s: t, omega_end: w, top_mps: w * h_m }
 }
 
-/// Speed of a point `r_m` from the base of a rod `h_m` tall falling from `tilt0_deg`, at tilt `tilt_deg`, m/s.
 pub fn rod_point_speed(h_m: f32, r_m: f32, tilt0_deg: f32, tilt_deg: f32) -> f32 {
     let k = 3.0 * G / h_m.max(1e-3);
     r_m * (k * (tilt0_deg.to_radians().cos() - tilt_deg.to_radians().cos()).max(0.0)).sqrt()
@@ -1679,12 +1288,6 @@ mod tests {
 
     #[test]
     fn a_rigid_pendulum_falls_in_its_closed_form_time() {
-        // A point mass on a massless rod about a held edge: θ̈ = (g/L)·sin θ; the
-        // body's own inertia adds to m·L², so the fall is slower than the point's.
-        // A body of mass m and inertia I about its CoM, the CoM L above a held
-        // edge (the pivot's offset from the CoM is (0, −L)), released 5° past
-        // upright: θ̈ = m·g·L·sin θ / (I + m·L²). One probe ahead of the edge
-        // meets the ground at 40°, before the edge would have to pull.
         let (l, m, i) = (1.0f32, 10.0f32, 0.5f32);
         let th_s = 40f32.to_radians();
         let (pu, pz) = (0.3f32, 0.3 * th_s.tan());
@@ -1693,7 +1296,6 @@ mod tests {
         let piv = [0.0, -l];
         let th0 = 5.0f32.to_radians();
         let rk = rock(m, i, &probes, &[], &sc, piv, about_edge(piv, th0, 0.0, 0.0), false, 5.0);
-        // Time from 5° to 40° by quadrature of dt = dθ/√(2k(cos θ₀ − cos θ)).
         let k = m * G * l / (i + m * l * l);
         let n = 20000;
         let mut t = 0.0f32;
@@ -1703,14 +1305,10 @@ mod tests {
         }
         let first = rk.hits.first().expect("the probe strikes the ground");
         assert!((first.t - t).abs() < 0.01, "strike at {} s vs {t} s", first.t);
-        // It closes at ω·(u·cos θ + z·sin θ), ω from the energy of the fall.
         let w = (2.0 * k * (th0.cos() - th_s.cos())).sqrt();
         let v = w * (pu * th_s.cos() + pz * th_s.sin());
         assert!((first.v_n - v).abs() < 0.02 * v, "{} vs {v}", first.v_n);
-        // The CoM started past the edge: it never goes over that edge (over the
-        // probe it later rocks on, it may).
         assert!(rk.over.map_or(true, |o| o.2 != piv), "{:?}", rk.over);
-        // The rod's closed form: the top lands at √(3gH) from near upright.
         let r = rod_topple(10.0, 1.0);
         assert!((r.top_mps - (3.0 * G * 10.0f32).sqrt()).abs() < 0.05, "{r:?}");
         assert!(r.t_s > 2.0 && r.t_s < 6.0, "{r:?}");
@@ -1718,10 +1316,6 @@ mod tests {
 
     #[test]
     fn a_taller_body_falls_longer_and_hits_harder() {
-        // The same robot standing tall and squatting (its CoM lower): the fall
-        // from the edge takes longer, the CoM drops further and the same links
-        // land faster; the hardest strike takes in more energy (the link that
-        // strikes it may differ: the squat pitches the trunk forward).
         let b = body(Tier::Mid, BaseKind::HumanFoot);
         let tall = fall(&FallInput::lost_balance(&b, KinPose::stand(0.0), FallCause::Pushed, 0.0, 0.3, Surface::Firm));
         let low_pose = KinPose { hip: [-0.06, HIP_M - 0.18], pelvis_deg: 25.0, ..KinPose::stand(0.0) };
@@ -1733,14 +1327,11 @@ mod tests {
         assert!(tall.head_v.unwrap() > low.head_v.unwrap() && tall.pelvis_v.unwrap() > low.pelvis_v.unwrap(), "head {:?} vs {:?}, pelvis {:?} vs {:?}", tall.head_v, low.head_v, tall.pelvis_v, low.pelvis_v);
         assert!(mt.energy_j > ml.energy_j, "{} vs {} J", mt.energy_j, ml.energy_j);
         assert!(tall.lying.com[2] < 0.3 && tall.lying.down(), "{:?}", tall.lying);
-        // Legs can get up; the head or the trunk hits first going forward.
         assert!(tall.get_up.can && !tall.get_up.needs_help, "{:?}", tall.get_up);
         assert!(matches!(mt.segment, Segment::Head | Segment::Chest | Segment::Arm | Segment::Hand), "{mt:?}");
         assert!(tall.head_v.unwrap() > tall.pelvis_v.unwrap(), "the head is further from the edge than the pelvis");
-        // Sideways: about the outer edge of the feet.
         let side = fall(&FallInput::lost_balance(&b, KinPose::stand(0.0), FallCause::Pushed, 90.0, 0.3, Surface::Firm));
         assert!(side.fell && side.pelvis_v.unwrap() > 0.5, "{:?}", side.pelvis_v);
-        // The lying pose puts the head on the ground ahead of the feet.
         let head = tall.lying.place([0.0, 0.0, 1.14]);
         assert!(head[0] > 0.8 && head[2] < 0.3, "{head:?}");
     }
@@ -1748,7 +1339,6 @@ mod tests {
     #[test]
     fn wheels_cannot_get_up_and_soft_ground_hits_softer() {
         let w = body(Tier::Mid, BaseKind::Wheel);
-        // Backward over the rear axle (no bumper behind).
         let f = fall(&FallInput::lost_balance(&w, KinPose::stand(0.0), FallCause::Pushed, 180.0, 0.3, Surface::Firm));
         assert!(f.fell && !f.get_up.can && f.get_up.needs_help && f.get_up.righting_force_n > 0.0, "{:?} {:?}", f.get_up, f.rollout.events);
         let g = fall(&FallInput::lost_balance(&w, KinPose::stand(0.0), FallCause::Pushed, 180.0, 0.3, Surface::Sand));
@@ -1758,14 +1348,6 @@ mod tests {
 
     #[test]
     fn a_bumper_catches_a_wheeled_base_going_over_slowly_and_a_fast_one_rolls_over_it() {
-        // Over the front axle, the bumper's lower front corner (8 cm ahead of
-        // the axle's contact, 3 cm up) meets the ground at atan(0.03/0.08) =
-        // 20.6°, past the 16.4° at which the CoM stands over the axle and almost
-        // under the CoM, so its strike takes little of the turn. Going over from
-        // just past the balance point, the base could only rock between the
-        // bumper and the axle (each change of contact takes a little of its
-        // turn): it lies on the two (it needs help). Fast, it rolls on over the
-        // bumper onto its face.
         let w = body(Tier::Mid, BaseKind::Wheel);
         let solved = kin::solve(&w, &KinPose::stand(0.0), &KinLoads::default());
         let pl = Planar::of(&collide::mass_props_of(&w, &solved), solved.support, [1.0, 0.0]);
@@ -1791,27 +1373,17 @@ mod tests {
         assert!(edge.lying.com[2] < 0.0, "below the edge: {:?}", edge.lying.com);
     }
 
-    /// The fall's mechanical energy in a state (kinetic, and potential above the first edge's level), J.
     fn energy(p: &Played, st: &Rigid2) -> f32 {
         kinetic_j(p.mp.mass_kg, p.pl.inertia, [st.v[0], st.v[1], st.w]) + p.mp.mass_kg * G * st.c[1]
     }
 
     #[test]
     fn strikes_and_turns_never_add_energy_and_every_fall_settles() {
-        // Falls over presets × bases × directions × drops (on the flat, a curb,
-        // a porch step): balance lost standing, slowly and fast; driving or
-        // walking off an edge, and tipped off one from standing; on soft
-        // ground. The body's kinetic and potential energy never rises across a
-        // strike, nor along the turn between strikes beyond the integration's
-        // error, and every fall comes to rest on its contacts before
-        // FALL_MAX_S, not because the time or the strikes ran out, with almost
-        // no motion left when it is set still.
         let mut bad: Vec<String> = Vec::new();
         let (mut n, mut n_face, mut n_edge, mut worst_ke) = (0usize, 0usize, 0usize, (0.0f32, String::new()));
         let mut run = |inp: &FallInput, tag: String| {
             let p = play(inp);
             n += 1;
-            // The energy of the CoM's height, the scale of the fall.
             let scale = p.mp.mass_kg * G * p.pl.com_z;
             for h in &p.rk.hits {
                 let e0 = energy(&p, &h.before);
@@ -1828,15 +1400,10 @@ mod tests {
                     bad.push(format!("{tag}: {:.3}-{:.3} s gains {gain:.2} J of {scale:.0}", w[0].0, w[1].0));
                 }
             }
-            // It rests on its contacts, not because the time or the strikes ran out.
             if p.rk.end != RockEnd::Rest || p.rk.capped || p.rk.hits.len() >= MAX_STRIKES {
                 let l = p.rk.track.iter().rev().nth(1).map_or(p.rk.last, |x| x.1);
                 bad.push(format!("{tag}: not at rest at {:.2} s ({:?}, {} strikes, {} settles, {:.1}°, v ({:.2}, {:.2}), ω {:.2}, {:.2} J)", p.rk.t, p.rk.end, p.rk.hits.len(), p.rk.settles, l.th.to_degrees(), l.v[0], l.v[1], l.w, p.rk.ke_end));
             }
-            // Set still with next to no motion left: a body lying on two contacts may
-            // still slide (friction stops it, `slide_m`) or roll on its wheels
-            // (`roll_mps`); one rocking between two contacts without the energy to
-            // climb over either is set down on them (`trapped`).
             let ke = if p.rk.rest == Some("trapped") { 0.0 } else { p.rk.ke_left / scale };
             if ke > worst_ke.0 {
                 worst_ke = (ke, tag.clone());
@@ -1861,7 +1428,6 @@ mod tests {
         for tier in tiers {
             for base in [BaseKind::HumanFoot, BaseKind::Wheel, BaseKind::Track, BaseKind::Mecanum] {
                 let b = body(tier, base);
-                // Off an edge: driving or walking off it, or tipped off it from standing.
                 for dir in [0.0f32, 45.0, 90.0, 135.0, 180.0] {
                     for speed in [0.0f32, 0.3, 1.0] {
                         for drop in [0.15f32, 0.5] {
@@ -1869,7 +1435,6 @@ mod tests {
                         }
                     }
                 }
-                // Slow and fast starts, diagonal.
                 for dir in [45.0f32, 135.0] {
                     for omega0 in [0.05f32, 1.5] {
                         for drop in [0.0f32, 0.1, 0.5] {
@@ -1878,7 +1443,6 @@ mod tests {
                         }
                     }
                 }
-                // Soft ground.
                 for ground in [Surface::Sand, Surface::Water] {
                     for dir in [0.0f32, 90.0, 180.0] {
                         for drop in [0.0f32, 0.5] {

@@ -1,10 +1,3 @@
-//! Composite N:N phases as they happen in the world's own quests: every
-//! balance state the robot enters is matched to the development scenario
-//! phases whose causes it has (`noto_core::nn::matching_phases`), scored with
-//! that scenario's research weights, recorded in the SDS (`balance` track,
-//! primary `nn:<scenario>`, secondary the phase) and kept here for `nn_status`.
-//! No separate benchmark run: the existing quests and tests produce them.
-
 use std::collections::BTreeMap;
 
 use noto_core::nn::PhaseResult;
@@ -17,7 +10,6 @@ pub struct PhaseStat {
     pub phase: String,
     pub subsystem: String,
     pub weight: f32,
-    /// The ladder the phase is a rung of (a scenario counts a ladder once, at its worst rung).
     pub ladder: Option<String>,
     pub count: u32,
     pub score_mean: f32,
@@ -25,7 +17,6 @@ pub struct PhaseStat {
     pub item_ok: u32,
     pub min_margin: f32,
     pub peak_ratio: f32,
-    /// The latest result, cells included.
     pub last: Option<PhaseResult>,
 }
 
@@ -63,10 +54,6 @@ impl NnLive {
         self.phases.is_empty()
     }
 
-    /// Per scenario: the phases seen so far, combined with their weights
-    /// (renormalised over the phases seen, so a partial scenario is marked).
-    /// A ladder's rungs share one weight and the ladder counts once, at its
-    /// worst rung seen, as `noto_core::nn::combine` scores a scenario.
     pub fn summary(&self) -> Vec<serde_json::Value> {
         let mut by: BTreeMap<&str, Vec<&PhaseStat>> = BTreeMap::new();
         for p in self.phases.values() {
@@ -129,10 +116,8 @@ mod tests {
         live.record("S4", "짐 들고 제동", &phase("brake_0.5", 0.375, Some("brake"), 80.0));
         live.record("S4", "짐 들고 제동", &phase("brake_2.5", 0.375, Some("brake"), 40.0));
         let s = live.summary();
-        // nn::combine: (0.625·90 + 0.375·min(80, 40)) / (0.625 + 0.375) = 71.25; summing every rung would give 73.6.
         let score = s[0]["score"].as_f64().unwrap();
         assert!((score - 71.3).abs() < 0.051, "{score}");
-        // One rung seen: the same as without a ladder.
         let mut one = NnLive::default();
         one.record("S4", "짐 들고 제동", &phase("carry", 0.625, None, 90.0));
         one.record("S4", "짐 들고 제동", &phase("brake_0.5", 0.375, Some("brake"), 80.0));

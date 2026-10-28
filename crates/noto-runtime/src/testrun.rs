@@ -1,23 +1,3 @@
-//! The integrated test: one command, three passes, one timeline.
-//!
-//! 1. **game**: the quest driver (game logic) carries the command out while
-//!    the recorder takes a small video and fixed-interval keyframes;
-//! 2. **perceive**: every game keyframe goes through the ML tracks (depth,
-//!    semantic location, mask tracking), with opportunistic triangulation
-//!    between keyframes where the robot moved across the line of sight;
-//! 3. **decide**: the same world again (same seed and presets), and the ML
-//!    logic decides where to go: capture, analyse, triangulate, forecast,
-//!    move, capture.
-//!
-//! The UI advances the session in small steps (`test_step`) so the timeline
-//! fills while it runs.
-//!
-//! A **live** session (`live_start`) records a command typed while the world
-//! plays: the game pass runs in the live world from where it is (no reset),
-//! the start state is kept as a copy, and the decision pass replays that copy
-//! while the live world waits; afterwards the live world comes back as the
-//! game pass left it. The play loop (`sim_step`) advances it.
-
 use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{anyhow, Result};
@@ -40,10 +20,8 @@ use crate::runtime::{Runtime, ScanReport, Submission};
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TestCfg {
     pub record: RecordCfg,
-    /// Ticks the game pass and the decision pass may each use.
     pub max_pass_ticks: u64,
     pub max_ml_decisions: u32,
-    /// Keyframes the perception pass handles per `test_step` call.
     pub perceive_per_step: usize,
 }
 
@@ -78,16 +56,12 @@ pub struct TestSession {
     pub error: Option<String>,
     started_tick: u64,
     rays: HashMap<u32, Vec<Bearing>>,
-    /// Recorded from the live world while it plays (see the module comment).
     pub live: bool,
-    /// The quest needs finding things, so the ML decision pass is worth running.
     pub ml_needed: bool,
     start_world: Option<World>,
     stash: Option<LiveStash>,
 }
 
-/// The live world, its quests and landmarks, kept aside while the decision
-/// pass replays the start state.
 struct LiveStash {
     world: World,
     quests: QuestBook,
@@ -108,7 +82,6 @@ impl Runtime {
         self.test.as_ref()
     }
 
-    /// Starts a test: a fresh world with `seed`, the presets and the base, and the game pass.
     pub fn test_start(&mut self, command: &str, seed: u64, body: BodyPlan, base: Option<BaseKind>) -> Result<()> {
         self.cancel();
         let mut hand = self.cfg.noto;
@@ -151,11 +124,6 @@ impl Runtime {
         Ok(())
     }
 
-    /// Starts recording a command in the live world, from where it is now:
-    /// the game pass begins at once, perception and the ML decision follow by
-    /// themselves as the play loop advances. Only when nothing else runs (the
-    /// caller queues the command otherwise). A command that makes no quest
-    /// (a stop, an error) records nothing.
     pub fn live_start(&mut self, command: &str) -> Result<Submission> {
         let start = self.world.clone();
         self.test = None;
@@ -200,8 +168,6 @@ impl Runtime {
         Ok(s)
     }
 
-    /// Ends a live session early. The live world comes back if the decision
-    /// pass had set it aside.
     pub(crate) fn live_restore(&mut self) {
         if let Some(st) = self.test.as_mut().and_then(|t| t.stash.take()) {
             self.ml_task = None;
@@ -228,7 +194,6 @@ impl Runtime {
         self.recording = Some(rec);
     }
 
-    /// Video frames and the game pass's fixed keyframes, after each tick.
     pub(crate) fn record_tick(&mut self) {
         let Some((started, is_game, n_video, n_kf)) = self.recording.as_ref().map(|r| (r.started_tick, r.pass == "game", r.video.len(), r.keyframes.len())) else { return };
         let cfg = self.test_cfg.record.clone();
@@ -242,7 +207,6 @@ impl Runtime {
                 }
             }
         }
-        // How far the robot's belief is off the truth (the record's, never the robot's).
         if since % BELIEF_EVERY_TICKS == 0 {
             let e = self.world.belief_error_m();
             if let Some(r) = self.recording.as_mut() {
@@ -274,8 +238,6 @@ impl Runtime {
         q.steps.iter().find(|s| s.state == noto_quest::State::Active).map(|s| s.label_ko.clone())
     }
 
-    /// Advances the running test by up to `budget_ticks` world ticks (or a
-    /// few keyframes in the perception pass). Returns the phase after.
     pub fn test_advance(&mut self, budget_ticks: u32) -> Result<TestPhase> {
         let Some(phase) = self.test.as_ref().map(|t| t.phase) else { return Err(anyhow!("진행 중인 통합 테스트가 없습니다")) };
         match phase {
@@ -323,7 +285,6 @@ impl Runtime {
                 t.phase = TestPhase::Done;
                 self.pass = "game".into();
                 if let Some(st) = t.stash.take() {
-                    // Back to the live world as the game pass left it.
                     self.world = st.world;
                     self.quests = st.quests;
                     self.gates = st.gates;
@@ -344,8 +305,6 @@ impl Runtime {
         Ok(())
     }
 
-    /// Wanted vision labels of a quest: the source nodes of every target (a
-    /// placed item, a parcel, is seen as itself).
     fn quest_labels(&self, q: Option<&Quest>) -> Vec<String> {
         let Some(q) = q else { return vec![] };
         let resources: Vec<String> = match &q.plan {
@@ -369,8 +328,6 @@ impl Runtime {
         let prev_pass = std::mem::replace(&mut self.pass, "game".into());
         let run = t.game.as_ref().map(|g| g.run_id.clone()).unwrap_or_default();
         let prev_run = std::mem::replace(&mut self.run_id, run);
-        // Depth, semantic location and the mask encoder for this step's
-        // keyframes in batched calls; the loop below then only tracks.
         if let Some(g) = t.game.as_ref() {
             let rgbs: Vec<Rgb> = (t.perceive_next..end).filter_map(|i| g.keyframes.get(i).and_then(|k| k.rgb().ok())).collect();
             let refs: Vec<&Rgb> = rgbs.iter().collect();
@@ -382,7 +339,6 @@ impl Runtime {
             let Some(mut kf) = t.game.as_mut().and_then(|g| g.keyframes.get_mut(i)).map(|k| std::mem::replace(k, placeholder(k))) else { continue };
             let res = self.ml_analyse(&mut kf, &wanted, None);
             if let Ok(out) = res {
-                // Opportunistic triangulation over the keyframes of the same track.
                 if let Some(s) = out.sighting {
                     let rays = t.rays.entry(s.track_id).or_default();
                     if rays.last().map_or(true, |r| (r.x - s.pose.x).hypot(r.z - s.pose.z) > 0.2) {
@@ -419,7 +375,6 @@ impl Runtime {
         self.pass = prev_pass;
         self.run_id = prev_run;
         if end >= n && t.live && !t.ml_needed {
-            // A command with nothing to find: the game and perception rows are the record.
             t.phase = TestPhase::Done;
             self.log("quest", Level::Info, format!("기록 {} 끝: ML 결정 통과는 찾을 대상이 없어 생략", t.id), None);
             for l in self.db.flush() {
@@ -429,10 +384,8 @@ impl Runtime {
             return Ok(());
         }
         if end >= n {
-            // Decision pass: the same world again, the ML logic finds and approaches.
             let (seed, body, base, cmd, id) = (t.seed, t.body, t.base, t.command.clone(), t.id.clone());
             if t.live {
-                // The start state the game pass began from, in a copy; the live world waits.
                 let start = t.start_world.take().unwrap_or_else(|| self.world.clone());
                 let world = std::mem::replace(&mut self.world, start);
                 let quests = std::mem::replace(&mut self.quests, QuestBook::new());
@@ -465,8 +418,6 @@ impl Runtime {
         Ok(())
     }
 
-    // ----- views -----
-
     fn kf_brief(kf: &Keyframe) -> Value {
         let ml = kf.ml.as_ref();
         json!({
@@ -483,7 +434,6 @@ impl Runtime {
             })),
             "decision": kf.decision.as_ref().map(|d| json!({"label": d.decision, "kind": d.kind, "residual": d.residual_deg.map(r3), "executed": d.executed, "ok": d.ok})),
             "sds": kf.sds.iter().map(|(k, v)| (k.clone(), json!(r3(*v)))).collect::<serde_json::Map<String, Value>>(),
-            // The action moment that made the keyframe, and what its focus views are about.
             "event": kf.event.as_ref().map(|e| json!({"act": e.act, "kind": e.kind, "label": e.label, "ok": e.ok, "parts": e.parts})),
             "focus": kf.focus.as_ref().map(|f| json!({"action": f.action, "action_ko": f.action_ko, "phase": f.phase, "parts": f.parts, "margin": r3(f.body.margin), "trunk_deg": r3(f.body.trunk_deg), "slip_ratio": f.hand.grip.map(|g| r3(g.slip_ratio)), "closure": r3(f.hand.closure)})),
         })
@@ -500,7 +450,6 @@ impl Runtime {
         }
     }
 
-    /// `test_status()`: phase, progress and the keyframe briefs of every row.
     pub fn api_test_status(&self) -> Result<Value, String> {
         let Some(t) = &self.test else { return Ok(json!({"active": false})) };
         let live = self.recording.as_ref();
@@ -511,7 +460,6 @@ impl Runtime {
                     "run_id": r.run_id, "start_tick": r.started_tick, "end_tick": r.ended_tick,
                     "video": r.video.len(), "dropped": r.dropped_keyframes,
                     "keyframes": r.keyframes.iter().map(Self::kf_brief).collect::<Vec<_>>(),
-                    // When the robot looked and what it did on memory alone (the vision lane).
                     "vision": r.vision.iter().map(|m| json!({"tick": m.tick, "kind": m.kind, "what": m.what, "s0": m.sigma_before_m.map(r3), "s1": m.sigma_after_m.map(r3), "innov": m.innovation_m.map(r3)})).collect::<Vec<_>>(),
                     "belief_err": r.belief_err.iter().map(|(t, e)| json!([t, r3(*e)])).collect::<Vec<_>>(),
                 }),
@@ -544,14 +492,10 @@ impl Runtime {
         }
     }
 
-    /// `test_keyframe({pass, index})`: the keyframe's pictures and everything the tracks said.
     pub fn api_test_keyframe(&self, pass: &str, index: usize) -> Result<Value, String> {
         self.api_test_keyframe_with(pass, index, true)
     }
 
-    /// `test_keyframe({pass, index, close_ups})`: without the focus close-ups
-    /// (`close_ups: false`) for the timeline's tiles, which draw only the frame
-    /// or the focus numbers.
     pub fn api_test_keyframe_with(&self, pass: &str, index: usize, close_ups: bool) -> Result<Value, String> {
         let rec = self.rec_of(pass).ok_or("이 통과의 기록이 없습니다")?;
         let kf = rec.keyframes.get(index).ok_or_else(|| format!("키프레임 {index}이(가) 없습니다"))?;
@@ -561,26 +505,21 @@ impl Runtime {
             "ml_webp": kf.ml_webp.as_deref().map(b64),
             "width": kf.intr.width, "height": kf.intr.height,
             "ml": kf.ml, "decision": kf.decision, "balance": kf.balance,
-            // Every focus view of the instant (hand, finger joints, feet, leg joints, waist, neck, wheels, tracks).
             "focus": kf.focus, "event": kf.event,
             "truth": kf.truth.objects.iter().map(|o| json!({"entity": o.entity, "label": o.label, "label_ko": o.label_ko, "bbox": [o.bbox[0] as f32 / kf.truth.src_width as f32, o.bbox[1] as f32 / kf.truth.src_height as f32, o.bbox[2] as f32 / kf.truth.src_width as f32, o.bbox[3] as f32 / kf.truth.src_height as f32], "depth_m": r3(o.depth_m)})).collect::<Vec<_>>(),
         });
-        // The close-ups: the hand, the body from the side, low by the feet or wheels.
         if close_ups {
             v["focus_webp"] = Value::Object(kf.focus_webp.iter().map(|(k, w)| (k.clone(), json!(b64(w)))).collect());
         }
         Ok(v)
     }
 
-    /// `test_video({pass, from, count})`: video frames as WebP.
     pub fn api_test_video(&self, pass: &str, from: usize, count: usize) -> Result<Value, String> {
         let rec = self.rec_of(pass).ok_or("이 통과의 기록이 없습니다")?;
         let frames: Vec<Value> = rec.video.iter().skip(from).take(count.clamp(1, 120)).map(|v| json!({"tick": v.tick, "t": r3(v.time_s as f32), "webp": b64(&v.webp)})).collect();
         Ok(json!({"from": from, "total": rec.video.len(), "frames": frames}))
     }
 
-    /// `test_stats()`: success per pass, kind, target, preset and step; the N:N
-    /// balance matrix from the SDS (value, reference, deviation, share in band).
     pub fn api_test_stats(&self) -> Result<Value, String> {
         let stats = self.db.stats();
         let mut nn: Vec<Value> = Vec::new();
@@ -599,8 +538,6 @@ impl Runtime {
                         "mean": rep.as_ref().map(|r| r.mean).or(base.map(|b| b.0)),
                         "n": rep.as_ref().map(|r| r.n).or(base.map(|b| b.2)),
                         "dev": rep.as_ref().map(|r| r.mean_dev), "in_band": rep.as_ref().map(|r| r.in_band_rate),
-                        // The reference recorded with the observations (it scales with load and slope);
-                        // the context-free one only when nothing was recorded against a reference.
                         "reference": rep.as_ref().map(|r| r.mean_ref).filter(|x| x.is_finite()).or(rf.as_ref().map(|r| r.value as f64)),
                         "tolerance": rep.as_ref().map(|r| r.mean_tol).filter(|x| x.is_finite()).or(rf.as_ref().map(|r| r.tolerance as f64)),
                         "cite": rf.as_ref().map(|r| r.cite),
@@ -617,11 +554,9 @@ impl Runtime {
     }
 }
 
-/// The belief's error is recorded every this many ticks, up to this many points.
 const BELIEF_EVERY_TICKS: u64 = 5;
 const MAX_BELIEF_POINTS: usize = 6000;
 
-/// A cheap stand-in left in a slot while its keyframe is being analysed.
 fn placeholder(k: &Keyframe) -> Keyframe {
     Keyframe {
         index: k.index,

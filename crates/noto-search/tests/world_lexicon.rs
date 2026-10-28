@@ -1,9 +1,3 @@
-//! The shipped dictionary (`data/world_lexicon.json`) driven through the parser.
-//!
-//! These are consistency tests over the project's own vocabulary and rules.
-//! They say nothing about how well a real embedding model understands
-//! unseen Korean; the semantic test uses a character-bigram stand-in.
-
 use std::sync::Arc;
 
 use noto_search::{
@@ -41,12 +35,10 @@ fn the_shipped_lexicon_is_valid_and_complete() {
         assert!(l.place(id).is_some());
         assert!(l.vision.iter().any(|e| e.link == id));
     }
-    // the world defines these exact entity ids (world-sim kinds / waypoint keys)
     for id in ["tree", "boulder", "coal_ore", "iron_ore_node", "log", "stone", "coal", "iron_ore", "base_camp", "warehouse"] {
         assert!(l.vision.iter().any(|e| e.id == id), "vision entity {id}");
     }
     assert!(l.all_phrases().len() > 100);
-    // A site's places and what the camera sees of them (never a target).
     for id in ["house", "doorstep", "shelf", "table"] {
         assert!(l.place(id).is_some(), "place {id}");
         assert!(l.structures.iter().any(|e| e.id == id && e.link == id), "structure {id}");
@@ -173,11 +165,9 @@ fn an_origin_is_ignored_with_a_warning_when_a_destination_exists() {
     let p = parse("창고에서 석탄 베이스캠프로 가져와");
     assert_eq!(fetch(&p), (vec![("coal".to_string(), 1)], "base_camp".to_string()));
     assert!(p.warnings.iter().any(|w| w.contains("출발 지점")));
-    // Since v1.0 the origin is kept as a search hint, never a destination.
     assert_eq!(origin(&p), vec!["warehouse".to_string()]);
 }
 
-/// The search hint of the first target.
 fn origin(p: &ParsedCommand) -> Vec<String> {
     match p.plan.as_ref().unwrap_or_else(|| panic!("no plan for {:?}: {:?}", p.text, p.problem)) {
         Plan::Fetch { targets, .. } | Plan::Collect { targets } => targets[0].origin.iter().map(|o| o.place.clone()).collect(),
@@ -201,13 +191,11 @@ fn a_parcel_without_a_destination_goes_back_to_the_base_camp() {
     assert!(p.trace.iter().any(|t| t.detail.contains("home place")));
     let p = parse("택배 상자 2개 갖다줘");
     assert_eq!(fetch(&p), (vec![("parcel".to_string(), 2)], "base_camp".to_string()));
-    // Said out loud, it is an ordinary destination; a mined item still needs one.
     let p = parse("택배를 창고로 가져와");
     assert_eq!(fetch(&p).1, "warehouse");
     assert!(!implied_destination(&p));
     assert_eq!(parse("철광석 가져와").problem.unwrap().code, "missing_destination");
     assert_eq!(parse("택배랑 나무 가져와").problem.unwrap().code, "missing_destination", "only placed items have a home");
-    // Picking it up without bringing it keeps it in hand.
     match parse("택배 주워").plan.unwrap() {
         Plan::Collect { targets } => assert_eq!(targets[0].resource, "parcel"),
         other => panic!("{other:?}"),
@@ -234,13 +222,11 @@ fn where_a_parcel_lies_becomes_a_search_hint() {
     assert_eq!(origin(&p), vec!["table".to_string()]);
     let p = parse("현관 앞 택배를 창고로 옮겨줘");
     assert_eq!(fetch(&p).1, "warehouse");
-    // An origin alone is still not a command.
     assert_eq!(parse("집 앞에서").problem.unwrap().code, "unsupported_origin");
 }
 
 #[test]
 fn the_new_place_words_leave_the_verbs_alone() {
-    // 집어 (pick) is a verb form, not the place 집 (house) with a tail.
     for text in ["택배 집어와", "돌 하나 집어", "택배 집어서 창고로 가져와"] {
         let p = parse(text);
         assert!(p.hits.iter().all(|h| h.category != Category::Place || h.node == "warehouse"), "{text}: {:?}", p.hits);
@@ -258,7 +244,6 @@ fn nothing_understood_is_reported_not_guessed() {
     assert_eq!(p.problem.as_ref().unwrap().code, "no_target");
     let p = parse("   ");
     assert_eq!(p.problem.unwrap().code, "empty");
-    // unknown words next to known ones are listed, and the rest still runs
     let p = parse("다이아몬드 나무 창고로 가져와");
     assert_eq!(fetch(&p).0, vec![("log".to_string(), 1)]);
     assert_eq!(p.unmatched, vec!["다이아몬드".to_string()]);
@@ -275,7 +260,6 @@ fn quantity_limits() {
 
 #[test]
 fn tails_must_agree_so_a_misspelt_particle_does_not_match() {
-    // 창고을 is not Korean; the word stays unmatched rather than being repaired
     let p = parse("나무를 창고을 가져와");
     assert!(p.hits.iter().all(|h| h.category != Category::Place));
 }
@@ -289,7 +273,6 @@ fn every_parse_leaves_a_trace() {
     }
 }
 
-/// Character n-gram stand-in for an embedding model.
 struct Bigrams;
 
 fn vector(text: &str) -> Vec<f32> {
@@ -332,7 +315,6 @@ fn an_unknown_compound_is_found_by_embedding_and_the_known_words_are_not_re_scor
     p.attach_embedder(&Bigrams).unwrap();
     assert!(p.has_embedder());
     let r = p.parse("장작더미 두 개를 물류창고로 가져와", Some(&Bigrams));
-    // 물류창고 is an exact word, 장작더미 is not
     let (targets, dest) = fetch(&r);
     assert_eq!(targets, vec![("log".to_string(), 2)]);
     assert_eq!(dest, "warehouse");

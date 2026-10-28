@@ -1,26 +1,8 @@
-//! ML track 3: mask tracking from point prompts.
-//!
-//! The interface is the one SAM 3.1 offers (point prompts in, masks with
-//! object ids out, objects kept across frames), so the real model can replace
-//! the stand-in without touching the callers. The SAM 3.1 weights the project
-//! points at (`avencera/sam3.1-mlx-bf16`) are for Apple's MLX and do not run
-//! on this Windows/CUDA build; see `docs/PLAN-v0.3.md` for what it takes.
-//!
-//! [`RegionTracker`] is the stand-in and an honest one: it uses only the
-//! keyframe and the depth map, never the renderer's object ids. From each
-//! prompt it grows a region over pixels whose colour stays close to the
-//! region's mean and whose depth does not jump (an object ends where the depth
-//! steps to what is behind it). A track is re-found in the next keyframe by
-//! growing again from the pixel nearest the predicted centroid whose colour
-//! matches the track's colour model; prompts that land inside a track's mask
-//! refresh it instead of making a new one.
-
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::frame::{DepthMap, Mask, Rgb};
 
-/// A point prompt, as SAM takes it: a pixel and the label it stands for.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PointPrompt {
     pub label: String,
@@ -33,38 +15,24 @@ pub struct PointPrompt {
 pub struct TrackedMask {
     pub id: u32,
     pub label: String,
-    /// Mask at the tracker's working resolution.
     pub mask: Mask,
-    /// Centroid in pixels of the keyframe.
     pub cx: f32,
     pub cy: f32,
-    /// Box in pixels of the keyframe.
     pub bbox: [f32; 4],
     pub area_frac: f32,
-    /// Mask quality 0..1 (colour coherence times prompt agreement).
     pub score: f32,
-    /// IoU with this track's mask in the previous keyframe (no motion compensation).
     pub iou_prev: Option<f32>,
-    /// Keyframes this track has been followed.
     pub age: u32,
-    /// True when it was re-found from the previous keyframe without a fresh prompt.
     pub propagated: bool,
 }
 
 pub trait MaskTracker: Send {
-    /// `region-grow` (stand-in) or `sam3.1`.
     fn mode(&self) -> &str;
     fn reset(&mut self);
-    /// Follows the existing tracks into this keyframe and starts tracks for
-    /// prompts that do not fall on one. Returns the live tracks.
     fn update(&mut self, rgb: &Rgb, depth: Option<&DepthMap>, prompts: &[PointPrompt]) -> Result<Vec<TrackedMask>>;
-    /// Called with keyframes that [`MaskTracker::update`] will see next, so a
-    /// model with an image encoder can encode them in one batch ahead of the
-    /// sequential tracking. The default does nothing.
     fn prepare(&mut self, _frames: &[&Rgb]) -> Result<()> {
         Ok(())
     }
-    /// Device the tracker runs on.
     fn device(&self) -> String {
         "cpu".into()
     }
@@ -72,23 +40,14 @@ pub trait MaskTracker: Send {
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RegionCfg {
-    /// Working resolution divisor (2 means half width and height).
     pub downscale: u32,
-    /// Largest RGB distance from the running region mean for a pixel to join.
     pub color_tol: f32,
-    /// A pixel whose depth differs from its neighbour's by more than this
-    /// fraction is across an object edge.
     pub depth_jump: f32,
     pub min_area_frac: f32,
     pub max_area_frac: f32,
-    /// Search radius around the predicted centroid when re-finding a track, working pixels.
     pub search_px: i32,
-    /// Colour distance accepted when re-finding a track's seed.
     pub refind_tol: f32,
     pub max_tracks: usize,
-    /// Keyframes a track may be carried without a prompt landing on it. SAM
-    /// keeps an object through short detection gaps; past this the track is
-    /// dropped instead of drifting onto the background.
     pub max_misses: u32,
 }
 
@@ -142,8 +101,6 @@ fn dist(a: [f32; 3], b: [f32; 3]) -> f32 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
 }
 
-/// 3×3 per-channel median: removes one-pixel flecks and lines (ore texture)
-/// that would otherwise wall a region off, and keeps object edges.
 fn median3(px: &[[f32; 3]], w: u32, h: u32) -> Vec<[f32; 3]> {
     let mut out = px.to_vec();
     let mut win: [Vec<f32>; 3] = [Vec::with_capacity(9), Vec::with_capacity(9), Vec::with_capacity(9)];
@@ -179,7 +136,6 @@ impl Work {
         let mut px = Vec::with_capacity((w * h) as usize);
         for y in 0..h {
             for x in 0..w {
-                // Box filter over the k x k block: flecks average out a little.
                 let mut s = [0.0f32; 3];
                 let mut n = 0.0;
                 for dy in 0..k {
@@ -212,9 +168,6 @@ impl Work {
         (y * self.w + x) as usize
     }
 
-    /// Grows a region from a seed. Returns the mask, its mean colour, and
-    /// whether it stopped at the size cap (then it is ground or sky, not an
-    /// object bounded by colour and depth edges).
     fn grow(&self, seed: (u32, u32), cfg: &RegionCfg) -> (Mask, [f32; 3], bool) {
         let mut mask = Mask::empty(self.w, self.h);
         let max_px = (cfg.max_area_frac * (self.w * self.h) as f32) as u32 + 1;
@@ -235,7 +188,7 @@ impl Work {
                 if let Some(d) = &self.depth {
                     let (a, b) = (d[here], d[j]);
                     if !b.is_finite() {
-                        continue; // sky
+                        continue;
                     }
                     if a.is_finite() && (a - b).abs() > cfg.depth_jump * a.min(b).max(0.1) {
                         continue;
@@ -259,8 +212,6 @@ impl Work {
         (mask, mean, false)
     }
 
-    /// Per-channel median colour of the window of radius `r` around `(x, y)`.
-    /// A prompt that lands on a fleck of ore still seeds the stone around it.
     fn local_median(&self, x: f32, y: f32, r: i32) -> Option<[f32; 3]> {
         let (cx, cy) = (x as i32, y as i32);
         let mut ch: [Vec<f32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
@@ -287,7 +238,6 @@ impl Work {
         Some(out)
     }
 
-    /// Pixel within `r` of `(x, y)` whose colour is nearest to `color`.
     fn best_seed(&self, x: f32, y: f32, color: Option<[f32; 3]>, r: i32) -> Option<((u32, u32), f32)> {
         let (cx, cy) = (x as i32, y as i32);
         let mut best: Option<((u32, u32), f32)> = None;
@@ -357,10 +307,7 @@ impl MaskTracker for RegionTracker {
         let mut out = Vec::new();
         let mut used = vec![false; prompts.len()];
         let old = std::mem::take(&mut self.tracks);
-        // 1. Follow the existing tracks.
         for mut t in old {
-            // A prompt of the same label on the mask, or near its box (the
-            // object moved in the image between keyframes), refreshes the track.
             let near = |p: &PointPrompt| -> bool {
                 let (x, y) = (p.px / kf, p.py / kf);
                 let (xi, yi) = (x as u32, y as u32);
@@ -404,7 +351,6 @@ impl MaskTracker for RegionTracker {
             out.push(self.out(&t, k, (rgb.width, rgb.height), Some(iou), propagated, score));
             self.tracks.push(t);
         }
-        // 2. New tracks from the prompts that did not land on one.
         for (i, p) in prompts.iter().enumerate() {
             if used[i] || self.tracks.len() >= self.cfg.max_tracks {
                 continue;
@@ -437,7 +383,6 @@ mod tests {
     use super::*;
     use crate::frame::DepthKind;
 
-    /// Grass background with a grey block at `x0..x0+20, 20..40`, nearer than the ground.
     fn scene(x0: u32) -> (Rgb, DepthMap) {
         let (w, h) = (80u32, 60u32);
         let mut rgb = Vec::new();
@@ -462,7 +407,6 @@ mod tests {
         let m = &first[0];
         assert!(m.mask.area() >= 300 && m.mask.area() <= 400, "area {}", m.mask.area());
         assert!((m.cx - 40.0).abs() < 2.0 && (m.cy - 30.0).abs() < 2.0, "{} {}", m.cx, m.cy);
-        // Next keyframe: the block moved 6 px right, no prompt. The track is re-found.
         let (rgb2, depth2) = scene(36);
         let next = t.update(&rgb2, Some(&depth2), &[]).unwrap();
         assert_eq!(next.len(), 1);
@@ -479,7 +423,6 @@ mod tests {
         let (rgb, depth) = scene(30);
         let first = t.update(&rgb, Some(&depth), &[PointPrompt { label: "stone".into(), px: 40.0, py: 30.0, score: 0.8 }]).unwrap();
         let id = first[0].id;
-        // A prompt just outside the moved block's old box still refreshes the same track.
         let (rgb2, depth2) = scene(44);
         let near = t.update(&rgb2, Some(&depth2), &[PointPrompt { label: "stone".into(), px: 53.0, py: 30.0, score: 0.8 }]).unwrap();
         assert_eq!(near.len(), 1);

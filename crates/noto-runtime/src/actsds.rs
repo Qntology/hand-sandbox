@@ -1,34 +1,3 @@
-//! The actions' physics in the live record.
-//!
-//! * Keyframes: every moment of an action's physics the world reports (a
-//!   contact, a lift-off, a slip, an impact, a heel slip, a fall, a push lost)
-//!   becomes a keyframe of the row being recorded, beside the fixed-interval
-//!   ones, with the focus views of that instant (`record::capture_keyframe`).
-//! * SDS (`act` track), in four layers per finished action:
-//!   1. outcome — `act|<action>|<plan>:<base>:f<fingers>` (the robot's form,
-//!      `noto_core::bench::form_id`): `ok` agreement, every attempt counted
-//!      once under its outcome (`attempt>ok`, `attempt>grasp_slip`, a
-//!      transition count), and the success the action predicted scored as a
-//!      forecast (`p_success:brier`, and per decile of the prediction the
-//!      observed rate `p_success:bin<k>` beside the mean prediction
-//!      `p_success:bin<k>:p`: a reliability diagram);
-//!   2. time series — `act|<action>:ts|<item or ground>`: every number of the
-//!      rollout as a baseline, and against the benchmark's measurement where
-//!      it has one (`noto_core::actbench`);
-//!   3. part — `act|<action>>part|<state>`: the joints' peak ratios and the
-//!      bend's angles at the bottom (the lowest palm over every phase), the
-//!      floor-lift angles as references; a push's most loaded instant;
-//!   4. coupling — `act|nn:<action>|<part>`: what the action asked of another
-//!      part (the feet's margin while the hands lift, the camera's pitch, the
-//!      bumper's push at the wheels).
-//! * The moves, which the world plays without a rollout, in the same layers
-//!   when they end (`walk` on legs, `drive` on wheels and tracks): the gait's
-//!   or the drive's numbers on that ground, the stance's joint loads, the
-//!   friction the sole or the wheels use; and the falls, slips and
-//!   collisions as they happen (`act|event:<kind>|<form>`, a slip's outcome
-//!   as `slip>fall` / `slip>recover`).
-//!   The engine never reads any of this back.
-
 use noto_core::act::{drive, gait, ActKind, ActRollout};
 use noto_core::actbench as ab;
 use noto_core::balance::{reference, RefCtx, Source, G};
@@ -41,23 +10,13 @@ use world_sim::{TimedEvent, WorldEvent};
 use crate::record::{capture_keyframe, KeyEvent};
 use crate::runtime::Runtime;
 
-/// Action moments that make a keyframe. The last ten come from the
-/// collision, fall, tactile and cooperation physics as the world reports them.
 pub const KEY_KINDS: [&str; 32] = [
     "bend_bottom", "contact", "lift_off", "hold", "slip", "pivot", "drop", "stowed", "release", "impact", "stall", "miss", "reach_fail", "foot_slip", "fall", "breakaway", "turn_slide", "push_lost", "collision", "arrive", "stuck", "wheel_slip", "bump", "tip", "hit", "edge_fall", "yield", "co_drop", "overload_share",
     "incipient_slip", "heel_off", "toe_push",
 ];
 
-/// Moments of moving about that the `act` track counts as they happen
-/// (`act|event:<kind>|<form>`): a foot or a wheel slipping, a fall, a pushed
-/// object stopped or lost. The collision physics' own moments (a bump, a tip,
-/// a hit) go to `benchsds`.
 pub const MOTION_EVENTS: [&str; 6] = ["foot_slip", "fall", "wheel_slip", "stuck", "collision", "push_lost"];
 
-/// A predicted probability against what happened, as a forecast is scored:
-/// the Brier score (`<axis>:brier`, `(y − p)²`) and the reliability diagram
-/// (per decile of `p`, the observed rate `<axis>:bin<k>` and the mean
-/// prediction `<axis>:bin<k>:p`).
 pub(crate) fn record_forecast(sds: &mut SdsStore, scope: &Scope, axis: &str, happened: bool, p: f32) {
     let y = if happened { 1.0 } else { 0.0 };
     let p = (p as f64).clamp(0.0, 1.0);
@@ -67,7 +26,6 @@ pub(crate) fn record_forecast(sds: &mut SdsStore, scope: &Scope, axis: &str, hap
     sds.record_baseline(scope, &format!("{axis}:bin{bin}:p"), p);
 }
 
-/// A failure reason as a short code: what comes before its first `:`.
 fn code_of(reason: Option<&str>) -> String {
     let r = reason.unwrap_or("failed").split(':').next().unwrap_or("failed").trim();
     let c: String = r.chars().take(32).map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' }).collect();
@@ -77,10 +35,8 @@ fn code_of(reason: Option<&str>) -> String {
         c
     }
 }
-/// Action keyframes come no closer together than this, seconds (one world tick).
 pub const KEY_GAP_S: f64 = 0.1;
 
-/// The benchmark's measurement for a rollout number, when it has one: (reference, tolerance).
 fn ts_reference(action: ActKind, metric: &str) -> Option<(f32, f32)> {
     match (action, metric) {
         (ActKind::Grasp, "preload_s") => Some(ab::PRELOAD_S),
@@ -94,7 +50,6 @@ fn ts_reference(action: ActKind, metric: &str) -> Option<(f32, f32)> {
 }
 
 impl Runtime {
-    /// Action moments of this tick become keyframes of the row being recorded.
     pub(crate) fn record_act_keyframes(&mut self, events: &[TimedEvent]) {
         let Some(rec) = self.recording.as_ref() else { return };
         let last = rec.keyframes.iter().rev().find(|k| k.event.is_some()).map_or(f64::NEG_INFINITY, |k| k.time_s);
@@ -102,7 +57,6 @@ impl Runtime {
         if n >= self.test_cfg.record.max_keyframes {
             return;
         }
-        // One keyframe per tick: a failure first, else the tick's first moment.
         let moments: Vec<(String, String, String, bool, Vec<String>)> = events
             .iter()
             .filter_map(|e| match &e.event {
@@ -113,7 +67,6 @@ impl Runtime {
         let Some((act, kind, label, ok, parts)) = moments.iter().find(|m| !m.3).or(moments.first()).cloned() else {
             return;
         };
-        // A failure always gets its keyframe; the rest keep a little apart.
         if ok && self.world.time_s - last < KEY_GAP_S {
             return;
         }
@@ -121,7 +74,6 @@ impl Runtime {
         if let Ok(mut kf) = capture_keyframe(&self.world, &self.cam, quality, n as u32) {
             kf.step = self.current_step_label();
             kf.event = Some(KeyEvent { act: act.clone(), kind: kind.clone(), label, ok, parts });
-            // The SDS lane: the moment's number against what this kind of moment usually shows.
             let value = events.iter().find_map(|e| match &e.event {
                 WorldEvent::Act { kind: k, value, .. } if *k == kind => *value,
                 _ => None,
@@ -139,7 +91,6 @@ impl Runtime {
         }
     }
 
-    /// A finished action (pick, set-down, push) into the SDS `act` track, layer by layer.
     pub(crate) fn record_act_sds(&mut self, events: &[TimedEvent]) {
         self.record_motion_sds(events);
         let done = events.iter().any(|e| matches!(&e.event, WorldEvent::ActionDone { action, .. } if action.starts_with("pick_up") || action.starts_with("drop") || action.starts_with("deliver") || action.starts_with("push")));
@@ -151,14 +102,12 @@ impl Runtime {
         let action = r.kind;
         let preset = noto_core::bench::form_id(&self.world.body);
         let what = p.object.map(|o| o.0.id().to_string()).unwrap_or_default();
-        // 1. outcome: every attempt counted once under how it ended.
         let s1 = Scope::new(Track::Act, action.id(), &preset);
         self.sds.record_agreement(&s1, "ok", r.outcome.ok);
         self.sds.record_transition(&s1, "attempt", r.outcome.code.unwrap_or("ok"));
         if let Some(pred) = r.metric("p_success") {
             record_forecast(&mut self.sds, &s1, "p_success", r.outcome.ok, pred);
         }
-        // 2. time series
         let s2 = Scope::new(Track::Act, &format!("{}:ts", action.id()), &what);
         for (k, v) in &r.metrics {
             if !v.is_finite() {
@@ -170,11 +119,9 @@ impl Runtime {
             }
         }
         if action == ActKind::Push {
-            // A push does not bend to the floor: its key instant is its most loaded one.
             self.record_push_layers(r);
             return;
         }
-        // 3. part: the deepest sample of the action (lowest palm, whatever its phase), its joints and angles.
         let bottom = r.samples.iter().min_by(|a, b| {
             let za = kin::solve_fast(&self.world.body, &a.pose, &a.loads).hands[0][2];
             let zb = kin::solve_fast(&self.world.body, &b.pose, &b.loads).hands[0][2];
@@ -196,7 +143,6 @@ impl Runtime {
                     self.sds.record_reference(&s3, "knee_flex_deg", n as f64, ab::LIFT_KNEE_DEG.0 as f64, ab::LIFT_KNEE_DEG.1 as f64);
                 }
             }
-            // 4. coupling: the feet's margin while the hands work, the camera's pitch.
             let s4 = Scope::new(Track::Act, &format!("nn:{}", action.id()), "foot");
             match reference(Source::ArmLift, Segment::Foot, "margin", &RefCtx::default()) {
                 Some(rf) => self.sds.record_reference(&s4, "margin", k.margin as f64, rf.value as f64, rf.tolerance as f64),
@@ -207,9 +153,6 @@ impl Runtime {
         }
     }
 
-    /// A push's part and coupling layers: the joints at its most loaded
-    /// instant, and what the bumper's peak push asks of the drive (the
-    /// action benchmark's `bumper>wheel` cells).
     fn record_push_layers(&mut self, r: &ActRollout) {
         let Some(key) = r.samples.iter().max_by(|a, b| a.peak_ratio.total_cmp(&b.peak_ratio)) else { return };
         let k = kin::solve_fast(&self.world.body, &key.pose, &key.loads);
@@ -228,9 +171,6 @@ impl Runtime {
         self.sds.record_baseline(&Scope::new(Track::Act, "nn:push", "base"), "margin", k.margin as f64);
     }
 
-    /// Moves, falls, slips and collisions: the world plays no rollout for
-    /// them, so a move's layers come from its end (the gait or the drive on
-    /// that ground) and the moments from the events as they happen.
     fn record_motion_sds(&mut self, events: &[TimedEvent]) {
         let form = noto_core::bench::form_id(&self.world.body);
         for e in events {
@@ -255,7 +195,6 @@ impl Runtime {
                     if let Some(v) = value {
                         self.sds.record_baseline(&Scope::new(Track::Act, &format!("event:{kind}:ts"), ground), "value", *v as f64);
                     }
-                    // How a walking slip ended, per slip (the benchmark's fall given a slip).
                     if act == "walk" && matches!(kind.as_str(), "foot_slip" | "fall") {
                         self.sds.record_transition(&Scope::new(Track::Act, "walk", &form), "slip", if kind == "fall" { "fall" } else { "recover" });
                     }
@@ -265,9 +204,6 @@ impl Runtime {
         }
     }
 
-    /// A walk's layers at the end of a move, from the gait of its last edge:
-    /// the step's numbers on that ground, the legs' loads at mid-stance and
-    /// the friction the sole uses there.
     fn record_walk_layers(&mut self) {
         let Some((g, ground, _)) = self.world.walk.plan.clone() else { return };
         let body = &self.world.body;
@@ -289,9 +225,6 @@ impl Runtime {
         self.sds.record_baseline(&s4, "margin", k.margin as f64);
     }
 
-    /// A drive's layers at the end of a move on wheels or tracks: the slip and
-    /// the axle loads cruising on the ground and slope where it stopped (the
-    /// action benchmark's drive cells).
     fn record_drive_layers(&mut self) {
         let ground = self.world.ground_here();
         let props = *ground.surface().props();
@@ -327,7 +260,6 @@ mod tests {
         assert_eq!(n, 6);
         let want = [(1.0f64, 0.95f64), (1.0, 0.92), (0.0, 0.97), (1.0, 0.35), (0.0, 0.31), (1.0, 0.93)].iter().map(|(y, p)| (y - p).powi(2)).sum::<f64>() / 6.0;
         assert!((brier - want).abs() < 1e-6, "{brier} vs {want}");
-        // The 0.9 decile: 3 of 4 happened at a mean prediction of 0.9425.
         let (p9, _, n9) = sds.exact_baseline(&s, "p_success:bin9:p").unwrap();
         assert_eq!(n9, 4);
         assert!((p9 - 0.9425).abs() < 1e-6, "{p9}");
@@ -346,9 +278,6 @@ mod tests {
 
     #[test]
     fn a_finished_move_records_its_layers_by_base() {
-        // Legs record a walk (the gait on that ground), wheels a drive (the
-        // drive model on that ground): outcome by form, numbers by ground,
-        // joints or axles, and what the ground asks of the sole or the wheels.
         for (base, act, ts, part, nn) in [
             (BaseKind::HumanFoot, "walk", ["speed_mps", "step_m", "rcof", "froude"], "walk>part|", ("act|nn:walk|foot", "foot>sole:rcof_over_mu")),
             (BaseKind::Wheel, "drive", ["slip_cruise", "speed_factor", "slip_cruise", "speed_factor"], "drive>part|wheel", ("act|nn:drive|wheel", "slope>drive:need_over_limit")),

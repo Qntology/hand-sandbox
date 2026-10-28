@@ -1,23 +1,10 @@
-//! Temporal consistency gate.
-//!
-//! A detection score that jumps outside what the recent history predicts is
-//! held back instead of accepted. The expected range is the forecast's P10..P90
-//! band widened by the SDS standard deviation of that score, so a label whose
-//! scores are naturally noisy gets a wider band than a steady one.
-//!
-//! The gate costs one frame at first sight of an object: the first high score
-//! is held, and the next consistent one is accepted because the history now
-//! contains the first. That is the intended "confirm twice" behaviour.
-
 use serde::{Deserialize, Serialize};
 
 use crate::fusion::{forecast, HistoryMse, Predictor};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GateConfig {
-    /// SDS standard deviations added on each side of the P10..P90 band.
     pub widen_sd: f64,
-    /// Fewest history points that make the gate act; below it the gate abstains.
     pub min_history: usize,
 }
 
@@ -30,7 +17,6 @@ impl Default for GateConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TemporalOutcome {
-    /// Not enough history: the gate does not judge. Counts as a pass.
     Abstained,
     Accepted,
     Held,
@@ -43,20 +29,17 @@ pub struct TemporalVerdict {
     pub expected: Option<f64>,
     pub lo: Option<f64>,
     pub hi: Option<f64>,
-    /// Distance from the expectation in units of the widened band's half width / 1.2816.
     pub z: Option<f64>,
     pub method: String,
     pub reason: String,
 }
 
 impl TemporalVerdict {
-    /// True when the observation may pass (accepted or abstained).
     pub fn passes(&self) -> bool {
         self.outcome != TemporalOutcome::Held
     }
 }
 
-/// Judges `observed` against the forecast made from `history` (oldest first).
 pub fn temporal_gate(
     history: &[f64],
     observed: f64,

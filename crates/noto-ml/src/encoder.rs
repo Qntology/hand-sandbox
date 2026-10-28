@@ -1,6 +1,3 @@
-//! Transformer pieces shared by the SigLIP2 vision and text towers: multi-head
-//! self-attention, the GELU (tanh) MLP and the pre-norm encoder block.
-
 use candle_core::{Result, Tensor};
 use candle_nn::{layer_norm, linear, LayerNorm, Linear, Module, VarBuilder};
 
@@ -25,8 +22,6 @@ impl Attention {
         })
     }
 
-    /// `x` is `(batch, tokens, hidden)`. `mask`, when given, is an additive
-    /// mask of shape `(batch, 1, 1, tokens)`: 0 for keep, large negative for drop.
     pub fn forward(&self, x: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
         let (b, n, _) = x.dims3()?;
         let split = |t: Tensor| -> Result<Tensor> {
@@ -66,7 +61,6 @@ impl Mlp {
         })
     }
 
-    /// SigLIP uses the tanh approximation of GELU (`gelu_pytorch_tanh`), which is candle's `gelu`.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         self.fc2.forward(&self.fc1.forward(x)?.gelu()?)
     }
@@ -125,10 +119,8 @@ mod tests {
         let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
         let attn = Attention::new(8, 2, vb).unwrap();
         let x = Tensor::randn(0f32, 1.0, (1, 3, 8), &dev).unwrap();
-        // Mask out the third token completely.
         let mask = Tensor::from_vec(vec![0f32, 0.0, -1e9], (1, 1, 1, 3), &dev).unwrap();
         let full = attn.forward(&x, Some(&mask)).unwrap();
-        // Changing only the masked token must not change the output of the others.
         let mut changed = x.to_vec3::<f32>().unwrap();
         changed[0][2] = vec![9.0; 8];
         let x2 = Tensor::new(changed, &dev).unwrap();

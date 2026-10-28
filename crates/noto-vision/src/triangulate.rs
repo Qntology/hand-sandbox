@@ -1,34 +1,12 @@
-//! Range by triangulation: two or more bearings to the same tracked target,
-//! taken from poses a known baseline apart, intersect at the target.
-//!
-//! A single image gives the direction to the target well and its distance
-//! badly: a monocular depth model is trained for relative depth, and its
-//! metric scale on this renderer is unknown. So before the ML logic drives up
-//! to a target it makes a deliberate sideways move (the "triangulation step"):
-//! look, move a baseline across the line of sight, look again, intersect. The
-//! range it gets is metric because the baseline comes from odometry. It also
-//! tells the depth model's scale on this scene (`depth_scale`), which the SDS
-//! learns without any ground truth.
-//!
-//! Geometry (ground plane): ray `i` starts at `p_i` with unit direction `u_i`.
-//! The point closest to all rays in least squares solves
-//! `sum(I - u_i u_iᵀ) p = sum(I - u_i u_iᵀ) p_i`. For two rays the range error
-//! is roughly `r · σθ · √2 / sin γ`, where `γ` is the parallax (the angle
-//! between the rays) and `σθ` the bearing noise; that is why a minimum
-//! parallax is required and the baseline is planned from it.
-
 use serde::{Deserialize, Serialize};
 
 use crate::camera::{wrap_angle, Pose};
 
-/// One sighting: where the robot stood and the world heading of the target.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Bearing {
     pub x: f32,
     pub z: f32,
-    /// World heading of the ray, radians.
     pub heading: f32,
-    /// Bearing noise, radians (one standard deviation).
     pub sigma: f32,
 }
 
@@ -36,17 +14,10 @@ pub struct Bearing {
 pub struct Fix {
     pub x: f32,
     pub z: f32,
-    /// Ground distance from the last sighting to the target, metres.
     pub range_m: f32,
-    /// Largest angle between two of the rays, degrees.
     pub parallax_deg: f32,
-    /// Distance between the two sightings furthest apart, metres.
     pub baseline_m: f32,
-    /// Estimated one-sigma range error, metres.
     pub sigma_m: f32,
-    /// Root mean square distance of the fix from the rays, metres. With two
-    /// rays it is always zero; only three or more can show that one of them
-    /// belonged to another object.
     pub residual_m: f32,
     pub rays: usize,
 }
@@ -55,9 +26,7 @@ pub struct Fix {
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum TriError {
     TooFewRays,
-    /// The rays are too close to parallel for a usable range.
     LowParallax { parallax_deg: f32, need_deg: f32 },
-    /// The rays meet behind one of the sightings.
     Behind,
 }
 
@@ -75,8 +44,6 @@ fn dir(h: f32) -> (f32, f32) {
     (h.cos(), h.sin())
 }
 
-/// Least-squares intersection of the rays. Needs at least two rays and the
-/// largest pairwise angle at or above `min_parallax_deg`.
 pub fn triangulate(rays: &[Bearing], min_parallax_deg: f32) -> Result<Fix, TriError> {
     if rays.len() < 2 {
         return Err(TriError::TooFewRays);
@@ -93,7 +60,6 @@ pub fn triangulate(rays: &[Bearing], min_parallax_deg: f32) -> Result<Fix, TriEr
     if parallax_deg < min_parallax_deg {
         return Err(TriError::LowParallax { parallax_deg, need_deg: min_parallax_deg });
     }
-    // A = sum (I - u uᵀ), b = sum (I - u uᵀ) p, each ray weighted by 1/σ².
     let (mut a11, mut a12, mut a22, mut b1, mut b2) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
     for r in rays {
         let w = 1.0 / (r.sigma.max(1e-4) as f64).powi(2);
@@ -132,13 +98,10 @@ pub fn triangulate(rays: &[Bearing], min_parallax_deg: f32) -> Result<Fix, TriEr
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TriCfg {
-    /// Smallest parallax accepted, degrees.
     pub min_parallax_deg: f32,
-    /// The baseline is planned for this much more parallax than the minimum.
     pub plan_margin: f32,
     pub min_step_m: f32,
     pub max_step_m: f32,
-    /// Heading offset from the line of sight for a base that cannot strafe, degrees.
     pub angled_offset_deg: f32,
 }
 
@@ -148,25 +111,16 @@ impl Default for TriCfg {
     }
 }
 
-/// The triangulation step to make before approaching.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TriStep {
-    /// `strafe` (holonomic base) or `angled` (drive off the line of sight).
     pub kind: String,
-    /// Where to stand for the second sighting.
     pub to: (f32, f32),
     pub step_m: f32,
-    /// Part of the step across the line of sight, metres.
     pub baseline_perp_m: f32,
-    /// Parallax expected if the range guess is right, degrees.
     pub expected_parallax_deg: f32,
-    /// Point to face after the step so the target stays in view.
     pub face: (f32, f32),
 }
 
-/// Plans the sideways step for a first sighting at `heading` and a rough
-/// range guess (from the depth model). `side` is +1 for the camera's right,
-/// -1 for its left.
 pub fn plan_step(pose: &Pose, heading: f32, range_guess_m: f32, holonomic: bool, side: f32, cfg: &TriCfg) -> TriStep {
     let range = range_guess_m.clamp(1.0, 30.0);
     let need = (cfg.min_parallax_deg * cfg.plan_margin).to_radians();
@@ -218,7 +172,6 @@ mod tests {
         let narrow = triangulate(&[sight((0.0, 0.0), t, 0.0), sight((0.0, 1.2), t, 0.0)], 6.0).unwrap();
         let wide = triangulate(&[sight((0.0, 0.0), t, 0.0), sight((0.0, 2.5), t, 0.0)], 6.0).unwrap();
         assert!(wide.sigma_m < narrow.sigma_m, "{} vs {}", wide.sigma_m, narrow.sigma_m);
-        // The error model is about right: a 0.4 degree bearing error moves the fix by about one sigma.
         let bent = triangulate(&[sight((0.0, 0.0), t, 0.007), sight((0.0, 1.2), t, 0.0)], 6.0).unwrap();
         let moved = (bent.range_m - narrow.range_m).abs();
         assert!(moved < 2.0 * narrow.sigma_m && moved > 0.2 * narrow.sigma_m, "moved {moved}, sigma {}", narrow.sigma_m);

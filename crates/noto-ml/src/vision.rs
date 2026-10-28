@@ -1,14 +1,3 @@
-//! SigLIP2 vision tower with NaFlex patches and a multihead attention-pooling
-//! (MAP) head that turns the patch tokens into one image embedding.
-//!
-//! The learned position table is a 16x16 grid; a NaFlex image of another
-//! grid gets it resized. Hugging Face's `Siglip2VisionEmbeddings.
-//! resize_positional_embeddings` does that with `F.interpolate(mode=
-//! "bilinear", align_corners=False, antialias=True)`, so a 13-row grid (a
-//! 384x256 keyframe) averages the 16 table rows instead of sampling them.
-//! [`VisionTower::set_position_antialias`] chooses between that reference
-//! filter (the default) and the plain bilinear resize this port used before.
-
 use candle_core::{Device, Result, Tensor};
 use candle_nn::{layer_norm, linear, LayerNorm, Linear, Module, VarBuilder};
 
@@ -16,7 +5,6 @@ use crate::config::Siglip2Config;
 use crate::encoder::{EncoderLayer, Mlp};
 use crate::preprocess::NaflexInput;
 
-/// Learned pooling query that attends over all patch tokens.
 pub struct MapHead {
     probe: Tensor,
     in_w: Tensor,
@@ -44,7 +32,6 @@ impl MapHead {
         })
     }
 
-    /// `tokens` is `(1, n, hidden)`; returns `(1, hidden)`.
     fn forward(&self, tokens: &Tensor) -> Result<Tensor> {
         let d = self.hidden;
         let (b, n, _) = tokens.dims3()?;
@@ -85,10 +72,6 @@ impl MapHead {
         pooled.reshape((b, d))
     }
 
-    /// Every patch token mapped into the image-text space on its own:
-    /// the value projection, output projection and MLP of the head, as if the
-    /// probe attended to that one token (the MaskCLIP trick for an attention
-    /// pool). `tokens` is `(b, n, hidden)`; returns `(b, n, hidden)`.
     fn dense(&self, tokens: &Tensor) -> Result<Tensor> {
         let d = self.hidden;
         let v = tokens
@@ -99,8 +82,6 @@ impl MapHead {
         &attended + self.mlp.forward(&normed)?
     }
 
-    /// The probe's attention over the patch tokens, averaged over heads:
-    /// `(b, n)`, each row sums to one.
     fn attention(&self, tokens: &Tensor) -> Result<Tensor> {
         let d = self.hidden;
         let (b, n, _) = tokens.dims3()?;
@@ -122,7 +103,6 @@ impl MapHead {
 
 pub struct VisionTower {
     patch_proj: Linear,
-    /// Learned positions, `(max_patches, hidden)`, laid out as a square grid.
     position: Tensor,
     layers: Vec<EncoderLayer>,
     post_ln: LayerNorm,
@@ -130,15 +110,9 @@ pub struct VisionTower {
     side: usize,
     hidden: usize,
     device: Device,
-    /// Resize the position table with the antialiased filter of the reference.
     pos_antialias: bool,
 }
 
-/// Weights of PyTorch's antialiased bilinear resize along one axis
-/// (`_compute_indices_min_size_weights_aa` with `align_corners=False`), as a
-/// row-major `dst x src` matrix. Upsampling reduces to ordinary bilinear with
-/// half-pixel centres; downsampling widens the triangle to the scale factor so
-/// every input sample contributes.
 pub fn antialias_bilinear_weights(src: usize, dst: usize) -> Vec<f32> {
     let scale = src as f64 / dst as f64;
     let (support, inv_scale) = if scale >= 1.0 { (scale, 1.0 / scale) } else { (1.0, 1.0) };
@@ -146,7 +120,6 @@ pub fn antialias_bilinear_weights(src: usize, dst: usize) -> Vec<f32> {
     let mut weights = vec![0f32; dst * src];
     for o in 0..dst {
         let center = scale * (o as f64 + 0.5);
-        // `as i64` truncates toward zero like the C++ `static_cast<int64_t>`.
         let lo = ((center - support + 0.5) as i64).max(0) as usize;
         let hi = ((center + support + 0.5) as i64).min(src as i64).max(lo as i64) as usize;
         let taps: Vec<f64> = (lo..hi).map(|j| triangle((j as f64 - center + 0.5) * inv_scale)).collect();
@@ -161,7 +134,6 @@ pub fn antialias_bilinear_weights(src: usize, dst: usize) -> Vec<f32> {
 }
 
 impl VisionTower {
-    /// `vb` must point at the `vision_model` prefix of the checkpoint.
     pub fn new(cfg: &Siglip2Config, vb: VarBuilder) -> Result<Self> {
         let d = cfg.vision_hidden;
         let emb = vb.pp("embeddings");
@@ -191,8 +163,6 @@ impl VisionTower {
         })
     }
 
-    /// `true` (default): the reference's antialiased resize of the position
-    /// table; `false`: plain bilinear (this port before v1.0).
     pub fn set_position_antialias(&mut self, on: bool) {
         self.pos_antialias = on;
     }
@@ -201,8 +171,6 @@ impl VisionTower {
         self.pos_antialias
     }
 
-    /// Positions for a `grid_h x grid_w` patch grid. The square table is
-    /// resized when the grid is not square-shaped like the table.
     fn positions(&self, grid_h: usize, grid_w: usize) -> Result<Tensor> {
         let d = self.hidden;
         let table = self.position.reshape((self.side, self.side, d))?;
@@ -210,7 +178,6 @@ impl VisionTower {
             return table.reshape((1, grid_h * grid_w, d));
         }
         if self.pos_antialias {
-            // Separable: rows, then columns, as two small matrix products.
             let side = self.side;
             let wy = Tensor::from_vec(antialias_bilinear_weights(side, grid_h), (grid_h, side), &self.device)?;
             let wx = Tensor::from_vec(antialias_bilinear_weights(side, grid_w), (grid_w, side), &self.device)?;
@@ -228,7 +195,6 @@ impl VisionTower {
             .reshape((1, grid_h * grid_w, d))
     }
 
-    /// Patch tokens after the encoder and the final layer norm, `(1, n, hidden)`.
     fn tokens(&self, input: &NaflexInput) -> Result<Tensor> {
         let (gh, gw, pd) = (input.grid_h, input.grid_w, input.patch_dim);
         let patches = Tensor::from_slice(&input.patches, (1, gh * gw, pd), &self.device)?;
@@ -240,10 +206,6 @@ impl VisionTower {
         self.post_ln.forward(&x)
     }
 
-    /// Dense output for one image: per-patch embeddings in the image-text
-    /// space `(n, hidden)` before normalization, the pooling head's attention
-    /// over the patches `(n,)`, and the pooled image embedding `(hidden,)`.
-    /// Patches are row-major on the `grid_h x grid_w` grid of `input`.
     pub fn forward_dense(&self, input: &NaflexInput) -> Result<(Tensor, Tensor, Tensor)> {
         let x = self.tokens(input)?;
         let dense = self.head.dense(&x)?.squeeze(0)?;
@@ -252,19 +214,15 @@ impl VisionTower {
         Ok((dense, attn, pooled))
     }
 
-    /// Image embedding `(1, hidden)` before normalization.
     pub fn forward(&self, input: &NaflexInput) -> Result<Tensor> {
         self.forward_batch(&[input])
     }
 
-    /// [`VisionTower::forward_dense`] for images that share one patch grid:
-    /// dense `(b, n, hidden)`, attention `(b, n)`, pooled `(b, hidden)`.
     pub fn forward_dense_batch(&self, inputs: &[&NaflexInput]) -> Result<(Tensor, Tensor, Tensor)> {
         let x = self.batch_tokens(inputs)?;
         Ok((self.head.dense(&x)?, self.head.attention(&x)?, self.head.forward(&x)?))
     }
 
-    /// Patch tokens `(b, n, hidden)` after the encoder and the final norm.
     fn batch_tokens(&self, inputs: &[&NaflexInput]) -> Result<Tensor> {
         let first = match inputs.first() {
             Some(f) => f,
@@ -288,8 +246,6 @@ impl VisionTower {
         self.post_ln.forward(&x)
     }
 
-    /// Embeddings `(batch, hidden)` before normalization for images that share
-    /// one patch grid. Rows are independent: attention never mixes images.
     pub fn forward_batch(&self, inputs: &[&NaflexInput]) -> Result<Tensor> {
         self.head.forward(&self.batch_tokens(inputs)?)
     }

@@ -1,13 +1,3 @@
-//! Spatial-memory benchmark: the robot's intermittent vision and the memory
-//! it acts on in between, against people's and other robots' (research
-//! `docs/research/perception.md` §4, group B). None of these sources is an
-//! engine input.
-//!
-//! Scoring as the other benchmarks: `like` scores `100 − 10·|z|` against a
-//! reference and its spread, `no_worse` scores 100 at or below a reference
-//! error and `100 − 10·z` above it, `at_most` gates the scenario when a limit
-//! is broken, and a `raw` cell is recorded only.
-
 use noto_core::bench::{form_id, BenchCell, BenchScenario, Rule};
 use noto_core::{BaseKind, Body, BodyPlan, FingerCount};
 use noto_runtime::{NoiseCfg, Runtime, RuntimeConfig};
@@ -16,31 +6,16 @@ use world_sim::{Action, ItemKind};
 
 const LEX: &str = include_str!("../../../../data/world_lexicon.json");
 
-// ----- references (benchmark side only; the engine never reads these) -----
-
-/// Blind walking to a target seen 4–12 m away: absolute error 92 cm over the
-/// 8 m mean, 11.5% of the distance (Loomis et al. 1992, Exp. 1, n = 10, p. 911);
-/// the variable error is about 8% of the distance (Rieser et al. 1990).
 const BLIND_ABS_FRAC: f32 = 0.115;
 const BLIND_SPREAD_FRAC: f32 = 0.08;
 const CITE_BLIND: &str = "눈 감고 걷기 4–12 m: 절대 오차 92 cm / 평균 8 m = 거리의 11.5% (Loomis 1992 실험 1, n = 10), 가변 오차 거리의 약 8% (Rieser 1990)";
-/// Signed error +55 cm over 8 m (+7%), same study.
 const CITE_BLIND_SIGNED: &str = "부호 있는 오차 +55 cm / 8 m = +7% (Loomis 1992 실험 1)";
-/// Waiting before walking: no effect within 30 s (Steenhuis & Goodale 1988),
-/// none at all (Rieser et al. 1990), against Thomson 1983's 8 s.
 const CITE_DELAY: &str = "출발 전 기다림: 30 s 안에는 영향 없음 (Steenhuis & Goodale 1988), 없음 (Rieser 1990) — Thomson 1983의 8 s 효과는 재현되지 않음";
-/// Self-chosen sampling of less than half the walking time keeps walking safe (Patla et al. 1996).
 const VISION_SHARE_MAX: f32 = 0.5;
 const CITE_SHARE: &str = "스스로 고른 시각 표집이 걷는 시간의 50% 미만이어도 안전하게 걸음 (Patla 1996)";
-/// Robots picking objects off the floor: 96.2% of the localised objects
-/// (TidyBot, Wu et al. 2023 §4.5), 98.4% (Dusty, King et al. 2012), 94.7% of
-/// 680 trials (Xu, Deyle & Kemp 2009): mean and SD of the three.
 const FLOOR_PICK: (f32, f32) = (0.964, 0.019);
 const CITE_FLOOR_PICK: &str = "로봇의 바닥 물건 집기 성공률 96.2% (TidyBot, Wu 2023) · 98.4% (Dusty, King 2012) · 94.7% (Xu 2009) — 평균 ± SD";
-/// Pointing from memory: the error about doubles after a 2 s delay (Elliott & Madalena 1987).
 const CITE_MEMORY_REACH: &str = "기억으로 가리키기: 2 s 지연 뒤 오차가 약 2배 (Elliott & Madalena 1987, 초록만 — SD 없음, 기록만)";
-
-// ----- cells -----
 
 fn mean(xs: &[f32]) -> Option<f32> {
     (!xs.is_empty()).then(|| xs.iter().sum::<f32>() / xs.len() as f32)
@@ -58,10 +33,6 @@ fn runtime(seed: u64, base: BaseKind, plan: &str, parcels: Option<usize>, interm
     Runtime::new(cfg, LEX, None).expect("runtime")
 }
 
-/// One blind walk: the robot sees a parcel `d` ahead, waits `delay_s`, then
-/// walks to it without looking; how far its memory of the parcel is off when
-/// it gets there (the memory carried into the world against the parcel), and
-/// along the way (positive: it believes it is further than it is).
 fn blind_walk(seed: u64, base: BaseKind, plan: &str, d: f32, delay_s: f32) -> Option<(f32, f32)> {
     let mut rt = runtime(seed, base, plan, Some(0), true, NoiseCfg::none());
     let (x0, z0, yaw) = {
@@ -90,7 +61,6 @@ fn blind_walk(seed: u64, base: BaseKind, plan: &str, d: f32, delay_s: f32) -> Op
     Some((err, along))
 }
 
-/// V1: walking blind to a parcel seen in front.
 pub fn v1(plan: &str, base: BaseKind) -> BenchScenario {
     let id = format!("V1-{plan}-{base:?}");
     let f = form(plan, base);
@@ -120,8 +90,6 @@ pub fn v1(plan: &str, base: BaseKind) -> BenchScenario {
     BenchScenario::from_cells("VX", &id, "본 물건까지 눈 감고 걷기", &f, false, cells)
 }
 
-/// V2: the base camp's parcel to the warehouse: seen in front at the start,
-/// picked from the side in passing (or in front when the side does not hold).
 pub fn v2(plan: &str) -> BenchScenario {
     let id = format!("V2-{plan}");
     let f = form(plan, BaseKind::HumanFoot);
@@ -164,10 +132,6 @@ pub fn v2(plan: &str) -> BenchScenario {
     BenchScenario::from_cells("VX", &id, "베이스캠프 택배 상자를 지나가며 오른쪽으로 집기", &f, false, cells)
 }
 
-/// V3: the same fetch with the camera on a pattern and always on: what
-/// looking less costs in success and time, and what it saves in looks (a
-/// design check against the robot's own always-on runs, not a research
-/// reference; it has nothing to score against).
 pub fn v3(plan: &str) -> BenchScenario {
     let id = format!("V3-{plan}");
     let f = form(plan, BaseKind::HumanFoot);
@@ -202,7 +166,6 @@ pub fn v3(plan: &str) -> BenchScenario {
     BenchScenario::from_cells("VX", &id, "패턴 시각과 늘 켠 시각 (원목 1개)", &f, false, cells)
 }
 
-/// Every vision scenario, in the order the bench prints them.
 pub fn scenarios() -> Vec<BenchScenario> {
     vec![v1("mid", BaseKind::HumanFoot), v1("mid", BaseKind::Wheel), v2("mid"), v3("pro")]
 }

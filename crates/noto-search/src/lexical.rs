@@ -1,10 +1,3 @@
-//! Lexical matching: exact words, words behind a closed tail, and unambiguous
-//! prefixes of dictionary words. No embedding is involved.
-//!
-//! Words are compared with spaces removed, so "베이스 캠프", "베이스캠프" and
-//! "베이스캠프로" all reach the same node, and a dictionary phrase of several
-//! words ("iron ore") matches a run of up to three tokens.
-
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::Serialize;
@@ -13,9 +6,7 @@ use crate::lexicon::{Lexicon, Node};
 use crate::tails::{peel, verb_remainder, TailKind};
 use crate::TraceLine;
 
-/// Longest dictionary phrase, in tokens.
 pub const MAX_SPAN: usize = 3;
-/// A typed prefix must cover at least this share of the dictionary word.
 const PREFIX_COVERAGE: f32 = 0.66;
 const PREFIX_MIN_CHARS: usize = 2;
 
@@ -25,9 +16,7 @@ pub enum Category {
     Resource,
     Place,
     Negation,
-    /// "to", "into": the next place is a destination.
     Direction,
-    /// "from": the next place is an origin.
     Source,
     Verb,
     Filler,
@@ -36,27 +25,20 @@ pub enum Category {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Via {
-    /// The words equal a dictionary word.
     Exact,
-    /// Equal after a closed tail was removed.
     Tail,
-    /// A typed prefix of exactly one dictionary word.
     Prefix,
-    /// Scored by embedding.
     Embedding,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Hit {
     pub category: Category,
-    /// Node id; empty for filler, negation and prepositions.
     pub node: String,
-    /// Token range `[start, end)`.
     pub start: usize,
     pub end: usize,
     pub via: Via,
     pub score: f32,
-    /// The words as typed.
     pub text: String,
     pub tail: String,
     pub tail_kind: TailKind,
@@ -68,13 +50,9 @@ struct Entry {
     node: String,
 }
 
-/// Index over every dictionary word.
 pub struct LexMatcher {
-    /// space-free word -> owners (nouns, multiword verbs and verb surfaces, filler, negation, prepositions)
     words: HashMap<String, Vec<Entry>>,
-    /// single-token verb stems that may take a closed verb ending
     verb_stems: Vec<(String, String)>,
-    /// space-free noun words, for prefix matching
     prefix_words: Vec<(String, Category, String)>,
 }
 
@@ -122,12 +100,10 @@ impl LexMatcher {
                 if w.contains(' ') || w.chars().count() < 2 {
                     add(&mut words, w, Category::Verb, &n.id);
                 } else {
-                    // Also whole, then with a closed verb ending (see `verb_hit`).
                     verb_stems.push((w.clone(), n.id.clone()));
                 }
             }
         }
-        // "있는", "놓인": filler to the matcher; the role stage reads them after a place.
         for w in lex.filler.exact_match.iter().chain(&lex.filler.surface).chain(&lex.located_words) {
             add(&mut words, w, Category::Filler, "");
         }
@@ -144,7 +120,6 @@ impl LexMatcher {
     }
 
     fn verb_hit(&self, token: &str, start: usize) -> Option<Hit> {
-        // The longest matching stem wins, so "가져오" beats any shorter stem.
         let mut best: Option<(usize, &str, &str)> = None;
         for (stem, node) in &self.verb_stems {
             if let Some(rest) = verb_remainder(token, stem) {
@@ -167,8 +142,6 @@ impl LexMatcher {
         })
     }
 
-    /// Every lexical hit over the tokens, as non-overlapping spans chosen
-    /// longest first. Tokens with `blocked[i]` are not considered.
     pub fn find(&self, tokens: &[String], blocked: &[bool], trace: &mut Vec<TraceLine>) -> Vec<Hit> {
         let mut candidates: Vec<Hit> = Vec::new();
         for i in 0..tokens.len() {
@@ -211,7 +184,6 @@ impl LexMatcher {
                 if exact_found {
                     continue;
                 }
-                // Prefix: the typed stem begins exactly one dictionary word's spelling.
                 for reading in peel(last) {
                     let key = format!("{head}{}", reading.stem);
                     let len = key.chars().count();
@@ -249,7 +221,6 @@ impl LexMatcher {
             }
         }
 
-        // Longest span first, then score, then a fixed category order, then position.
         candidates.sort_by(|a, b| {
             (b.end - b.start)
                 .cmp(&(a.end - a.start))
@@ -347,7 +318,6 @@ mod tests {
 
     #[test]
     fn tails_must_agree_with_the_stem_or_the_word_stays_unmatched() {
-        // 나무을 is not a valid spelling, so no tail is peeled and "나무을" matches nothing
         let h = find("나무을");
         assert!(pick(&h, Category::Resource).is_empty());
     }
@@ -370,7 +340,6 @@ mod tests {
         assert!(pick(&find("채굴장"), Category::Verb).is_empty(), "채굴장 is a place, not the verb");
         assert_eq!(pick(&find("가져오세요"), Category::Verb)[0].node, "deliver");
         assert_eq!(pick(&find("가져와줘"), Category::Verb)[0].node, "deliver");
-        // short irregular forms are surface-only
         assert_eq!(pick(&find("캐서"), Category::Verb)[0].node, "harvest");
         assert!(pick(&find("캐릭터"), Category::Verb).is_empty());
     }
@@ -381,7 +350,6 @@ mod tests {
         let r = pick(&h, Category::Resource);
         assert_eq!((r[0].node.as_str(), r[0].via), ("iron_ore", Via::Prefix));
         assert!(r[0].score < 0.7 && r[0].score > 0.4);
-        // "베이스" covers only 3 of the 5 characters of 베이스캠프
         assert!(pick(&find("베이스"), Category::Place).is_empty());
     }
 

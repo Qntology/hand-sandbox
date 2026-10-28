@@ -1,15 +1,3 @@
-//! Scoring of image vectors against the vision entities of the lexicon.
-//!
-//! The entities (tree, boulder, warehouse, ...) carry English `bias` and
-//! `prejudice` prompts in the same node format as the command words. An image
-//! tile is scored against every entity at once; the caller decides how a raw
-//! cosine becomes a probability (SigLIP uses `sigmoid(scale * cos + bias)`).
-//!
-//! [`VisionPrompting`] (the lexicon's `vision_prompting` key, v1.0) adds
-//! prompt templates, averaged per phrase in embedding space, and a background
-//! set: scene-generic phrases that are not subtracted from an entity as its
-//! prejudice when [`VisionBank::build_with`] is given the prompting.
-
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -23,7 +11,6 @@ use crate::semantic::{cosine, PhraseEmbedder};
 pub struct EntityVectors {
     pub id: String,
     pub kind: EntityKind,
-    /// Resource id for sources and drops, place id for waypoints.
     pub link: String,
     bias: Vec<(Arc<[f32]>, f32)>,
     prejudice: Vec<Arc<[f32]>>,
@@ -43,10 +30,8 @@ pub struct VisionBank {
     pub entities: Vec<EntityVectors>,
 }
 
-/// Prompt templates and background phrases (the lexicon's `vision_prompting`).
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 pub struct VisionPrompting {
-    /// `{}` stands for a phrase.
     #[serde(default)]
     pub templates: Vec<String>,
     #[serde(default)]
@@ -54,7 +39,6 @@ pub struct VisionPrompting {
 }
 
 impl VisionPrompting {
-    /// Reads the `vision_prompting` key of a lexicon file; empty when it has none.
     pub fn from_lexicon_json(raw: &str) -> Result<VisionPrompting> {
         #[derive(Deserialize)]
         struct Raw {
@@ -65,7 +49,6 @@ impl VisionPrompting {
         Ok(r.vision_prompting.unwrap_or_default())
     }
 
-    /// A phrase in one template.
     pub fn apply(template: &str, phrase: &str) -> String {
         if template.contains("{}") {
             template.replace("{}", phrase)
@@ -74,13 +57,11 @@ impl VisionPrompting {
         }
     }
 
-    /// Whether a phrase is one of the background phrases.
     pub fn is_background(&self, phrase: &str) -> bool {
         self.background.iter().any(|b| b.eq_ignore_ascii_case(phrase.trim()))
     }
 }
 
-/// The unit mean of unit vectors.
 fn mean_unit(vs: &[Arc<[f32]>]) -> Option<Arc<[f32]>> {
     let first = vs.first()?;
     let mut m = vec![0.0f32; first.len()];
@@ -94,16 +75,10 @@ fn mean_unit(vs: &[Arc<[f32]>]) -> Option<Arc<[f32]>> {
 }
 
 impl VisionBank {
-    /// Embeds every vision prompt once (the embedder deduplicates and caches).
     pub fn build(lex: &Lexicon, emb: &dyn PhraseEmbedder) -> Result<VisionBank> {
         VisionBank::build_with(lex, emb, None)
     }
 
-    /// [`VisionBank::build`] with prompting: every phrase's vector is the unit
-    /// mean over its templated forms, and prejudice phrases that are
-    /// background phrases are left out (a grass field is behind almost every
-    /// tile; subtracting it lowers true detections, it does not separate
-    /// look-alikes).
     pub fn build_with(lex: &Lexicon, emb: &dyn PhraseEmbedder, prompting: Option<&VisionPrompting>) -> Result<VisionBank> {
         let templates: &[String] = prompting.map_or(&[], |p| p.templates.as_slice());
         let skip = |t: &str| prompting.map_or(false, |p| p.is_background(t));
@@ -116,7 +91,6 @@ impl VisionBank {
                 }
             }
         }
-        // The forms that go to the embedder: the phrases, or every phrase in every template.
         let forms: Vec<String> = if templates.is_empty() { phrases.clone() } else { phrases.iter().flat_map(|p| templates.iter().map(move |t| VisionPrompting::apply(t, p))).collect() };
         let vecs = emb.embed_phrases(&forms)?;
         if vecs.len() != forms.len() {
@@ -138,20 +112,12 @@ impl VisionBank {
                     .iter()
                     .filter_map(|p| by_text.get(p.text.as_str()).map(|v| (v.clone(), p.weight)))
                     .collect(),
-                // A background phrase is never subtracted, even when another
-                // entity has it as a bias phrase (so it has a vector).
                 prejudice: e.prejudice.iter().filter(|p| !skip(&p.text)).filter_map(|p| by_text.get(p.text.as_str()).cloned()).collect(),
             })
             .collect();
         Ok(VisionBank { entities })
     }
 
-    /// Scores one image vector against every entity, best first.
-    ///
-    /// `calibrate` maps a cosine to the scale the thresholds use (identity for
-    /// raw cosines, a sigmoid for SigLIP pair probabilities). `bias` is the
-    /// weighted maximum over the entity's bias prompts, `prejudice` the maximum
-    /// over its prejudice prompts, and `score = bias − prejudice_weight · prejudice`.
     pub fn score(&self, q: &[f32], calibrate: &dyn Fn(f32) -> f32, prejudice_weight: f32) -> Vec<EntityScore> {
         let mut out: Vec<EntityScore> = self
             .entities
@@ -173,7 +139,6 @@ impl VisionBank {
         out
     }
 
-    /// Entity ids that can stand for `resource`: its source node and its drop.
     pub fn ids_for_resource(&self, resource: &str) -> Vec<&str> {
         self.entities
             .iter()
@@ -246,7 +211,6 @@ mod tests {
         let bank = VisionBank::build_with(&lex(), &BigramEmbedder, Some(&prompting)).unwrap();
         let tree = bank.entities.iter().find(|e| e.id == "tree").unwrap();
         assert!(tree.prejudice.is_empty(), "the tree's only prejudice is a background phrase");
-        // A bias vector is the unit mean of the templated forms.
         let a = bigram_vector("a photo of green leafy tree");
         let b = bigram_vector("green leafy tree in a game");
         let mut m: Vec<f32> = a.iter().zip(&b).map(|(x, y)| x + y).collect();

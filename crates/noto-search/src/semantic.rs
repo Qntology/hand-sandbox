@@ -1,21 +1,3 @@
-//! Embedding scoring, ported from logis-center's phrase scoring.
-//!
-//! A query vector is scored against a node by
-//!
-//! ```text
-//! score = bias − prejudice_weight · prejudice − verb_penalty
-//! bias        = weighted max-pool over the node's bias phrases
-//! prejudice   = max-pool over the node's prejudice phrases
-//! verb_penalty = beta · max-pool over every verb phrase
-//! ```
-//!
-//! with `prejudice_weight` 0.3 and `beta` 0.05 for spans of up to two words,
-//! 0.7 and 0.10 for longer ones (the constants of logis-center's Plinko
-//! window). Spans are then thinned by non-maximum suppression (a better
-//! overlapping span wins) and assigned greedily so each node is used once.
-//!
-//! Nothing in this file knows a model: callers pass a [`PhraseEmbedder`].
-
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -26,7 +8,6 @@ use crate::lexicon::{Lexicon, Node, Phrase};
 use crate::tails::{peel, TailKind};
 use crate::TraceLine;
 
-/// Anything that turns phrases into vectors (one per phrase, in order).
 pub trait PhraseEmbedder {
     fn embed_phrases(&self, phrases: &[String]) -> Result<Vec<Arc<[f32]>>>;
 }
@@ -48,12 +29,10 @@ fn is_zero(v: &[f32]) -> bool {
     v.iter().all(|&x| x == 0.0)
 }
 
-/// Largest cosine against any phrase, floored at 0.
 pub fn max_pool(q: &[f32], phrases: &[Arc<[f32]>]) -> f32 {
     phrases.iter().map(|p| cosine(q, p)).fold(0.0f32, f32::max)
 }
 
-/// Largest weight-scaled cosine, floored at 0; zero vectors are skipped.
 pub fn weighted_max_pool(q: &[f32], phrases: &[(Arc<[f32]>, f32)]) -> f32 {
     let mut best = 0.0f32;
     for (p, w) in phrases {
@@ -65,7 +44,6 @@ pub fn weighted_max_pool(q: &[f32], phrases: &[(Arc<[f32]>, f32)]) -> f32 {
     best
 }
 
-/// Prejudice wins when it outweighs the bias by the cohesion allowance.
 pub fn prejudice_dominates(own: f32, prej: f32, cohesion: f32) -> bool {
     if own <= 0.0 {
         return true;
@@ -92,26 +70,18 @@ pub struct NodeScore {
 
 #[derive(Clone, Debug)]
 pub struct SemanticOpts {
-    /// A span must score at least this to be accepted.
     pub min_score: f32,
-    /// ... and beat the runner-up node by this much.
     pub margin: f32,
-    /// Longest span, in tokens.
     pub max_span: usize,
-    /// Cohesion allowance for [`prejudice_dominates`].
     pub cohesion: f32,
 }
 
 impl Default for SemanticOpts {
-    /// The thresholds are starting points chosen without the real embedding
-    /// model (it cannot be downloaded in the build sandbox). They need tuning
-    /// against real vectors; `noto-runtime` lets the SDS baseline move them.
     fn default() -> Self {
         SemanticOpts { min_score: 0.30, margin: 0.04, max_span: 3, cohesion: 0.0 }
     }
 }
 
-/// Vectors of every dictionary phrase that the command search scores against.
 pub struct SemanticBank {
     pub resources: Vec<NodeVectors>,
     pub places: Vec<NodeVectors>,
@@ -126,7 +96,6 @@ fn pairs(
 }
 
 impl SemanticBank {
-    /// Embeds every command-side phrase of the lexicon in one call.
     pub fn build(lex: &Lexicon, emb: &dyn PhraseEmbedder) -> Result<SemanticBank> {
         let mut texts: Vec<String> = Vec::new();
         let mut seen = HashSet::new();
@@ -167,7 +136,6 @@ impl SemanticBank {
         }
     }
 
-    /// Scores `q` (a span of `words` tokens) against every node of `category`, best first.
     pub fn score(&self, q: &[f32], words: usize, category: Category) -> Vec<NodeScore> {
         let (pw, beta) = if words <= 2 { (0.3, 0.05) } else { (0.7, 0.10) };
         let verb = max_pool(q, &self.verb_phrases);
@@ -194,7 +162,6 @@ impl SemanticBank {
 struct Span {
     start: usize,
     end: usize,
-    /// Strings to embed for this span: as typed, and with the last token's tail removed.
     variants: Vec<String>,
 }
 
@@ -209,7 +176,6 @@ fn spans(tokens: &[String], free: &[bool], max_span: usize) -> Vec<Span> {
             let last = &tokens[i + n - 1];
             let join = |tail: &str| if head.is_empty() { tail.to_string() } else { format!("{head} {tail}") };
             let mut variants = vec![join(last)];
-            // The reading with the longest closed tail removed.
             if let Some(r) = peel(last).into_iter().filter(|r| !r.tail.is_empty()).max_by_key(|r| r.tail.chars().count()) {
                 let v = join(&r.stem);
                 if !variants.contains(&v) {
@@ -225,9 +191,6 @@ fn spans(tokens: &[String], free: &[bool], max_span: usize) -> Vec<Span> {
     out
 }
 
-/// Finds resource and place words that the lexical stage did not know, by
-/// scoring free token spans against the bank. `free[i]` marks tokens no
-/// earlier stage used.
 pub fn search_spans(
     bank: &SemanticBank,
     emb: &dyn PhraseEmbedder,
@@ -266,7 +229,6 @@ pub fn search_spans(
     let mut cands: Vec<Cand> = Vec::new();
     for s in &spans {
         let words = s.end - s.start;
-        // Best over variants, per node, across both categories.
         let mut best: Vec<(Category, NodeScore)> = Vec::new();
         for cat in [Category::Resource, Category::Place] {
             let mut per_node: HashMap<String, NodeScore> = HashMap::new();
@@ -315,7 +277,6 @@ pub fn search_spans(
         cands.push(Cand { start: s.start, end: s.end, category: cat, node: top.id, score: top.score, text: typed });
     }
 
-    // Non-maximum suppression, then one span per node.
     cands.sort_by(|a, b| b.score.total_cmp(&a.score).then((b.end - b.start).cmp(&(a.end - a.start))));
     let mut taken: HashSet<usize> = HashSet::new();
     let mut used: HashSet<(Category, String)> = HashSet::new();
@@ -334,7 +295,6 @@ pub fn search_spans(
             "semantic",
             format!("{:?} -> {:?} {} by embedding (score {:.2})", c.text, c.category, c.node, c.score),
         ));
-        // Report the tail the stem variant dropped, for the role logic.
         let last = &tokens[c.end - 1];
         let reading = peel(last).into_iter().filter(|r| !r.tail.is_empty()).max_by_key(|r| r.tail.chars().count());
         let (tail, tail_kind) = reading.map(|r| (r.tail, r.kind)).unwrap_or((String::new(), TailKind::Bare));
@@ -358,10 +318,6 @@ pub fn search_spans(
 pub(crate) mod testing {
     use super::*;
 
-    /// A stand-in embedder: character unigrams and bigrams hashed into a
-    /// fixed-width vector, so phrases that share characters are close. It
-    /// models "related words are near" well enough to test the plumbing; it is
-    /// not a language model and says nothing about real accuracy.
     pub struct BigramEmbedder;
 
     pub fn bigram_vector(text: &str) -> Vec<f32> {
@@ -374,7 +330,6 @@ pub(crate) mod testing {
                 h ^= b as u64;
                 h = h.wrapping_mul(0x0000_0100_0000_01b3);
             }
-            // finalize so nearby strings spread over the whole vector
             h ^= h >> 33;
             h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
             h ^= h >> 33;
@@ -469,7 +424,6 @@ mod tests {
         let (hits, _) = run("물류창고로", &SemanticOpts::default());
         assert_eq!(hits[0].node, "warehouse");
         assert_eq!(hits[0].tail_kind, TailKind::Direction);
-        // "운반하다" is a verb phrase: it must not turn into a place or resource
         let (hits, _) = run("운반하다", &SemanticOpts::default());
         assert!(hits.is_empty(), "{hits:?}");
     }
@@ -482,14 +436,12 @@ mod tests {
 
     #[test]
     fn prejudice_phrases_push_confusable_words_away() {
-        // "돌멩이" is a bias phrase of stone and a prejudice phrase of log: stone must win.
         let (hits, _) = run("돌멩이", &SemanticOpts::default());
         assert_eq!(hits[0].node, "stone");
     }
 
     #[test]
     fn a_tight_margin_rejects_an_ambiguous_span_and_says_why() {
-        // scores never differ by more than 1, so a margin of 2 rejects every span
         let wide = SemanticOpts { min_score: 0.05, margin: 2.0, ..SemanticOpts::default() };
         let (hits, trace) = run("장작을", &wide);
         assert!(hits.is_empty());
@@ -502,7 +454,6 @@ mod tests {
         let logs = hits.iter().filter(|h| h.node == "log").count();
         assert!(logs <= 1, "{hits:?}");
         assert!(hits.iter().any(|h| h.node == "warehouse"));
-        // no two hits overlap
         for (i, a) in hits.iter().enumerate() {
             for b in hits.iter().skip(i + 1) {
                 assert!(a.end <= b.start || b.end <= a.start, "{a:?} overlaps {b:?}");

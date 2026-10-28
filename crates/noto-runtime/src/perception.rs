@@ -1,15 +1,3 @@
-//! What the robot sees. A [`Recognizer`] turns a rendered frame into
-//! [`Candidate`]s: a label from the dictionary, a score, a margin over the
-//! runner-up, a box, and where that is on the ground. Candidates are not
-//! trusted yet; `precision` decides which ones are.
-//!
-//! [`OraclePerception`] is the stand-in used without model weights. It reads the
-//! renderer's id buffer (which says what every pixel truly is) and then spoils
-//! it on purpose: score noise, look-alike labels, misses and phantom detections.
-//! Its scores come from a made-up model (bigger on screen means surer), so the
-//! tests that use it show the gates behave consistently, not how a real
-//! recogniser performs. `embedding::EmbeddingPerception` is the real path.
-
 use std::collections::HashMap;
 
 use anyhow::Result;
@@ -25,9 +13,7 @@ use crate::config::NoiseCfg;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntKind {
-    /// A resource node standing in the world.
     Source,
-    /// An item lying on the ground.
     Drop,
     Waypoint,
 }
@@ -42,34 +28,23 @@ impl From<&EntityKind> for EntKind {
     }
 }
 
-/// A detection that has not been judged yet.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Candidate {
-    /// Dictionary entity id: `tree`, `boulder`, `log`, `warehouse`, ...
     pub label: String,
     pub kind: EntKind,
-    /// Resource id for sources and drops, place id for waypoints.
     pub link: String,
     pub score: f32,
-    /// Score of this label minus the runner-up's.
     pub margin: f32,
     pub runner_up: Option<String>,
-    /// Box as fractions of the frame: `[x0, y0, x1, y1]`.
     pub bbox: [f32; 4],
     pub pixels: u32,
     pub depth_m: f32,
-    /// Estimated ground position `(x, z)`.
     pub world: Option<(f32, f32)>,
-    /// What was really there (`n12`, `d3`, `w1`). Only the oracle knows this.
-    /// It is for scoring tests and the evaluation counters; nothing that
-    /// decides what the robot does may read it.
     pub truth: Option<String>,
-    /// The true label of that object.
     pub truth_label: Option<String>,
 }
 
 impl Candidate {
-    /// True when the label is the true one (needs ground truth).
     pub fn is_correct(&self) -> Option<bool> {
         self.truth_label.as_ref().map(|t| *t == self.label)
     }
@@ -84,29 +59,21 @@ pub struct ScanInput<'a> {
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ScanOutput {
     pub candidates: Vec<Candidate>,
-    /// Image crops that went through the vision tower.
     pub tiles: usize,
     pub embed_ms: f32,
     pub device: String,
-    /// Scores of every entity for the whole frame, best first (label, score).
     pub scene: Vec<(String, f32)>,
 }
 
 pub trait Recognizer: Send {
-    /// `oracle` or `embedding`.
     fn mode(&self) -> &str;
-    /// What the SDS `vision` statistics of this recogniser are kept under:
-    /// its mode, plus anything that changes what its scores mean (a
-    /// calibrated embedding recogniser is `embedding+cal`).
     fn scope(&self) -> String {
         self.mode().to_string()
     }
     fn scan(&mut self, input: ScanInput<'_>) -> Result<ScanOutput>;
-    /// Changes the injected errors. Only the stand-in recogniser has any.
     fn set_noise(&mut self, _noise: &NoiseCfg) {}
 }
 
-/// Entity table from the dictionary: label to (kind, link).
 #[derive(Clone, Debug, Default)]
 pub struct EntityTable {
     map: HashMap<String, (EntKind, String)>,
@@ -128,13 +95,6 @@ impl EntityTable {
     }
 }
 
-/// Ground position of an object's centre from a point on its visible
-/// surface seen from `view`. From above, the camera sees the object's front
-/// face (whose centre lies `r` in front of the object's) and its top face
-/// (right above the centre) in proportion to their projected areas, `cos θ`
-/// and `sin θ` for a cube at the depression θ of the ray to the point; the
-/// centre is the point moved away from the camera by `r` times the front
-/// face's share. Seen level (θ ≤ 0) that is the whole `r`.
 pub fn centre_from_surface(view: &View, p: [f32; 3], r: f32) -> (f32, f32) {
     let (dx, dz) = (p[0] - view.origin[0], p[2] - view.origin[2]);
     let ground = dx.hypot(dz).max(1e-4);
@@ -162,8 +122,6 @@ pub fn box_iou_and_iomin(a: &[f32; 4], b: &[f32; 4]) -> (f32, f32) {
     (inter / union, inter / area_a.min(area_b))
 }
 
-/// The centroid (x, y, z) of each object's visible pixels in a frame, by
-/// entity (`n12`, `d3`, `w1`): what an RGB-D camera's points of a mask give.
 pub fn visible_centroids(frame: &Frame, camera: &Camera, view: &View) -> HashMap<String, [f32; 3]> {
     let mut acc: HashMap<u32, ([f64; 3], u32)> = HashMap::new();
     for (idx, &raw) in frame.ids.iter().enumerate() {
@@ -192,8 +150,6 @@ pub fn visible_centroids(frame: &Frame, camera: &Camera, view: &View) -> HashMap
         .collect()
 }
 
-/// Distance of the object's centre behind the surface the camera sees, metres
-/// (seen level; `centre_from_surface` scales it for a view from above).
 pub fn centre_offset_m(kind: EntKind) -> f32 {
     match kind {
         EntKind::Source => 0.20,
@@ -202,7 +158,6 @@ pub fn centre_offset_m(kind: EntKind) -> f32 {
     }
 }
 
-/// The label a recogniser tends to confuse `label` with.
 pub fn look_alike(label: &str) -> Option<&'static str> {
     Some(match label {
         "boulder" => "coal_ore",
@@ -213,7 +168,6 @@ pub fn look_alike(label: &str) -> Option<&'static str> {
         "stone" => "coal",
         "coal" => "iron_ore",
         "iron_ore" => "stone",
-        // A brown box on the ground reads like a brown log.
         "parcel" => "log",
         "base_camp" => "warehouse",
         "warehouse" => "base_camp",
@@ -227,39 +181,20 @@ fn gauss(rng: &mut Rng) -> f32 {
     (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
 }
 
-/// Outcome model of the real tile recogniser (SigLIP2 through
-/// `embedding::EmbeddingPerception`) after the gates' score and margin floor,
-/// measured on rendered keyframes by the A/B harness (`tests/ml_ab.rs`,
-/// `[MLAB] scan/errmodel`, `docs/research/ml-ab.md`). It describes what the
-/// real recogniser was seen to do, it is not a choice:
-///
-/// * a source or drop in view is reported under its own label within the
-///   gates' 1 m with probability `σ(det_a·ln(pixels) + det_b)`;
-/// * `false_per_scan` wrong candidates (another label, or nothing within
-///   1 m) pass the floor per scan on average (Poisson);
-/// * a right candidate's ground position is off by `pos_sd_m` per axis;
-/// * the scores and margins of passing candidates, right and wrong.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScanErrModel {
     pub det_a: f32,
     pub det_b: f32,
     pub false_per_scan: f32,
     pub pos_sd_m: f32,
-    /// Score of a right candidate, (mean, SD).
     pub score_true: (f32, f32),
-    /// Score of a wrong candidate, (mean, SD).
     pub score_false: (f32, f32),
-    /// Margin over the runner-up of a passing candidate, (mean, SD).
     pub margin: (f32, f32),
-    /// The score and margin floors the passing candidates were measured at
-    /// (draws stay at or above them).
     pub score_floor: f32,
     pub margin_floor: f32,
 }
 
 impl ScanErrModel {
-    /// SigLIP2 (`siglip2-base-patch16-naflex`) through the tile scan as the
-    /// v1.0 runtime uses it, on this renderer (`[MLAB] scan/errmodel`).
     pub const SIGLIP_MEASURED: ScanErrModel = ScanErrModel {
         det_a: 0.0,
         det_b: 0.0,
@@ -278,8 +213,6 @@ pub struct OraclePerception {
     noise: NoiseCfg,
     rng: Rng,
     min_pixels: u32,
-    /// The measured error model of the real recogniser; `None` is the chosen
-    /// noise of [`NoiseCfg`] (before v1.0).
     honest: Option<ScanErrModel>,
 }
 
@@ -289,9 +222,6 @@ impl OraclePerception {
         OraclePerception { table: EntityTable::from_lexicon(lex), noise, rng, min_pixels, honest: None }
     }
 
-    /// The stand-in spoiled the way the real tile recogniser was measured to
-    /// be wrong ([`ScanErrModel`]) instead of by [`NoiseCfg`]; `None` goes back.
-    /// Its SDS statistics are kept apart (`scope`).
     pub fn set_honest(&mut self, model: Option<ScanErrModel>) {
         self.honest = model;
     }
@@ -300,7 +230,6 @@ impl OraclePerception {
         self.honest.as_ref()
     }
 
-    /// One candidate of the honest stand-in.
     #[allow(clippy::too_many_arguments)]
     fn measured_candidate(&mut self, m: &ScanErrModel, label: &str, bbox: [f32; 4], pixels: u32, depth_m: f32, world: Option<(f32, f32)>, right: bool, truth: Option<(String, String)>) -> Option<Candidate> {
         let (kind, link) = self.table.get(label).cloned()?;
@@ -334,7 +263,6 @@ impl OraclePerception {
             let bbox = [v.bbox[0] as f32 / w, v.bbox[1] as f32 / h, (v.bbox[2] + 1) as f32 / w, (v.bbox[3] + 1) as f32 / h];
             let (px, py) = ((bbox[0] + bbox[2]) * 0.5 * w, (bbox[1] + bbox[3]) * 0.5 * h);
             let world = centroids.get(&v.entity).copied().or_else(|| input.camera.world_point3_in(&view, px, py, v.depth_m)).map(|p| centre_from_surface(&view, p, centre_offset_m(kind)));
-            // Places were never part of the measurement: reported as they are.
             let p_det = if kind == EntKind::Waypoint { 1.0 } else { 1.0 / (1.0 + (-(m.det_a * (v.pixels.max(1) as f32).ln() + m.det_b)).exp()) };
             if self.rng.next_f32() < p_det {
                 if let Some(c) = self.measured_candidate(&m, &v.label, bbox, v.pixels, v.depth_m, world, true, Some((v.entity.clone(), v.label.clone()))) {
@@ -342,7 +270,6 @@ impl OraclePerception {
                 }
             }
         }
-        // Wrong candidates: a Poisson count, each a random label somewhere on the ground in view.
         let mut k = 0u32;
         let (limit, mut p) = ((-m.false_per_scan.max(0.0)).exp(), 1.0f32);
         loop {
@@ -382,7 +309,6 @@ impl OraclePerception {
         self.noise = noise;
     }
 
-    /// Made-up confidence: the more pixels, the surer.
     fn base_confidence(pixels: u32) -> f32 {
         0.55 + 0.30 * ((pixels as f32).sqrt() / 12.0).clamp(0.0, 1.0)
     }
@@ -410,7 +336,6 @@ impl Recognizer for OraclePerception {
             return self.scan_measured(input, m);
         }
         let (w, h) = (input.frame.width as f32, input.frame.height as f32);
-        // The head camera as the robot believes it is (joints and the head IMU).
         let view = input.world.head_view(input.camera).est;
         let centroids = visible_centroids(input.frame, input.camera, &view);
         let mut out = ScanOutput { device: "cpu (oracle)".into(), ..ScanOutput::default() };
@@ -461,7 +386,6 @@ impl Recognizer for OraclePerception {
             let _ = kind;
         }
 
-        // A phantom detection where nothing is.
         if self.rng.next_f32() < self.noise.false_positive_rate {
             let labels: Vec<&str> = self.table.labels().into_iter().filter(|l| self.table.get(l).map_or(false, |(k, _)| *k != EntKind::Waypoint)).collect();
             if !labels.is_empty() {
@@ -494,7 +418,6 @@ impl Recognizer for OraclePerception {
     }
 }
 
-/// Whether a frame pixel class is something the recogniser could name.
 pub fn is_thing(class: ObjectClass) -> bool {
     matches!(class, ObjectClass::Node | ObjectClass::Drop | ObjectClass::Waypoint)
 }
@@ -600,7 +523,6 @@ mod tests {
     #[test]
     fn tiny_objects_are_not_reported() {
         let (mut w, cam) = world_with_tree_ahead();
-        // far away the tree covers only a few pixels
         w.nodes[0].x += 18.0;
         let mut p = OraclePerception::new(&lexicon(), NoiseCfg::none(), 400);
         assert!(scan_once(&mut p, &w, &cam).candidates.is_empty());
@@ -619,7 +541,6 @@ mod tests {
         let tree = s.candidates.iter().find(|c| c.truth.as_deref() == Some("n1")).expect("always detected");
         assert_eq!(tree.label, "tree");
         assert!((tree.score - 0.7).abs() < 1e-6 && (tree.margin - 0.1).abs() < 1e-6);
-        // Never detected, two wrong candidates per scan on average, all at the floor or above.
         let blind = ScanErrModel { det_b: -50.0, false_per_scan: 2.0, score_false: (0.2, 0.1), ..sure };
         p.set_honest(Some(blind));
         let (mut wrong, scans) = (0usize, 300);

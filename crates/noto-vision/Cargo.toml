@@ -19,7 +19,6 @@ noto-ts = { path = "../noto-ts" }
 
 [features]
 default = []
-# GPU backends for the depth (TIPS), semantic location (SigLIP2) and mask (SAM) models.
 cuda = ["noto-ml/cuda"]
 metal = ["noto-ml/metal"]
 vulkan = ["noto-ml/vulkan"]

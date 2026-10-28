@@ -1,11 +1,3 @@
-//! The named robot forms (`morph`) in every model: does each one build, stand,
-//! balance and move with only the parts it has? For every form and tier the
-//! robot is built and checked in the quasi-static balance (`balance`), the
-//! whole-body kinematics (`kin`) and the joint dynamics (`dynamics`), and its
-//! camera, cargo and manipulator are checked against the real robot it follows
-//! (`docs/research/parts.md` §7). Each check prints a `[MORPH]` line. These are
-//! correctness checks against the engine's own inputs, not benchmarks.
-
 use noto_core::act::focus::{self, FocusCtx};
 use noto_core::act::grasp::{self, GraspInput, ReleaseInput};
 use noto_core::act::material::ItemMaterial;
@@ -30,11 +22,6 @@ fn hand_for(base: BaseKind) -> noto_core::Hand {
     cfg.build().unwrap()
 }
 
-/// The mass of each form's real analogue, kg, from the engine's own inputs
-/// (`None`: no published figure): Stretch RE1 23 kg (Kemp et al. 2022), the
-/// LeKiwi base 1.7 kg plus an SO-101 arm ~0.8 kg (parts.md [29][30]), an AgileX
-/// Tracer chassis 30 kg (parts.md [33]); the humanoids are checked against the
-/// research tier totals in `balance`.
 fn analogue_kg(form: &str) -> Option<(f32, Tier)> {
     match form {
         "mast_gripper" => Some((23.0, Tier::Mid)),
@@ -52,19 +39,16 @@ fn every_form_builds_stands_and_moves_in_all_three_models() {
             let stand = b.stand(0.0);
             let k = kin::solve(&b, &stand, &KinLoads::default());
             let q = b.solve(&b.quiet(0.0), &FeedForward { enabled: false, gain: 1.0 }, 1e3);
-            // The three models carry the same masses at the same places.
             assert!((k.mass_kg - b.mass_kg()).abs() < 1e-3, "{} {tier:?}: kin {} vs balance {}", f.id, k.mass_kg, b.mass_kg());
             assert!((k.com[2] - q.com[2]).abs() < 0.01 && (k.com[0] - q.com[0]).abs() < 0.01, "{} {tier:?}: CoM kin {:?} vs balance {:?}", f.id, k.com, q.com);
             assert!(k.feasible && k.margin > 0.3, "{} {tier:?}: standing {:?} margin {}", f.id, k.limiting, k.margin);
             assert!((k.grf[2] - k.mass_kg * G).abs() < 1e-2);
-            // The CoM sits over the support, below the camera and above the ground.
             assert!(q.com[2] > 0.05 && q.com[2] < kin::camera(&b, &stand).pos[2].max(0.3), "{} {tier:?}: CoM {}", f.id, q.com[2]);
             let r = simulate(&b, &b.quiet(0.0), &b.quiet(0.0), &FeedForward::default(), 1e3, &DynCfg { settle_s: 0.2, ..DynCfg::default() });
             let last = r.samples.last().unwrap();
             assert!(r.reached && r.feasible, "{} {tier:?}: {:?}", f.id, r.notes);
             assert!((last.grf[2] - b.mass_kg() * G).abs() < 0.005 * b.mass_kg() * G, "{} {tier:?}: dynamics GRF {} vs {}", f.id, last.grf[2], b.mass_kg() * G);
             assert!((last.com[2] - q.com[2]).abs() < 0.01, "{} {tier:?}: dynamics CoM {} vs balance {}", f.id, last.com[2], q.com[2]);
-            // Drive limits are finite and the joints of every report exist on the form.
             let lim = b.drive_limits(&b.base.spec(), 0.0);
             assert!(lim.max_speed_mps > 0.0 && lim.max_slope_deg >= 0.0 && lim.capacity_kg >= 0.0);
             for j in &r.joints {
@@ -85,8 +69,6 @@ fn every_form_builds_stands_and_moves_in_all_three_models() {
             );
         }
         if let Some((kg, tier)) = analogue_kg(f.id) {
-            // Within a factor of two of the real robot it follows (the presets are
-            // this project's parts, not that robot's; the deviation is reported).
             let m = body_of(f.id, tier).mass_kg();
             assert!(m > 0.5 * kg && m < 2.0 * kg, "{}: {m} kg vs analogue {kg} kg", f.id);
             println!("[MORPH] {:<15} 질량 {:.1} kg ({}) vs 원형 {kg:.1} kg ({:+.0}%) — {}", f.id, m, tier.id(), 100.0 * (m - kg) / kg, f.analogue);
@@ -94,11 +76,6 @@ fn every_form_builds_stands_and_moves_in_all_three_models() {
     }
 }
 
-/// Every combination of the layers (with and without a torso lift), fitted to
-/// each drive: it builds what the fit says, the three models carry the same
-/// masses at the same places, it stands, every report has exactly the joints
-/// the form has, and the status, focus, reach, grasp and release code never
-/// panics on it.
 #[test]
 fn every_layer_combination_builds_in_all_three_models() {
     use noto_core::morph::{Cargo, Lower, Manip, Torso, AMR_CAMERA_H_MM, FIXED_HEAD_TILT_DEG, TRUCK_BED};
@@ -138,7 +115,6 @@ fn every_layer_combination_builds_in_all_three_models() {
                             assert_eq!(plan.id().contains('+'), !m.humanoid_upper(), "{tag}");
                             let back: BodyPlan = serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
                             assert_eq!(back, plan, "{tag}");
-                            // The three models: same mass, same CoM, standing.
                             let stand = b.stand(0.0);
                             let k = kin::solve(&b, &stand, &KinLoads::default());
                             let q = b.solve(&b.quiet(0.0), &FeedForward { enabled: false, gain: 1.0 }, 1e3);
@@ -149,7 +125,6 @@ fn every_layer_combination_builds_in_all_three_models() {
                             let last = r.samples.last().unwrap();
                             assert!((last.grf[2] - b.mass_kg() * G).abs() < 0.005 * b.mass_kg() * G, "{tag}: dynamics GRF {} vs {}", last.grf[2], b.mass_kg() * G);
                             assert!((last.com[2] - q.com[2]).abs() < 0.01, "{tag}: dynamics CoM {} vs balance {}", last.com[2], q.com[2]);
-                            // Only the joints the form has, in every report.
                             let has = |name: &str| match name {
                                 "neck" => b.has_neck(),
                                 "waist_yaw" => b.has_torso(),
@@ -168,7 +143,6 @@ fn every_layer_combination_builds_in_all_three_models() {
                                 }
                             }
                             assert!(r.pose_at(&b, &b.quiet(0.0), 0.1).is_some(), "{tag}");
-                            // The status and the focus views show only what the form has.
                             let l = b.drive_limits(&base.spec(), 0.0);
                             assert!(l.max_speed_mps > 0.0 && l.capacity_kg >= 0.0 && l.capacity_kg.is_finite(), "{tag}: {l:?}");
                             assert!(b.cargo_geom().is_some() || l.capacity_kg == 0.0, "{tag}: no cargo place carries nothing");
@@ -199,12 +173,10 @@ fn every_layer_combination_builds_in_all_three_models() {
                                 assert!(b.has_manipulator() || !f.parts.contains(&"hand"), "{tag} {kind:?}: {:?}", f.parts);
                                 assert!(b.has_neck() || !f.parts.contains(&"neck"), "{tag} {kind:?}: {:?}", f.parts);
                             }
-                            // Reach, grasp and release: refused at once without a manipulator, never a panic.
                             let p = reach::plan(&b, &ReachGoal::ground_object(0.15, 1.0, false, 0.0));
                             assert_eq!(p.code == Some("no_manipulator"), !b.has_manipulator(), "{tag}: {:?}", p.code);
                             let g = grasp::grasp(&GraspInput::front(&b, &hand, ItemMaterial::Wood, 1.0, [0.15; 3], Surface::Firm, false, 0.0, 0.0, 5));
                             let rel = grasp::release(&ReleaseInput { body: &b, material: ItemMaterial::Wood, mass_kg: 1.0, size_m: [0.15; 3], ground: Surface::Firm, surface_z_m: 0.0, cargo_kg: 1.0, aim_sigma_m: 0.0, seed: 5 });
-                            // The plan is valid exactly when the hand can load the cargo place it has.
                             let off_pelvis = b.cargo_geom().is_some_and(|c| !c.on_pelvis);
                             let stowable = !b.has_manipulator() || b.cargo_geom().is_none() || grasp::stow_pose(&b, false, 0.0).is_some();
                             assert_eq!(plan.validate(base).is_ok(), stowable, "{tag}: {:?}", plan.validate(base));
@@ -216,7 +188,6 @@ fn every_layer_combination_builds_in_all_three_models() {
                                 assert!(g.outcome.ok || g.outcome.code.is_some_and(|c| c.starts_with("reach")), "{tag}: {:?}", g.outcome);
                                 assert!(rel.outcome.ok, "{tag}: {:?}", rel.outcome);
                                 if g.outcome.ok {
-                                    // Stowed where it can, and never quietly kept in the hand where it cannot.
                                     let has = |k: &str| g.events.iter().any(|e| e.kind == k);
                                     assert_eq!(has("stowed"), b.cargo_geom().is_some() && stowable, "{tag}");
                                     assert_eq!(has("stow_unreachable"), !stowable, "{tag}");
@@ -236,7 +207,6 @@ fn every_layer_combination_builds_in_all_three_models() {
 
 #[test]
 fn the_default_forms_are_todays_robots() {
-    // The humanoid forms are today's robots to the last digit.
     for (form, base) in [("legs_humanoid", BaseKind::HumanFoot), ("wheel_humanoid", BaseKind::Wheel), ("track_humanoid", BaseKind::Track)] {
         let today = Body::new(&BodyPlan::default(), base, FingerCount::Five);
         let f = body_of(form, Tier::Mid);
@@ -264,7 +234,6 @@ fn forms_have_only_the_joints_they_have() {
     let deck = body_of("deck_gripper", Tier::Mid);
     let d = names(&deck);
     assert!(!d.iter().any(|j| j == "neck" || j == "waist_pitch" || j.ends_with("_l")), "{d:?}");
-    // The balance model and the dynamics report the same joints, and look-ups of absent ones are None.
     for b in [&noneck, &truck, &mast, &deck] {
         let rep = b.solve(&Posture::arm_raise(0.0), &FeedForward::default(), 1e3);
         assert_eq!(rep.joint("neck").is_some(), b.has_neck());
@@ -275,7 +244,6 @@ fn forms_have_only_the_joints_they_have() {
         assert_eq!(r.joints.iter().any(|j| j.name == "waist_yaw"), b.has_torso());
         assert!(r.pose_at(b, &Posture::arm_raise(0.0), 0.3).is_some());
     }
-    // A fixed head carries no neck servos and no gaze stabilisation.
     let today = Body::new(&BodyPlan::default(), BaseKind::Wheel, FingerCount::Five);
     assert!((today.head.mass_kg - noneck.head.mass_kg - 2.0 * today.head.neck.mass_kg).abs() < 1e-6);
     assert_eq!(noneck.head.gaze_stabilization, 0.0);
@@ -286,10 +254,8 @@ fn forms_have_only_the_joints_they_have() {
 #[test]
 fn the_camera_follows_the_mount() {
     let stand = KinPose::stand(0.0);
-    // A head on a neck (today's): 1.14 m, pitched by the neck.
     let legs = body_of("legs_humanoid", Tier::Mid);
     assert!((kin::camera(&legs, &stand).pos[2] - 1.14).abs() < 0.01);
-    // A fixed head: the neck's angle does nothing, the trunk and the fixed tilt do.
     let noneck = body_of("wheel_noneck", Tier::Mid);
     let level = kin::camera(&noneck, &stand);
     let asked = kin::camera(&noneck, &KinPose { neck_deg: 30.0, neck_pan_deg: 40.0, ..stand });
@@ -298,7 +264,6 @@ fn the_camera_follows_the_mount() {
     let pro_noneck = Body::new(&BodyPlan { morph: Morphology::named("wheel_noneck").unwrap(), ..BodyPlan::uniform(Tier::Pro) }, BaseKind::Wheel, FingerCount::Five);
     let leaned = kin::camera(&pro_noneck, &KinPose { waist_deg: 20.0, ..stand });
     assert!((leaned.pitch_down_deg - 35.0).abs() < 1e-3, "{leaned:?}");
-    // A mast camera at Stretch RE1's 1.31 m, on its pan-tilt, inside Fetch's 1.061–1.447 m range.
     let mast = body_of("mast_gripper", Tier::Mid);
     let c = kin::camera(&mast, &stand);
     assert!((c.pos[2] - STRETCH_CAMERA_H_MM as f32 / 1000.0).abs() < 1e-4 && (1.061..=1.447).contains(&c.pos[2]), "{c:?}");
@@ -306,7 +271,6 @@ fn the_camera_follows_the_mount() {
     assert!((down.pitch_down_deg - 60.0).abs() < 1e-4 && down.pos[2] < c.pos[2], "{down:?}");
     assert!(kin::solve(&mast, &KinPose { neck_deg: 60.0, ..mast.stand(0.0) }, &KinLoads::default()).feasible, "a mast pan-tilt looks 60° down (Fetch: 83°)");
     assert!(!kin::solve(&noneck, &KinPose { neck_deg: 10.0, ..noneck.stand(0.0) }, &KinLoads::default()).feasible, "no neck joint to ask");
-    // Chassis cameras: low on the deck front, under the 0.30 m top of an AMR body (MiR250), level, tilted only with the chassis.
     for (form, h) in [("deck_gripper", 0.20), ("truck", 0.25)] {
         let b = body_of(form, Tier::Mid);
         let c = kin::camera(&b, &stand);
@@ -320,7 +284,6 @@ fn the_camera_follows_the_mount() {
 
 #[test]
 fn a_neckless_camera_feels_the_whole_tilt_and_a_pan_tilt_levels_it() {
-    // On an 8° slope the neck takes back its share of the base's pitch; without one the camera keeps all of it.
     let slope = Posture { source: Source::Slope, slope_deg: 8.0, ..Posture::quiet(0.0) };
     let hold = |b: &Body| {
         let p = Posture { arm_elev_deg: b.quiet(0.0).arm_elev_deg, elbow_deg: b.quiet(0.0).elbow_deg, ..slope };
@@ -344,13 +307,11 @@ fn the_truck_refuses_a_pick_and_carries_more_on_its_bed() {
     assert_eq!(r.outcome.code, Some("no_manipulator"));
     let (lift, two) = truck.lift(1.4, 0.0, &FeedForward::default(), 200.0);
     assert!(!lift.feasible && !two && lift.limiting.as_deref().is_some_and(|l| l.contains("no_manipulator")));
-    // Without arms and a torso the chassis keeps more of its rating for the bed; the bed's own rating bounds it.
     for tier in [Tier::Mid, Tier::Pro] {
         let t = body_of("truck", tier);
         let h = Body::new(&BodyPlan::uniform(tier), BaseKind::Wheel, FingerCount::Five);
         let (ct, ch) = (t.drive_limits(&BaseKind::Wheel.spec(), 0.0).capacity_kg, h.drive_limits(&BaseKind::Wheel.spec(), 0.0).capacity_kg);
         assert!(ct > ch && ct <= 100.0 + 1e-3, "{tier:?}: truck {ct} vs humanoid {ch}");
-        // Loaded with that much on the bed it still stands, lower than the humanoid with its bay.
         let k = kin::solve(&t, &t.stand(ct), &KinLoads::default());
         assert!(k.feasible && k.com[2] < h.com_height_m(), "{tier:?}: {:?} CoM {}", k.limiting, k.com[2]);
         println!("[MORPH] truck {:<6} 짐칸 적재 {ct:.1} kg (휴머노이드 배 적재 {ch:.1} kg) · 만재 CoM {:.2} m · 여유 {:.2}", tier.id(), k.com[2], k.margin);
@@ -374,14 +335,11 @@ fn a_deck_arm_reaches_the_floor_and_stows_in_its_tote() {
     assert!(stowed.label_ko.contains("토트"), "{}", stowed.label_ko);
     let drop = g.metric("stow_drop_m").unwrap();
     assert!(drop > 0.0 && drop < 0.3, "{drop}");
-    // The object ends in the tote on the deck.
     let at = g.samples.last().unwrap().object.unwrap();
     assert!((at[0] - noto_core::morph::TOTE_X_M).abs() < 1e-4 && at[2] < 0.3, "{at:?}");
-    // One arm: a two-handed lift is refused, never quietly done with one.
     let two = grasp::grasp(&GraspInput::front(&deck, &hand, ItemMaterial::Wood, 1.4, [0.15; 3], Surface::Firm, true, 0.0, 0.0, 3));
     assert_eq!(two.outcome.code, Some("one_arm"));
     assert!(!deck.lift(4.0, 0.0, &FeedForward::default(), 1e3).1, "one arm never lifts with two");
-    // A release takes it out of the tote and sets it down from the low shoulder.
     let rel = grasp::release(&ReleaseInput { body: &deck, material: ItemMaterial::Wood, mass_kg: 1.4, size_m: [0.15; 3], ground: Surface::Firm, surface_z_m: 0.0, cargo_kg: 0.0, aim_sigma_m: 0.0, seed: 1 });
     assert!(rel.outcome.ok && rel.metric("drop_height_m").unwrap() < 0.05, "{:?} {:?}", rel.outcome, rel.metric("drop_height_m"));
     println!("[MORPH] deck_gripper    바닥 집기 {} · {:.1} s · 토트 낙하 {drop:.2} m · 내려놓기 낙하 {:.3} m", p.strategy_ko, g.duration_s, rel.metric("drop_height_m").unwrap());
@@ -389,9 +347,6 @@ fn a_deck_arm_reaches_the_floor_and_stows_in_its_tote() {
 
 #[test]
 fn a_deck_arm_tips_where_the_moment_balance_says() {
-    // Kemp et al.'s moment balance for a narrow base with an arm (m_payload = m_r·d_ra/d_p):
-    // the load that puts the ZMP on the front axle, from the unloaded body's CoM.
-    // The statics must tip at that load, not before and not after.
     for tier in [Tier::Mid, Tier::Pro] {
         let deck = body_of("deck_gripper", tier);
         let mut pose = deck.stand(0.0);
@@ -410,14 +365,11 @@ fn a_deck_arm_tips_where_the_moment_balance_says() {
 
 #[test]
 fn a_mast_robot_rides_its_lift_to_the_floor_and_to_a_table_top() {
-    // Stretch-like: the arm rides a carriage on the camera's mast, from the
-    // deck up to 1.10 m (Kemp et al. 2022: 0–1.10 m).
     let mast = body_of("mast_gripper", Tier::Mid);
     let lift = mast.lift.as_ref().expect("a mast with an arm has its lift");
     let (top, stroke) = mast.morph.mast_lift_m().unwrap();
     assert!((top - noto_core::morph::MAST_LIFT_TOP_M).abs() < 1e-6 && (lift.stroke_m - stroke).abs() < 1e-6 && stroke > 0.8, "{top} {stroke}");
     assert!((mast.shoulder_at(0, stroke)[2] - (noto_core::morph::DECK_Z_M + noto_core::morph::DECK_ARM_BASE_H_M)).abs() < 1e-5);
-    // A parcel on the floor: the carriage comes down and the pan-tilt looks at the hand.
     let floor = reach::plan(&mast, &ReachGoal::ground_object(0.10, 1.0, false, 0.0));
     assert!(floor.ok && floor.strategy == "lower" && floor.pose.lift_m > 0.4, "{floor:?}");
     assert!(floor.pose.neck_deg > 30.0 && floor.pose.neck_deg <= mast.head_range_deg().0 + 1e-3, "{}", floor.pose.neck_deg);
@@ -425,10 +377,7 @@ fn a_mast_robot_rides_its_lift_to_the_floor_and_to_a_table_top() {
     assert!(neck.in_range && neck.ratio < 0.2, "{neck:?}");
     let carriage = floor.loaded.joint("torso_lift").expect("the mast's lift is a joint");
     assert!(carriage.in_range && carriage.ratio < 0.2, "{carriage:?}");
-    // The carriage travels at the lift's speed: the descent takes at least the minimum-jerk travel.
     assert!(floor.descend_s >= noto_core::act::MIN_JERK_PEAK * floor.pose.lift_m / lift.speed_mps - 1e-3, "{}", floor.descend_s);
-    // A parcel on a 0.75 m table top: the palm gets there from the mast (the
-    // planner picks the carriage height with the least effort). A deck arm cannot.
     let table = ReachGoal { palm_z: 0.75 + 0.15 + reach::PALM_CLEARANCE_M, ..ReachGoal::ground_object(0.15, 1.0, false, 0.0) };
     let high = reach::plan(&mast, &table);
     assert!(high.ok && (high.empty.hands[0][2] - table.palm_z).abs() < 3e-3, "{high:?}");
@@ -454,18 +403,14 @@ fn a_mast_robot_stows_in_its_tote_with_the_carriage_lowered() {
     assert!(g.outcome.ok, "{:?} {:?}", g.outcome, g.notes);
     let stowed = g.events.iter().find(|e| e.kind == "stowed").expect("stowed");
     assert!(stowed.label_ko.contains("토트"), "{}", stowed.label_ko);
-    // The palm let go over the tote, low enough for a short drop, the carriage partly down.
     let stow = g.samples.iter().filter(|s| s.phase == "stow").last().unwrap();
     assert!(stow.pose.lift_m > 0.05, "{:?}", stow.pose);
-    // The carriage rises with the object only to the height it stows it at,
-    // never up to the top of the mast and down again.
     let highest = g.samples.iter().filter(|s| s.phase == "lift" || s.phase == "stow").map(|s| s.pose.lift_m).fold(f32::INFINITY, f32::min);
     assert!(highest >= stow.pose.lift_m - 1e-3, "carriage went up to {highest} m below the top, stows at {}", stow.pose.lift_m);
     let drop = g.metric("stow_drop_m").unwrap();
     assert!(drop > 0.0 && drop <= noto_core::morph::RIM_RELEASE_M + 1e-4, "{drop}");
     let at = g.samples.last().unwrap().object.unwrap();
     assert!((at[0] - noto_core::morph::TOTE_X_M).abs() < 1e-4, "{at:?}");
-    // And sets a parcel down again from the tote onto the floor.
     let rel = grasp::release(&ReleaseInput { body: &mast, material: ItemMaterial::Wood, mass_kg: 1.0, size_m: [0.10; 3], ground: Surface::Firm, surface_z_m: 0.0, cargo_kg: 0.0, aim_sigma_m: 0.0, seed: 1 });
     assert!(rel.outcome.ok && rel.metric("drop_height_m").unwrap() < 0.05, "{:?} {:?}", rel.outcome, rel.metric("drop_height_m"));
     println!("[MORPH] mast_gripper    바닥 집어 토트에: {:.1} s · 리프트 {:.2} m · 토트 낙하 {drop:.2} m · 내려놓기 {:.1} s", g.duration_s, stow.pose.lift_m, rel.duration_s);
@@ -522,8 +467,6 @@ fn body_status_draws_the_form() {
 fn drive_and_push_draw_each_form_in_its_own_rest_pose() {
     use noto_core::act::drive;
     use noto_core::act::push::{self, PushInput, PushLeg};
-    // Today's humanoid pose would hang a deck arm straight down through its
-    // deck: the hand under the ground. Every rollout sample must use the form's own rest.
     let deck = body_of("deck_gripper", Tier::Mid);
     let hanging = kin::solve(&deck, &KinPose::stand(0.0), &KinLoads::default());
     assert!(hanging.hands[0][2] < 0.0, "{:?}", hanging.hands[0]);
@@ -546,7 +489,6 @@ fn drive_and_push_draw_each_form_in_its_own_rest_pose() {
         if b.morph.humanoid_upper() {
             assert_eq!(d.samples[0].pose, KinPose { base_pitch_deg: 5.0, ..KinPose::stand(1.0) }, "{form}: today's pose, bit for bit");
         }
-        // The axle loads of the drive state come from that pose.
         let st = drive::state(&b, Surface::Firm.props(), 0.0, 0.0, 0.0, 0.0);
         let r = kin::solve_fast(&b, &b.stand(0.0), &KinLoads::default());
         if let (Some(f), Some(rr)) = (r.contact("axle_front"), r.contact("axle_rear")) {
@@ -567,21 +509,17 @@ fn a_gripper_squeezes_with_its_jaws_and_is_drawn_with_two() {
         cfg.base = BaseKind::Wheel;
         cfg.build().unwrap()
     };
-    // SO-101's jaw (21 N, est) and Robotiq 2F-85 (235 N) press from both sides: 2·F.
     let budget = body_of("deck_gripper", Tier::Budget);
     let pro = body_of("deck_gripper", Tier::Pro);
     let mid = body_of("deck_gripper", Tier::Mid);
     let cap = |b: &Body| grasp::capacity_for(b, &hand, size, 0.5, 0.6);
     assert_eq!((cap(&budget).squeeze_n, cap(&budget).contacts), (42.0, 2));
     assert_eq!((cap(&pro).squeeze_n, cap(&pro).contacts), (470.0, 2));
-    // No force given for the mid tier's XM430 jaw: the two-finger hand's own contacts.
     assert_eq!(cap(&mid), grasp::capacity(&two, size, 0.5, 0.6));
-    // A hand keeps its fingers.
     let today = Body::new(&BodyPlan::default(), BaseKind::Wheel, FingerCount::Five);
     assert_eq!(grasp::capacity_for(&today, &hand, size, 0.5, 0.6), grasp::capacity(&hand, size, 0.5, 0.6));
     let g = grasp::grasp(&GraspInput::front(&pro, &hand, ItemMaterial::Wood, 1.0, [0.08; 3], Surface::Firm, false, 0.0, 0.0, 3));
     assert!(g.outcome.ok && g.metric("squeeze_cap_n") == Some(470.0), "{:?} {:?}", g.outcome, g.metric("squeeze_cap_n"));
-    // Drawn with two jaws in the whole-body boxes and in the focus view.
     for b in [&budget, &mid, &pro, &body_of("mast_gripper", Tier::Mid)] {
         let k = kin::solve(b, &b.stand(0.0), &KinLoads::default());
         assert_eq!(k.boxes.iter().filter(|x| x.name == "finger_r").count(), 4, "two jaws of two links");
@@ -604,15 +542,12 @@ fn a_load_on_an_arm_the_form_does_not_have_is_never_dropped() {
     let left = deck.solve(&Posture { hand_load_kg: [0.0, 1.0], ..deck.quiet(0.0) }, &FeedForward::default(), 1e3);
     assert!(!left.feasible && left.limiting.as_deref().is_some_and(|l| l.contains("왼팔 없음")), "{:?}", left.limiting);
     assert!(deck.solve(&Posture { hand_load_kg: [1.0, 0.0], ..deck.quiet(0.0) }, &FeedForward::default(), 1e3).feasible);
-    // Two arms: as before.
     let today = Body::new(&BodyPlan::default(), BaseKind::Wheel, FingerCount::Five);
     assert!(kin::solve(&today, &KinPose::stand(0.0), &KinLoads::holding(1.0, true, 0.0)).out_of_range.is_empty());
 }
 
 #[test]
 fn a_mast_cameras_mass_sits_where_all_three_models_swing_it() {
-    // A head whose mass sits higher above its pivot than the lens: the
-    // balance model, the kinematics and the dynamics must still agree.
     for pan_tilt in [true, false] {
         let m = Morphology { head: HeadMount::MastCamera { height_mm: STRETCH_CAMERA_H_MM, pan_tilt }, ..Morphology::named("mast_gripper").unwrap() };
         let mut b = Body::new(&BodyPlan { morph: m, ..BodyPlan::default() }, BaseKind::Wheel, FingerCount::Five);
@@ -648,8 +583,6 @@ fn kin_and_dynamics_draw_the_same_deck_and_nothing_on_it_intersects() {
             }
         }
         assert!(!k.boxes.iter().any(|x| x.name == "electronics"), "the electronics ride inside the chassis");
-        // The deck arm's base, the tote or the bed, the pole and the carriage (at rest and all the way down)
-        // stand apart (the chassis camera sits in the front wall: parts.md §7.7).
         let mut parts: Vec<(&str, Aabb)> = deck.iter().filter(|d| d.name != "camera").map(|d| (d.name, aabb(d.center, d.half))).collect();
         for x in k.boxes.iter().filter(|x| matches!(x.name, "pole" | "column" | "carriage")) {
             parts.push((x.name, aabb(x.center, x.half)));
@@ -663,7 +596,7 @@ fn kin_and_dynamics_draw_the_same_deck_and_nothing_on_it_intersects() {
             for bb in &parts[i + 1..] {
                 let rides = (a.0 == "pole" && bb.0.starts_with("carriage")) || (bb.0 == "pole" && a.0.starts_with("carriage"));
                 if rides {
-                    continue; // the carriage rides on the pole
+                    continue;
                 }
                 assert!(!overlap(a.1, bb.1), "{}: {} intersects {} ({:?} / {:?})", f.id, a.0, bb.0, a.1, bb.1);
             }
@@ -674,7 +607,6 @@ fn kin_and_dynamics_draw_the_same_deck_and_nothing_on_it_intersects() {
 #[test]
 fn the_body_keeps_the_plan_it_built() {
     use noto_core::morph::{Cargo, Torso};
-    // A neck and a bay on a deck cannot be built: the body is the fitted form, and its plan names it.
     let asked = BodyPlan { morph: Morphology { torso: Torso::None, ..Morphology::default() }, ..BodyPlan::default() };
     assert!(asked.validate(BaseKind::Wheel).is_err());
     let b = Body::new(&asked, BaseKind::Wheel, FingerCount::Five);
@@ -682,11 +614,9 @@ fn the_body_keeps_the_plan_it_built() {
     assert_ne!(b.plan.id(), asked.id());
     assert!(b.plan.id().contains("mast1310pt") && b.plan.id().contains("c:tote"), "{} (asked {})", b.plan.id(), asked.id());
     assert!(b.plan.validate(BaseKind::Wheel).is_ok(), "{:?}", b.plan.validate(BaseKind::Wheel));
-    // Today's plans stay exactly as given.
     for base in BaseKind::ALL {
         assert_eq!(Body::new(&BodyPlan::default(), base, FingerCount::Five).plan, BodyPlan::default(), "{base:?}");
     }
-    // An arm on a humanoid trunk cannot reach a tote on its deck without a lift: the plan says so.
     let tote = BodyPlan { morph: Morphology { cargo: Cargo::Tote, ..Morphology::default() }, ..BodyPlan::default() };
     let why = tote.validate(BaseKind::Wheel).unwrap_err();
     assert!(why.contains("닿지 않음"), "{why}");
@@ -696,10 +626,6 @@ fn the_body_keeps_the_plan_it_built() {
 
 #[test]
 fn the_engine_never_names_a_morphology_benchmark_source() {
-    // The form files cite where their own numbers come from (Kemp et al. 2022
-    // for Stretch RE1, the Fetch URDF, the MiR250 and Tracer sheets); the
-    // sources kept for scoring the forms (research pack robot-morphologies,
-    // benchmark_refs; docs/research/parts.md §7.4) must never appear in them.
     let files = [
         ("morph.rs", include_str!("../src/morph.rs")),
         ("parts.rs", include_str!("../src/parts.rs")),

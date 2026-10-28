@@ -1,11 +1,3 @@
-//! The collision benchmark (`noto_core::collbench`) for the named presets on
-//! legs, wheels and tracks. The lines this prints (`[CX]` cells, `[CX-SUM]`
-//! scenarios, `[CX-WHY]` what the engine said happened) are the record of how
-//! far bumps, falls and falling objects are from the measurements; the
-//! assertions check the scoring machinery, the physics' own consistency and
-//! the rule that keeps the references out of the engine, never a score
-//! threshold.
-
 use noto_core::act::collide::{self, BumpInput, Obstacle};
 use noto_core::act::fall::{self, FallCause, FallInput};
 use noto_core::actbench::Layer;
@@ -96,9 +88,6 @@ fn the_same_engine_gives_the_same_answer() {
 
 #[test]
 fn the_physics_holds_its_own_laws_across_the_presets() {
-    // Consistency of the engine (not references): a wall stops a robot and a
-    // faster bump hits harder; a standing legged robot pushed over falls and
-    // gets up when its joints carry the squat; a wheeled one never gets up.
     for plan in PLANS {
         for base in BASES {
             let b = Body::new(&BodyPlan::named(plan).unwrap(), base, FingerCount::Five);
@@ -114,7 +103,6 @@ fn the_physics_holds_its_own_laws_across_the_presets() {
             } else {
                 assert!(!f.get_up.can && f.get_up.needs_help && f.get_up.righting_force_n > 0.0, "{plan} {base:?}: {:?}", f.get_up);
             }
-            // No strike takes in more than the fall released: the CoM's drop and the push's turn.
             let main = f.main.as_ref().expect("a fall strikes");
             let com_z = kin::solve(&b, &KinPose::stand(0.0), &KinLoads::default()).com[2];
             assert!(main.energy_j <= b.mass_kg() * 9.81 * com_z * 1.05 + 1.0, "{plan} {base:?}: {} J from a {com_z} m CoM", main.energy_j);
@@ -137,10 +125,6 @@ fn every_scenario_kind_runs_on_every_base() {
 
 #[test]
 fn the_engine_never_names_a_collision_benchmark_source() {
-    // The model files cite where their own numbers come from (ISO/TS 15066,
-    // ACI 318, Petrone, Bourke, NHTSA, ...), never a source the collision
-    // benchmark scores with: a constant set from the reference would make the
-    // score say nothing.
     let files = [
         ("kin.rs", include_str!("../src/kin.rs")),
         ("act/mod.rs", include_str!("../src/act/mod.rs")),

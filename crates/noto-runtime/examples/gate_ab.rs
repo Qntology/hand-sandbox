@@ -1,12 +1,3 @@
-//! Runs the same commands with the precision gates on and off under injected
-//! recogniser errors, and prints what each cost.
-//!
-//! `cargo run --release -p noto-runtime --example gate_ab [seeds] [confusion] [false_positive] [command]`
-//!
-//! The errors come from the stand-in recogniser's made-up model. The table
-//! shows whether the gates do their job under that model, not how a real
-//! SigLIP2 behaves.
-
 use noto_quest::State;
 use noto_runtime::{GateCfg, NoiseCfg, Runtime, RuntimeConfig};
 

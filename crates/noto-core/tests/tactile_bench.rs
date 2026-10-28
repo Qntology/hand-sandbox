@@ -1,10 +1,3 @@
-//! The tactile N:N benchmark (`noto_core::tactbench`) for the named presets
-//! on legs, wheels and tracks. The lines this prints (`[TX]` cells,
-//! `[TX-SUM]` scenarios, `[TX-HELD]` held-out) are the record of how far the
-//! robot's pads, grip loop and soles are from the measurements; the
-//! assertions check the scoring machinery and the rules that keep the
-//! references from becoming tuning targets, never a score threshold.
-
 use noto_core::actbench::Layer;
 use noto_core::balance::Body;
 use noto_core::effects::Rule;
@@ -14,7 +7,6 @@ use noto_core::{BaseKind, FingerCount};
 
 const PLANS: [&str; 3] = ["mid", "pro", "wheel_lift"];
 const BASES: [BaseKind; 3] = [BaseKind::HumanFoot, BaseKind::Wheel, BaseKind::Track];
-/// The evaluation seed of the held-out draws (draw new ones per release, never tune against them).
 const HOLDOUT_SEED: u64 = 20261027;
 
 fn num(v: f32) -> String {
@@ -73,7 +65,6 @@ fn tactile_answers_against_the_measurements() {
                 assert!(r.score.is_finite() && (0.0..=100.0).contains(&r.score), "{} {}", r.id, r.score);
                 assert!(r.cells.iter().all(|c| c.value.map_or(true, f32::is_finite)), "{}", r.id);
                 if r.skipped.is_none() {
-                    // Every scenario asks about the outcome and at least one other layer, and scores something.
                     assert!(r.cells.iter().any(|c| c.layer == Layer::Outcome), "{} lacks an outcome", r.id);
                     assert!(r.cells.iter().any(|c| c.layer != Layer::Outcome), "{} has only an outcome", r.id);
                     assert!(r.layer_scores.iter().any(|s| s.is_some()), "{} scores nothing", r.id);
@@ -115,9 +106,6 @@ fn held_out_draws_are_counted_not_tuned() {
 
 #[test]
 fn the_engine_never_names_a_tactile_benchmark_source() {
-    // The model files cite where their own numbers come from, never a source
-    // the tactile benchmark scores with (`docs/research/tactile.md` §5): a
-    // constant set from the reference would make the score say nothing.
     let files = [
         ("contact.rs", include_str!("../src/contact.rs")),
         ("sim.rs", include_str!("../src/sim.rs")),
@@ -131,9 +119,7 @@ fn the_engine_never_names_a_tactile_benchmark_source() {
         ("world-sim world/acts.rs", include_str!("../../world-sim/src/world/acts.rs")),
     ];
     let sources = [
-        // fingers and the grip loop
         "Delhaye", "Lefèvre", "Lefevre", "Thonnard", "Häger", "Hager", "Luciw", "Jarocka", "WAY-EEG-GAL", "Westling", "Johansson", "Flanagan", "Riso",
-        // soles and toes
         "Jacob 1989", "Jacob H", "Hughes", "Klenerman", "Koo ", "Koo,", "Hessert", "Becker", "Chou", "Pedar", "tactbench",
     ];
     for (name, src) in files {

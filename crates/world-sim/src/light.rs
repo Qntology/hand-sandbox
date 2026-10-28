@@ -1,61 +1,14 @@
-//! Daylight (v1.0): where the sun stands, how much light it and the sky
-//! give, and in what colour, for the renderer (`render`) and the head
-//! camera's exposure (`world::eye`). Numbers and sources:
-//! `docs/research/lighting.md` (§5 lists the engine inputs).
-//!
-//! * [`Lighting::Flat`] is the renderer as it was before v1.0: every face lit
-//!   by a fixed factor of its axis (top 1.0, x faces 0.82, z faces 0.66), the
-//!   constant sky gradient and fog, and 10 000 lx for the exposure. It is the
-//!   default, so seeded runs and every benchmark keep their pixels byte for
-//!   byte.
-//! * [`Lighting::Sun`] puts the sun at an elevation and a compass azimuth.
-//!   [`solar_position`] finds it for a latitude, a day and a clock with the
-//!   NOAA solar position series (NOAA GMD, "General Solar Position
-//!   Calculations"; the azimuth in the quadrant-safe form of the research
-//!   pack) and the banded refraction of NOAA's solar calculator.
-//! * The light on a horizontal face is the IESNA daylight availability model
-//!   (IESNA Lighting Handbook, coefficients as reproduced by Golmohammadi,
-//!   Shekari & Mahjub 2009): a direct beam `E_dn = E_xt·exp(−c·m)` through the
-//!   Kasten & Young (1989) relative air mass `m`, and a sky term
-//!   `A + B·sin^C h`, for a clear, a partly cloudy and an overcast sky.
-//! * A face receives the beam by the cosine of its angle to the sun when a
-//!   ray toward the sun is free (otherwise it lies in a shadow), the sky by
-//!   the share of the dome it sees, `(1 + n_y)/2` (an isotropic sky), and the
-//!   light the ground reflects by the rest, `ρ_g·E_h·(1 − n_y)/2`. The
-//!   camera's auto exposure meters the global horizontal illuminance `E_h`
-//!   (the scene lux), so a sunlit top face renders as bright as the flat
-//!   mode's top face; faces turned to a low sun get brighter, shadows darker.
-//!   Light adds in linear units; the pixels are sRGB, so the gain is applied
-//!   through the display gamma (IEC 61966-2-1, ≈ 2.2).
-//! * Colour: the direct beam reddens with the air mass (Rayleigh plus
-//!   Ångström aerosol optical depth at a representative wavelength of each
-//!   channel); the sky's light is the scattered share, proportional to the
-//!   same optical depth (bluish); an overcast sky is grey. The camera's white
-//!   balance is fixed to the sun at the zenith.
-//! * When the scene is too dark for the longest exposure at the highest gain
-//!   the frame darkens by what is missing.
-//!
-//! Directions: the world has x and z on the ground and y up; the UI's map
-//! (and `noto-runtime::api`) shows +x to the east and −z to the north, so a
-//! compass azimuth `A` (0 = north, 90 = east) points along `(sin A, −cos A)`
-//! in `(x, z)`.
-
 use std::f32::consts::PI;
 
 use serde::{Deserialize, Serialize};
 
 use crate::world::{World, EXPOSURE_MAX_S, SCENE_LUX};
 
-/// How the scene is lit.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum Lighting {
-    /// The pre-v1.0 renderer: fixed face factors, constant sky, 10 000 lx.
     #[default]
     Flat,
-    /// A sun at `elevation_deg` above the horizon (apparent, refraction
-    /// included) and `azimuth_deg` on the compass (0 north, 90 east), under a
-    /// sky from clear (`overcast` 0) through partly cloudy (0.5) to overcast (1).
     Sun {
         elevation_deg: f32,
         azimuth_deg: f32,
@@ -64,32 +17,16 @@ pub enum Lighting {
     },
 }
 
-// ----- the sun's position (research lighting.md §1) -----
-
-/// Where the sun is for a place and an instant.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct SolarPosition {
-    /// Elevation above the horizon with refraction, degrees.
     pub elevation_deg: f32,
-    /// The geometric elevation (no refraction), degrees.
     pub geometric_elevation_deg: f32,
-    /// Compass azimuth, degrees clockwise from north.
     pub azimuth_deg: f32,
     pub declination_deg: f32,
-    /// Hour angle, degrees (negative in the morning).
     pub hour_angle_deg: f32,
-    /// Equation of time, minutes.
     pub eqtime_min: f32,
 }
 
-/// The sun's position at `hour` (local clock time, fractional hours) of
-/// `day_of_year` (1 = 1 January) at latitude `lat_deg` (north positive) and
-/// longitude `lon_deg` (east positive), in a time zone `tz_h` hours from UTC.
-/// NOAA GMD "General Solar Position Calculations": the fractional year from
-/// the UTC hour, the equation of time and declination series, the true solar
-/// time, the hour angle and the zenith; the azimuth as
-/// `arccos[(sin δ − sin φ·cos Z)/(cos φ·sin Z)]`, mirrored after noon; the
-/// apparent elevation with the banded refraction of NOAA's calculator.
 pub fn solar_position(lat_deg: f32, lon_deg: f32, tz_h: f32, day_of_year: u32, hour: f32) -> SolarPosition {
     let (lat, lon, tz, hour) = (lat_deg as f64, lon_deg as f64, tz_h as f64, hour as f64);
     let utc_h = hour - tz;
@@ -118,8 +55,6 @@ pub fn solar_position(lat_deg: f32, lon_deg: f32, tz_h: f32, day_of_year: u32, h
     }
 }
 
-/// Atmospheric refraction of a geometric elevation `h`, degrees, added to it
-/// (NOAA solar calculator, after Meeus; four bands).
 pub fn refraction_deg(h: f64) -> f64 {
     let t = h.to_radians().tan();
     let arcsec = if h > 85.0 {
@@ -134,16 +69,8 @@ pub fn refraction_deg(h: f64) -> f64 {
     arcsec / 3600.0
 }
 
-// ----- how much light (research lighting.md §2) -----
-
-/// The luminous solar constant, lux: the sun's illuminance outside the
-/// atmosphere at the mean Sun–Earth distance (IESNA, 127.5 klx). The year's
-/// ±3.4 % from the orbit's eccentricity is left out.
 pub const SOLAR_CONSTANT_LX: f32 = 127_500.0;
 
-/// One sky of the IESNA daylight availability model: the direct beam's
-/// extinction coefficient `c` (none: no beam gets through) and the sky's
-/// horizontal illuminance `A + B·sin^C h`, lux.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SkyType {
     pub extinction: Option<f32>,
@@ -152,28 +79,18 @@ pub struct SkyType {
     pub c: f32,
 }
 
-/// IESNA clear sky: c = 0.21; A = 0.8, B = 15.5 klx, C = 0.5.
 pub const CLEAR_SKY: SkyType = SkyType { extinction: Some(0.21), a_lx: 800.0, b_lx: 15_500.0, c: 0.5 };
-/// IESNA partly cloudy sky: c = 0.80; A = 0.3, B = 45.0 klx, C = 1.0.
 pub const PARTLY_CLOUDY_SKY: SkyType = SkyType { extinction: Some(0.80), a_lx: 300.0, b_lx: 45_000.0, c: 1.0 };
-/// IESNA overcast sky: no beam; A = 0.3, B = 21.0 klx, C = 1.0.
 pub const OVERCAST_SKY: SkyType = SkyType { extinction: None, a_lx: 300.0, b_lx: 21_000.0, c: 1.0 };
 
-/// Elevation at which civil twilight ends, degrees (the definition of civil
-/// twilight). Below the horizon the sky term fades linearly from its
-/// horizon value to nothing there (est: the IESNA model stops at h = 0).
 pub const CIVIL_TWILIGHT_DEG: f32 = -6.0;
 
-/// Relative optical air mass at an elevation (Kasten & Young 1989:
-/// `1/[cos z + 0.50572·(96.07995 − z)^−1.6364]`, z the zenith angle in
-/// degrees; about 38 at the horizon).
 pub fn air_mass(elevation_deg: f32) -> f32 {
     let z = (90.0 - elevation_deg).clamp(0.0, 90.0);
     1.0 / (z.to_radians().cos() + 0.50572 * (96.07995 - z).powf(-1.6364))
 }
 
 impl SkyType {
-    /// Direct normal and sky (diffuse horizontal) illuminance at an elevation, lux.
     pub fn components(&self, elevation_deg: f32) -> (f32, f32) {
         if elevation_deg <= 0.0 {
             let fade = (1.0 - elevation_deg / CIVIL_TWILIGHT_DEG).clamp(0.0, 1.0);
@@ -185,9 +102,6 @@ impl SkyType {
     }
 }
 
-/// Direct normal and sky illuminance under a cloud cover from 0 (clear)
-/// through 0.5 (partly cloudy) to 1 (overcast): linear between the model's
-/// three skies (est: the model gives only the three).
 pub fn sky_components(elevation_deg: f32, overcast: f32) -> (f32, f32) {
     let w = overcast.clamp(0.0, 1.0);
     let lerp = |a: (f32, f32), b: (f32, f32), t: f32| (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
@@ -199,33 +113,18 @@ pub fn sky_components(elevation_deg: f32, overcast: f32) -> (f32, f32) {
     }
 }
 
-// ----- colour (research lighting.md §3) -----
-
-/// Representative wavelengths of the red, green and blue channels, µm (est:
-/// near the dominant wavelengths of the sRGB primaries).
 pub const CHANNEL_UM: [f32; 3] = [0.61, 0.55, 0.465];
-/// Ångström turbidity of a clear sky and its wavelength exponent (research
-/// pack: β about 0.05–0.1 for a clear sky, α = 1.3).
 pub const ANGSTROM_BETA: f32 = 0.05;
 pub const ANGSTROM_ALPHA: f32 = 1.3;
-/// Relative luminance of the sRGB (BT.709) primaries.
 pub const LUMA: [f32; 3] = [0.2126, 0.7152, 0.0722];
-/// Display gamma of the frame's sRGB values (IEC 61966-2-1, ≈ 2.2).
 pub const DISPLAY_GAMMA: f32 = 2.2;
-/// Share of the global light the ground reflects onto faces that see it (est: grass and soil).
 pub const GROUND_ALBEDO: f32 = 0.2;
-/// Highest sensor gain over ISO 100: ISO 1600, the top of the OAK-D Lite
-/// RGB control range (research camera.md §4, [29]).
 pub const SENSOR_GAIN_MAX: f32 = 16.0;
 
-/// Rayleigh optical depth of the atmosphere at sea level at a wavelength in
-/// µm, `0.008569·λ⁻⁴·(1 + 0.0113·λ⁻² + 0.00013·λ⁻⁴)` (the research pack's
-/// form; the original was not re-read).
 pub fn rayleigh_depth(um: f32) -> f32 {
     0.008569 * um.powi(-4) * (1.0 + 0.0113 * um.powi(-2) + 0.00013 * um.powi(-4))
 }
 
-/// Total vertical optical depth (Rayleigh plus aerosol) of each channel.
 pub fn channel_depth() -> [f32; 3] {
     CHANNEL_UM.map(|um| rayleigh_depth(um) + ANGSTROM_BETA * um.powf(-ANGSTROM_ALPHA))
 }
@@ -239,26 +138,18 @@ fn unit_luma(c: [f32; 3]) -> [f32; 3] {
     c.map(|v| v / l)
 }
 
-/// Colour of the direct beam at an elevation, relative luminance 1: its
-/// transmission through `m − 1` more air masses than at the zenith, per channel.
 pub fn sun_colour(elevation_deg: f32) -> [f32; 3] {
     let m = air_mass(elevation_deg.max(0.0));
     let tau = channel_depth();
     unit_luma(tau.map(|t| (-(m - 1.0) * t).exp()))
 }
 
-/// Colour of the clear sky's light, relative luminance 1: the share of the
-/// beam the atmosphere scatters, proportional to each channel's optical
-/// depth (thin-atmosphere single scattering, est), going grey as clouds close.
 pub fn sky_colour(overcast: f32) -> [f32; 3] {
     let blue = unit_luma(channel_depth());
     let w = overcast.clamp(0.0, 1.0);
     blue.map(|b| b + (1.0 - b) * w)
 }
 
-/// Share of the auto exposure's target the camera reaches at an
-/// illuminance: 1 while the longest exposure (33 ms) at the highest gain
-/// covers the meter's time `t = 0.5/L` (`world::eye::exposure_s`), less below.
 pub fn exposure_reach(lux: f32) -> f32 {
     let luminance = 0.18 * lux.max(0.0) / PI;
     if luminance <= 0.0 {
@@ -267,40 +158,30 @@ pub fn exposure_reach(lux: f32) -> f32 {
     (EXPOSURE_MAX_S * SENSOR_GAIN_MAX * luminance / 0.5).min(1.0)
 }
 
-/// Unit vector toward the sun (world, y up) from an elevation and a compass azimuth.
 pub fn sun_direction(elevation_deg: f32, azimuth_deg: f32) -> [f32; 3] {
     let (se, ce) = elevation_deg.to_radians().sin_cos();
     let (sa, ca) = azimuth_deg.to_radians().sin_cos();
     [ce * sa, se, -ce * ca]
 }
 
-/// The sun and sky of a [`Lighting::Sun`], worked out once per frame.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct Daylight {
     pub elevation_deg: f32,
     pub azimuth_deg: f32,
     pub overcast: f32,
-    /// Toward the sun (world, y up).
     pub sun_dir: [f32; 3],
-    /// Direct normal, direct horizontal, sky (diffuse horizontal) and global horizontal illuminance, lux.
     pub direct_normal_lx: f32,
     pub direct_lx: f32,
     pub sky_lx: f32,
     pub global_lx: f32,
-    /// Colours of the beam and of the sky light, relative luminance 1.
     pub sun_rgb: [f32; 3],
     pub sky_rgb: [f32; 3],
-    /// Share of the exposure target the sensor reaches (1 in daylight).
     pub reach: f32,
 }
 
-/// The sky's glow around a low sun: angular scale, degrees, and its share
-/// of the sky colour at the horizon (est, for the picture only).
 const GLOW_DEG: f32 = 12.0;
 const GLOW_SHARE: f32 = 0.55;
-/// Elevation over which the glow fades as the sun climbs, degrees (est).
 const GLOW_FADE_DEG: f32 = 15.0;
-/// Angular radius of the sun's disc, degrees (0.53° across, the standard value).
 const SUN_DISC_DEG: f32 = 0.265;
 
 impl Daylight {
@@ -324,9 +205,6 @@ impl Daylight {
         }
     }
 
-    /// Light on a face with unit normal `n` (world), per channel, over the
-    /// metered horizontal illuminance (1 = a sunlit top face), linear units.
-    /// `lit`: the ray toward the sun is free.
     pub fn face_light(&self, n: [f32; 3], lit: bool) -> [f32; 3] {
         if self.global_lx <= 0.0 {
             return [0.0; 3];
@@ -342,20 +220,14 @@ impl Daylight {
         out
     }
 
-    /// The factor a face's sRGB colour is multiplied by: [`Daylight::face_light`]
-    /// times the exposure's reach, through the display gamma.
     pub fn face_gain(&self, n: [f32; 3], lit: bool) -> [f32; 3] {
         self.face_light(n, lit).map(|k| (k * self.reach).max(0.0).powf(1.0 / DISPLAY_GAMMA))
     }
 
-    /// Whether the sun stands high enough for a face to be lit directly.
     pub fn has_beam(&self) -> bool {
         self.direct_normal_lx > 0.0 && self.elevation_deg > 0.0
     }
 
-    /// The sky seen along `d` (unit): the flat sky's gradient `base` (sRGB),
-    /// greyed by clouds, warmed into a glow around a low sun, the sun's disc,
-    /// darkened when the exposure falls short.
     pub fn sky_px(&self, d: [f32; 3], base: [f32; 3]) -> [f32; 3] {
         let grey = luma(base);
         let mut c = [0.0f32; 3];
@@ -381,21 +253,15 @@ impl Daylight {
 }
 
 impl Lighting {
-    /// A sun at a place's clock: [`solar_position`] with the clock read as
-    /// mean solar time of the time zone's own meridian (longitude `15·tz`).
     pub fn from_clock(lat_deg: f32, day_of_year: u32, hour: f32) -> Lighting {
         let p = solar_position(lat_deg, 0.0, 0.0, day_of_year, hour);
         Lighting::Sun { elevation_deg: p.elevation_deg, azimuth_deg: p.azimuth_deg, overcast: 0.0 }
     }
 
-    /// One of the named times of day (`dawn`, `morning`, `noon`,
-    /// `afternoon`, `dusk`, or their Korean names): the sun over Seoul at the
-    /// March equinox at that clock.
     pub fn preset(id: &str) -> Option<Lighting> {
         PRESETS.iter().find(|p| p.id == id || p.label_ko == id).map(|p| Lighting::from_clock(PRESET_LAT_DEG, PRESET_DAY, p.hour))
     }
 
-    /// The sun and sky of this lighting (`None` for the flat mode).
     pub fn daylight(&self) -> Option<Daylight> {
         match *self {
             Lighting::Flat => None,
@@ -403,13 +269,10 @@ impl Lighting {
         }
     }
 
-    /// Illuminance the camera's exposure meters, lux: 10 000 for the flat
-    /// mode (`world::SCENE_LUX`), the global horizontal illuminance otherwise.
     pub fn scene_lux(&self) -> f32 {
         self.daylight().map_or(SCENE_LUX, |d| d.global_lx)
     }
 
-    /// What the UI shows of the lighting.
     pub fn summary(&self) -> LightSummary {
         let lux = self.scene_lux();
         let base = LightSummary {
@@ -447,15 +310,12 @@ impl Lighting {
     }
 }
 
-/// The lighting as the UI reads it.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct LightSummary {
     pub mode: &'static str,
     pub label_ko: String,
-    /// Illuminance the exposure meters, lux, and the exposure it sets, ms.
     pub lux: f32,
     pub exposure_ms: f32,
-    /// Share of the exposure target the sensor reaches.
     pub reach: f32,
     pub sun: Option<SunSummary>,
 }
@@ -470,26 +330,19 @@ pub struct SunSummary {
     pub sky_lux: f32,
     pub sun_rgb: [f32; 3],
     pub sky_rgb: [f32; 3],
-    /// Shadow length per metre of height (`1/tan h`; none without a beam).
     pub shadow_per_m: Option<f32>,
 }
 
-/// A named time of day.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct Preset {
     pub id: &'static str,
     pub label_ko: &'static str,
-    /// Clock time, hours (mean solar time of the zone's meridian).
     pub hour: f32,
 }
 
-/// Latitude of the presets, degrees north (Seoul, 37.57° N).
 pub const PRESET_LAT_DEG: f32 = 37.57;
-/// Day of the year of the presets (21 March, about the equinox: sunrise and sunset near 6 and 18 h).
 pub const PRESET_DAY: u32 = 80;
 
-/// The times of day the UI offers: just after sunrise, mid-morning, noon,
-/// mid-afternoon and just before sunset.
 pub const PRESETS: [Preset; 5] = [
     Preset { id: "dawn", label_ko: "새벽", hour: 6.25 },
     Preset { id: "morning", label_ko: "아침", hour: 9.0 },
@@ -499,17 +352,14 @@ pub const PRESETS: [Preset; 5] = [
 ];
 
 impl World {
-    /// The lighting of the world (`WorldConfig::lighting`).
     pub fn lighting(&self) -> Lighting {
         self.cfg.lighting
     }
 
-    /// Changes the lighting; nothing else in the world changes with it.
     pub fn set_lighting(&mut self, lighting: Lighting) {
         self.cfg.lighting = lighting;
     }
 
-    /// Illuminance the head camera's exposure meters now, lux.
     pub fn scene_lux(&self) -> f32 {
         self.cfg.lighting.scene_lux()
     }
@@ -528,7 +378,6 @@ mod tests {
         assert!(Lighting::Flat.daylight().is_none());
         let w = World::new(WorldConfig::default()).unwrap();
         assert_eq!(w.scene_lux(), 10_000.0);
-        // The serialised default reads back, and an old config without the field is flat.
         let v = serde_json::to_value(Lighting::Sun { elevation_deg: 30.0, azimuth_deg: 200.0, overcast: 0.0 }).unwrap();
         assert_eq!(v["mode"], "sun");
         assert_eq!(serde_json::from_value::<Lighting>(v).unwrap(), Lighting::Sun { elevation_deg: 30.0, azimuth_deg: 200.0, overcast: 0.0 });
@@ -537,27 +386,20 @@ mod tests {
 
     #[test]
     fn the_sun_follows_the_noaa_series() {
-        // Equinox noon: the sun stands at 90° − latitude in the south.
         let noon = solar_position(37.57, 0.0, 0.0, 80, 12.0);
         assert!((noon.elevation_deg - (90.0 - 37.57)).abs() < 1.5, "{noon:?}");
         assert!((noon.azimuth_deg - 180.0).abs() < 4.0, "{noon:?}");
-        // Morning in the east, afternoon in the west, mirrored about solar noon
-        // (the clock's noon shifted by the equation of time).
         let solar_noon = 12.0 - noon.eqtime_min / 60.0;
         let am = solar_position(37.57, 0.0, 0.0, 80, solar_noon - 3.0);
         let pm = solar_position(37.57, 0.0, 0.0, 80, solar_noon + 3.0);
         assert!(am.azimuth_deg > 90.0 && am.azimuth_deg < 180.0 && pm.azimuth_deg > 180.0 && pm.azimuth_deg < 270.0, "{am:?} {pm:?}");
         assert!((am.elevation_deg - pm.elevation_deg).abs() < 0.2 && (am.azimuth_deg + pm.azimuth_deg - 360.0).abs() < 0.5, "{am:?} {pm:?}");
         assert!(am.hour_angle_deg < 0.0 && pm.hour_angle_deg > 0.0);
-        // The June solstice's declination is the tilt of the axis; December's its negative.
         assert!((solar_position(0.0, 0.0, 0.0, 172, 12.0).declination_deg - 23.44).abs() < 0.3);
         assert!((solar_position(0.0, 0.0, 0.0, 355, 12.0).declination_deg + 23.44).abs() < 0.3);
-        // Night: below the horizon.
         assert!(solar_position(37.57, 0.0, 0.0, 80, 0.0).elevation_deg < -40.0);
-        // A longitude east of the zone's meridian brings noon earlier by 4 min per degree.
         let east = solar_position(37.57, 7.5, 0.0, 80, 11.5);
         assert!((east.hour_angle_deg - noon.hour_angle_deg).abs() < 0.2, "{east:?}");
-        // Refraction lifts the sun most at the horizon (about half a degree).
         assert!(refraction_deg(0.0) > 0.45 && refraction_deg(0.0) < 0.5 && refraction_deg(45.0) < 0.02 && refraction_deg(89.0) == 0.0);
     }
 
@@ -570,16 +412,12 @@ mod tests {
             assert!(lux(h) > last, "{h}: {} after {last}", lux(h));
             last = lux(h);
         }
-        // Computed from the model's own equations (research lighting.md §2): h = 30° about 53.6 klx, 60° about 102 klx.
         assert!((lux(30.0) - 53_600.0).abs() < 1_500.0 && (lux(60.0) - 101_900.0).abs() < 2_000.0, "{} {}", lux(30.0), lux(60.0));
-        // Low sun: the sky gives most of the light.
         let low = Daylight::new(5.0, 90.0, 0.0);
         assert!(low.sky_lx / low.global_lx > 0.7);
-        // Overcast: no beam, much less light.
         let grey = Daylight::new(45.0, 180.0, 1.0);
         assert_eq!(grey.direct_normal_lx, 0.0);
         assert!(grey.global_lx < 0.3 * lux(45.0));
-        // Past civil twilight it is dark: the frame goes black.
         assert_eq!(Daylight::new(-7.0, 270.0, 0.0).global_lx, 0.0);
         assert_eq!(Daylight::new(-7.0, 270.0, 0.0).face_gain([0.0, 1.0, 0.0], true), [0.0; 3]);
         assert!(exposure_reach(100_000.0) == 1.0 && exposure_reach(5.0) < 0.5);
@@ -593,7 +431,6 @@ mod tests {
         let sky = sky_colour(0.0);
         assert!(sky[2] > sky[1] && sky[1] > sky[0]);
         assert!(sky_colour(1.0).iter().all(|&v| (v - 1.0).abs() < 1e-6));
-        // A sunlit top face renders as the flat mode's top face; one in shadow much darker.
         let d = Daylight::new(50.0, 180.0, 0.0);
         let lit = d.face_light([0.0, 1.0, 0.0], true);
         assert!((luma(lit) - 1.0).abs() < 1e-3);
@@ -608,7 +445,6 @@ mod tests {
         assert!((north[2] + 1.0).abs() < 1e-6);
         let south_high = sun_direction(60.0, 180.0);
         assert!(south_high[2] > 0.0 && (south_high[1] - 60f32.to_radians().sin()).abs() < 1e-6);
-        // A wall facing the sun gets more light than the one facing away.
         let d = Daylight::new(30.0, 90.0, 0.0);
         assert!(luma(d.face_light([1.0, 0.0, 0.0], true)) > 2.0 * luma(d.face_light([-1.0, 0.0, 0.0], true)));
     }

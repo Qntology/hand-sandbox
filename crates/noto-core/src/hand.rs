@@ -1,6 +1,3 @@
-//! Hand configuration: finger count presets, joint options and base choice,
-//! and the geometry each configuration builds.
-
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -10,13 +7,9 @@ use crate::finger::FingerSpec;
 use crate::joint::{Actuation, JointKind, JointSpec};
 use crate::math::Vec3;
 
-/// Torque of the proximal (knuckle) joint, N·m.
 const KNUCKLE_TORQUE_NM: f32 = 1.2;
-/// Torque of every distal joint, N·m.
 const DISTAL_TORQUE_NM: f32 = 0.4;
-/// Drive speed of every joint, rad/s (360 deg/s).
 const JOINT_SPEED_RAD_S: f32 = std::f32::consts::TAU;
-/// Lateral width of the palm for each finger count, metres.
 const PALM_WIDTH_M: f32 = 0.09;
 const PALM_LENGTH_M: f32 = 0.10;
 
@@ -41,7 +34,6 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-/// Number of fingers, including the thumb when the preset has one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "u8", into = "u8")]
 pub enum FingerCount {
@@ -89,20 +81,15 @@ impl From<FingerCount> for u8 {
     }
 }
 
-/// Joint options applied to every finger of the hand.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct JointOptions {
-    /// Joints per finger, 2 to 4.
     pub segments: u8,
-    /// Kind of the proximal knuckle joint.
     pub base_kind: JointKind,
-    /// Kind of every other joint in the finger.
     pub distal_kind: JointKind,
     pub actuation: Actuation,
 }
 
 impl Default for JointOptions {
-    /// Human-like finger: universal knuckle, hinge joints, tendon-style coupling.
     fn default() -> Self {
         JointOptions {
             segments: 3,
@@ -113,7 +100,6 @@ impl Default for JointOptions {
     }
 }
 
-/// Full choice for one robot: fingers, joints and the locomotion base.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NotoConfig {
     pub fingers: FingerCount,
@@ -122,12 +108,6 @@ pub struct NotoConfig {
 }
 
 impl NotoConfig {
-    /// Default configuration for a finger count.
-    ///
-    /// * 2 fingers: parallel-jaw style pinch gripper, hinge joints, direct drive.
-    /// * 3 fingers: thumb and two fingers (tripod).
-    /// * 4 fingers: thumb and three fingers.
-    /// * 5 fingers: human-like hand with tendon-coupled fingers.
     pub fn preset(fingers: FingerCount) -> Self {
         let joints = match fingers {
             FingerCount::Two => JointOptions {
@@ -156,7 +136,6 @@ impl NotoConfig {
         Ok(())
     }
 
-    /// Builds the hand geometry. Fails when the options are out of range.
     pub fn build(&self) -> Result<Hand, ConfigError> {
         self.validate()?;
         let fingers = layout(self.fingers)
@@ -181,7 +160,6 @@ pub struct PalmSpec {
     pub length: f32,
 }
 
-/// A built hand: geometry for every finger plus the locomotion base.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Hand {
     pub config: NotoConfig,
@@ -190,7 +168,6 @@ pub struct Hand {
     pub base: BaseSpec,
 }
 
-/// Where one finger sits on the palm.
 struct Slot {
     name: &'static str,
     thumb: bool,
@@ -215,7 +192,6 @@ impl Slot {
     }
 }
 
-/// Finger placement per finger count. Fingers flex toward +Y (palm side).
 fn layout(count: FingerCount) -> Vec<Slot> {
     match count {
         FingerCount::Two => vec![
@@ -244,7 +220,6 @@ fn layout(count: FingerCount) -> Vec<Slot> {
 }
 
 fn segment_lengths(n: usize, thumb: bool) -> Vec<f32> {
-    // Thumbs are a little shorter than fingers in the proximal segments.
     let base: &[f32] = match (n, thumb) {
         (2, _) => &[0.050, 0.035],
         (3, true) => &[0.040, 0.028, 0.020],
@@ -254,14 +229,12 @@ fn segment_lengths(n: usize, thumb: bool) -> Vec<f32> {
     base.to_vec()
 }
 
-/// Limits for joint `index` of a finger. Index 0 is the knuckle.
 fn joint_spec(options: &JointOptions, index: usize, thumb: bool) -> JointSpec {
     let (kind, torque) = if index == 0 {
         (options.base_kind, KNUCKLE_TORQUE_NM)
     } else {
         (options.distal_kind, DISTAL_TORQUE_NM)
     };
-    // Approximate human flexion ranges per joint, editable in the config.
     let flex_max_deg: f32 = match index {
         0 => 90.0,
         1 => 100.0,

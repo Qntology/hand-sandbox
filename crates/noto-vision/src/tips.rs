@@ -1,45 +1,3 @@
-//! TIPSv2-B/14 DPT depth on candle: the depth path of `google/tipsv2-b14-dpt`,
-//! ported from the official PyTorch code (`image_encoder.py` for the ViT,
-//! `dpt_head.py` for the decoder). Only `vision_encoder.*` and `depth_head.*`
-//! are read from the checkpoint; the normals and segmentation heads that share
-//! the file are never loaded.
-//!
-//! The pipeline, with the shapes of a 384x256 keyframe:
-//!
-//! 1. The image is resized to a whole number of 14 px patches (504x336, a
-//!    36x24 grid; see [`InputGrid`]) and scaled to `[0, 1]`. TIPS takes raw
-//!    `ToTensor()` pixels: there is no mean/std normalisation.
-//! 2. A DINOv2-style ViT-B/14 (12 blocks, LayerScale, one register token)
-//!    runs over `[cls, register, patches]`. The learned positions belong to
-//!    the 448x448 training grid (32x32) and are resized to the input grid with
-//!    PyTorch's antialiased bilinear filter, because that is what the
-//!    reference does and a 24-row grid is a downsample of the 32-row table.
-//! 3. Blocks 3, 6, 9 and 12 (counting from one; [`TipsConfig::tap_blocks`]
-//!    is 0-based) are tapped, each through the final LayerNorm, as
-//!    (cls, patch) pairs. DPT reassembles them at 4x, 2x, 1x and 1/2x of the
-//!    patch grid, fuses them coarse to fine (each fusion block doubles the
-//!    size) and ends at 8x the patch grid.
-//! 4. A linear classifier gives 256 logits per pixel over depth bins spaced
-//!    evenly between 0.001 and 10 m. The depth is the expectation over the
-//!    bins, so it can never leave that range, which is why the model reports
-//!    [`DepthModel::max_depth_m`] and the decision step must triangulate
-//!    anything farther.
-//! 5. The map is resized bilinearly to the keyframe's own size.
-//!
-//! Numerics follow the Python line by line (exact-erf GELU in the ViT, the
-//! align-corners upsample inside the fusion blocks, the skip resized to the
-//! upsampled path when their sizes differ). The readout projection's GELU is
-//! the tanh approximation (`readout_act: "gelu_pytorch_tanh"` in the
-//! checkpoint's `config.json`, also Hugging Face's `Tipsv2DptConfig` default);
-//! before v1.0 this port used the exact form there
-//! ([`TipsConfig::readout_gelu_tanh`]). v1.0 compared the port with the
-//! Hugging Face implementation on rendered keyframes (`docs/research/ml-ab.md`).
-//!
-//! Besides the expected depth, the bin distribution gives a spread (its
-//! standard deviation): [`TipsDepth::predict_batch_spread`] returns it for the
-//! A/B harness, and [`TipsDepth::max_rel_spread`] can mark pixels whose
-//! distribution is too flat as unknown.
-
 use std::path::Path;
 
 use anyhow::{bail, Context};
@@ -49,44 +7,24 @@ use candle_nn::{
     ConvTranspose2dConfig, LayerNorm, Linear, VarBuilder,
 };
 
-// The position table resize of the reference, shared with the SigLIP2 tower.
 use noto_ml::vision::antialias_bilinear_weights;
 
 use crate::depth::{clamp_metric, DepthModel};
 use crate::frame::{DepthKind, DepthMap, Rgb};
 
-/// Name reported by [`DepthModel::mode`].
 pub const MODE: &str = "tipsv2-b14-dpt";
-/// Folder the caller loads from when [`DIR_ENV`] is not set.
 pub const DEFAULT_DIR: &str = "models/tipsv2-b14-dpt";
-/// Environment variable that overrides [`DEFAULT_DIR`]. The caller resolves
-/// it; [`TipsDepth::load`] only ever sees the final folder.
 pub const DIR_ENV: &str = "TIPS_DIR";
-/// The checkpoint inside the model folder.
 pub const WEIGHTS_FILE: &str = "model.safetensors";
-/// Optional configuration inside the model folder.
 pub const CONFIG_FILE: &str = "config.json";
 
-/// Patches along the shorter image side by default. 24 patches (336 px) turn
-/// the 384x256 keyframes into 504x336, a 36x24 grid that keeps the 3:2 aspect
-/// exactly and stays under the 32x32 = 1024 tokens of the training
-/// resolution, so the position table is only mildly resampled.
 pub const DEFAULT_SHORT_SIDE_PATCHES: usize = 24;
 
-/// Number of ViT blocks the DPT decoder taps.
 const DPT_LEVELS: usize = 4;
-/// Every fusion block ends with a 2x bilinear upsample.
 const FUSION_UPSAMPLE: usize = 2;
-/// Kernel of the stride-2 conv that halves the deepest level.
 const DOWN_KERNEL: usize = 3;
-/// 3x3 convs keep their size with one pixel of padding.
 const SAME_PAD_3X3: usize = 1;
 
-/// How `ReassembleBlocks` resamples each tapped level relative to the patch
-/// grid, in tap order: 4x and 2x up with transposed convs whose kernel equals
-/// the stride (every patch becomes a block of pixels), unchanged, and 2x down
-/// with a 3x3 stride-2 conv. With the 2x of the last fusion block the depth
-/// map lands at 8x the patch grid.
 #[derive(Clone, Copy, Debug)]
 enum LevelScale {
     Up(usize),
@@ -96,8 +34,6 @@ enum LevelScale {
 
 const LEVEL_SCALES: [LevelScale; DPT_LEVELS] = [LevelScale::Up(4), LevelScale::Up(2), LevelScale::Keep, LevelScale::Down(2)];
 
-/// Architecture of the checkpoint. Defaults match `google/tipsv2-b14-dpt`
-/// (and every shape in its safetensors header).
 #[derive(Clone, Debug, PartialEq)]
 pub struct TipsConfig {
     pub hidden: usize,
@@ -105,27 +41,15 @@ pub struct TipsConfig {
     pub heads: usize,
     pub mlp_hidden: usize,
     pub patch_size: usize,
-    /// Training resolution. `image_size / patch_size` is the side of the
-    /// square position table (448 / 14 = 32).
     pub image_size: usize,
-    /// Extra cls-like tokens without a position, placed right after cls.
     pub register_tokens: usize,
     pub layer_norm_eps: f64,
-    /// 0-based ViT blocks whose (normed) output feeds the DPT levels, shallow first.
     pub tap_blocks: [usize; DPT_LEVELS],
-    /// Channels of the four reassembled levels.
     pub post_process_channels: [usize; DPT_LEVELS],
-    /// Channels inside the fusion stage.
     pub dpt_channels: usize,
     pub depth_bins: usize,
-    /// Centre of the first bin, metres. The decoder also adds it to every
-    /// rectified logit, so no bin ever has zero weight.
     pub min_depth: f32,
-    /// Centre of the last bin, metres: the farthest the model can answer.
     pub max_depth: f32,
-    /// The readout projection's GELU is the tanh approximation
-    /// (`gelu_pytorch_tanh`), as the checkpoint's config says; `false` is the
-    /// exact erf form this port used before v1.0.
     pub readout_gelu_tanh: bool,
 }
 
@@ -152,19 +76,11 @@ impl Default for TipsConfig {
 }
 
 impl TipsConfig {
-    /// Reads a `config.json`. Missing fields keep their defaults.
     pub fn from_file(path: &Path) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         Self::from_json(&raw).with_context(|| format!("parsing {}", path.display()))
     }
 
-    /// Field names follow the Python constructors (`embed_dim`, `img_size`,
-    /// `post_process_channels`, `num_depth_bins`, ...) with the Hugging Face
-    /// spellings as aliases. The layout of the published `config.json` is not
-    /// pinned down, so unknown fields are ignored and the defaults, which match
-    /// the checkpoint, fill the gaps. `out_indices` uses the Hugging Face
-    /// backbone convention where stage 0 is the patch embedding, so
-    /// `[3, 6, 9, 12]` means blocks 2, 5, 8 and 11.
     pub fn from_json(raw: &str) -> anyhow::Result<Self> {
         let v: serde_json::Value = serde_json::from_str(raw)?;
         if let Some(f) = v["vision_fn"].as_str() {
@@ -220,7 +136,6 @@ impl TipsConfig {
         })
     }
 
-    /// Side of the square position table.
     pub fn position_side(&self) -> usize {
         self.image_size / self.patch_size
     }
@@ -242,15 +157,9 @@ impl TipsConfig {
     }
 }
 
-/// Patch grid a keyframe is resized to before the ViT. The model accepts any
-/// grid; more patches mean finer depth (8 px of output per patch) at a
-/// quadratic attention cost.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InputGrid {
-    /// The shorter image side becomes this many patches, the longer side the
-    /// nearest count that keeps the aspect ratio.
     ShortSide(usize),
-    /// Always this grid, whatever the image aspect.
     Fixed { cols: usize, rows: usize },
 }
 
@@ -261,7 +170,6 @@ impl Default for InputGrid {
 }
 
 impl InputGrid {
-    /// `(cols, rows)` for an image of `width x height` pixels, at least one patch each way.
     pub fn grid_for(self, width: u32, height: u32) -> (usize, usize) {
         match self {
             InputGrid::Fixed { cols, rows } => (cols.max(1), rows.max(1)),
@@ -279,7 +187,6 @@ impl InputGrid {
     }
 }
 
-/// Self-attention with the fused `qkv` projection of DINOv2.
 struct Attention {
     qkv: Linear,
     proj: Linear,
@@ -293,12 +200,9 @@ impl Attention {
         Ok(Attention { qkv: linear(d, 3 * d, vb.pp("qkv"))?, proj: linear(d, d, vb.pp("proj"))?, heads: cfg.heads, head_dim: d / cfg.heads })
     }
 
-    /// `x` is `(batch, tokens, hidden)`.
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let (b, n, d) = x.dims3()?;
         let qkv = self.qkv.forward(x)?;
-        // The Python reshapes to (b, n, 3, heads, head_dim): q, k and v are the
-        // three consecutive `hidden`-wide slices of the projection.
         let split = |i: usize| -> candle_core::Result<Tensor> {
             qkv.narrow(D::Minus1, i * d, d)?.reshape((b, n, self.heads, self.head_dim))?.transpose(1, 2)?.contiguous()
         };
@@ -310,7 +214,6 @@ impl Attention {
     }
 }
 
-/// Pre-norm transformer block with LayerScale on both residual branches.
 struct Block {
     norm1: LayerNorm,
     attn: Attention,
@@ -338,28 +241,22 @@ impl Block {
 
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let x = (x + self.attn.forward(&self.norm1.forward(x)?)?.broadcast_mul(&self.ls1)?)?;
-        // `nn.GELU()` defaults to the exact erf form, not the tanh approximation.
         let mlp = self.fc2.forward(&self.fc1.forward(&self.norm2.forward(&x)?)?.gelu_erf()?)?;
         &x + mlp.broadcast_mul(&self.ls2)?
     }
 }
 
-/// One tapped block output after the final norm.
 struct Tap {
-    /// `(batch, hidden)`.
     cls: Tensor,
-    /// `(batch, rows * cols, hidden)`, row-major over the patch grid.
     patches: Tensor,
     rows: usize,
     cols: usize,
 }
 
-/// The TIPSv2 image encoder (`vision_encoder.*`), up to the last tapped block.
 struct Encoder {
     patch_embed: Conv2d,
     cls_token: Tensor,
     register_tokens: Option<Tensor>,
-    /// `(1, 1 + side * side, hidden)`: the cls position, then the square grid.
     pos_embed: Tensor,
     blocks: Vec<Block>,
     norm: LayerNorm,
@@ -377,8 +274,6 @@ impl Encoder {
             0 => None,
             r => Some(vb.get((1, r, d), "register_tokens")?),
         };
-        // `mask_token` is only substituted for masked patches during
-        // pre-training (`prepare_tokens_with_masks` with masks), never at inference.
         Ok(Encoder {
             patch_embed: conv2d(3, d, cfg.patch_size, patch_cfg, vb.pp("patch_embed").pp("proj"))?,
             cls_token: vb.get((1, 1, d), "cls_token")?,
@@ -393,10 +288,6 @@ impl Encoder {
         })
     }
 
-    /// Positions for a `rows x cols` grid, `(1, 1 + rows * cols, hidden)`.
-    /// `interpolate_pos_encoding` resizes the patch table with
-    /// `F.interpolate(size=..., mode="bilinear", antialias=True)`; the filter
-    /// is separable, so it is two small matrix products here.
     fn positions(&self, rows: usize, cols: usize) -> candle_core::Result<Tensor> {
         let (side, d) = (self.side, self.hidden);
         if (rows, cols) == (side, side) {
@@ -411,15 +302,12 @@ impl Encoder {
         Tensor::cat(&[&self.pos_embed.narrow(1, 0, 1)?, &grid], 1)
     }
 
-    /// `pixels` is `(batch, 3, h, w)` in `[0, 1]` with `h` and `w` multiples of
-    /// the patch size. Returns the tapped blocks, shallow first.
     fn taps(&self, pixels: &Tensor) -> candle_core::Result<Vec<Tap>> {
         let (b, _, h, w) = pixels.dims4()?;
         let (rows, cols, d) = (h / self.patch_size, w / self.patch_size, self.hidden);
         let n = rows * cols;
         let patches = self.patch_embed.forward(pixels)?.flatten_from(2)?.transpose(1, 2)?;
         let cls = self.cls_token.broadcast_as((b, 1, d))?;
-        // Positions go on [cls, patches]; registers are inserted afterwards and get none.
         let mut x = Tensor::cat(&[&cls, &patches], 1)?.broadcast_add(&self.positions(rows, cols)?)?;
         let registers = match &self.register_tokens {
             Some(r) => {
@@ -434,7 +322,6 @@ impl Encoder {
         for (i, block) in self.blocks.iter().enumerate().take(last + 1) {
             x = block.forward(&x)?;
             if self.tap_blocks.contains(&i) {
-                // `get_intermediate_layers(norm=True)`: every tap goes through the final norm.
                 let normed = self.norm.forward(&x)?;
                 taps.push(Tap {
                     cls: normed.narrow(1, 0, 1)?.squeeze(1)?,
@@ -448,7 +335,6 @@ impl Encoder {
     }
 }
 
-/// `ReassembleBlocks` with the `project` readout for one level.
 struct ReassembleLevel {
     readout: Linear,
     out_projection: Conv2d,
@@ -482,8 +368,6 @@ impl ReassembleLevel {
         })
     }
 
-    /// Every patch sees the cls token through `concat[patch, cls] -> Linear -> GELU`,
-    /// then a 1x1 conv sets the level's channels and the resize its scale.
     fn forward(&self, tap: &Tap) -> candle_core::Result<Tensor> {
         let (b, n, d) = tap.patches.dims3()?;
         let readout = tap.cls.unsqueeze(1)?.broadcast_as((b, n, d))?;
@@ -499,7 +383,6 @@ impl ReassembleLevel {
     }
 }
 
-/// `PreActResidualConvUnit`: `x + conv2(relu(conv1(relu(x))))`, both convs without bias.
 struct ResidualUnit {
     conv1: Conv2d,
     conv2: Conv2d,
@@ -517,7 +400,6 @@ impl ResidualUnit {
     }
 }
 
-/// `FeatureFusionBlock`: add the refined skip (if any), refine, upsample 2x, 1x1 conv.
 struct FusionBlock {
     residual_unit: Option<ResidualUnit>,
     main_unit: ResidualUnit,
@@ -537,28 +419,22 @@ impl FusionBlock {
         let mut x = x.clone();
         if let (Some(unit), Some(skip)) = (&self.residual_unit, skip) {
             let (_, _, h, w) = x.dims4()?;
-            // On grids with an odd side the halved deepest level rounds up, so
-            // the upsampled path can outgrow the skip; the Python resizes the
-            // skip to it (plain bilinear, half-pixel centres).
             let skip = if skip.dims() != x.dims() { skip.upsample_bilinear2d(h, w, false)? } else { skip.clone() };
             x = (x + unit.forward(&skip)?)?;
         }
         let x = self.main_unit.forward(&x)?;
         let (_, _, h, w) = x.dims4()?;
-        // The Scenic reference upsamples with align_corners=True here.
         let x = x.upsample_bilinear2d(h * FUSION_UPSAMPLE, w * FUSION_UPSAMPLE, true)?;
         self.out_conv.forward(&x)
     }
 }
 
-/// `DPTDepthHead` (`depth_head.*`).
 struct DepthHead {
     reassemble: Vec<ReassembleLevel>,
     convs: Vec<Conv2d>,
     fusion: Vec<FusionBlock>,
     project: Conv2d,
     classifier: Linear,
-    /// `(bins,)` bin centres in metres.
     centers: Tensor,
     min_depth: f64,
 }
@@ -571,7 +447,6 @@ impl DepthHead {
         let convs = (0..DPT_LEVELS)
             .map(|i| conv2d_no_bias(cfg.post_process_channels[i], ch, 3, same, vb.pp("convs").pp(i)))
             .collect::<candle_core::Result<_>>()?;
-        // The first block starts from the deepest level alone; the others add a skip.
         let fusion = (0..DPT_LEVELS).map(|i| FusionBlock::new(ch, i > 0, vb.pp("fusion_blocks").pp(i))).collect::<candle_core::Result<_>>()?;
         Ok(DepthHead {
             reassemble,
@@ -584,9 +459,6 @@ impl DepthHead {
         })
     }
 
-    /// Depth in metres, `(batch, 1, 8 * rows, 8 * cols)` (rounded up on odd
-    /// grids), and with `spread` the standard deviation of the bin
-    /// distribution in metres, same shape.
     fn forward(&self, taps: &[Tap], spread: bool) -> candle_core::Result<(Tensor, Option<Tensor>)> {
         let levels: Vec<Tensor> = taps
             .iter()
@@ -594,7 +466,6 @@ impl DepthHead {
             .zip(&self.convs)
             .map(|((tap, level), conv)| conv.forward(&level.forward(tap)?))
             .collect::<candle_core::Result<_>>()?;
-        // Coarse to fine: block 0 takes the deepest level, block i adds level 3 - i.
         let mut out = self.fusion[0].forward(&levels[DPT_LEVELS - 1], None)?;
         for (i, block) in self.fusion.iter().enumerate().skip(1) {
             out = block.forward(&out, Some(&levels[DPT_LEVELS - 1 - i]))?;
@@ -610,27 +481,18 @@ impl DepthHead {
     }
 }
 
-/// `torch.linspace(min, max, bins)` on `device`.
 fn bin_centers(min: f32, max: f32, bins: usize, device: &Device) -> candle_core::Result<Tensor> {
     let step = (max as f64 - min as f64) / (bins - 1) as f64;
     let centers: Vec<f32> = (0..bins).map(|i| (min as f64 + step * i as f64) as f32).collect();
     Tensor::from_vec(centers, bins, device)
 }
 
-/// Metric depth from bin logits `(..., bins)` -> `(...)`, as `DPTDepthHead`
-/// does it: rectify, add `min_depth` so every bin keeps some weight, normalise
-/// to a distribution and take the expected bin centre. The result is a convex
-/// combination of the centres, so it always lies in `[min_depth, max_depth]`.
 fn decode_bins(logits: &Tensor, centers: &Tensor, min_depth: f64) -> candle_core::Result<Tensor> {
     let p = (logits.relu()? + min_depth)?;
     let p = p.broadcast_div(&p.sum_keepdim(D::Minus1)?)?;
     p.broadcast_mul(centers)?.sum(D::Minus1)
 }
 
-/// [`decode_bins`] plus the standard deviation of the same distribution over
-/// the bin centres, `sqrt(E[c^2] - E[c]^2)`, metres. A flat distribution (the
-/// head does not know) has a large spread and its expectation drifts toward
-/// the middle of the range.
 fn decode_bins_spread(logits: &Tensor, centers: &Tensor, min_depth: f64) -> candle_core::Result<(Tensor, Tensor)> {
     let p = (logits.relu()? + min_depth)?;
     let p = p.broadcast_div(&p.sum_keepdim(D::Minus1)?)?;
@@ -640,23 +502,16 @@ fn decode_bins_spread(logits: &Tensor, centers: &Tensor, min_depth: f64) -> cand
     Ok((mean, var.sqrt()?))
 }
 
-/// `google/tipsv2-b14-dpt` metric depth.
 pub struct TipsDepth {
     cfg: TipsConfig,
     encoder: Encoder,
     head: DepthHead,
     device: Device,
-    /// Patch grid keyframes are resized to; see [`InputGrid`].
     pub input_grid: InputGrid,
-    /// Pixels whose bin spread exceeds this share of their depth are marked
-    /// unknown (`INFINITY`). `None` (the default) keeps every answer.
     pub max_rel_spread: Option<f32>,
 }
 
 impl TipsDepth {
-    /// Loads `model.safetensors` (memory-mapped, F32) and, when present,
-    /// `config.json` from `dir`. The caller picks `dir`: `$TIPS_DIR` when set,
-    /// otherwise [`DEFAULT_DIR`].
     pub fn load(dir: &Path, device: &Device) -> anyhow::Result<Self> {
         let weights = dir.join(WEIGHTS_FILE);
         if !weights.exists() {
@@ -668,13 +523,10 @@ impl TipsDepth {
         }
         let config_path = dir.join(CONFIG_FILE);
         let cfg = if config_path.exists() { TipsConfig::from_file(&config_path)? } else { TipsConfig::default() };
-        // SAFETY: the file is only read, and the mapping lives as long as the model.
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[&weights], DType::F32, device)? };
         Self::from_var_builder(cfg, vb, device).with_context(|| format!("loading {}", weights.display()))
     }
 
-    /// Builds the model from any `VarBuilder` rooted at the checkpoint (it
-    /// reads `vision_encoder.*` and `depth_head.*`). Tests use synthetic tensors.
     pub fn from_var_builder(cfg: TipsConfig, vb: VarBuilder, device: &Device) -> anyhow::Result<Self> {
         cfg.validate()?;
         let encoder = Encoder::new(&cfg, vb.pp("vision_encoder"))?;
@@ -686,8 +538,6 @@ impl TipsDepth {
         &self.cfg
     }
 
-    /// Switches the readout GELU between the tanh form of the reference
-    /// (`true`) and the exact form (`false`, this port before v1.0).
     pub fn set_readout_gelu_tanh(&mut self, on: bool) {
         self.cfg.readout_gelu_tanh = on;
         for level in &mut self.head.reassemble {
@@ -695,26 +545,15 @@ impl TipsDepth {
         }
     }
 
-    /// Metric depth at the keyframe's size. Takes `&self` so one loaded model
-    /// can serve several callers.
     pub fn predict(&self, rgb: &Rgb) -> anyhow::Result<DepthMap> {
         let mut out = self.predict_batch(&[rgb])?;
         Ok(out.pop().expect("one map per frame"))
     }
 
-    /// [`TipsDepth::predict`] for many keyframes. Frames of one size share the
-    /// input grid and go through the encoder and the DPT head together, as
-    /// many per pass as the device's [`noto_ml::BatchPolicy`] allows for that
-    /// grid. Batch rows never mix (attention is per image, convolutions per
-    /// sample), so every map equals the single-frame one up to float
-    /// rounding. The idle device pool is trimmed afterwards.
     pub fn predict_batch(&self, frames: &[&Rgb]) -> anyhow::Result<Vec<DepthMap>> {
         Ok(self.run_batch(frames, false)?.into_iter().map(|(d, _)| d).collect())
     }
 
-    /// [`TipsDepth::predict_batch`] with the spread of each pixel's bin
-    /// distribution (metres, same size), for measuring how far the
-    /// expectation can be trusted.
     pub fn predict_batch_spread(&self, frames: &[&Rgb]) -> anyhow::Result<Vec<(DepthMap, DepthMap)>> {
         Ok(self.run_batch(frames, true)?.into_iter().map(|(d, s)| (d, s.expect("spread was asked for"))).collect())
     }
@@ -743,8 +582,6 @@ impl TipsDepth {
                 let sd = sd.map(|t| t.upsample_bilinear2d(h as usize, w as usize, false)).transpose()?;
                 for (k, &i) in chunk.iter().enumerate() {
                     let mut map = DepthMap { width: w, height: h, kind: DepthKind::Metric, data: depth.get(k)?.flatten_all()?.to_vec1()? };
-                    // The expectation cannot leave the bin range; this only removes float
-                    // rounding past the last centre.
                     clamp_metric(&mut map, self.cfg.max_depth);
                     let sd = match &sd {
                         Some(t) => Some(DepthMap { width: w, height: h, kind: DepthKind::Metric, data: t.get(k)?.flatten_all()?.to_vec1()? }),
@@ -766,8 +603,6 @@ impl TipsDepth {
     }
 }
 
-/// `(1, 3, height, width)` in `[0, 1]`. Resizing uses the triangle (bilinear)
-/// filter, which also antialiases when the keyframe is larger than the input.
 fn model_input(rgb: &Rgb, width: u32, height: u32, device: &Device) -> anyhow::Result<Tensor> {
     let resized;
     let data: &[u8] = if (rgb.width, rgb.height) == (width, height) {
@@ -819,22 +654,13 @@ mod tests {
 
     use super::*;
 
-    /// Prefixes of the checkpoint the depth path may read.
     const DEPTH_PREFIXES: [&str; 2] = ["vision_encoder.", "depth_head."];
-    /// In the checkpoint but deliberately unread: the masked-patch token of pre-training.
     const UNUSED_AT_INFERENCE: [&str; 1] = ["vision_encoder.mask_token"];
-    /// Synthetic weights are uniform in `[-WEIGHT_RANGE, WEIGHT_RANGE]`, small
-    /// enough that 12 blocks keep the activations tame.
     const WEIGHT_RANGE: f32 = 0.05;
 
-    /// Tensor name -> shape.
     type Shapes = BTreeMap<String, Vec<usize>>;
-    /// Names the model asked the backend for, shared with the test after the
-    /// `VarBuilder` has taken the backend.
     type Requested = Arc<Mutex<BTreeSet<String>>>;
 
-    /// Names and shapes of `google/tipsv2-b14-dpt/model.safetensors`, read
-    /// from its header (data offsets dropped; every tensor is F32).
     fn checkpoint_shapes() -> Shapes {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/tipsv2_b14_dpt_header.json");
         let raw = std::fs::read_to_string(&path).unwrap();
@@ -851,14 +677,10 @@ mod tests {
 
     #[derive(Clone, Copy)]
     enum Fill {
-        /// Small random values, for running the model.
         Random,
-        /// One broadcast zero per tensor: no memory, for construction only.
         Zero,
     }
 
-    /// Serves exactly the depth-path tensors of the real header, refuses any
-    /// other name or shape, and records what the model asked for.
     struct HeaderBackend {
         shapes: Shapes,
         fill: Fill,
@@ -917,7 +739,6 @@ mod tests {
     #[test]
     fn runs_on_every_name_and_shape_of_the_real_checkpoint() {
         let (mut model, _, _) = header_model(Fill::Random);
-        // 4x3 patches: the odd row count also drives the skip resize in the fusion blocks.
         model.input_grid = InputGrid::Fixed { cols: 4, rows: 3 };
         let cfg = model.config().clone();
         let map = model.infer(&gradient(50, 37)).unwrap();
@@ -951,7 +772,7 @@ mod tests {
         let sum_c: f64 = c.iter().map(|&x| x as f64).sum();
 
         let (big, k) = (1000.0f32, 200usize);
-        let mut logits = vec![-3.0f32; n]; // all rectified away: uniform over the bins
+        let mut logits = vec![-3.0f32; n];
         let mut peaked = vec![0.0f32; n];
         peaked[k] = big;
         logits.extend(peaked);
@@ -961,7 +782,6 @@ mod tests {
         let uniform = sum_c / n as f64;
         assert!((uniform - (0.001 + 10.0) / 2.0).abs() < 1e-5);
         assert!((depth[0][0] as f64 - uniform).abs() < 1e-4, "{} vs {uniform}", depth[0][0]);
-        // One bin at `big`, every bin at `m` on top: (m * sum(c) + big * c_k) / (n * m + big).
         let expected = (m * sum_c + big as f64 * c[k] as f64) / (n as f64 * m + big as f64);
         assert!((depth[0][1] as f64 - expected).abs() < 1e-4, "{} vs {expected}", depth[0][1]);
         assert!((depth[0][1] - c[k]).abs() < 0.01, "a confident bin dominates");
@@ -970,15 +790,11 @@ mod tests {
     #[test]
     fn position_resampling_matches_torch_antialias() {
         let w = |src, dst| antialias_bilinear_weights(src, dst);
-        // Same size is the identity.
         assert_eq!(w(3, 3), vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
-        // Upsampling is plain bilinear with half-pixel centres.
         assert_eq!(w(2, 4), vec![1.0, 0.0, 0.75, 0.25, 0.25, 0.75, 0.0, 1.0]);
-        // 4 -> 2 widens the triangle: F.interpolate([0, 1, 2, 3], size=2, antialias=True) = [5/7, 16/7].
         let down = w(4, 2);
         let expect = [3.0 / 7.0, 3.0 / 7.0, 1.0 / 7.0, 0.0, 0.0, 1.0 / 7.0, 3.0 / 7.0, 3.0 / 7.0];
         assert!(down.iter().zip(expect).all(|(a, b)| (a - b).abs() < 1e-6), "{down:?}");
-        // Rows of the real 32 -> 24 resize are distributions.
         for row in w(32, 24).chunks(32) {
             assert!((row.iter().sum::<f32>() - 1.0).abs() < 1e-5);
         }

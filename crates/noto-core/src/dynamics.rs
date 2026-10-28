@@ -1,42 +1,3 @@
-//! Joint-level rigid-body dynamics of a robot built from the part presets.
-//!
-//! [`crate::balance`] answers, for one posture, where the centre of mass is
-//! and what torque each joint holds (quasi-static). This module moves the
-//! joints between two postures and reports every joint at every instant:
-//!
-//! * The upper body is a tree of rigid links rooted at the pelvis: waist yaw,
-//!   waist pitch (or a rigid trunk when the belly preset has no pitch
-//!   actuator), neck, and per arm a shoulder and an elbow with the hand and
-//!   its load welded to the forearm. Masses and centres of mass are the
-//!   presets' (the same split as `balance`); inertias are those of solid
-//!   boxes of the drawn link sizes (est).
-//! * Forward dynamics `M(q) q̈ = τ − h(q, q̇)`: `h` and the columns of `M` come
-//!   from the recursive Newton–Euler algorithm (the CRBA-by-RNEA route of
-//!   Featherstone 2008, *Rigid Body Dynamics Algorithms*, ch. 5–6), solved by
-//!   Cholesky and integrated by semi-implicit Euler (2 ms).
-//! * Each joint is driven by its preset's actuator: computed-torque control
-//!   around a minimum-jerk reference (Flash & Hogan 1985), clipped to the
-//!   torque the actuator has at that speed (`Actuator::torque_at`, the linear
-//!   torque–speed line). A non-backdrivable actuator (the bus servos) stalls
-//!   instead of being driven back by an overload; a backdrivable QDD yields.
-//! * The root moves as the base makes it: the pelvis shifts over the stance
-//!   foot, rises on a step, accelerates with a start, and a wheeled base
-//!   pitches on a slope. Gravity enters as an upward root acceleration.
-//! * The root wrench of the Newton–Euler pass plus the lower body gives the
-//!   ground reaction and the dynamic zero-moment point (Vukobratović &
-//!   Borovac 2004). The leg and drive torques are its statics on the stance
-//!   feet (Jacobian transpose, knee lever as in `balance`): the legs are not
-//!   simulated as moving links.
-//! * The balance strategy (trunk lean, pelvis shift) is the one `balance`
-//!   solves for the target posture. With the feed-forward its anticipated
-//!   share starts with the motion; the rest, and everything without it,
-//!   starts one electromechanical delay late (`REACTION_DELAY_S`), so the
-//!   margin dip of a late reaction comes out of the simulation.
-//!
-//! Simplifications, all marked in the code: legs are statics, no joint
-//! friction or rotor inertia (armature), no current-loop lag, a stalled
-//! servo's gearbox holds any load (est), box inertias.
-
 use serde::Serialize;
 
 use crate::balance::{step_knee_lever, Body, FeedForward, Posture, Source, CARGO_X_M, CARGO_Z_M, G, HIP_HALF_WIDTH_M, KNEE_LEVER_STAND_M, KNEE_LEVER_WALK_M, REACTION_DELAY_S};
@@ -78,7 +39,6 @@ fn tr(a: &M) -> M {
     [[a[0][0], a[1][0], a[2][0]], [a[0][1], a[1][1], a[2][1]], [a[0][2], a[1][2], a[2][2]]]
 }
 const EYE: M = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-/// Rotation by `ang` about the unit axis `a` (Rodrigues).
 fn rot(a: V, ang: f64) -> M {
     let (s, c) = ang.sin_cos();
     let t = 1.0 - c;
@@ -95,15 +55,12 @@ fn d3(v: [f32; 3]) -> V {
     [v[0] as f64, v[1] as f64, v[2] as f64]
 }
 
-/// Inertia of a solid box of half sizes `h` and mass `m` about its centre.
 fn box_inertia(m: f64, h: V) -> M {
     let (a, b, c) = (2.0 * h[0], 2.0 * h[1], 2.0 * h[2]);
     [[m * (b * b + c * c) / 12.0, 0.0, 0.0], [0.0, m * (a * a + c * c) / 12.0, 0.0], [0.0, 0.0, m * (a * a + b * b) / 12.0]]
 }
 
-/// Raising axis of the arm joints: rotation about −y turns a hanging limb forward.
 const ARM_AXIS: V = [0.0, -1.0, 0.0];
-/// Pitch axis of the waist and neck: positive leans forward.
 const PITCH_AXIS: V = [0.0, 1.0, 0.0];
 const YAW_AXIS: V = [0.0, 0.0, 1.0];
 
@@ -112,22 +69,16 @@ struct Link {
     name: &'static str,
     segment: Segment,
     parent: Option<usize>,
-    /// Joint origin in the parent's frame.
     origin: V,
-    /// Joint axis, in the parent's frame (and this link's).
     axis: V,
-    /// Degree of freedom of the joint, `None` when welded.
     dof: Option<usize>,
-    /// A welded joint whose structural moment about `axis` is reported.
     locked: Option<usize>,
     mass: f64,
     com: V,
     inertia: M,
-    /// Drawn box: centre in the link frame and half sizes.
     shape: (V, V),
 }
 
-/// One joint of the report, simulated or not.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct DynJoint {
     pub name: String,
@@ -137,26 +88,17 @@ pub struct DynJoint {
     pub cont_nm: f32,
     pub speed_rad_s: f32,
     pub backdrivable: bool,
-    /// `sim` (moved by the dynamics), `statics` (leg and drive torques from
-    /// the ground reaction) or `structure` (a rigid joint without an actuator).
     pub kind: &'static str,
     pub q_min_deg: f32,
     pub q_max_deg: f32,
 }
 
-/// The upper-body tree of one robot with one load case.
 #[derive(Clone, Debug)]
 pub struct Robot {
     links: Vec<Link>,
-    /// Simulated joints, in degree-of-freedom order.
     dof_joints: Vec<(usize, Actuator, f64, f64)>,
-    /// The report's joint list: simulated, structural, then statics.
     pub joints: Vec<DynJoint>,
-    /// Height of the root's frame above the ground at rest, metres: the waist
-    /// joint for a humanoid torso, the ground for a column or a deck (`morph`).
     root_z: f64,
-    /// The head (or a mast camera on its pan-tilt) is a link of the tree; a
-    /// camera fixed to the chassis is one of `lower_masses` instead.
     head_in_tree: bool,
 }
 
@@ -164,12 +106,6 @@ fn sim_joint(name: &str, seg: Segment, a: &Actuator, lo: f64, hi: f64) -> DynJoi
     DynJoint { name: name.into(), segment: seg, actuator: a.name.into(), peak_nm: a.peak_nm, cont_nm: a.cont_nm, speed_rad_s: a.speed_rad_s, backdrivable: a.backdrivable, kind: "sim", q_min_deg: lo as f32, q_max_deg: hi as f32 }
 }
 
-/// Adds the head to the tree on the last link (the trunk, or the root of a
-/// column or a deck) at `origin` in its frame: on its pan-tilt's tilt joint
-/// (`neck`, within `lim_deg`) for a neck or a mast's pan-tilt, welded and
-/// pitched by its tilt for a head fixed on the trunk or the column. A camera
-/// on the chassis front or a fixed mast camera is not added (it stays with
-/// the chassis). Whether the head is in the tree.
 fn head_link(body: &Body, links: &mut Vec<Link>, dof_joints: &mut Vec<(usize, Actuator, f64, f64)>, joints: &mut Vec<DynJoint>, origin: V, lim_deg: f64, half: V) -> bool {
     let parent = links.len() - 1;
     let m = body.head.mass_kg as f64;
@@ -190,22 +126,16 @@ fn head_link(body: &Body, links: &mut Vec<Link>, dof_joints: &mut Vec<(usize, Ac
     true
 }
 
-/// Where the base puts the pelvis at one instant.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
 pub struct RootState {
-    /// Pelvis shift toward the stance foot, metres.
     pub shift_y: f32,
-    /// Pelvis rise (stepping up), metres, and its vertical acceleration.
     pub rise_m: f32,
     pub rise_acc: f32,
-    /// Forward acceleration of the base, m/s².
     pub accel: f32,
-    /// Pitch of a wheeled base, radians (nose up positive).
     pub pitch: f32,
 }
 
 impl Robot {
-    /// Builds the tree from the presets with the hand loads and cargo of `post`.
     pub fn new(body: &Body, post: &Posture) -> Robot {
         let mut links: Vec<Link> = Vec::new();
         let mut joints = Vec::new();
@@ -224,10 +154,8 @@ impl Robot {
         };
         let head_half = [0.07, 0.08, 0.07];
         let neck_lim = body.head_range_deg().0 as f64;
-        // Where the arms hang from: the trunk link with its origin at the waist, or the root at the ground.
         let (arm_parent, root_z, head_in_tree): (usize, f32, bool);
         if body.has_torso() {
-            // Pelvis (root): belly, the battery when it sits low, and the cargo bay.
             let pelvis_half = [0.09, 0.14, 0.07];
             let mut pm = body.belly.mass_kg as f64;
             let mut pc = scale([0.0, 0.0, -(body.belly.com_down_m as f64)], pm);
@@ -240,11 +168,9 @@ impl Robot {
                 pc = add(pc, scale([CARGO_X_M as f64, 0.0, (CARGO_Z_M - WAIST_M) as f64], post.cargo_kg as f64));
             }
             links.push(Link { name: "pelvis", segment: Segment::Belly, parent: None, origin: [0.0; 3], axis: YAW_AXIS, dof: None, locked: None, mass: pm, com: scale(pc, 1.0 / pm.max(1e-6)), inertia: box_inertia(pm, pelvis_half), shape: ([0.0, 0.0, -0.06], pelvis_half) });
-            // Waist yaw: carries the whole upper body about the vertical.
             dof_joints.push((1, body.belly.waist, -90f64.to_radians(), 90f64.to_radians()));
             joints.push(sim("waist_yaw", Segment::Belly, &body.belly.waist, -90.0, 90.0));
             links.push(Link { name: "waist", segment: Segment::Belly, parent: Some(0), origin: [0.0; 3], axis: YAW_AXIS, dof: Some(0), locked: None, mass: 0.0, com: [0.0; 3], inertia: [[0.0; 3]; 3], shape: ([0.0; 3], [0.0; 3]) });
-            // Trunk: chest structure and computer, the battery when it sits high.
             let trunk_half = [0.10, 0.16, 0.16];
             let mut tm = body.chest.mass_kg as f64;
             if !body.plan.battery_low {
@@ -265,8 +191,6 @@ impl Robot {
             arm_parent = 2;
             root_z = WAIST_M;
         } else {
-            // A column or a deck: the root is the chassis frame at the ground; what
-            // sits on the chassis (electronics, column, cargo) is in `lower_masses`.
             links.push(Link { name: "deck", segment: Segment::Foot, parent: None, origin: [0.0; 3], axis: YAW_AXIS, dof: None, locked: None, mass: 0.0, com: [0.0; 3], inertia: [[0.0; 3]; 3], shape: ([0.0; 3], [0.0; 3]) });
             let pivot = match body.camera_mount() {
                 HeadMount::MastCamera { height_mm, .. } => Some([body.mast_camera_x() as f64, 0.0, (height_mm as f32 / 1000.0 - CAMERA_UP_M) as f64]),
@@ -281,7 +205,6 @@ impl Robot {
         let (m_up, r_up, m_fore) = (m_up as f64, r_up as f64, m_fore as f64);
         let (up_l, fo_l) = (UPPER_ARM_M as f64, FOREARM_M as f64);
         for (side, tag) in [(0usize, "r"), (1, "l")].into_iter().take(body.arm_count()) {
-            // The shoulder in the parent's frame (the trunk's origin is the waist joint, the root's the ground).
             let mount = body.shoulder_mount(side);
             let origin = [mount[0] as f64, mount[1] as f64, (mount[2] - root_z) as f64];
             let sh = links.len();
@@ -321,26 +244,20 @@ impl Robot {
         self.dof_joints.len()
     }
 
-    /// Index of a joint of the report by name.
     pub fn joint_index(&self, name: &str) -> Option<usize> {
         self.joints.iter().position(|j| j.name == name)
     }
 
-    /// Index of a simulated joint (its degree of freedom) by name.
     pub fn dof_index(&self, name: &str) -> Option<usize> {
         self.joint_index(name).filter(|k| *k < self.dofs())
     }
 
-    /// Root pose: rotation and position of the pelvis frame (the chassis frame of a column or a deck).
     fn root_pose(&self, root: &RootState) -> (M, V) {
         let r = rot(PITCH_AXIS, -(root.pitch as f64));
         let p = mv(&r, [0.0, root.shift_y as f64, self.root_z + root.rise_m as f64]);
         (r, p)
     }
 
-    /// Recursive Newton–Euler: joint torques for `q, qd, qdd`, the wrench the
-    /// root takes (force, moment about the ground origin), the structural
-    /// moments of locked joints, and the link frames for drawing.
     fn rnea(&self, q: &[f64], qd: &[f64], qdd: &[f64], root: &RootState, gravity: bool) -> Rnea {
         let n = self.links.len();
         let (r0, p0) = self.root_pose(root);
@@ -403,7 +320,6 @@ impl Robot {
         Rnea { tau, f0, n0, locked, rot: rot_w, pos, com: com_w }
     }
 
-    /// Joint-space inertia matrix (columns by RNEA with unit accelerations).
     fn mass_matrix(&self, q: &[f64], root: &RootState) -> Vec<Vec<f64>> {
         let n = self.dofs();
         let zero = vec![0.0; n];
@@ -422,7 +338,6 @@ impl Robot {
 struct Rnea {
     tau: Vec<f64>,
     f0: V,
-    /// About the ground origin.
     n0: V,
     locked: Vec<f64>,
     rot: Vec<M>,
@@ -430,7 +345,6 @@ struct Rnea {
     com: Vec<V>,
 }
 
-/// Solves `a x = b` for a symmetric positive definite `a` (Cholesky).
 fn cholesky_solve(a: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
     let n = b.len();
     let mut l = vec![vec![0.0; n]; n];
@@ -459,7 +373,6 @@ fn cholesky_solve(a: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
     Some(x)
 }
 
-/// Minimum-jerk blend 0 → 1 over `u` in [0, 1], with its first two derivatives (per unit `u`).
 fn min_jerk(u: f64) -> (f64, f64, f64) {
     if u <= 0.0 {
         return (0.0, 0.0, 0.0);
@@ -474,32 +387,23 @@ fn min_jerk(u: f64) -> (f64, f64, f64) {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct DynCfg {
     pub dt_s: f32,
-    /// Report every this many seconds.
     pub sample_s: f32,
-    /// Time after the motion to settle.
     pub settle_s: f32,
-    /// Closed-loop bandwidth of the joint controller, Hz.
     pub bandwidth_hz: f32,
-    /// A joint has "reached" its target within this error, degrees.
     pub reach_tol_deg: f32,
 }
 
 impl Default for DynCfg {
     fn default() -> Self {
-        // 4 Hz with critical damping is a moderate position loop for these
-        // actuators (est); 2 ms keeps ω·dt ≈ 0.05.
         DynCfg { dt_s: 0.002, sample_s: 0.02, settle_s: 0.6, bandwidth_hz: 4.0, reach_tol_deg: 3.0 }
     }
 }
 
-/// One reported instant.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct DynSample {
     pub t: f32,
-    /// Per simulated joint (degree-of-freedom order).
     pub q_deg: Vec<f32>,
     pub qd: Vec<f32>,
-    /// Per report joint ([`Robot::joints`]): torque, torque available, peak ratio.
     pub tau_nm: Vec<f32>,
     pub avail_nm: Vec<f32>,
     pub ratio: Vec<f32>,
@@ -509,7 +413,6 @@ pub struct DynSample {
     pub zmp: [f32; 2],
     pub margin: f32,
     pub grf: [f32; 3],
-    /// Camera pitch left after the neck's correction, degrees.
     pub head_pitch_deg: f32,
     pub root: RootState,
 }
@@ -519,23 +422,18 @@ pub struct JointSummary {
     pub name: String,
     pub kind: &'static str,
     pub peak_ratio: f32,
-    /// Root mean square of torque over the continuous rating.
     pub rms_effort: f32,
     pub saturated_s: f32,
     pub stalled_s: f32,
-    /// Largest |reference − actual| during the motion, degrees (simulated joints).
     pub max_lag_deg: f32,
-    /// |target − actual| at the end, degrees (simulated joints).
     pub final_err_deg: f32,
 }
 
-/// A simulated transition between two postures.
 #[derive(Clone, Debug, Serialize)]
 pub struct Rollout {
     pub source: Source,
     pub duration_s: f32,
     pub feed_forward: bool,
-    /// Share of the compensation started with the motion (the rest starts late).
     pub anticipated: f32,
     pub joints: Vec<DynJoint>,
     pub samples: Vec<DynSample>,
@@ -543,20 +441,14 @@ pub struct Rollout {
     pub min_margin: f32,
     pub min_margin_t: f32,
     pub final_margin: f32,
-    /// The quasi-static margin `balance` gives for the target posture.
     pub static_margin: f32,
     pub peak_ratio: f32,
     pub worst_joint: Option<String>,
-    /// Every simulated joint ended within the tolerance of its target.
     pub reached: bool,
-    /// When every simulated joint stayed within the tolerance, seconds.
     pub settle_s: Option<f32>,
-    /// Reached, nothing over its peak or stalled, margin never below zero.
     pub feasible: bool,
     pub notes: Vec<String>,
-    /// Largest camera pitch left after the neck, degrees.
     pub head_pitch_max_deg: f32,
-    /// Largest sideways acceleration of the pelvis (the weight shift), m/s².
     pub pelvis_lat_acc_max: f32,
     #[serde(skip)]
     robot: Robot,
@@ -568,12 +460,7 @@ pub struct Rollout {
     lift_at: f32,
 }
 
-/// Simulated joint targets of a posture: waist yaw, waist pitch, neck,
-/// shoulders and elbows, radians, for the joints the form has, in
-/// degree-of-freedom order (by the joints' names, so an absent neck or waist
-/// shifts nothing).
 fn targets(body: &Body, post: &Posture, lean_rad: f64, pitch: f64, robot: &Robot) -> Vec<f64> {
-    // The neck cancels its share of the body's tilt to keep the camera level.
     let tilt = if body.belly.pitch.is_some() { lean_rad } else { 0.0 } - pitch;
     (0..robot.dofs())
         .map(|k| match robot.joints[k].name.as_str() {
@@ -583,15 +470,11 @@ fn targets(body: &Body, post: &Posture, lean_rad: f64, pitch: f64, robot: &Robot
             "elbow_r" => (post.elbow_deg[0] as f64).to_radians(),
             "shoulder_l" => (post.arm_elev_deg[1] as f64).to_radians(),
             "elbow_l" => (post.elbow_deg[1] as f64).to_radians(),
-            // The waist yaw stays straight ahead.
             _ => 0.0,
         })
         .collect()
 }
 
-/// Simulates the move from posture `from` to posture `to` (the motion of
-/// `to.source`) and reports every joint. `grip_capacity_n` is the friction
-/// capacity of one hand, as for `Body::solve`.
 pub fn simulate(body: &Body, from: &Posture, to: &Posture, ff: &FeedForward, grip_capacity_n: f32, cfg: &DynCfg) -> Rollout {
     let robot = Robot::new(body, to);
     let n = robot.dofs();
@@ -607,14 +490,9 @@ pub fn simulate(body: &Body, from: &Posture, to: &Posture, ff: &FeedForward, gri
     let pitch1 = body.base_pitch(to) as f64;
     let q_from = targets(body, from, lean0, pitch0, &robot);
     let q_to = targets(body, to, lean1, pitch1, &robot);
-    // Posture leads movement (APA before the push-off: Callegari 2018, Honeine
-    // 2016): a start or a stop begins its acceleration once the posture change
-    // that goes with it (arms, lean, neck) has settled, so the two inertial
-    // disturbances do not add up.
     let posture_moves = q_from.iter().zip(&q_to).any(|(a, b)| (a - b).abs() > 1f64.to_radians());
     let accel_t0 = if to.source == Source::Accel && posture_moves { dur } else { 0.0 };
     let total = dur + accel_t0 + cfg.settle_s as f64;
-    // How much of the balance correction is anticipated (as in `Body::solve`).
     let anticipated = if ff.enabled && goal.shift_uncomp_m.abs() > 1e-5 { (ff.gain * goal.ff_predicted_m / goal.shift_uncomp_m).clamp(0.0, 2.0) } else { 0.0 } as f64;
     let delay = REACTION_DELAY_S as f64;
     let comp = |t: f64| -> (f64, f64, f64) {
@@ -627,9 +505,6 @@ pub fn simulate(body: &Body, from: &Posture, to: &Posture, ff: &FeedForward, gri
     let (shift0, shift1) = (start.lateral_shift_m as f64, goal.lateral_shift_m as f64);
     let step = to.step_m as f64;
     let support = body.support_rect(to, pitch1 as f32);
-    // Going from two feet to one, the weight shifts first and the foot lifts
-    // when the move ends (APA before foot-off, Honeine 2016): until then the
-    // support is still both feet.
     let lift_at = if to.single_support && !from.single_support { dur } else { 0.0 };
     let support_before = body.support_rect(from, pitch0 as f32);
     let root_at = |t: f64| -> RootState {
@@ -637,7 +512,6 @@ pub fn simulate(body: &Body, from: &Posture, to: &Posture, ff: &FeedForward, gri
         let _ = cd;
         let (s, _, sdd) = min_jerk(t / dur);
         let _ = cdd;
-        // A start or stop holds its acceleration for the whole move, with 0.1 s ramps.
         let ramp = |x: f64| (x / 0.1).clamp(0.0, 1.0);
         let acc = if to.source == Source::Accel { to.accel_mps2 as f64 * ramp(t - accel_t0).min(ramp(accel_t0 + dur - t)) } else { 0.0 };
         RootState {
@@ -667,8 +541,6 @@ pub fn simulate(body: &Body, from: &Posture, to: &Posture, ff: &FeedForward, gri
     let mut notes = Vec::new();
     while t <= total + 1e-9 {
         let root = root_at(t);
-        // Reference: the arms follow min-jerk to their targets; the
-        // compensating waist pitch follows the (partly late) balance profile.
         let (s, sd, sdd) = min_jerk(t / dur);
         let (c, cd, cdd) = comp(t);
         lat_acc_max = lat_acc_max.max(((shift1 - shift0) * cdd).abs() as f32);
@@ -701,7 +573,6 @@ pub fn simulate(body: &Body, from: &Posture, to: &Posture, ff: &FeedForward, gri
         for k in 0..n {
             let (_, act, lo, hi) = robot.dof_joints[k];
             let mut v = qd[k] + qdd[k] * dt;
-            // A self-locking gearbox does not let an overload drive the joint back (est).
             if !act.backdrivable && sat[k] && v * tau[k] < 0.0 {
                 v = 0.0;
                 stalled[k] = true;
@@ -716,9 +587,7 @@ pub fn simulate(body: &Body, from: &Posture, to: &Posture, ff: &FeedForward, gri
                 lag[k] = lag[k].max(((r[k] - q[k]).abs().to_degrees()) as f32);
             }
         }
-        // Whole-body wrench: the tree's root wrench plus the lower body.
         let full = robot.rnea(&q, &qd, &qdd, &root, true);
-        // One foot carries the robot only once the swing foot has lifted.
         let single = to.single_support && t >= lift_at;
         let (grf, zmp, com) = whole_body(body, to, single, &robot, &full, &root);
         let margin = margin_of(zmp, if t < lift_at { &support_before } else { &support });
@@ -767,7 +636,6 @@ pub fn simulate(body: &Body, from: &Posture, to: &Posture, ff: &FeedForward, gri
         }
         if t + 1e-9 >= next_sample {
             next_sample += cfg.sample_s as f64;
-            // The camera's pitch: the trunk's lean and the base's pitch, less what the neck (if any) takes back.
             let tilt = comp_dof.map_or(0.0, |k| q[k]) - root.pitch as f64;
             let neck = neck_dof.map_or(0.0, |k| q[k]);
             head_max = head_max.max(((tilt + neck).to_degrees() as f32).abs());
@@ -843,8 +711,6 @@ pub fn simulate(body: &Body, from: &Posture, to: &Posture, ff: &FeedForward, gri
     }
 }
 
-/// Ground reaction force, dynamic ZMP and whole-body CoM: the tree's root
-/// wrench plus the legs and feet (or the mast and chassis) moving with the base.
 fn whole_body(body: &Body, post: &Posture, single: bool, robot: &Robot, r: &Rnea, root: &RootState) -> ([f32; 3], [f32; 2], [f32; 3]) {
     let mut f = r.f0;
     let mut m_o = r.n0;
@@ -868,11 +734,6 @@ fn whole_body(body: &Body, post: &Posture, single: bool, robot: &Robot, r: &Rnea
     (f3(f), zmp, f3(scale(mc, 1.0 / mass_sum.max(1e-6))))
 }
 
-/// Point masses of the lower body in the base frame (as `balance` places them),
-/// and what the form fixes to the chassis outside the tree: the column or the
-/// camera pole, a deck's electronics, a camera off the trunk (unless the tree
-/// holds it, `head_in_tree`), the cargo structure, and cargo that sits on the
-/// chassis instead of the pelvis.
 fn lower_masses(body: &Body, post: &Posture, single: bool, root: &RootState, head_in_tree: bool) -> Vec<(f64, V)> {
     let mut v = Vec::new();
     if body.legged() {
@@ -886,7 +747,6 @@ fn lower_masses(body: &Body, post: &Posture, single: bool, root: &RootState, hea
     } else {
         let r = rot(PITCH_AXIS, -(root.pitch as f64));
         if body.has_torso() {
-            // The mast under a humanoid torso (`Body::column`), at its centre 0.35 m up.
             v.push((body.mast_kg() as f64, mv(&r, [0.0, 0.0, 0.35])));
         } else if let Some((m, p)) = body.column() {
             v.push((m as f64, mv(&r, d3(p))));
@@ -906,8 +766,6 @@ fn lower_masses(body: &Body, post: &Posture, single: bool, root: &RootState, hea
     v
 }
 
-/// Leg (hip pitch, hip roll, knee, ankle per side) or drive torques: the
-/// statics of the ground reaction on the stance feet.
 fn lower_torques(body: &Body, post: &Posture, single: bool, grf: [f32; 3], zmp: [f32; 2], root: &RootState) -> Vec<f32> {
     let f = d3(grf);
     if !body.legged() {
@@ -919,7 +777,6 @@ fn lower_torques(body: &Body, post: &Posture, single: bool, grf: [f32; 3], zmp: 
     }
     let half = STANCE_WIDTH_M as f64 / 2.0;
     let feet = [-half, half];
-    // Vertical load share of each foot from the lateral ZMP (all on the stance foot in single support).
     let share_r = if single { 1.0 } else { ((half - zmp[1] as f64) / (2.0 * half)).clamp(0.0, 1.0) };
     let d = if post.step_m > 0.0 { step_knee_lever(post.step_m) } else if single { KNEE_LEVER_WALK_M } else { KNEE_LEVER_STAND_M } as f64;
     let mut out = Vec::with_capacity(8);
@@ -930,7 +787,6 @@ fn lower_torques(body: &Body, post: &Posture, single: bool, grf: [f32; 3], zmp: 
         let x_hi = 0.75 * body.leg.foot_len_m as f64;
         let cop = [(zmp[0] as f64).clamp(x_lo, x_hi), *fy, 0.0];
         let ankle = [0.0, *fy, 0.08];
-        // The knee lever of the sizing rule is the horizontal distance from the reaction to the knee.
         let knee = [cop[0] + d, *fy, 0.5 * (HIP_M as f64 + 0.08)];
         let side = if k == 0 { -1.0 } else { 1.0 };
         let hip = [0.0, root.shift_y as f64 + side * HIP_HALF_WIDTH_M as f64, HIP_M as f64 + root.rise_m as f64];
@@ -943,14 +799,12 @@ fn lower_torques(body: &Body, post: &Posture, single: bool, grf: [f32; 3], zmp: 
     out
 }
 
-/// `balance`'s margin of a ZMP in a support rectangle.
 fn margin_of(zmp: [f32; 2], s: &[f32; 4]) -> f32 {
     let (hx, hy) = (0.5 * (s[1] - s[0]), 0.5 * (s[3] - s[2]));
     let (cx, cy) = (0.5 * (s[0] + s[1]), 0.5 * (s[2] + s[3]));
     (1.0 - (zmp[0] - cx).abs() / hx.max(1e-3)).min(1.0 - (zmp[1] - cy).abs() / hy.max(1e-3))
 }
 
-/// A drawn link: centre, orientation (columns are the box axes) and half sizes, base frame.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct LinkBox {
     pub name: &'static str,
@@ -960,7 +814,6 @@ pub struct LinkBox {
     pub half: [f32; 3],
 }
 
-/// A joint as the third-person view draws it.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct JointPoint {
     pub name: String,
@@ -974,7 +827,6 @@ pub struct JointPoint {
     pub stalled: bool,
 }
 
-/// The whole body at one instant, base frame (x forward, y left, z up, ground at z = 0).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct BodyPose {
     pub t: f32,
@@ -992,7 +844,6 @@ fn axes_of(r: &M) -> [[f32; 3]; 3] {
     [[r[0][0] as f32, r[1][0] as f32, r[2][0] as f32], [r[0][1] as f32, r[1][1] as f32, r[2][1] as f32], [r[0][2] as f32, r[1][2] as f32, r[2][2] as f32]]
 }
 
-/// What a rollout says, without the time series: for event logs and the SDS.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct DynDigest {
     pub source: Source,
@@ -1033,13 +884,11 @@ impl Rollout {
         }
     }
 
-    /// The sample at or before `t` (the last one after the end).
     pub fn sample_at(&self, t: f32) -> Option<&DynSample> {
         let i = self.samples.partition_point(|s| s.t <= t);
         self.samples.get(i.saturating_sub(1))
     }
 
-    /// The pose at time `t` of the rollout, for drawing.
     pub fn pose_at(&self, body: &Body, post: &Posture, t: f32) -> Option<BodyPose> {
         let s = self.sample_at(t)?;
         let q: Vec<f64> = s.q_deg.iter().map(|d| (*d as f64).to_radians()).collect();
@@ -1103,14 +952,12 @@ impl Rollout {
                     boxes.push(LinkBox { name: "column", segment: Segment::Leg, center: f3(mv(&r, [0.0, 0.0, (0.14 + top as f64) / 2.0])), axes: axes_of(&r), half: [0.04, 0.04, (top - 0.14) / 2.0] });
                 }
                 Torso::None => {
-                    // A camera's pole or mast.
                     if let HeadMount::MastCamera { height_mm, .. } = body.camera_mount() {
                         let top = height_mm as f32 / 1000.0 - CAMERA_UP_M;
                         boxes.push(LinkBox { name: "pole", segment: Segment::Leg, center: f3(mv(&r, [body.mast_camera_x() as f64, 0.0, (0.14 + top as f64) / 2.0])), axes: axes_of(&r), half: [0.01, 0.01, ((top - 0.14) / 2.0).max(0.0)] });
                     }
                 }
             }
-            // A deck arm's base, a tote or a bed, a chassis camera: the boxes `kin` draws.
             for b in body.deck_boxes() {
                 boxes.push(LinkBox { center: f3(mv(&r, d3(b.center))), axes: axes_of(&r), ..b });
             }
@@ -1122,7 +969,6 @@ impl Rollout {
     }
 }
 
-/// A box along the segment from `a` to `b`, `w` half wide.
 fn limb_box(name: &'static str, segment: Segment, a: [f32; 3], b: [f32; 3], w: f32) -> LinkBox {
     let (a, b) = (d3(a), d3(b));
     let d = sub(b, a);
@@ -1149,7 +995,6 @@ mod tests {
 
     #[test]
     fn holding_torques_match_the_quasi_static_model() {
-        // Holding still, the dynamics' shoulder and elbow torques are the statics of `balance`.
         let b = body(Tier::Mid, BaseKind::Wheel);
         let p = Posture::arm_lift(2.0, false, 0.0);
         let r = simulate(&b, &p, &p, &FeedForward::default(), 200.0, &DynCfg::default());
@@ -1161,7 +1006,6 @@ mod tests {
             assert!((dyn_tau - st_tau).abs() < 0.03 * st_tau.max(0.5), "{name}: dynamics {dyn_tau} vs statics {st_tau}");
         }
         assert!(r.reached && r.feasible, "{:?}", r.notes);
-        // The ZMP of a still robot is the CoM's ground projection.
         let s = r.samples.last().unwrap();
         assert!((s.zmp[0] - s.com[0]).abs() < 2e-3 && (s.zmp[1] - s.com[1]).abs() < 2e-3, "{:?} vs {:?}", s.zmp, s.com);
         assert!((s.margin - st.margin_x.min(st.margin_y)).abs() < 0.02, "{} vs {}", s.margin, st.margin);
@@ -1179,7 +1023,6 @@ mod tests {
                 assert!((m[i][j] - m[j][i]).abs() < 1e-9, "M[{i}][{j}]");
             }
         }
-        // Elbow: the forearm and hand about the elbow axis (point masses plus box terms).
         let e = r.joint_index("elbow_r").unwrap();
         let (_, _, m_fore) = b.arm_split();
         let fo = FOREARM_M as f64;
@@ -1190,7 +1033,6 @@ mod tests {
 
     #[test]
     fn a_free_arm_swings_without_gaining_energy() {
-        // With the actuators off, the arm is a passive pendulum: semi-implicit Euler keeps its energy within 2%.
         let b = body(Tier::Mid, BaseKind::Wheel);
         let r = Robot::new(&b, &Posture::quiet(0.0));
         let n = r.dofs();
@@ -1226,7 +1068,6 @@ mod tests {
 
     #[test]
     fn a_weak_servo_elbow_stalls_where_a_qdd_elbow_lifts() {
-        // A log (2.4 kg) with bus-servo arms: the non-backdrivable elbow cannot lift it and stalls.
         let ff = FeedForward::default();
         let from = Posture { hand_load_kg: [2.4, 0.0], ..Posture::quiet(0.0) };
         let to = Posture::arm_lift(2.4, false, 0.0);
@@ -1236,13 +1077,11 @@ mod tests {
         let elbow = budget.summary.iter().find(|s| s.name == "elbow_r").unwrap();
         assert!(elbow.saturated_s > 0.0, "{elbow:?}");
         assert!(mid.reached && mid.feasible, "{:?}", mid.notes);
-        // The static check says the same (balance: the budget arm cannot lift a log).
         assert!(!body(Tier::Budget, BaseKind::Wheel).lift(2.4, 0.0, &ff, 200.0).0.feasible);
     }
 
     #[test]
     fn a_late_reaction_dips_the_dynamic_margin() {
-        // Pro belly (waist pitch) lifting 4 kg: the feed-forward starts the lean with the arm.
         let b = body(Tier::Pro, BaseKind::HumanFoot);
         let from = Posture { hand_load_kg: [4.0, 0.0], ..Posture::quiet(0.0) };
         let to = Posture::arm_lift(4.0, false, 0.0);
@@ -1256,8 +1095,6 @@ mod tests {
 
     #[test]
     fn the_weight_shifts_before_the_foot_lifts() {
-        // From two feet to one: the pelvis moves over the stance foot first, so the
-        // dynamic ZMP never leaves the support (it did when the foot lifted at t = 0).
         for tier in [Tier::Mid, Tier::Pro] {
             let b = body(tier, BaseKind::HumanFoot);
             let to = Posture { source: Source::FootLift, single_support: true, ..Posture::quiet(0.0) };
@@ -1277,7 +1114,6 @@ mod tests {
         let p = Posture { source: Source::Accel, accel_mps2: 1.0, ..Posture::quiet(0.0) };
         let r = simulate(&b, &Posture::quiet(0.0), &p, &FeedForward::default(), 1e3, &DynCfg::default());
         let mid = r.sample_at(0.25).unwrap();
-        // x_zmp = x_com - z_com * a / g for a rigid body moving with the base.
         let want = mid.com[0] - mid.com[2] * 1.0 / G;
         assert!((mid.zmp[0] - want).abs() < 0.01, "{} vs {want}", mid.zmp[0]);
         let drive = r.summary.iter().find(|s| s.name == "drive").unwrap();
@@ -1301,7 +1137,6 @@ mod tests {
             } else {
                 assert!(names.contains(&"chassis"));
             }
-            // The raised arm's hand is in front of the shoulder at the end.
             let end = r.pose_at(&b, &p, 10.0).unwrap();
             let hand = end.boxes.iter().find(|x| x.name == "hand_r").unwrap();
             let sh = end.joints.iter().find(|j| j.name == "shoulder_r").unwrap();

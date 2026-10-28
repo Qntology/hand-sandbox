@@ -1,22 +1,3 @@
-//! Precision gates between the recogniser and the robot's decisions.
-//!
-//! A detection is only acted on when it passes every gate that applies:
-//!
-//! 1. `score`: at least the floor. The floor is the fixed `min_score`, raised
-//!    when the SDS has learned that touching objects of this label confirmed
-//!    only high-scoring detections, and raised again while the label's touch
-//!    agreement rate is low. It is never lowered below the fixed value.
-//! 2. `margin`: the label beat its runner-up by enough.
-//! 3. `temporal`: the score fits the forecast made from the earlier scores of
-//!    the same landmark (Granite TTM when loaded, otherwise Holt, EWMA and
-//!    persistence fused by their remembered errors). Needs enough history.
-//! 4. `conflict`: no other label already holds the same spot with a better score.
-//! 5. `touch`: the spot was not ruled out by touching it earlier.
-//! 6. `confirm`: the landmark has been seen well enough several times.
-//!
-//! Every outcome is written to the SDS (`record_gates`) so the UI can show how
-//! often each gate blocks and how often it was the only one that did.
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -35,7 +16,6 @@ const MAX_LANDMARKS: usize = 256;
 const SERIES_CAP: usize = 64;
 const HISTORY_CAP: usize = 32;
 const METHODS: [&str; 4] = ["last", "ewma", "holt", "ttm"];
-/// Held scores in a row that agree within `SHIFT_SPREAD` count as a level change.
 const SHIFT_RUN: usize = 3;
 const SHIFT_SPREAD: f64 = 0.08;
 
@@ -43,11 +23,9 @@ const SHIFT_SPREAD: f64 = 0.08;
 #[serde(rename_all = "snake_case")]
 pub enum LmState {
     Active,
-    /// Touching the spot showed it was not this label.
     Rejected,
 }
 
-/// Something the robot believes is out there.
 #[derive(Clone, Debug, Serialize)]
 pub struct Landmark {
     pub id: u32,
@@ -56,26 +34,17 @@ pub struct Landmark {
     pub link: String,
     pub x: f32,
     pub z: f32,
-    /// Smoothed score.
     pub score: f32,
-    /// Smoothed margin over the runner-up.
     pub margin: f32,
-    /// Sightings that passed the earlier gates.
     pub good: u32,
     pub seen: u32,
     pub first_tick: u64,
     pub last_tick: u64,
     pub confirmed: bool,
     pub state: LmState,
-    /// Times the robot failed to reach it.
     pub unreachable: u32,
     pub history: Vec<f64>,
-    /// Consecutive scores the temporal gate held. Three that agree with each
-    /// other are taken as a real change of level (the robot got closer, the
-    /// light changed) and replace the history.
     pub held_run: Vec<f64>,
-    /// 1σ of the position when it was last fused, metres, and the odometer
-    /// then: the landmark is a memory that spreads as the robot moves (`vision`).
     pub sigma_m: f32,
     pub odo_m: f32,
 }
@@ -85,34 +54,25 @@ impl Landmark {
         ((self.x - x).powi(2) + (self.z - z).powi(2)).sqrt()
     }
 
-    /// The landmark as a memory.
     pub fn memory(&self) -> Memory {
         Memory::seen(self.x, self.z, self.sigma_m, self.odo_m, self.last_tick)
     }
 }
 
-/// What the gates need to keep landmarks as memories (`vision`).
 #[derive(Clone, Debug)]
 pub struct MemCtx {
-    /// The odometer now, metres.
     pub odo_m: f32,
     pub rate: DriftRate,
-    /// The base, for the SDS scope of what re-sightings show.
     pub base: String,
-    /// The head camera: focal length (px), stereo baseline (m), subpixel error.
     pub camera: (f32, f32, f32),
-    /// The scatter re-sightings without travel showed (SDS), metres per axis; 0 before any.
     pub obs_floor_m: f32,
 }
 
 impl MemCtx {
-    /// No motion and the D435's camera: sightings at one range weigh the same (as before v0.7).
     pub fn still() -> MemCtx {
         MemCtx { odo_m: 0.0, rate: DriftRate { per_m: 0.0, walk_m: 0.0, source: "spec" }, base: String::new(), camera: (424.0, 0.050, 0.08), obs_floor_m: 0.0 }
     }
 
-    /// 1σ of a sighting at `depth_m`, metres per axis: the stereo depth law
-    /// along the ray and one pixel across it, or what re-sightings showed.
     pub fn sigma_obs(&self, depth_m: f32) -> f32 {
         let (f, b, sub) = self.camera;
         let along = noto_core::act::material::stereo_depth_sigma(depth_m, f, b, sub);
@@ -125,10 +85,8 @@ impl MemCtx {
 pub struct GateResult {
     pub gate: &'static str,
     pub passed: bool,
-    /// False when the gate had nothing to judge with (for example no history yet).
     pub applied: bool,
     pub detail: String,
-    /// 0 (passed) to 100 (far off).
     pub severity: u8,
 }
 
@@ -144,7 +102,6 @@ pub struct Judged {
 }
 
 impl Judged {
-    /// One line on why the detection was accepted or held.
     pub fn reason_ko(&self) -> String {
         match self.gates.iter().find(|g| g.applied && !g.passed) {
             Some(g) => format!("보류 · {} 게이트: {}", gate_ko(g.gate), g.detail),
@@ -152,15 +109,10 @@ impl Judged {
         }
     }
 
-    /// Name of the first gate that blocked, if any.
     pub fn blocked_by(&self) -> Option<&'static str> {
         self.gates.iter().find(|g| g.applied && !g.passed).map(|g| g.gate)
     }
 
-    /// The detection itself holds (its score and its margin pass), whatever
-    /// the gates that need a history said (repeated sightings, the score's
-    /// time series, a landmark of another label nearby): enough to find again
-    /// a piece the robot already knows is there, not to believe a new one.
     pub fn sound(&self) -> bool {
         self.gates.iter().filter(|g| g.applied && !g.passed).all(|g| matches!(g.gate, "confirm" | "temporal" | "conflict"))
     }
@@ -178,19 +130,12 @@ pub struct PrecisionGates {
     next_id: u32,
     landmarks: Vec<Landmark>,
     series: HashMap<String, Vec<f64>>,
-    /// Margin over the runner-up, kept next to `series` so the UI can chart both.
     margins: HashMap<String, Vec<f64>>,
-    /// Granite TTM, when its weights are loaded. It joins the fusion as one more predictor.
     ttm: Option<Arc<TtmForecaster>>,
     pub counters: GateCounters,
-    /// Secondary of the `vision` scopes: empty for the stand-in recogniser
-    /// (its statistics live in the label's scope, as before v1.0), the
-    /// recogniser's mode otherwise. A real recogniser reads only its own
-    /// mode's statistics, so a stand-in's learned floor never gates it.
     scope_mode: String,
 }
 
-/// Runs `f` with the extra predictors that are available (Granite TTM, if loaded).
 fn with_extra<T>(ttm: &Option<Arc<TtmForecaster>>, f: impl FnOnce(&[&dyn Predictor]) -> T) -> T {
     match ttm {
         Some(t) => {
@@ -201,7 +146,6 @@ fn with_extra<T>(ttm: &Option<Arc<TtmForecaster>>, f: impl FnOnce(&[&dyn Predict
     }
 }
 
-/// Korean name of a gate.
 pub fn gate_ko(gate: &str) -> &str {
     match gate {
         "score" => "점수",
@@ -218,21 +162,11 @@ fn severity(shortfall: f64, scale: f64) -> u8 {
     ((shortfall / scale.max(1e-6)).clamp(0.0, 1.0) * 100.0).round() as u8
 }
 
-/// Remembered per-method forecast errors of a label, from the SDS.
 pub fn past_errors(sds: &SdsStore, label: &str) -> Vec<HistoryMse> {
     let scope = Scope::new(Track::Forecast, label, "");
     METHODS.iter().filter_map(|m| sds.fusion_mse(&scope, m).map(|(mse, n)| HistoryMse { method: (*m).to_string(), mse, n })).collect()
 }
 
-/// What a re-sighting says about the robot's memory (SDS `memory` track).
-/// The squared 2-D innovation is, on average, the two sightings' scatter in
-/// both axes (`2·σ0² + 2·σ_obs²`), the random walk in both (`2·w²·d`) and the
-/// odometer's one-dimensional scale drift `(r·d)²` (the memory's model,
-/// `vision::Memory::sigma_m`). So a sighting after a walk of `d` (far enough
-/// to tell drift from scatter) gives an unbiased sample of `r²`, and one
-/// without travel a sample of the camera's per-axis variance; both are kept
-/// as variances (a square root per sighting would bias the mean low), and the
-/// innovation over the spread the memory predicted is about 1 when the model is right.
 fn record_memory(sds: &mut SdsStore, mem: &MemCtx, label: &str, travelled: f32, innov: f32, predicted: f32, sigma0: f32, sigma_obs: f32) {
     if mem.base.is_empty() {
         return;
@@ -245,7 +179,6 @@ fn record_memory(sds: &mut SdsStore, mem: &MemCtx, label: &str, travelled: f32, 
     } else if travelled < 0.2 {
         sds.record_baseline(&Scope::new(Track::Memory, &mem.base, "obs"), "scatter_var_m2", (0.5 * sq - sigma0 * sigma0) as f64);
     }
-    // The spread the memory predicted, as the same sum (its σ already holds σ0, one walk and the drift).
     let spread = (sigma0 * sigma0 + predicted * predicted + 2.0 * sigma_obs * sigma_obs + walk_var).sqrt().max(1e-4);
     sds.record_baseline(&Scope::new(Track::Memory, label, &mem.base), "innovation_z", (innov / spread) as f64);
 }
@@ -255,18 +188,14 @@ impl PrecisionGates {
         PrecisionGates { cfg, next_id: 1, landmarks: Vec::new(), series: HashMap::new(), margins: HashMap::new(), ttm: None, counters: GateCounters::default(), scope_mode: String::new() }
     }
 
-    /// The recogniser whose candidates these gates judge (`oracle`, `embedding`).
     pub fn set_recognizer_mode(&mut self, mode: &str) {
         self.scope_mode = if mode == "oracle" { String::new() } else { mode.to_string() };
     }
 
-    /// The SDS `vision` scope of a label for the current recogniser.
     pub fn vision_scope(&self, label: &str) -> Scope {
         Scope::new(Track::Vision, label, &self.scope_mode)
     }
 
-    /// Keeps a learned statistic only when it is the current recogniser's own:
-    /// any scope for the stand-in, the mode's own scope for a real recogniser.
     fn own<T>(&self, got: Option<(T, String)>, scope: &Scope) -> Option<T> {
         got.filter(|(_, key)| self.scope_mode.is_empty() || *key == scope.key_secondary()).map(|(v, _)| v)
     }
@@ -279,12 +208,10 @@ impl PrecisionGates {
         self.cfg = cfg;
     }
 
-    /// Lets the forecasts use Granite TTM (or stop using it with `None`).
     pub fn set_ttm(&mut self, ttm: Option<Arc<TtmForecaster>>) {
         self.ttm = ttm;
     }
 
-    /// The attached Granite TTM, for other forecasts (the ML decision) to use.
     pub fn ttm(&self) -> Option<Arc<TtmForecaster>> {
         self.ttm.clone()
     }
@@ -297,7 +224,6 @@ impl PrecisionGates {
         &self.landmarks
     }
 
-    /// Moves every landmark by `f` (from its position and its odometer: a fix of the robot's pose).
     pub fn shift_landmarks(&mut self, f: impl Fn(f32, f32, f32) -> (f32, f32)) {
         for l in self.landmarks.iter_mut() {
             (l.x, l.z) = f(l.x, l.z, l.odo_m);
@@ -315,19 +241,16 @@ impl PrecisionGates {
         self.counters = GateCounters::default();
     }
 
-    /// The landmark is gone (the robot broke the node).
     pub fn consume(&mut self, id: u32) {
         self.landmarks.retain(|l| l.id != id);
     }
 
-    /// Touch showed the spot is not this label.
     pub fn reject(&mut self, id: u32) {
         if let Some(l) = self.landmarks.iter_mut().find(|l| l.id == id) {
             l.state = LmState::Rejected;
         }
     }
 
-    /// The robot could not get there. Two failures rule the landmark out.
     pub fn note_unreachable(&mut self, id: u32) {
         if let Some(l) = self.landmarks.iter_mut().find(|l| l.id == id) {
             l.unreachable += 1;
@@ -337,18 +260,14 @@ impl PrecisionGates {
         }
     }
 
-    /// Score history of a label, oldest first.
     pub fn series(&self, label: &str) -> &[f64] {
         self.series.get(label).map_or(&[], Vec::as_slice)
     }
 
-    /// Margin history of a label, oldest first.
     pub fn margin_series(&self, label: &str) -> &[f64] {
         self.margins.get(label).map_or(&[], Vec::as_slice)
     }
 
-    /// Forecast of the next margins. No remembered errors: the SDS keeps those
-    /// for scores only.
     pub fn forecast_margin(&self, label: &str, horizon: usize) -> Option<Forecast> {
         let m = self.margins.get(label)?;
         if m.is_empty() {
@@ -357,14 +276,12 @@ impl PrecisionGates {
         Some(with_extra(&self.ttm, |extra| forecast(m, horizon, extra, &[])))
     }
 
-    /// Labels that have a score history, longest first.
     pub fn series_labels(&self) -> Vec<(String, usize)> {
         let mut v: Vec<(String, usize)> = self.series.iter().map(|(k, s)| (k.clone(), s.len())).collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         v
     }
 
-    /// Forecast of the next scores of a label, with the SDS's remembered errors.
     pub fn forecast_for(&self, label: &str, horizon: usize, sds: &SdsStore) -> Option<Forecast> {
         let s = self.series.get(label)?;
         if s.is_empty() {
@@ -374,7 +291,6 @@ impl PrecisionGates {
         Some(with_extra(&self.ttm, |extra| forecast(s, horizon, extra, &past)))
     }
 
-    /// Score floor for a label and where it came from.
     pub fn floor_for(&self, label: &str, sds: &SdsStore) -> (f32, String) {
         let fixed = self.cfg.min_score as f64;
         let mut floor = fixed;
@@ -480,13 +396,10 @@ impl PrecisionGates {
         }
     }
 
-    /// Judges the candidates of one scan, in order, with the robot standing still.
     pub fn judge(&mut self, cands: Vec<Candidate>, tick: u64, sds: &mut SdsStore) -> Vec<Judged> {
         self.judge_with(cands, tick, sds, &MemCtx::still())
     }
 
-    /// Judges the candidates of one scan; a landmark seen again is fused with
-    /// its memory by their variances (`mem`: how far the robot has moved since).
     pub fn judge_with(&mut self, cands: Vec<Candidate>, tick: u64, sds: &mut SdsStore, mem: &MemCtx) -> Vec<Judged> {
         self.prune(tick);
         let deduped = self.dedup_scan_candidates(cands);
@@ -500,7 +413,6 @@ impl PrecisionGates {
 
         let mut gates: Vec<GateResult> = Vec::new();
 
-        // 1. score
         let (floor, floor_source) = self.floor_for(&c.label, sds);
         let score_ok = c.score >= floor;
         gates.push(GateResult {
@@ -511,7 +423,6 @@ impl PrecisionGates {
             detail: format!("점수 {:.2} {} 하한 {floor:.2} ({floor_source})", c.score, if score_ok { "≥" } else { "<" }),
         });
 
-        // 2. margin
         let margin_ok = c.margin >= self.cfg.min_margin;
         gates.push(GateResult {
             gate: "margin",
@@ -528,11 +439,9 @@ impl PrecisionGates {
         });
         let plausible = score_ok && margin_ok;
 
-        // The spot as a landmark.
         let tid = c.world.map(|(x, z)| self.associate(&c, x, z, tick));
         let state = tid.and_then(|id| self.landmark(id)).map(|l| l.state);
 
-        // 3. temporal
         let mut temporal = None;
         match tid {
             Some(id) => {
@@ -589,7 +498,6 @@ impl PrecisionGates {
             None => gates.push(GateResult { gate: "temporal", passed: true, applied: false, severity: 0, detail: "위치를 알 수 없어 건너뜀".into() }),
         }
 
-        // 4. conflict
         if let Some((x, z)) = c.world {
             let close_inspection = c.depth_m <= 1.6 && c.margin >= self.cfg.min_margin * 1.5;
             let rival = self
@@ -612,7 +520,6 @@ impl PrecisionGates {
             gates.push(GateResult { gate: "conflict", passed: true, applied: false, severity: 0, detail: "위치를 알 수 없어 건너뜀".into() });
         }
 
-        // 5. touch
         let ruled_out = state == Some(LmState::Rejected);
         gates.push(GateResult {
             gate: "touch",
@@ -626,7 +533,6 @@ impl PrecisionGates {
         let temporal_ok = gates.iter().find(|g| g.gate == "temporal").map_or(true, |g| g.passed);
         let record_ok = plausible && temporal_ok;
 
-        // Update the landmark before the confirmation gate reads it.
         if let Some(id) = tid {
             let (x, z) = c.world.unwrap_or((0.0, 0.0));
             let sigma_obs = mem.sigma_obs(c.depth_m);
@@ -645,7 +551,6 @@ impl PrecisionGates {
                         l.z = z;
                         l.sigma_m = sigma_obs;
                     } else {
-                        // The memory and the new sighting, each by its variance: after a walk the sighting counts for more.
                         let before = l.memory();
                         let travelled = mem.odo_m - before.odo_m;
                         let predicted = before.sigma_m(mem.odo_m, mem.rate);
@@ -653,7 +558,6 @@ impl PrecisionGates {
                         record_memory(sds, mem, &c.label, travelled, innov, predicted, before.sigma0_m, sigma_obs);
                         l.x = fused.x;
                         l.z = fused.z;
-                        // The camera's own bias does not average away (est: at most four sightings' worth).
                         l.sigma_m = fused.sigma0_m.max(0.5 * sigma_obs);
                     }
                     l.odo_m = mem.odo_m;
@@ -677,7 +581,6 @@ impl PrecisionGates {
             }
         }
 
-        // 6. confirm
         let need = self.cfg.confirm_sightings;
         match tid.and_then(|id| self.landmark(id)) {
             Some(l) => {
@@ -701,7 +604,6 @@ impl PrecisionGates {
             }
         }
 
-        // Bookkeeping: counters and SDS gate record.
         self.counters.evaluated += 1;
         if accepted {
             self.counters.accepted += 1;
@@ -793,20 +695,17 @@ mod tests {
             sds.record_baseline(&scope, "score", 0.85 + 0.01 * ((i % 3) as f64 - 1.0));
         }
         let (floor, src) = g.floor_for("tree", &sds);
-        // mean 0.85 - 2 sd would be about 0.83, but the learned floor is capped 0.25 above the fixed one
         assert!((floor - 0.55).abs() < 1e-6, "{floor}");
         assert!(src.contains("SDS"), "{src}");
         let weak = judge1(&mut g, &mut sds, cand("tree", 0.50, 0.2, 5.0, 5.0), 1);
         assert_eq!(weak.blocked_by(), Some("score"), "0.50 passes the fixed floor but not the learned one");
         let fine = judge1(&mut g, &mut sds, cand("tree", 0.70, 0.2, 5.0, 5.0), 2);
         assert!(fine.gates.iter().find(|x| x.gate == "score").unwrap().passed);
-        // low scores learned (mean 0.20): the learned bound is below the fixed floor, which stays
         let mut sds2 = SdsStore::memory();
         for i in 0..40 {
             sds2.record_baseline(&scope, "score", 0.20 + 0.02 * ((i % 3) as f64 - 1.0));
         }
         assert_eq!(g.floor_for("tree", &sds2).0, 0.30);
-        // adaptive off ignores the SDS
         g.set_cfg(GateCfg { adaptive: false, ..GateCfg::default() });
         assert_eq!(g.floor_for("tree", &sds).0, 0.30);
     }
@@ -854,7 +753,6 @@ mod tests {
         for t in 0..10u64 {
             judge1(&mut g, &mut sds, cand("tree", 0.80 + 0.02 * ((t % 3) as f32 - 1.0), 0.2, 5.0, 5.0), t);
         }
-        // the robot's view changed and the score now sits near 0.45
         let a = judge1(&mut g, &mut sds, cand("tree", 0.45, 0.2, 5.0, 5.0), 20);
         let b = judge1(&mut g, &mut sds, cand("tree", 0.46, 0.2, 5.0, 5.0), 21);
         assert!(!a.accepted && !b.accepted, "held at first");
@@ -890,10 +788,8 @@ mod tests {
         judge1(&mut g, &mut sds, cand("boulder", 0.86, 0.2, 6.0, 6.0), 2);
         let alt = judge1(&mut g, &mut sds, cand("coal_ore", 0.60, 0.2, 6.1, 6.0), 3);
         assert_eq!(alt.blocked_by(), Some("conflict"), "{:?}", alt.gates);
-        // a distant object of the other label is fine
         let far = judge1(&mut g, &mut sds, cand("coal_ore", 0.60, 0.2, 9.0, 6.0), 4);
         assert!(far.gates.iter().find(|x| x.gate == "conflict").unwrap().passed);
-        // and a clearly stronger label on the spot is not blocked
         let strong = judge1(&mut g, &mut sds, cand("coal_ore", 0.95, 0.3, 6.1, 6.0), 5);
         assert!(strong.gates.iter().find(|x| x.gate == "conflict").unwrap().passed);
     }
@@ -941,9 +837,9 @@ mod tests {
     fn unconfirmed_phantoms_expire_but_confirmed_landmarks_stay() {
         let mut g = PrecisionGates::new(GateCfg::default());
         let mut sds = SdsStore::memory();
-        judge1(&mut g, &mut sds, cand("tree", 0.8, 0.2, 5.0, 5.0), 1); // one sighting only
+        judge1(&mut g, &mut sds, cand("tree", 0.8, 0.2, 5.0, 5.0), 1);
         judge1(&mut g, &mut sds, cand("boulder", 0.8, 0.2, 9.0, 5.0), 1);
-        judge1(&mut g, &mut sds, cand("boulder", 0.8, 0.2, 9.0, 5.0), 2); // confirmed
+        judge1(&mut g, &mut sds, cand("boulder", 0.8, 0.2, 9.0, 5.0), 2);
         assert_eq!(g.landmarks().len(), 2);
         judge1(&mut g, &mut sds, cand("log", 0.8, 0.2, 2.0, 2.0), 2 + STALE_TICKS + 5);
         let labels: Vec<&str> = g.landmarks().iter().map(|l| l.label.as_str()).collect();

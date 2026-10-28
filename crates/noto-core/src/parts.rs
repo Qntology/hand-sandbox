@@ -1,18 +1,3 @@
-//! Part presets for a ~1.2 m logistics robot that a small team can build.
-//!
-//! Every segment (head, chest, belly/pelvis, arm, leg or chassis, foot) comes
-//! in tiers built from off-the-shelf actuators: bus servos and printed PLA
-//! (budget), small quasi-direct-drive (QDD) motors and aluminium (mid), large
-//! QDDs and carbon fibre (pro). The numbers are datasheet values with sources
-//! in `docs/research/parts.md` (the `src` keys below), or estimates marked
-//! "est" there with the arithmetic shown. They are what makes a preset matter
-//! to the physics: total mass, centre-of-mass height, joint peak and
-//! continuous torque, joint speed, drive force and battery energy decide what
-//! the robot can lift, how steep it can go and how fast it moves.
-//!
-//! Geometry of the reference robot (est, research report §5): hip 0.58 m,
-//! waist 0.70 m, shoulder 1.00 m, upper arm 0.22 m, forearm 0.20 m.
-
 use serde::{Deserialize, Serialize};
 
 use crate::base::BaseKind;
@@ -20,26 +5,19 @@ use crate::hand::FingerCount;
 use crate::morph::{HeadMount, Morphology, Torso};
 use crate::wear::Reducer;
 
-/// Hip height above the ground (or the chassis mast top for wheeled bases), metres.
 pub const HIP_M: f32 = 0.58;
-/// Waist joint height, metres.
 pub const WAIST_M: f32 = 0.70;
-/// Shoulder joint height, metres.
 pub const SHOULDER_M: f32 = 1.00;
-/// Half the distance between the two shoulders, metres (est).
 pub const SHOULDER_HALF_WIDTH_M: f32 = 0.18;
 pub const UPPER_ARM_M: f32 = 0.22;
 pub const FOREARM_M: f32 = 0.20;
-/// Centre-to-centre distance of the two feet in stance, metres (est, about a human's).
 pub const STANCE_WIDTH_M: f32 = 0.18;
-/// Track width of the wheeled chassis, metres (est).
 pub const CHASSIS_WIDTH_M: f32 = 0.40;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Tier {
     Budget,
-    /// Only for legs: DIY printed cycloidal BLDC actuators (Berkeley Humanoid Lite).
     BudgetPlus,
     Mid,
     Pro,
@@ -67,7 +45,6 @@ impl Tier {
         }
     }
 
-    /// `BudgetPlus` exists only for legs; elsewhere it means `Budget`.
     fn no_plus(self) -> Tier {
         if self == Tier::BudgetPlus {
             Tier::Budget
@@ -77,27 +54,21 @@ impl Tier {
     }
 }
 
-/// One actuator, or several ganged on one joint.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct Actuator {
     pub name: &'static str,
     pub peak_nm: f32,
     pub cont_nm: f32,
-    /// No-load output speed, rad/s.
     pub speed_rad_s: f32,
     pub mass_kg: f32,
     pub price_usd: f32,
     pub backdrivable: bool,
-    /// Thermal time constant of the heat model, seconds (est: research §1).
     pub thermal_tau_s: f32,
-    /// Reducer family, for the wear model's life rating (`wear::rating`).
     pub reducer: Reducer,
-    /// Source keys in `docs/research/parts.md`.
     pub src: &'static str,
 }
 
 impl Actuator {
-    /// Two of the same actuator driving one joint.
     pub const fn ganged(self, name: &'static str) -> Actuator {
         Actuator {
             name,
@@ -109,30 +80,20 @@ impl Actuator {
         }
     }
 
-    /// Torque available at joint speed `omega` (linear torque-speed line).
     pub fn torque_at(&self, omega: f32) -> f32 {
         self.peak_nm * (1.0 - (omega.abs() / self.speed_rad_s.max(1e-3))).clamp(0.0, 1.0)
     }
 }
 
-/// Feetech STS3215-C018, 12 V [1].
 pub const STS3215: Actuator = Actuator { name: "Feetech STS3215 (12 V)", peak_nm: 2.94, cont_nm: 0.98, speed_rad_s: 4.7, mass_kg: 0.055, price_usd: 32.0, backdrivable: false, thermal_tau_s: 200.0, reducer: Reducer::Spur, src: "1" };
-/// Hiwonder HTD-45H, 11.1 V [4]; continuous is an estimate (a third of peak, like Feetech).
 pub const HTD45H: Actuator = Actuator { name: "Hiwonder HTD-45H", peak_nm: 4.41, cont_nm: 1.5, speed_rad_s: 5.8, mass_kg: 0.064, price_usd: 30.0, backdrivable: false, thermal_tau_s: 200.0, reducer: Reducer::Spur, src: "4" };
-/// Dynamixel XM430-W350 [7][10].
 pub const XM430: Actuator = Actuator { name: "Dynamixel XM430-W350", peak_nm: 4.1, cont_nm: 0.82, speed_rad_s: 4.8, mass_kg: 0.082, price_usd: 310.0, backdrivable: false, thermal_tau_s: 250.0, reducer: Reducer::Spur, src: "7,10" };
-/// Robstride 01 [15].
 pub const RS01: Actuator = Actuator { name: "Robstride 01", peak_nm: 17.0, cont_nm: 6.0, speed_rad_s: 33.0, mass_kg: 0.38, price_usd: 130.0, backdrivable: true, thermal_tau_s: 600.0, reducer: Reducer::Planetary, src: "15" };
-/// Robstride 02 [15].
 pub const RS02: Actuator = Actuator { name: "Robstride 02", peak_nm: 17.0, cont_nm: 6.0, speed_rad_s: 42.9, mass_kg: 0.405, price_usd: 145.0, backdrivable: true, thermal_tau_s: 600.0, reducer: Reducer::Planetary, src: "15" };
-/// Robstride 03 [16].
 pub const RS03: Actuator = Actuator { name: "Robstride 03", peak_nm: 60.0, cont_nm: 20.0, speed_rad_s: 20.4, mass_kg: 0.88, price_usd: 225.0, backdrivable: true, thermal_tau_s: 800.0, reducer: Reducer::Planetary, src: "16" };
-/// Robstride 04 [17]; 40 N·m continuous needs the large heatsink.
 pub const RS04: Actuator = Actuator { name: "Robstride 04", peak_nm: 120.0, cont_nm: 40.0, speed_rad_s: 20.9, mass_kg: 1.42, price_usd: 255.0, backdrivable: true, thermal_tau_s: 900.0, reducer: Reducer::Planetary, src: "17" };
-/// Berkeley Humanoid Lite 6512 printed cycloidal actuator [22]; continuous and speed est.
 pub const BHL6512: Actuator = Actuator { name: "BHL 6512 (자작 사이클로이드)", peak_nm: 20.0, cont_nm: 7.0, speed_rad_s: 15.0, mass_kg: 0.55, price_usd: 170.0, backdrivable: true, thermal_tau_s: 500.0, reducer: Reducer::Cycloid, src: "22" };
 
-/// The seven segments of the body, as the N:N balance tables name them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Segment {
@@ -181,12 +142,9 @@ impl Segment {
 pub struct HeadPreset {
     pub tier: Tier,
     pub mass_kg: f32,
-    /// CoM above the neck joint, metres.
     pub com_up_m: f32,
     pub neck: Actuator,
     pub sensor: &'static str,
-    /// Share of a body tilt the neck can cancel to keep the camera level (est:
-    /// servo backlash and speed; a QDD neck would do better).
     pub gaze_stabilization: f32,
     pub power_w: f32,
     pub cost_usd: f32,
@@ -195,11 +153,9 @@ pub struct HeadPreset {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ChestPreset {
     pub tier: Tier,
-    /// Structure and computer, without the battery.
     pub mass_kg: f32,
     pub battery_kg: f32,
     pub battery_wh: f32,
-    /// CoM above the waist joint, metres.
     pub com_up_m: f32,
     pub computer: &'static str,
     pub power_w: f32,
@@ -210,16 +166,9 @@ pub struct ChestPreset {
 pub struct BellyPreset {
     pub tier: Tier,
     pub mass_kg: f32,
-    /// CoM below the waist joint, metres.
     pub com_down_m: f32,
-    /// Waist yaw actuator (turns the trunk; carries no pitch load).
     pub waist: Actuator,
-    /// Waist pitch actuator, if the tier has one. Without it the trunk is
-    /// rigid in pitch: it cannot lean to restore balance, and the pitch load
-    /// goes into the structure (research §5: a pitch joint needs ≥12 N·m
-    /// continuous, which only the pro tier's Robstride 03 has).
     pub pitch: Option<Actuator>,
-    /// Largest trunk lean the waist can hold, degrees (0 without a pitch joint).
     pub max_lean_deg: f32,
     pub power_w: f32,
     pub cost_usd: f32,
@@ -228,9 +177,7 @@ pub struct BellyPreset {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ArmPreset {
     pub tier: Tier,
-    /// One arm without the hand.
     pub mass_kg: f32,
-    /// CoM along the arm from the shoulder, metres (actuators near the shoulder pull it in).
     pub com_m: f32,
     pub shoulder: Actuator,
     pub elbow: Actuator,
@@ -241,13 +188,10 @@ pub struct ArmPreset {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct LegPreset {
     pub tier: Tier,
-    /// One leg without the foot.
     pub mass_kg: f32,
-    /// CoM below the hip, metres.
     pub com_down_m: f32,
     pub knee: Actuator,
     pub ankle: Actuator,
-    /// Walking speed limit as a Froude number v² / (g · leg length) (research §5 tier totals).
     pub froude: f32,
     pub foot_mass_kg: f32,
     pub foot_len_m: f32,
@@ -261,26 +205,18 @@ pub struct ChassisPreset {
     pub tier: Tier,
     pub name: &'static str,
     pub mass_kg: f32,
-    /// Height of the chassis' own CoM, metres.
     pub com_m: f32,
     pub max_speed_mps: f32,
-    /// Continuous traction force of all drive wheels together, N.
     pub drive_force_n: f32,
     pub power_w: f32,
     pub cost_usd: f32,
     pub src: &'static str,
 }
 
-/// A torso lift on the wheeled base's mast: a carriage that slides the
-/// pelvis, and everything the pelvis carries, down the mast so the hands get
-/// to the floor (the mobile manipulators that pick from the floor all have
-/// one: Fetch, TIAGo, HSR, Stretch; research `docs/research/perception.md` §1).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct LiftPreset {
     pub name: &'static str,
-    /// Travel down the mast, metres.
     pub stroke_m: f32,
-    /// Top speed, m/s, and the force it holds and drives, N.
     pub speed_mps: f32,
     pub force_n: f32,
     pub mass_kg: f32,
@@ -289,29 +225,12 @@ pub struct LiftPreset {
     pub src: &'static str,
 }
 
-/// Fetch's torso lift: 0–400 mm at 0.1 m/s and 450 N (Fetch mechanical
-/// specification; the URDF's torso_lift_joint 0–0.386 m, 0.1 m/s, 450 N). The
-/// stroke also fits this robot: the pelvis stops 1 cm above the chassis. Its
-/// mass on a robot this size: a belt axis with a stepper and a brake (est:
-/// igus drylin ZLW-1040 1.0 kg + 0.14 kg per 100 mm, about 1.6 kg for the
-/// stroke, and 0.9 kg of motor and brake), and its cost (est).
 pub const TORSO_LIFT: LiftPreset = LiftPreset { name: "몸통 리프트 (Fetch 급 0.40 m · 450 N)", stroke_m: 0.40, speed_mps: 0.10, force_n: 450.0, mass_kg: 2.5, power_w: 30.0, cost_usd: 600.0, src: "Fetch 사양 · 질량·가격 추정" };
 
-/// Mass of a belt-axis lift of `stroke_m`, kg: the axis (igus drylin
-/// ZLW-1040, 1.0 kg + 0.14 kg per 100 mm of stroke) and 0.9 kg of stepper and
-/// brake, the estimate [`TORSO_LIFT`]'s 2.5 kg is rounded from (est).
 pub const fn lift_mass_kg(stroke_m: f32) -> f32 {
     1.0 + 1.4 * stroke_m + 0.9
 }
 
-/// The lift of a mast that carries the arm's carriage below its camera (no
-/// torso, `morph::Morphology::mast_arms`): Stretch RE1 takes its arm from the
-/// floor to 1.10 m on such a lift (Kemp et al., ICRA 2022, Sec. II). The
-/// stroke here is the form's own (`Morphology::mast_lift_m`: from
-/// `morph::MAST_LIFT_TOP_M` down to a deck arm's shoulder height, 0.84 m for
-/// the Stretch-like form), and its mass follows the stroke by the same
-/// belt-axis estimate ([`lift_mass_kg`]: 3.08 kg at 0.84 m). No source gives
-/// the lift's speed or force: they are [`TORSO_LIFT`]'s (est); its cost est.
 pub const MAST_LIFT: LiftPreset = LiftPreset { name: "마스트 리프트 (Stretch 급)", stroke_m: 0.84, speed_mps: 0.10, force_n: 450.0, mass_kg: lift_mass_kg(0.84), power_w: 30.0, cost_usd: 600.0, src: "행정: Stretch RE1 리프트 · 속도·힘·질량·가격 추정" };
 
 impl HeadPreset {
@@ -368,23 +287,18 @@ impl LegPreset {
 impl ChassisPreset {
     pub fn of(tier: Tier) -> ChassisPreset {
         match tier.no_plus() {
-            // LeKiwi: 3× STS3215 on 100 mm omni wheels [30]; force est 3 × 0.98 N·m × 0.9 / 0.05 m × cos 30°.
             Tier::Budget => ChassisPreset { tier: Tier::Budget, name: "LeKiwi 급 (STS3215 ×3)", mass_kg: 1.7, com_m: 0.06, max_speed_mps: 0.24, drive_force_n: 46.0, power_w: 30.0, cost_usd: 226.0, src: "30" },
-            // Hub-motor base (est, between LeKiwi and Scout Mini): 4 × 100 W, force = 400 W × 0.9 / 1.5 m/s.
             Tier::Mid => ChassisPreset { tier: Tier::Mid, name: "허브 모터 4륜 (추정)", mass_kg: 8.0, com_m: 0.10, max_speed_mps: 1.5, drive_force_n: 240.0, power_w: 120.0, cost_usd: 900.0, src: "est" },
-            // AgileX Tracer: 2 × 150 W, 1.6 m/s, 100 kg payload [33]; force est 300 W × 0.9 / 1.6 m/s.
             _ => ChassisPreset { tier: Tier::Pro, name: "AgileX Tracer 급", mass_kg: 30.0, com_m: 0.12, max_speed_mps: 1.6, drive_force_n: 170.0, power_w: 300.0, cost_usd: 7590.0, src: "33" },
         }
     }
 }
 
-/// A parallel-jaw gripper at the end of a single arm (`morph::Manip::Gripper1`).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct GripperPreset {
     pub tier: Tier,
     pub name: &'static str,
     pub mass_kg: f32,
-    /// Jaw force, peak and continuous, N (`None` where no source gives it).
     pub peak_n: Option<f32>,
     pub cont_n: Option<f32>,
     pub src: &'static str,
@@ -393,19 +307,13 @@ pub struct GripperPreset {
 impl GripperPreset {
     pub fn of(tier: Tier) -> GripperPreset {
         match tier.no_plus() {
-            // SO-101 jaw: one STS3215, ~0.13 kg, ~21 N peak / ~7 N continuous (est) [29].
             Tier::Budget => GripperPreset { tier: Tier::Budget, name: "SO-101 집게 (STS3215 ×1)", mass_kg: 0.13, peak_n: Some(21.0), cont_n: Some(7.0), src: "29 · 힘 추정" },
-            // A two-finger XM430 jaw (est, research §2, as `hand_mass_kg(Two)`).
             Tier::Mid => GripperPreset { tier: Tier::Mid, name: "2지 XM430 집게 (추정)", mass_kg: 0.35, peak_n: None, cont_n: None, src: "est" },
-            // Robotiq 2F-85: 0.9 kg, 20–235 N [37].
             _ => GripperPreset { tier: Tier::Pro, name: "Robotiq 2F-85", mass_kg: 0.9, peak_n: Some(235.0), cont_n: Some(20.0), src: "37" },
         }
     }
 }
 
-/// Mass of the hand for a finger count (est from the hands in research §2:
-/// a two-finger XM430 jaw ~0.35 kg, an underactuated three-finger ~0.40 kg,
-/// five-finger dexterous hands 0.54–0.60 kg).
 pub fn hand_mass_kg(fingers: FingerCount) -> f32 {
     match fingers {
         FingerCount::Two => 0.35,
@@ -415,24 +323,17 @@ pub fn hand_mass_kg(fingers: FingerCount) -> f32 {
     }
 }
 
-/// The preset choice for every segment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BodyPlan {
     pub head: Tier,
     pub chest: Tier,
     pub belly: Tier,
     pub arm: Tier,
-    /// Legs for a walking base, the chassis for a wheeled or tracked one.
     pub leg: Tier,
-    /// Battery in the pelvis instead of the chest (lowers the CoM a little and
-    /// takes inertia off the waist; research §6).
     #[serde(default)]
     pub battery_low: bool,
-    /// A torso lift on the mast of a wheeled or tracked base ([`TORSO_LIFT`]; nothing on legs).
     #[serde(default)]
     pub lift: bool,
-    /// The robot's form layer by layer (`morph`); the default is today's
-    /// humanoid. Its lower body follows the drive (`NotoConfig.base`).
     #[serde(default)]
     pub morph: Morphology,
 }
@@ -448,9 +349,6 @@ impl BodyPlan {
         BodyPlan { head: tier, chest: tier, belly: tier, arm: tier, leg: tier, battery_low: false, lift: false, morph: Morphology::default() }
     }
 
-    /// Short id such as `mid` or `h:mid c:pro b:mid a:budget l:mid bat:low`,
-    /// with the form's key after a `+` when the upper layers are not the
-    /// humanoid's (`mid+truck`; `morph::Morphology::upper_key`).
     pub fn id(&self) -> String {
         match self.morph.upper_key() {
             Some(k) => format!("{}+{k}", self.tier_id()),
@@ -458,14 +356,6 @@ impl BodyPlan {
         }
     }
 
-    /// `Ok` when the plan's form can be built on the drive `base` (its lower
-    /// body is that drive, its sizes in range: `morph::Morphology::validate`)
-    /// and an arm can load its own tote or bed (the hand gets over it,
-    /// `act::grasp::stow_pose`, with the plan's lift), else the reasons in
-    /// Korean. `balance::Body::new` builds any plan by fitting the form
-    /// (`Morphology::fit`); this says what the fit would change and what the
-    /// built robot cannot do (an arm on a trunk or a column high over a low
-    /// tote or bed keeps what it picks in its hand).
     pub fn validate(&self, base: BaseKind) -> Result<(), String> {
         let mut v = self.morph.issues(base);
         let body = crate::balance::Body::new(self, base, FingerCount::Five);
@@ -498,20 +388,14 @@ impl BodyPlan {
         )
     }
 
-    /// Named starting points that make sense together (research §6).
     pub fn named(id: &str) -> Option<BodyPlan> {
         Some(match id {
             "budget" => BodyPlan::uniform(Tier::Budget),
             "mid" => BodyPlan::uniform(Tier::Mid),
             "pro" => BodyPlan::uniform(Tier::Pro),
-            // Budget arms and head on a wheeled base: an SO-101-like logistics robot.
             "budget_arms_mid_base" => BodyPlan { arm: Tier::Budget, head: Tier::Budget, ..BodyPlan::uniform(Tier::Mid) },
-            // Strong shoulders on mid legs: more payload, but the ankles must follow.
             "pro_arms" => BodyPlan { arm: Tier::Pro, ..BodyPlan::uniform(Tier::Mid) },
             "battery_low" => BodyPlan { battery_low: true, ..BodyPlan::uniform(Tier::Mid) },
-            // A wheeled base that reaches the floor: the torso lift lowers the
-            // shoulders 0.40 m and the pro belly's waist pitch leans them over
-            // the bumper (neither does it alone).
             "wheel_lift" => BodyPlan { lift: true, belly: Tier::Pro, ..BodyPlan::uniform(Tier::Mid) },
             _ => return None,
         })
@@ -537,11 +421,6 @@ impl BodyPlan {
     pub fn chassis_preset(&self) -> ChassisPreset {
         ChassisPreset::of(self.leg)
     }
-    /// The torso lift on a wheeled or tracked base, when the plan has one and
-    /// the form has a trunk or a column for its carriage to slide on; a mast
-    /// that carries the arm always has its own lift ([`MAST_LIFT`], its stroke
-    /// from the form's mast, `Morphology::mast_lift_m`). Call it with the form
-    /// fitted to the drive (`Morphology::fit`), as `Body::new` does.
     pub fn lift_preset(&self, base: BaseKind) -> Option<LiftPreset> {
         if base == BaseKind::HumanFoot {
             return None;
@@ -552,14 +431,10 @@ impl BodyPlan {
         (self.lift && self.morph.torso != Torso::None).then_some(TORSO_LIFT)
     }
 
-    /// The gripper of a single gripper arm (`Manip::Gripper1`), on the arm's tier.
     pub fn gripper_preset(&self) -> GripperPreset {
         GripperPreset::of(self.arm)
     }
 
-    /// Approximate parts cost, US dollars, of the parts the form has: the
-    /// head (without its neck servos when it is fixed), the chest, the belly
-    /// with a humanoid torso, each arm, two legs or one chassis (and the lift).
     pub fn cost_usd(&self, base: BaseKind) -> f32 {
         let m = self.morph.fit(base);
         let lower = if base == BaseKind::HumanFoot { 2.0 * self.leg_preset().cost_usd } else { self.chassis_preset().cost_usd + BodyPlan { morph: m, ..*self }.lift_preset(base).map_or(0.0, |l| l.cost_usd) };
@@ -583,7 +458,6 @@ mod tests {
         let (b, m, p) = (ArmPreset::of(Tier::Budget), ArmPreset::of(Tier::Mid), ArmPreset::of(Tier::Pro));
         assert!(b.mass_kg < m.mass_kg && m.mass_kg < p.mass_kg);
         assert!(b.shoulder.peak_nm < m.shoulder.peak_nm && m.shoulder.peak_nm < p.shoulder.peak_nm);
-        // Bus servos are not weak on static torque per kilogram, only on continuous torque and power.
         let per_kg = |a: Actuator| a.peak_nm / a.mass_kg;
         assert!(per_kg(STS3215) > per_kg(RS02), "{} vs {}", per_kg(STS3215), per_kg(RS02));
         assert!(STS3215.cont_nm / STS3215.peak_nm < 0.4);
@@ -612,11 +486,9 @@ mod tests {
         assert_eq!(truck.id(), "mid+truck");
         let lifted = BodyPlan { lift: true, morph: Morphology::named("mast_gripper").unwrap(), ..BodyPlan::default() };
         assert_eq!(lifted.id(), "h:mid c:mid b:mid a:mid l:mid lift+mast_gripper");
-        // The humanoid forms keep today's ids, whatever their lower body.
         for f in ["legs_humanoid", "wheel_humanoid", "track_humanoid"] {
             assert_eq!(BodyPlan { morph: Morphology::named(f).unwrap(), ..BodyPlan::default() }.id(), "mid");
         }
-        // No arms and no belly cost less; a bare deck has no carriage for a lift, a mast with an arm always has its own.
         assert!(truck.cost_usd(BaseKind::Wheel) < BodyPlan::default().cost_usd(BaseKind::Wheel));
         let deck = BodyPlan { lift: true, morph: Morphology::named("deck_gripper").unwrap(), ..BodyPlan::default() };
         assert!(deck.lift_preset(BaseKind::Wheel).is_none());

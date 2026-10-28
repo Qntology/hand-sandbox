@@ -22,23 +22,16 @@ license = "Apache-2.0"
 [workspace.dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
-# float_roundtrip: parsing a float must give back the exact value that was written, or the
-# audit log's hash chain cannot be verified when a line carries a score such as 0.98f32.
 serde_json = { version = "1", features = ["float_roundtrip"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 tokenizers = "0.22"
-# LanceDB: ML-native columnar store for synthetic samples, embeddings and dictionaries.
 lancedb = { version = "0.31.0", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 futures = "0.3"
 rayon = "1"
-# libwebp bindings: lossy WebP encoding (the pure-Rust `image-webp` encoder is lossless only).
 webp = "0.3"
-# candle ML framework. The Qntology fork adds ROCm (HIP) and Vulkan backends on top of
-# candle 0.11.0 and is pinned to one commit so every backend builds against the same core.
 candle-core = "0.11.0"
 candle-nn = "0.11.0"
-# Segment Anything (SAM / MobileSAM) for the mask track. Its candle-core is the patched fork below.
 candle-transformers = "0.11.0"
 
 [patch.crates-io]
@@ -54,15 +47,12 @@ opt-level = 3
 [profile.dev.package.tokenizers]
 opt-level = 3
 
-# The software renderer and the A* planner are CPU heavy; keep them fast in debug test runs.
 [profile.dev.package.world-sim]
 opt-level = 3
 
-# The ML stand-ins and the region tracker run per keyframe in the integrated test.
 [profile.dev.package.noto-vision]
 opt-level = 3
 
-# The joint dynamics run a 2 ms rigid-body simulation per posture change inside the world tests.
 [profile.dev.package.noto-core]
 opt-level = 3
 

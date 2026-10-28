@@ -1,22 +1,3 @@
-//! Features that mix the ML tracks, one set per keyframe.
-//!
-//! Each track can look fine on its own and still disagree with the others.
-//! These features say where they disagree, so the SDS `fusion` track can learn
-//! what normal disagreement looks like for each label and flag the keyframes
-//! that leave it:
-//!
-//! * `peak_in_mask`: the semantic peak (SigLIP2) lies inside the tracked mask;
-//! * `peak_depth_gap`: depth at the peak against the mask's median depth
-//!   (a peak on the background behind the object has a much larger depth);
-//! * `heat_in_mask`: share of the label's heat above half its peak that falls
-//!   inside the mask (the heat map and the mask describe the same object);
-//! * `range_gap`: depth-model range times the learned scale against the
-//!   triangulated range;
-//! * `motion_residual_deg`: what the decision predicted against what the
-//!   tracker saw after the move;
-//! * `head_tilt_deg`: residual camera tilt from the balance model (body
-//!   motion that reaches the camera makes the tracker's job harder).
-
 use serde::{Deserialize, Serialize};
 
 use crate::frame::{DepthMap, Mask};
@@ -32,8 +13,6 @@ pub struct Features {
     pub head_tilt_deg: Option<f32>,
 }
 
-/// Thresholds for the flags. They are starting values; the SDS baselines of
-/// the same features are what the runtime compares against once it has them.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FlagCfg {
     pub depth_gap: f32,
@@ -71,7 +50,6 @@ pub fn features(inp: &FusionInput<'_>) -> Features {
             (mx >= 0 && my >= 0 && mx < m.width as i64 && my < m.height as i64).then_some((mx as u32, my as u32))
         };
         f.peak_in_mask = Some(to_mask(p.px, p.py).map_or(false, |(x, y)| m.get(x, y)));
-        // Heat cells above half the peak, sampled at their centres.
         let h = &p.heat;
         let peak = h.values.iter().copied().fold(0.0f32, f32::max);
         let (mut inside, mut total) = (0.0f32, 0.0f32);
@@ -109,7 +87,6 @@ pub fn features(inp: &FusionInput<'_>) -> Features {
     f
 }
 
-/// Flag codes raised by fixed thresholds.
 pub fn flags(f: &Features, cfg: &FlagCfg) -> Vec<&'static str> {
     let mut v = Vec::new();
     if f.peak_in_mask == Some(false) {
@@ -133,7 +110,6 @@ pub fn flags(f: &Features, cfg: &FlagCfg) -> Vec<&'static str> {
     v
 }
 
-/// Named numeric features, for SDS baselines (`fusion|<label>|`).
 pub fn numeric(f: &Features) -> Vec<(&'static str, f64)> {
     let mut v = Vec::new();
     if let Some(b) = f.peak_in_mask {

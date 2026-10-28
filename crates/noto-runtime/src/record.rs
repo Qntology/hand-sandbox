@@ -1,15 +1,3 @@
-//! Recording a play-through: a low-resolution video and fixed-interval
-//! keyframes, each keyframe with what the ML tracks and the decision made of it.
-//!
-//! The game pass records at a fixed keyframe interval (the timeline's first
-//! row). The ML decision pass records one keyframe per decision (the third
-//! row): the picture taken after the move the previous decision asked for.
-//! Both rows also record a keyframe at each moment of an action's physics
-//! (a contact, a lift-off, a slip, an impact, a fall: `KeyEvent`), and every
-//! keyframe carries the focus views of that instant (`FocusFrame`: hand,
-//! finger joints, feet, leg joints, waist, neck, wheels, tracks) with three
-//! close-ups (the hand, the body from the side, low by the feet or wheels).
-
 use std::collections::BTreeMap;
 
 use anyhow::{anyhow, Result};
@@ -22,12 +10,9 @@ use world_sim::{decode_webp, encode_webp, Camera, World};
 
 use crate::ml::KeyTruth;
 
-/// Recording settings.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RecordCfg {
-    /// Ticks between keyframes of the game pass (10 ticks = 1 s).
     pub keyframe_every_ticks: u32,
-    /// Ticks between video frames (2 ticks = 5 fps).
     pub video_every_ticks: u32,
     pub video_width: u32,
     pub video_height: u32,
@@ -48,7 +33,6 @@ pub struct VideoFrame {
     pub webp: Vec<u8>,
 }
 
-/// What the ML tracks saw, for the UI (coordinates are fractions of the frame).
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct MlView {
     pub depth_mode: String,
@@ -99,7 +83,6 @@ pub struct TargetView {
     pub range_true_m: Option<f32>,
 }
 
-/// What the decision chose on a keyframe and how it went.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct DecisionView {
     pub decision: String,
@@ -110,7 +93,6 @@ pub struct DecisionView {
     pub band: Option<[f32; 4]>,
     pub estimate: Option<(f32, f32, f32, f32)>,
     pub fix: Option<(f32, f32, f32, f32, f32)>,
-    /// What the game executed for it (`move_to(...)`, `turn(...)`), or why it could not.
     pub executed: String,
     pub ok: bool,
 }
@@ -123,24 +105,18 @@ pub struct Keyframe {
     pub intr: Intrinsics,
     pub webp: Vec<u8>,
     pub truth: KeyTruth,
-    /// Quest step and world action at the time, for the game row's colour band.
     pub step: Option<String>,
     pub action: Option<String>,
     pub balance: Option<BalanceSummary>,
     pub ml: Option<MlView>,
     pub ml_webp: Option<Vec<u8>>,
     pub decision: Option<DecisionView>,
-    /// Per-track SDS z-scores (or flags) for the SDS lane: `depth`, `locate`, `tracker`, `decide`, `fusion`, `balance`, `act`.
     pub sds: BTreeMap<String, f32>,
-    /// The action moment that made this keyframe (`None` for a fixed-interval one).
     pub event: Option<KeyEvent>,
-    /// The focus views of this instant.
     pub focus: Option<FocusFrame>,
-    /// Focus close-ups as WebP: `hand`, `side`, `low`.
     pub focus_webp: Vec<(String, Vec<u8>)>,
 }
 
-/// An action moment that made a keyframe.
 #[derive(Clone, Debug, Serialize)]
 pub struct KeyEvent {
     pub act: String,
@@ -157,7 +133,6 @@ impl Keyframe {
     }
 }
 
-/// One pass's recording.
 pub struct Recording {
     pub pass: String,
     pub run_id: String,
@@ -166,13 +141,10 @@ pub struct Recording {
     pub started_tick: u64,
     pub ended_tick: Option<u64>,
     pub dropped_keyframes: usize,
-    /// When the robot looked, and the actions it took on memory (the vision lane).
     pub vision: Vec<crate::vision::VisionMark>,
-    /// The belief's true error over time (tick, metres): the record's, never the robot's.
     pub belief_err: Vec<(u64, f32)>,
 }
 
-/// Most vision marks kept per recording.
 pub const MAX_VISION_MARKS: usize = 4000;
 
 impl Recording {
@@ -181,11 +153,6 @@ impl Recording {
     }
 }
 
-/// The robot's pose from its own odometry (`world_sim::odometry`): it drifts
-/// as a real robot's does, which the triangulation residuals show. The camera
-/// is where the robot believes its head camera is on that pose: the head's
-/// offset from the body (its joints) turned into the believed heading, the
-/// neck's pan on top, and the eye's height above the ground.
 pub fn odometry(world: &World, cam: &Camera) -> Pose {
     let (x, z, yaw) = world.believed_pose();
     let est = world.head_view(cam).est;
@@ -194,18 +161,14 @@ pub fn odometry(world: &World, cam: &Camera) -> Pose {
     Pose { x: x + c * ox - s * oz, z: z + s * ox + c * oz, yaw: yaw + (est.yaw - world.agent.yaw), eye_m: est.origin[1] - world.agent_ground_m() }
 }
 
-/// The camera's intrinsics with the pitch the robot believes its head camera
-/// has now (the mount, the bend and the neck, the shake its IMU reads).
 pub fn intrinsics(world: &World, cam: &Camera) -> Intrinsics {
     let est = world.head_view(cam).est;
     Intrinsics { width: cam.width as u32, height: cam.height as u32, fov_deg: cam.fov_deg, pitch_deg: est.pitch.to_degrees() }
 }
 
-/// Width and height of the focus close-ups, pixels.
 pub const FOCUS_W: usize = 192;
 pub const FOCUS_H: usize = 128;
 
-/// The three focus close-ups of the world now, as WebP.
 pub fn capture_focus(world: &World, quality: f32) -> Vec<(String, Vec<u8>)> {
     let cam = Camera { width: FOCUS_W, height: FOCUS_H, fov_deg: 50.0, max_dist_m: 12.0, ..Camera::default() };
     FocusCam::ALL
@@ -217,7 +180,6 @@ pub fn capture_focus(world: &World, quality: f32) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
-/// Renders a keyframe with its ground truth and the focus views of the instant.
 pub fn capture_keyframe(world: &World, cam: &Camera, quality: f32, index: u32) -> Result<Keyframe> {
     let frame = world.render(cam);
     let enc = encode_webp(&frame.rgb, frame.width as u32, frame.height as u32, quality).map_err(|e| anyhow!("WebP 인코딩 실패: {e}"))?;
@@ -242,7 +204,6 @@ pub fn capture_keyframe(world: &World, cam: &Camera, quality: f32, index: u32) -
     })
 }
 
-/// A small video frame.
 pub fn capture_video(world: &World, cam: &Camera, cfg: &RecordCfg) -> Result<VideoFrame> {
     let c = Camera { width: cfg.video_width as usize, height: cfg.video_height as usize, ..*cam };
     let f = world.render(&c);

@@ -1,6 +1,3 @@
-//! Writes the logistics word dictionary (`data/logistics_dictionary.json`) to
-//! the Lance `dictionary` table, one row per label.
-
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -27,7 +24,6 @@ struct DictJsonEntry {
     source: String,
 }
 
-/// Arrow batch with one row per dictionary entry.
 pub fn dictionary_batch(raw_json: &str) -> Result<RecordBatch> {
     let file: DictFile = serde_json::from_str(raw_json).context("parsing logistics dictionary")?;
     let n = file.entries.len();

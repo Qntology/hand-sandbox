@@ -1,16 +1,3 @@
-//! Lance tables of the integrated test records (`noto_sds::records`).
-//!
-//! * `quest_runs`: one row per quest run (game or ML pass);
-//! * `quest_steps`: one row per step of a run, with its attempts;
-//! * `quest_stats`: attempts, successes and success rate per
-//!   `pass|kind|target|preset|step`, replaced on every write;
-//! * `ml_keyframes`: one row per analysed keyframe;
-//! * `balance_effort`: one row per N:N balance cell and state, with the
-//!   effort and margin with and without the learned feed-forward.
-//!
-//! The runtime writes the same rows to JSONL files; these tables are the
-//! queryable copy.
-
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -263,7 +250,6 @@ pub fn balance_effort_batch(rows: &[BalanceRow]) -> Result<RecordBatch> {
     Ok(RecordBatch::try_new(balance_effort_schema(), cols)?)
 }
 
-/// Rows written per table.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct MirrorCounts {
     pub quest_runs: usize,
@@ -273,7 +259,6 @@ pub struct MirrorCounts {
     pub balance_effort: usize,
 }
 
-/// Appends the new rows and replaces the success table.
 pub async fn write_mirror(store: &LanceStore, batch: &MirrorBatch, stats: &[SuccessStat]) -> Result<MirrorCounts> {
     let mut c = MirrorCounts::default();
     if !batch.runs.is_empty() {

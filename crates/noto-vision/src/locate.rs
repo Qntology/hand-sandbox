@@ -1,34 +1,3 @@
-//! ML track 2: semantic location. "Where in this keyframe is the iron ore?"
-//!
-//! [`SiglipLocator`] uses SigLIP2 dense patch embeddings
-//! (`noto_ml::Siglip2::embed_dense`): the cosine of every patch with a label's
-//! text vector is a heat map from one forward pass. The peak is the semantic
-//! position; it becomes the point prompt of the mask tracker. Negative
-//! prompts (what a label is often confused with) are subtracted, as the
-//! dictionary's `prejudice` phrases are elsewhere in the project.
-//!
-//! How a patch's cosines become heat is a [`LocateScoring`]:
-//!
-//! * [`LocateScoring::PairProb`] (before v1.0): the SigLIP pair probability
-//!   `σ(t·cos + b)` of each patch, minus half the look-alike's cosine. On this
-//!   renderer patch cosines are small (about 0.05 against the checkpoint's
-//!   0.15 for even odds), so every value is near zero and the argmax is set by
-//!   noise; and every label always gets a point, present or not.
-//! * [`LocateScoring::Contrast`]: a closed-set softmax of `t·cos` over all
-//!   labels plus explicit background classes (ground, grass, sky, ...), per
-//!   patch. A patch of grass goes to the grass class instead of to whichever
-//!   label happens to be least unlike it (the softmax over class prompts of
-//!   the OpenAI CLIP repository's zero-shot classifier, with background
-//!   classes added so the closed set does not force a choice).
-//! * [`LocateScoring::ZScore`]: each label's cosines standardised over the
-//!   image's patches (where in this frame it stands out most).
-//!
-//! Prompts can be put through templates and averaged in embedding space
-//! ([`LocateCfg::templates`], the prompt ensembling of the OpenAI CLIP
-//! repository's `Prompt_Engineering_for_ImageNet` notebook). The scores are
-//! not calibrated here: `calib` fits per-label thresholds on rendered frames,
-//! and the SDS `locate` track learns their per-label baseline.
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -37,17 +6,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::frame::Rgb;
 
-/// What to look for: a label id and the phrases that describe it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LabelPrompt {
     pub id: String,
     pub prompts: Vec<String>,
-    /// Phrases for look-alikes, subtracted from the score.
     #[serde(default)]
     pub negatives: Vec<String>,
 }
 
-/// A heat map on a coarse grid over the image (row-major).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Heat {
     pub cols: u32,
@@ -60,7 +26,6 @@ impl Heat {
         self.values[(r * self.cols + c) as usize]
     }
 
-    /// Cell holding the largest value.
     pub fn argmax(&self) -> Option<(u32, u32, f32)> {
         self.values
             .iter()
@@ -71,47 +36,33 @@ impl Heat {
     }
 }
 
-/// The semantic position of one label in one keyframe.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SemanticPoint {
     pub label: String,
-    /// Peak in pixels of the keyframe.
     pub px: f32,
     pub py: f32,
-    /// Pair probability at the peak (0..1).
     pub score: f32,
-    /// Peak score minus the best other label's score at the same place.
     pub margin: f32,
-    /// Whole-image presence of the label (SigLIP2 pair probability of the
-    /// pooled embedding); 1 when the locator has no such notion.
     pub presence: f32,
-    /// Cells above half of the peak, as a pixel box `[x0, y0, x1, y1]`.
     pub bbox: [f32; 4],
     pub heat: Heat,
 }
 
 pub trait SemanticLocator: Send {
-    /// `siglip2-dense` or the name of a stand-in.
     fn mode(&self) -> &str;
     fn device(&self) -> String {
         "cpu".into()
     }
-    /// One point per label that has a peak, best first.
     fn locate(&mut self, rgb: &Rgb, labels: &[LabelPrompt]) -> Result<Vec<SemanticPoint>>;
-    /// [`SemanticLocator::locate`] for several keyframes, in input order. A
-    /// locator that can batch its image model overrides this.
     fn locate_batch(&mut self, frames: &[&Rgb], labels: &[LabelPrompt]) -> Result<Vec<Vec<SemanticPoint>>> {
         frames.iter().map(|f| self.locate(f, labels)).collect()
     }
 }
 
-/// Turns per-label heat maps on one grid into semantic points. Shared by the
-/// SigLIP2 locator and the stand-ins, so both report the same way.
 pub fn points_from_heat(width: u32, height: u32, heats: Vec<(String, Heat)>) -> Vec<SemanticPoint> {
     points_with_presence(width, height, heats.into_iter().map(|(l, h)| (l, h, 1.0)).collect())
 }
 
-/// [`points_from_heat`] with a whole-image presence per label.
 pub fn points_with_presence(width: u32, height: u32, heats: Vec<(String, Heat, f32)>) -> Vec<SemanticPoint> {
     let mut out = Vec::new();
     for (i, (label, heat, presence)) in heats.iter().enumerate() {
@@ -125,7 +76,6 @@ pub fn points_with_presence(width: u32, height: u32, heats: Vec<(String, Heat, f
             .filter(|(j, _)| *j != i)
             .map(|(_, (_, h, _))| h.at(c, r))
             .fold(0.0f32, f32::max);
-        // Sub-cell peak: weighted centroid of the 3x3 neighbourhood.
         let (mut sx, mut sy, mut sw) = (0.0f32, 0.0f32, 0.0f32);
         for dr in -1i32..=1 {
             for dc in -1i32..=1 {
@@ -142,7 +92,6 @@ pub fn points_with_presence(width: u32, height: u32, heats: Vec<(String, Heat, f
         let (fc, fr) = if sw > 0.0 { (sx / sw, sy / sw) } else { (c as f32 + 0.5, r as f32 + 0.5) };
         let (cw, ch) = (width as f32 / heat.cols as f32, height as f32 / heat.rows as f32);
         let mut b = [f32::MAX, f32::MAX, 0.0f32, 0.0f32];
-        // Connected cells above half the peak, starting at the peak.
         let mut seen = vec![false; heat.values.len()];
         let mut stack = vec![(c, r)];
         while let Some((cc, rr)) = stack.pop() {
@@ -171,49 +120,33 @@ pub fn points_with_presence(width: u32, height: u32, heats: Vec<(String, Heat, f
     out
 }
 
-/// How patch embeddings become heat (see the module notes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LocateScoring {
-    /// SigLIP pair probability minus the weighted look-alike cosine (before v1.0).
     PairProb,
-    /// Softmax over labels and background classes of `t·cos`, per patch.
     Contrast,
-    /// Each label's cosines z-scored over the image's patches.
     ZScore,
 }
 
-/// Settings of the SigLIP2 locator.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LocateCfg {
     pub scoring: LocateScoring,
-    /// Weight of the negative phrases ([`LocateScoring::PairProb`] only).
     pub negative_weight: f32,
-    /// Background classes of [`LocateScoring::Contrast`]: phrases for what
-    /// most of an outdoor frame is (ground, grass, sky).
     #[serde(default)]
     pub background: Vec<String>,
-    /// Prompt templates with `{}` for the phrase; every phrase's vector is the
-    /// normalised mean over them. Empty: the phrases as written.
     #[serde(default)]
     pub templates: Vec<String>,
-    /// Logit scale of the softmax; `None` uses the checkpoint's `exp(t)`.
     #[serde(default)]
     pub logit_scale: Option<f32>,
 }
 
 impl Default for LocateCfg {
-    /// The locator as it was before v1.0.
     fn default() -> Self {
         LocateCfg { scoring: LocateScoring::PairProb, negative_weight: 0.5, background: Vec::new(), templates: Vec::new(), logit_scale: None }
     }
 }
 
 impl LocateCfg {
-    /// The settings a [`LocateCfg::mode`] name stands for, with the given
-    /// background phrases and templates (`None` for a name that is not a
-    /// SigLIP2 dense mode). A calibration table names its mode; this is how
-    /// the runtime scores the way the table was fitted.
     pub fn from_mode(mode: &str, background: &[String], templates: &[String]) -> Option<LocateCfg> {
         let rest = mode.strip_prefix("siglip2-dense")?;
         let mut cfg = LocateCfg::default();
@@ -231,8 +164,6 @@ impl LocateCfg {
         Some(cfg)
     }
 
-    /// The mode name the SDS scopes and the records carry, so statistics of
-    /// one scoring never gate another.
     pub fn mode(&self) -> String {
         let mut m = String::from("siglip2-dense");
         match self.scoring {
@@ -247,20 +178,15 @@ impl LocateCfg {
     }
 }
 
-/// Text vectors of the labels for one [`LocateCfg`]: per label the mean unit
-/// prompt vector and the negatives' vector, and the background classes.
 #[derive(Clone, Debug, Default)]
 pub struct LabelTexts {
     pub labels: Vec<(String, Vec<f32>, Option<Vec<f32>>)>,
     pub background: Vec<Vec<f32>>,
 }
 
-/// SigLIP2 dense-patch locator.
 pub struct SiglipLocator {
     model: Arc<noto_ml::Siglip2>,
-    /// Text vectors per (templated) phrase, embedded once.
     cache: HashMap<String, Vec<f32>>,
-    /// Weight of the negative phrases (kept in step with the settings).
     pub negative_weight: f32,
     cfg: LocateCfg,
     mode: String,
@@ -295,8 +221,6 @@ impl SiglipLocator {
         Ok(phrases.iter().map(|p| self.cache[p].clone()).collect())
     }
 
-    /// One vector per phrase: the phrase itself, or the normalised mean of
-    /// its templated forms.
     fn phrase_vectors(&mut self, phrases: &[String], templates: &[String]) -> Result<Vec<Vec<f32>>> {
         if templates.is_empty() {
             return self.text_vectors(phrases);
@@ -310,7 +234,6 @@ impl SiglipLocator {
         Ok(out)
     }
 
-    /// The text side of [`label_heats`] for these labels under `cfg`.
     pub fn label_texts(&mut self, labels: &[LabelPrompt], cfg: &LocateCfg) -> Result<LabelTexts> {
         let mut out = LabelTexts::default();
         for l in labels {
@@ -324,8 +247,6 @@ impl SiglipLocator {
     }
 }
 
-/// A prompt template applied to a phrase (`{}` stands for it; a template
-/// without one is followed by the phrase).
 pub fn apply_template(template: &str, phrase: &str) -> String {
     if template.contains("{}") {
         template.replace("{}", phrase)
@@ -338,10 +259,6 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
-/// Heat maps and presences of every label on one dense embedding, the way
-/// `cfg.scoring` says. `logit_scale` and `logit_bias` are the checkpoint's
-/// (`exp(t)` and `b`); `presence` is always SigLIP's own pooled pair
-/// probability `σ(exp(t)·cos(pooled, label) + b)`.
 pub fn label_heats(dense: &noto_ml::DenseEmbedding, texts: &LabelTexts, cfg: &LocateCfg, logit_scale: f32, logit_bias: f32) -> Vec<(String, Heat, f32)> {
     let (cols, rows) = (dense.grid_w as u32, dense.grid_h as u32);
     let pair = |c: f32| 1.0 / (1.0 + (-(logit_scale * c + logit_bias)).exp());
@@ -415,9 +332,6 @@ impl SemanticLocator for SiglipLocator {
         Ok(out.pop().unwrap_or_default())
     }
 
-    /// One batched dense pass for all keyframes (`Siglip2::embed_dense_batch`),
-    /// the label text vectors embedded once for the whole batch, then the
-    /// heat maps per keyframe.
     fn locate_batch(&mut self, frames: &[&Rgb], labels: &[LabelPrompt]) -> Result<Vec<Vec<SemanticPoint>>> {
         let mut cfg = self.cfg.clone();
         cfg.negative_weight = self.negative_weight;
@@ -443,7 +357,6 @@ mod tests {
         let pts = points_from_heat(320, 160, vec![("iron".into(), a), ("stone".into(), b)]);
         assert_eq!(pts[0].label, "iron");
         let p = &pts[0];
-        // Cell (5,1) is pixels 200..240 x 40..80; the neighbour at (6,1) pulls the peak right.
         assert!(p.px > 220.0 && p.px < 240.0, "{}", p.px);
         assert!((p.py - 60.0).abs() < 1e-3);
         assert!((p.margin - 0.7).abs() < 1e-5);
@@ -455,7 +368,6 @@ mod tests {
         v.iter().map(|x| x / n).collect()
     }
 
-    /// A 2 x 2 grid: patch 0 looks like the parcel, the others like grass.
     fn dense() -> (noto_ml::DenseEmbedding, LabelTexts) {
         let parcel = unit(&[1.0, 0.0, 0.0]);
         let grass = unit(&[0.0, 1.0, 0.0]);
@@ -480,11 +392,9 @@ mod tests {
         let parcel = &heats[0].1.values;
         assert!(parcel[0] > 0.99, "the parcel patch is the parcel's: {parcel:?}");
         assert!(parcel[1] < 0.01 && heats[1].1.values[1] < 0.01, "a grass patch belongs to the grass class");
-        // Without the background class the same grass patch has to pick a label.
         let nobg = LabelTexts { background: Vec::new(), ..texts.clone() };
         let forced = label_heats(&d, &nobg, &cfg, 100.0, -10.0);
         assert!(forced[0].1.values[1] + forced[1].1.values[1] > 0.99);
-        // The presence is SigLIP's own pooled pair probability, whatever the scoring.
         let want = 1.0 / (1.0 + (-(100.0 * dot(&d.pooled, &texts.labels[0].1) - 10.0)).exp());
         assert!((heats[0].2 - want).abs() < 1e-6);
     }

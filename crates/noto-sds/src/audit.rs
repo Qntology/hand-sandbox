@@ -1,15 +1,3 @@
-//! Inspectable log with a hash chain.
-//!
-//! Every line carries the hash of the previous line, so editing, deleting or
-//! reordering a line in the JSONL file is detected by [`verify_file`]. The
-//! chain uses SHA-256 over `prev || canonical line JSON`. logis-center has no
-//! such check; the line format `{seq, ts, cat, level, msg, data?}` is the one
-//! the UI log tab reads.
-//!
-//! The chain detects accidental corruption and casual edits. Someone who can
-//! rewrite the whole file can also recompute every hash, so it is not proof
-//! against a malicious owner of the file.
-
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -65,12 +53,10 @@ pub struct VerifyOk {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct VerifyError {
-    /// 1-based line number in the file.
     pub line_no: usize,
     pub reason: String,
 }
 
-/// Checks the chain of a log file from the first line to the last.
 pub fn verify_file(path: &Path) -> Result<VerifyOk, VerifyError> {
     let f = File::open(path).map_err(|e| VerifyError { line_no: 0, reason: format!("open: {e}") })?;
     let mut prev = GENESIS.to_string();
@@ -106,7 +92,6 @@ pub struct AuditLog {
     next_seq: u64,
     prev_hash: String,
     file: Option<(PathBuf, BufWriter<File>)>,
-    /// Set when a file write failed; the in-memory log keeps working.
     pub write_error: Option<String>,
 }
 
@@ -115,12 +100,10 @@ fn now_ms() -> i64 {
 }
 
 impl AuditLog {
-    /// In-memory log keeping the latest `cap` lines.
     pub fn memory(cap: usize) -> Self {
         AuditLog { ring: VecDeque::new(), cap: cap.max(16), next_seq: 1, prev_hash: GENESIS.into(), file: None, write_error: None }
     }
 
-    /// Log that also appends to `{dir}/{session}.jsonl` (new file per session).
     pub fn open(dir: &Path, session: &str, cap: usize) -> std::io::Result<Self> {
         std::fs::create_dir_all(dir)?;
         let safe: String = session.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
@@ -135,7 +118,6 @@ impl AuditLog {
         self.file.as_ref().map(|(p, _)| p.as_path())
     }
 
-    /// Appends a line and returns its sequence number.
     pub fn log(&mut self, cat: &str, level: Level, msg: impl Into<String>, data: Option<serde_json::Value>) -> u64 {
         let line = LogLine { seq: self.next_seq, ts: now_ms(), cat: cat.to_string(), level, msg: msg.into(), data };
         let hash = chain_hash(&self.prev_hash, &line);
@@ -174,8 +156,6 @@ impl AuditLog {
         &self.prev_hash
     }
 
-    /// Lines after `after_seq`, optionally of one category, at most `limit`.
-    /// `next_seq` is the value to pass next time (the last line looked at).
     pub fn tail(&self, after_seq: u64, limit: usize, cat: Option<&str>) -> (Vec<LogLine>, u64) {
         let limit = limit.max(1);
         let mut out = Vec::new();
@@ -214,8 +194,6 @@ mod tests {
 
     #[test]
     fn floats_that_came_from_f32_survive_the_round_trip_of_verification() {
-        // 0.98f32 is 0.9800000190734863 as an f64; reading that back must give the same f64,
-        // or the re-serialised line hashes differently from the one that was written.
         let dir = tmpdir("floats");
         let mut log = AuditLog::open(&dir, "f", 100).unwrap();
         for i in 0..200 {
@@ -271,7 +249,6 @@ mod tests {
 
         let truncated_tail = [lines[0], lines[1]].join("\n") + "\n";
         std::fs::write(&path, truncated_tail).unwrap();
-        // A shortened tail still verifies as a shorter chain; the line count tells the difference.
         assert_eq!(verify_file(&path).unwrap().lines, 2);
 
         std::fs::write(&path, "{broken").unwrap();

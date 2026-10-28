@@ -1,7 +1,3 @@
-//! Tauri commands. Each one is a thin wrapper over `views`, `noto-ml` or
-//! `noto-data`. Heavy work (model load, inference, Lance writes) runs off the
-//! UI thread.
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -59,7 +55,6 @@ pub struct DeviceState {
     pub backends: Vec<BackendStatus>,
     pub selected: Backend,
     pub ordinal: usize,
-    /// How the start-up device was chosen.
     pub reason: String,
 }
 
@@ -141,7 +136,6 @@ pub struct SynthSummary {
     pub store_dir: String,
 }
 
-/// Simulates `count` randomized episodes and appends them to the Lance store.
 #[tauri::command]
 pub async fn synthesize(
     count: usize,
@@ -182,7 +176,6 @@ pub async fn synthesize(
     })
 }
 
-/// Writes the shipped logistics dictionary to the Lance `dictionary` table, replacing it.
 #[tauri::command]
 pub async fn load_dictionary(store_dir: Option<String>) -> Result<usize, String> {
     let dir = store_path(store_dir);
@@ -202,7 +195,6 @@ pub async fn load_dictionary(store_dir: Option<String>) -> Result<usize, String>
 pub struct TableStatus {
     pub name: &'static str,
     pub rows: usize,
-    /// `recorded` when the simulator writes it now, `planned` otherwise.
     pub status: &'static str,
 }
 

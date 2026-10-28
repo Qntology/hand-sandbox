@@ -1,6 +1,3 @@
-//! Noto logistics robot simulator: Tauri shell over `noto-core`, `noto-ml`,
-//! `noto-data` and the simulated world (`noto-runtime`).
-
 pub mod commands;
 pub mod models;
 pub mod sim;
@@ -52,8 +49,6 @@ pub fn run() {
         .expect("error while building the Noto logistics robot simulator")
         .run(|_app, event| {
             if let tauri::RunEvent::Exit = event {
-                // A Windows process that used ROCm ends here without the DLL unload
-                // that can hang in rocBLAS (no-op for every other build and device).
                 noto_ml::device::rocm_exit_now_if_used(0);
             }
         });

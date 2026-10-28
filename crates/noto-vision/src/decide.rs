@@ -1,27 +1,3 @@
-//! ML track 4: the decision. Forecast where the target is, choose the move,
-//! predict what the next keyframe should show, then look again.
-//!
-//! One decision per keyframe, in this order:
-//!
-//! 1. Compare what the tracker sees with what the previous decision predicted
-//!    (the bearing residual). That is the "interpretation" of the move just
-//!    made: a large residual means the target, the track or the odometry is
-//!    not what the decision assumed.
-//! 2. Triangulate from the sightings of the same track. Until a fix exists the
-//!    decision is a mandatory sideways step ([`crate::triangulate::plan_step`]);
-//!    a monocular depth model cannot be trusted for metres on this renderer.
-//! 3. Feed the fixes into a time series of target positions and forecast it
-//!    with `noto_ts::forecast` (last, EWMA, Holt and Granite TTM when the
-//!    runtime passes it in). The fused forecast is the position used; a fix
-//!    outside the forecast band is held and re-triangulated rather than
-//!    followed.
-//! 4. Move a bounded hop toward the forecast and face it, or arrive.
-//!
-//! With nothing tracked the decision turns to look; after a full turn with
-//! nothing in sight it asks for another viewpoint (`Explore`): on a map where
-//! ridges and mesas hide the target, turning on the spot cannot find it. Where
-//! to go is the executor's call (it knows the terrain, not the target).
-
 use noto_ts::{forecast, Predictor};
 use serde::{Deserialize, Serialize};
 
@@ -30,22 +6,13 @@ use crate::triangulate::{plan_step, triangulate, Bearing, Fix, TriCfg, TriStep};
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DecideCfg {
-    /// Distance at which the target counts as reached, metres.
     pub reach_m: f32,
-    /// Longest move between two keyframes, metres.
     pub hop_max_m: f32,
-    /// Turn used while searching, degrees.
     pub search_turn_deg: f32,
-    /// A fix is good enough when its range sigma is below this share of the range.
     pub max_sigma_frac: f32,
-    /// Sightings kept for triangulation.
     pub max_rays: usize,
-    /// A fix further than this many sigmas outside the forecast band is held.
     pub band_widen_sigma: f32,
-    /// Range guess when there is no depth either, metres.
     pub default_range_m: f32,
-    /// Below this depth range (times the learned scale) the target is close
-    /// enough that depth alone decides: a metre-scale error is centimetres here.
     pub close_range_m: f32,
     pub tri: TriCfg,
 }
@@ -66,16 +33,12 @@ impl Default for DecideCfg {
     }
 }
 
-/// What the ML tracks saw of the target in one keyframe.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Sighting {
     pub keyframe: u32,
     pub pose: Pose,
-    /// World heading of the target's mask centroid, radians.
     pub heading: f32,
-    /// Bearing noise, radians.
     pub sigma: f32,
-    /// Ground range the depth model gives at the mask, metres.
     pub depth_range_m: Option<f32>,
     pub track_id: u32,
     pub score: f32,
@@ -118,10 +81,8 @@ pub struct Prediction {
 pub struct Estimate {
     pub x: f32,
     pub z: f32,
-    /// Range from the current pose, metres.
     pub range_m: f32,
     pub sigma_m: f32,
-    /// `triangulation`, `forecast` or `depth`.
     pub source: String,
 }
 
@@ -129,16 +90,11 @@ pub struct Estimate {
 pub struct DecisionReport {
     pub decision: Decision,
     pub estimate: Option<Estimate>,
-    /// The fix made at this keyframe, if any.
     pub fix: Option<Fix>,
-    /// Why a fix could not be made (`low_parallax`, ...).
     pub fix_error: Option<String>,
-    /// Triangulated range over the depth model's range at this keyframe.
     pub depth_scale: Option<f32>,
-    /// Observed minus predicted bearing at this keyframe, degrees.
     pub residual_deg: Option<f32>,
     pub prediction: Option<Prediction>,
-    /// Forecast method and the band `[x_lo, x_hi, z_lo, z_hi]` of the target position.
     pub forecast_method: String,
     pub band: Option<[f32; 4]>,
     pub note: String,
@@ -153,7 +109,6 @@ pub struct Decider {
     prediction: Option<Prediction>,
     side: f32,
     lost: u32,
-    /// Search turning since the last sighting or viewpoint change, degrees.
     turned_deg: f32,
 }
 
@@ -162,18 +117,14 @@ impl Decider {
         Decider { cfg, rays: Vec::new(), est_x: Vec::new(), est_z: Vec::new(), last_fix: None, prediction: None, side: 1.0, lost: 0, turned_deg: 0.0 }
     }
 
-    /// The side the next triangulation step goes to (+1 the camera's right, −1 its left).
     pub fn side(&self) -> f32 {
         self.side
     }
 
-    /// Keeps stepping to `side` from now on (the executor found the other
-    /// side blocked by terrain and took this one).
     pub fn set_side(&mut self, side: f32) {
         self.side = if side < 0.0 { -1.0 } else { 1.0 };
     }
 
-    /// Forgets the target (a new one is wanted, or the last one was wrong).
     pub fn reset(&mut self) {
         *self = Decider::new(self.cfg);
     }
@@ -182,12 +133,10 @@ impl Decider {
         self.last_fix.is_some()
     }
 
-    /// Track id of the target the sightings belong to, if any.
     pub fn track_id(&self) -> Option<u32> {
         self.rays.last().map(|r| r.track_id)
     }
 
-    /// A planned move could not be made (no path, refused): try the other side next time.
     pub fn move_failed(&mut self) {
         self.side = -self.side;
         self.prediction = None;
@@ -202,10 +151,6 @@ impl Decider {
         Some((fx.point[0] as f32, fz.point[0] as f32, [fx.p10[0] as f32, fx.p90[0] as f32, fz.p10[0] as f32, fz.p90[0] as f32], fx.method))
     }
 
-    /// One decision for the keyframe just analysed. `sighting` is `None` when
-    /// the target is not tracked in this keyframe. `extra` are additional
-    /// forecasters (Granite TTM). `depth_scale` is the SDS's learned scale of
-    /// the depth model, if any.
     pub fn observe(&mut self, pose: &Pose, sighting: Option<Sighting>, holonomic: bool, extra: &[&dyn Predictor], depth_scale: Option<f32>) -> DecisionReport {
         let mut rep = DecisionReport {
             decision: Decision::Hold { reason: "start".into() },
@@ -266,7 +211,6 @@ impl Decider {
         if let Some(p) = predicted {
             rep.residual_deg = Some(wrap_angle(s.heading - pose.yaw).to_degrees() - p.bearing_rel_deg);
         }
-        // Rays of the same track only; a new track id starts over.
         if self.rays.last().map_or(false, |r| r.track_id != s.track_id) {
             self.rays.clear();
         }
@@ -277,14 +221,11 @@ impl Decider {
         let bearings: Vec<Bearing> = self.rays.iter().map(|r| Bearing { x: r.pose.x, z: r.pose.z, heading: r.heading, sigma: r.sigma }).collect();
         match triangulate(&bearings, self.cfg.tri.min_parallax_deg) {
             Ok(fix) => {
-                // Only a good fix in the range where the depth model can be
-                // trusted says anything about its scale.
                 if let Some(d) = s.depth_range_m.filter(|d| *d > 0.1) {
                     if scale_usable(&fix, d) {
                         rep.depth_scale = Some(fix.range_m / d);
                     }
                 }
-                // A fix far outside the forecast band is not followed blindly.
                 if let Some((x, z, band, _)) = self.forecast_position(extra) {
                     let w = self.cfg.band_widen_sigma * fix.sigma_m;
                     let outside = fix.x < band[0] - w || fix.x > band[1] + w || fix.z < band[2] - w || fix.z > band[3] + w;
@@ -305,8 +246,6 @@ impl Decider {
             Err(e) => rep.fix_error = Some(e.code().to_string()),
         }
 
-        // Close in, the depth range decides (the triangulation step already
-        // happened on the way, or the target was close from the start).
         let near = s.depth_range_m.map(|d| d * depth_scale.unwrap_or(1.0)).filter(|r| *r <= self.cfg.close_range_m);
         if let Some(r) = near {
             let at = (pose.x + r * s.heading.cos(), pose.z + r * s.heading.sin());
@@ -374,16 +313,10 @@ impl Decider {
 }
 
 impl Decider {
-    /// The 1σ of the target's position the decision would act on now, metres
-    /// (its last good fix), if it has one.
     pub fn fix_sigma_m(&self) -> Option<f32> {
         self.last_fix.as_ref().map(|f| f.sigma_m)
     }
 
-    /// A decision without a keyframe (the ML tracks are off): the move the
-    /// forecast of the fixes asks for, from the pose the robot believes it
-    /// has. `extra_sigma_m` is what the robot's own drift since the last look
-    /// adds to the fix's spread. `None` without a good fix (then it must look).
     pub fn predict(&mut self, pose: &Pose, extra: &[&dyn Predictor], extra_sigma_m: f32) -> Option<DecisionReport> {
         let good = self.last_fix.clone().filter(|f| f.sigma_m <= (self.cfg.max_sigma_frac * f.range_m).max(0.25))?;
         let (x, z, band, method) = self.forecast_position(extra)?;
@@ -426,15 +359,10 @@ impl Decider {
     }
 }
 
-/// A fix says something about the depth model's scale when at least three
-/// rays agree (two always meet, even if one is on another object), its range
-/// error is small (at most 15%), the target is neither at the feet nor near
-/// the model's 10 m limit, and the depth model's own range is not tiny.
 pub fn scale_usable(fix: &Fix, depth_range_m: f32) -> bool {
     fix.rays >= 3 && fix.residual_m <= 0.15 && fix.sigma_m <= 0.15 * fix.range_m && (1.5..=9.0).contains(&fix.range_m) && depth_range_m >= 0.5
 }
 
-/// Bearing noise of a mask centroid: a couple of pixels over the focal length.
 pub fn centroid_sigma(width: u32, fov_deg: f32, px_err: f32) -> f32 {
     let f = width as f32 * 0.5 / (fov_deg.to_radians() * 0.5).tan();
     (px_err / f).max(1e-4)
@@ -456,7 +384,6 @@ mod tests {
         }
     }
 
-    /// Plays the decisions out with perfect execution and returns them.
     fn play(target: (f32, f32), holonomic: bool, steps: usize) -> Vec<DecisionReport> {
         let mut d = Decider::new(DecideCfg::default());
         let mut pose = Pose { x: 0.0, z: 0.0, yaw: 0.0, eye_m: 0.5 };
@@ -489,14 +416,10 @@ mod tests {
             assert!(reps[0].fix.is_none(), "one sighting cannot give a range");
             let fix = reps.iter().find_map(|r| r.fix.clone()).expect("a fix after the step");
             assert!((fix.x - 9.0).abs() < 0.05 && (fix.z - 2.0).abs() < 0.05, "{fix:?}");
-            // The depth model said 0.6 of the truth, so the scale it needed is about 1/0.6.
             let scale = reps.iter().find_map(|r| r.depth_scale).unwrap();
             assert!((scale - 1.0 / 0.6).abs() < 0.05, "{scale}");
             let last = reps.last().unwrap();
             assert!(matches!(last.decision, Decision::Arrive { .. }), "{holonomic}: {:?}", reps.iter().map(|r| r.decision.label()).collect::<Vec<_>>());
-            // Every approach predicted the target dead ahead and it was. (After a
-            // triangulation step the prediction rests on the rough depth guess, so
-            // its residual is large; that is what tells the decision the guess was off.)
             for w in reps.windows(2) {
                 if matches!(w[0].decision, Decision::Approach { .. }) {
                     let res = w[1].residual_deg.expect("an approach leaves a prediction");
@@ -511,7 +434,6 @@ mod tests {
         let mut d = Decider::new(DecideCfg::default());
         let reps = play((6.0, 0.0), true, 4);
         assert!(reps.iter().any(|r| r.fix.is_some()));
-        // Rebuild the same state in `d`, then lose the target behind the robot.
         let mut pose = Pose { x: 0.0, z: 0.0, yaw: 0.0, eye_m: 0.5 };
         let mut r = d.observe(&pose, Some(sight(0, pose, (6.0, 0.0), 1)), true, &[], None);
         for k in 1..4 {
@@ -549,7 +471,6 @@ mod tests {
             assert!(turns < 720.0, "never asks to move");
         };
         assert!(explore + DecideCfg::default().search_turn_deg >= 360.0 - 1e-3, "after about a full turn: {explore}");
-        // A sighting starts the count again.
         let t = (5.0, 1.0);
         let r = d.observe(&pose, Some(sight(0, pose, t, 3)), false, &[], None);
         assert!(matches!(r.decision, Decision::Triangulate(_)));

@@ -1,26 +1,11 @@
-//! Forecast fusion by holdout backtest.
-//!
-//! Every predictor forecasts the last few points of the series from the
-//! points before them. Its squared error there, optionally blended with the
-//! error the SDS remembers from earlier runs, gives an inverse-variance weight.
-//! Same method as endmill-sandbox `src/wearlog.rs` (`analyze_ext`), with two
-//! changes for score series that live in 0..1: the regulariser `eps` scales
-//! with the series variance instead of being a fixed constant, and a plain
-//! persistence predictor joins the pool because trend extrapolation is a poor
-//! guess for noisy scores.
-
 use serde::{Deserialize, Serialize};
 
 use crate::holt::holt_damped;
 
-/// Points held out for the backtest.
 pub const HOLDOUT: usize = 4;
-/// Fewer points than this are not backtested at all.
 pub const MIN_POINTS: usize = 6;
-/// Past observations of the SDS count at most this much against the new one.
 pub const HISTORY_CAP: f64 = 8.0;
 
-/// One predictor's forecast; `lo`/`hi` are its own 10% and 90% quantiles.
 #[derive(Debug, Clone)]
 pub struct Band {
     pub point: Vec<f64>,
@@ -30,16 +15,13 @@ pub struct Band {
 
 pub trait Predictor {
     fn name(&self) -> &str;
-    /// Shortest history it can forecast from.
     fn min_history(&self) -> usize;
-    /// Longest horizon it can produce.
     fn max_horizon(&self) -> usize {
         usize::MAX
     }
     fn predict(&self, series: &[f64], horizon: usize) -> Result<Band, String>;
 }
 
-/// Damped Holt trend.
 pub struct HoltPredictor;
 
 impl Predictor for HoltPredictor {
@@ -57,7 +39,6 @@ impl Predictor for HoltPredictor {
     }
 }
 
-/// Repeats the last value.
 pub struct LastPredictor;
 
 impl Predictor for LastPredictor {
@@ -73,7 +54,6 @@ impl Predictor for LastPredictor {
     }
 }
 
-/// Exponentially weighted level without trend.
 pub struct EwmaPredictor {
     pub alpha: f64,
 }
@@ -95,7 +75,6 @@ impl Predictor for EwmaPredictor {
     }
 }
 
-/// Past error of one method, as remembered by the SDS.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HistoryMse {
     pub method: String,
@@ -106,9 +85,7 @@ pub struct HistoryMse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MethodWeight {
     pub method: String,
-    /// Holdout RMSE of this run.
     pub rmse: f64,
-    /// RMSE remembered from earlier runs, if any.
     pub history_rmse: Option<f64>,
     pub history_n: u64,
     pub weight: f64,
@@ -122,7 +99,6 @@ pub struct Forecast {
     pub weights: Vec<MethodWeight>,
     pub rmse_fused: f64,
     pub holdout: usize,
-    /// e.g. `fusion(holt 0.41, last 0.59)` or `last` for very short series.
     pub method: String,
     pub notes: Vec<String>,
 }
@@ -135,9 +111,6 @@ fn variance(y: &[f64]) -> f64 {
     y.iter().map(|v| (v - m).powi(2)).sum::<f64>() / (y.len() - 1) as f64
 }
 
-/// Forecasts `horizon` steps. `extra` predictors (such as TTM) join the
-/// built-in Holt, persistence and EWMA predictors. `history` carries the SDS's
-/// remembered per-method errors. Never panics on short or constant series.
 pub fn forecast(series: &[f64], horizon: usize, extra: &[&dyn Predictor], history: &[HistoryMse]) -> Forecast {
     let horizon = horizon.max(1);
     let mut notes = Vec::new();
@@ -235,7 +208,6 @@ pub fn forecast(series: &[f64], horizon: usize, extra: &[&dyn Predictor], histor
         };
     }
 
-    // Forecast the full horizon with each surviving method; drop those that fail now.
     struct Live {
         w: MethodWeight,
         band: Band,
@@ -276,7 +248,6 @@ pub fn forecast(series: &[f64], horizon: usize, extra: &[&dyn Predictor], histor
             point[i] += v * l.w.weight;
         }
     }
-    // Band: the heaviest method that reports its own quantiles, widened by the fused holdout error.
     let band_src = live
         .iter()
         .filter(|l| l.band.lo.is_some() && l.band.hi.is_some())
@@ -312,7 +283,6 @@ pub fn forecast(series: &[f64], horizon: usize, extra: &[&dyn Predictor], histor
 mod tests {
     use super::*;
 
-    /// A predictor with a fixed bias, to test the weighting.
     struct Biased {
         name: &'static str,
         bias: f64,
@@ -372,7 +342,6 @@ mod tests {
         let wa0 = neutral.weights.iter().find(|w| w.method == "a").unwrap().weight;
         let wb0 = neutral.weights.iter().find(|w| w.method == "b").unwrap().weight;
         assert!((wa0 - wb0).abs() < 1e-9, "same bias gives the same weight");
-        // The SDS remembers that "a" used to be much worse.
         let hist = [HistoryMse { method: "a".into(), mse: 0.25, n: 8 }, HistoryMse { method: "b".into(), mse: 0.0025, n: 8 }];
         let f = forecast(&y, 2, &[&a, &b], &hist);
         let wa = f.weights.iter().find(|w| w.method == "a").unwrap();

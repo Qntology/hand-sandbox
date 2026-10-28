@@ -1,7 +1,3 @@
-//! Serializable views of the simulator, and the pure functions that build them.
-//! The Tauri commands are thin wrappers around these, so the logic can be
-//! unit-tested without a window.
-
 use noto_core::sim::{closure_angles, fk_all};
 use noto_core::{
     grasp, simulate_drive, BaseKind, BaseSpec, DriveReport, FingerCount, GraspResult, GraspSetup,
@@ -15,17 +11,14 @@ pub type Point = [f32; 3];
 pub struct FingerView {
     pub name: String,
     pub is_thumb: bool,
-    /// Joint points from the knuckle to the tip, hand frame, metres.
     pub points: Vec<Point>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct HandView {
     pub fingers: Vec<FingerView>,
-    /// Palm width and length, metres.
     pub palm: [f32; 2],
     pub base: BaseSpec,
-    /// Longest finger reach, metres.
     pub reach_m: f32,
 }
 
@@ -85,7 +78,6 @@ fn finger_views(hand: &noto_core::Hand, angles: &[Vec<JointAngles>]) -> Vec<Fing
         .collect()
 }
 
-/// Hand geometry with every finger closed to `closure` in `[0, 1]`.
 pub fn hand_view(config: &NotoConfig, closure: f32) -> Result<HandView, String> {
     let hand = config.build().map_err(|e| e.to_string())?;
     let actuation = hand.config.joints.actuation;
@@ -102,7 +94,6 @@ pub fn hand_view(config: &NotoConfig, closure: f32) -> Result<HandView, String> 
     })
 }
 
-/// Closes the hand on `payload` and reports the grasp.
 pub fn grasp_view(
     config: &NotoConfig,
     payload: &Payload,
@@ -125,7 +116,6 @@ pub fn grasp_view(
     })
 }
 
-/// The route used to compare bases: flat ground, two slopes, two steps.
 pub fn default_course() -> Vec<Terrain> {
     vec![
         Terrain::Flat { length_m: 10.0 },
@@ -152,7 +142,6 @@ pub fn base_label_ko(kind: BaseKind) -> &'static str {
     }
 }
 
-/// Every base driven over the same course.
 pub fn drive_matrix(course: &[Terrain]) -> Vec<DriveView> {
     BaseKind::ALL
         .into_iter()
@@ -234,7 +223,6 @@ mod tests {
             let cfg = NotoConfig::preset(c);
             let v = hand_view(&cfg, 0.5).unwrap();
             assert_eq!(v.fingers.len(), c.count() as usize);
-            // Each finger has one point per joint plus the tip.
             let expected = cfg.joints.segments as usize + 1;
             assert!(v.fingers.iter().all(|f| f.points.len() == expected));
             assert!(v.reach_m > 0.0);
@@ -275,7 +263,6 @@ mod tests {
     fn drive_matrix_covers_all_bases() {
         let m = drive_matrix(&default_course());
         assert_eq!(m.len(), BaseKind::ALL.len());
-        // Failure points follow the course: 5 cm step (index 2), 15 cm step (index 4).
         let failed_at = |kind| {
             m.iter()
                 .find(|d| d.base.kind == kind)
@@ -297,8 +284,6 @@ mod tests {
         assert_eq!(p.bases.len(), 4);
     }
 
-    /// The UI reads these exact keys. Renaming a field here breaks the page,
-    /// so the JSON shape is checked as well as the values.
     #[test]
     fn json_shapes_match_what_the_ui_reads() {
         let cfg = NotoConfig::preset(FingerCount::Five);
@@ -321,7 +306,6 @@ mod tests {
         let contacts = g["result"]["contacts"].as_array().unwrap();
         assert!(!contacts.is_empty());
         assert!(contacts[0]["source"]["source"].is_string());
-        // Vec3 values serialize as {x, y, z} objects; points in the fingers are arrays.
         assert!(contacts[0]["normal"]["z"].is_number());
         assert!(contacts[0]["point"]["y"].is_number());
 

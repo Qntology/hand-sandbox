@@ -1,7 +1,3 @@
-//! Small deterministic random numbers and value noise. No dependencies, so the
-//! same seed gives the same world on every platform.
-
-/// SplitMix64 generator.
 #[derive(Clone, Debug)]
 pub struct Rng(u64);
 
@@ -18,12 +14,10 @@ impl Rng {
         z ^ (z >> 31)
     }
 
-    /// Uniform in `[0, 1)`.
     pub fn next_f32(&mut self) -> f32 {
         (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
     }
 
-    /// Uniform integer in `[0, n)`. `n` must be non-zero.
     pub fn below(&mut self, n: u32) -> u32 {
         (self.next_u64() % n as u64) as u32
     }
@@ -33,7 +27,6 @@ impl Rng {
     }
 }
 
-/// Stateless hash of a seed and an integer lattice point.
 pub fn hash2(seed: u64, x: i32, y: i32) -> u64 {
     let mut z = seed
         ^ (x as i64 as u64).wrapping_mul(0x9E37_79B1_85EB_CA87)
@@ -51,7 +44,6 @@ fn smooth(t: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// Value noise in `[0, 1]`, smooth between lattice points.
 pub fn value_noise(seed: u64, x: f32, y: f32) -> f32 {
     let (x0, y0) = (x.floor(), y.floor());
     let (fx, fy) = (smooth(x - x0), smooth(y - y0));
@@ -65,7 +57,6 @@ pub fn value_noise(seed: u64, x: f32, y: f32) -> f32 {
     top + (bottom - top) * fy
 }
 
-/// Fractal sum of value noise, normalised to `[0, 1]`.
 pub fn fbm(seed: u64, x: f32, y: f32, octaves: u32) -> f32 {
     let (mut amp, mut freq, mut sum, mut norm) = (1.0f32, 1.0f32, 0.0f32, 0.0f32);
     for o in 0..octaves {

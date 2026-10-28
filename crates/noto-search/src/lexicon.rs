@@ -1,26 +1,3 @@
-//! The word dictionary, in the logis-center node format.
-//!
-//! A node is `{semantic, bias, prejudice, exact_match}`:
-//!
-//! * `semantic` describes the concept in one sentence;
-//! * `bias` and `prejudice` are comma separated phrase lists. Bias phrases
-//!   are what the concept *is*; prejudice phrases are near neighbours it must
-//!   not be confused with. Both are embedded and scored (see [`crate::semantic`]);
-//! * `exact_match` lists words that identify the node without any embedding.
-//!
-//! This crate adds one optional field, `surface`: complete word forms that
-//! must match whole (used for short irregular verb forms where stripping an
-//! ending would be unsafe), and one optional resource flag, `placed`: the item
-//! lies where it was put (a parcel at a door or on a shelf) instead of being
-//! mined out of a node, and one optional place flag, `home`: where such items
-//! are brought when a command names no destination ("택배 가져와"). The code
-//! holds no vocabulary: every word the search knows comes from the lexicon file.
-//!
-//! Vision entities of kind `structure` (a house, a doorstep, a shelf, a table)
-//! are kept apart in [`Lexicon::structures`]: recognisers built from
-//! [`Lexicon::vision`] keep their label sets, and one that wants to tell a
-//! parcel from the shelf it lies on opts in to them as never-a-target classes.
-
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -34,9 +11,6 @@ pub struct Phrase {
     pub weight: f32,
 }
 
-/// Splits a phrase list on commas, newlines, `|` and `/` (a slash between two
-/// short Latin abbreviations such as "w/o" stays), trims, and drops repeats.
-/// Port of logis-center `split_phrase_list` + `split_bias_phrases_full`.
 pub fn split_phrase_list(raw: &str) -> Vec<String> {
     let chars: Vec<char> = raw.chars().collect();
     let mut out: Vec<String> = Vec::new();
@@ -86,9 +60,6 @@ fn is_abbreviation_slash(chars: &[char], i: usize) -> bool {
     left_alpha && right_alpha && (1..=2).contains(&left) && (1..=2).contains(&right)
 }
 
-/// Phrases with weights: digit-heavy example literals are format hints and
-/// weigh less (0.80 when a quarter or more of the characters are digits,
-/// 0.95 when some are), meaning phrases weigh 1.0. Same rule as logis-center.
 pub fn weighted_phrases(raw: &str) -> Vec<Phrase> {
     split_phrase_list(raw)
         .into_iter()
@@ -115,47 +86,33 @@ pub struct Node {
     pub semantic: String,
     pub bias: Vec<Phrase>,
     pub prejudice: Vec<Phrase>,
-    /// Normalized words that identify the node (tails are allowed after them
-    /// for verbs and are peeled off for nouns).
     pub exact_match: Vec<String>,
-    /// Normalized complete forms that match whole only.
     pub surface: Vec<String>,
-    /// The resource a source/drop yields, or the place a waypoint stands for.
     pub link: Option<String>,
-    /// A resource that lies where it was put (a parcel) rather than being mined.
     pub placed: bool,
-    /// The place placed items are brought to when no destination is said.
     pub home: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum EntityKind {
-    /// A resource node standing in the world (tree, boulder, ore).
     Source,
-    /// A dropped item lying on the ground.
     Drop,
-    /// A named waypoint (base camp, warehouse).
     Waypoint,
 }
 
-/// A building part or a piece of furniture the camera may see (kind
-/// `structure` in the lexicon): never a target, only where targets lie.
 #[derive(Clone, Debug)]
 pub struct StructureEntity {
     pub id: String,
-    /// The place it stands for (`house`, `doorstep`, `shelf`, `table`).
     pub link: String,
     pub semantic: String,
     pub bias: Vec<Phrase>,
     pub prejudice: Vec<Phrase>,
 }
 
-/// What the camera should be able to recognise, with English prompts.
 #[derive(Clone, Debug)]
 pub struct VisionEntity {
     pub id: String,
     pub kind: EntityKind,
-    /// Resource id for sources and drops, place id for waypoints.
     pub link: String,
     pub semantic: String,
     pub bias: Vec<Phrase>,
@@ -182,11 +139,9 @@ pub struct Lexicon {
     pub negation: Node,
     pub direction_words: Vec<String>,
     pub source_words: Vec<String>,
-    /// Words after "X에" that make X where an item lies ("선반에 있는 택배"), not where it goes.
     pub located_words: Vec<String>,
     pub quantity: QuantityTable,
     pub vision: Vec<VisionEntity>,
-    /// Vision entities of kind `structure`, apart from [`Lexicon::vision`].
     pub structures: Vec<StructureEntity>,
 }
 
@@ -289,9 +244,7 @@ fn node_of(id: &str, raw: RawNode) -> Node {
     }
 }
 
-/// The verb node ids the parser understands.
 pub const KNOWN_VERBS: [&str; 6] = ["harvest", "pickup", "deliver", "go", "stop", "drop"];
-/// The verbs every lexicon must have (`drop` came later and is optional).
 pub const REQUIRED_VERBS: [&str; 5] = ["harvest", "pickup", "deliver", "go", "stop"];
 
 impl Lexicon {
@@ -363,9 +316,6 @@ impl Lexicon {
         Ok(lex)
     }
 
-    /// Structural checks. A word that two nodes of one category both claim
-    /// would make the command ambiguous, so it is an error here instead of a
-    /// coin toss at search time.
     pub fn validate(&self) -> Result<()> {
         for group in [&self.resources, &self.places, &self.verbs] {
             let mut owner: HashMap<String, &str> = HashMap::new();
@@ -440,18 +390,14 @@ impl Lexicon {
         self.verbs.iter().find(|n| n.id == id)
     }
 
-    /// Whether a resource lies where it was put (a parcel) rather than being mined.
     pub fn is_placed(&self, resource: &str) -> bool {
         self.resource(resource).is_some_and(|n| n.placed)
     }
 
-    /// The place placed items are brought to when a command names none.
     pub fn home(&self) -> Option<&Node> {
         self.places.iter().find(|p| p.home)
     }
 
-    /// Every phrase that would be embedded: node bias and prejudice phrases
-    /// and vision prompts, once each.
     pub fn all_phrases(&self) -> Vec<String> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();

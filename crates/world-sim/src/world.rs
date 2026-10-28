@@ -1,15 +1,3 @@
-//! The simulated open world and the robot living in it.
-//!
-//! The robot is the project's own hand and foot model: the base spec decides
-//! where it can drive and how fast (through `noto_core::simulate_drive`), the
-//! finger count decides how fast it mines, and `noto_core::grasp` decides
-//! whether it can pick an item up at all. Nothing here is tuned to make a
-//! scenario succeed; a weak configuration fails for the same reason it would
-//! fail in the standalone previews.
-//!
-//! Assumptions that are not in the Noto robot models are named constants below
-//! and listed in `data/README.md`.
-
 use std::sync::Mutex;
 use std::collections::{BTreeMap, HashSet};
 
@@ -33,74 +21,43 @@ mod eye;
 pub use acts::{camera_of, material_of, ActPlay, PushState, WalkState, GET_UP_S, PUSH_START_SLACK_M, SIDE_SHUFFLE_MAX_M};
 pub use eye::{chassis_accel_rms, exposure_s, profile, roughness_gd, sensor_timing, sensor_timing_at, strike_peak_mps2, strike_scale, EyeState, HeadView, SensorTiming, Shake, EXPOSURE_MAX_S, SCENE_LUX};
 
-/// Length of one simulation tick, seconds.
 pub const TICK_S: f32 = 0.1;
-/// How close the robot must be to mine a node, metres.
 pub const MINE_REACH_M: f32 = 0.9;
-/// How close the robot must be to pick up a dropped item, metres.
 pub const PICKUP_REACH_M: f32 = 0.7;
-/// How close the robot must be to hand over cargo at a waypoint, metres.
 pub const DELIVER_REACH_M: f32 = 1.6;
-/// Time to close the hand on an item and lift it, seconds (assumption).
 pub const PICKUP_TIME_S: f32 = 1.0;
-/// Time to put cargo down, seconds (assumption).
 pub const DELIVER_TIME_S: f32 = 1.0;
-/// Electrical power while mining, picking or putting down, watts (assumption).
 pub const MANIPULATION_POWER_W: f64 = 30.0;
-/// Turning speed, radians per second (assumption).
 pub const TURN_RATE_RAD_S: f32 = 2.5;
-/// Heading error above which a non-holonomic base turns in place, radians.
 const TURN_IN_PLACE_RAD: f32 = 0.6;
-/// Heading error at which the in-place turn stops, radians.
 const TURN_DONE_RAD: f32 = 0.2;
-/// Heading error accepted before manipulation starts, radians.
 const FACE_DONE_RAD: f32 = 0.08;
-/// A lift shared by both arms takes this much longer (est).
 pub const TWO_ARM_LIFT_FACTOR: f32 = 1.5;
-/// Time to reach cruise speed from standing, seconds (est); the first part of every move is an `accel` balance state.
 pub const ACCEL_TIME_S: f32 = 0.5;
-/// A balance state that lasts is recorded again every this many ticks.
 const BALANCE_RESAMPLE_TICKS: u64 = 50;
-/// Time to set carried items down on the ground or a waypoint's pile, seconds (assumption, as [`DELIVER_TIME_S`]).
 pub const DROP_TIME_S: f32 = 1.0;
-/// Items set down on the ground land this far in front of the robot, metres (est: forearm reach).
 pub const DROP_AHEAD_M: f32 = 0.45;
-/// Amounts within this of a whole number count as whole.
 pub const AMOUNT_EPS: f32 = 1e-3;
-/// The base camp's parcel lies this far ahead of the robot's start along the way
-/// to the warehouse, and this far to its right, metres (a scenario: seen in
-/// front at the start, picked from the side in passing).
 pub const CAMP_PARCEL_AHEAD_M: f32 = 2.0;
 pub const CAMP_PARCEL_RIGHT_M: f32 = 0.30;
-/// Parcels per cell of the map by default (about one per 175 m²).
 pub const PARCELS_PER_CELL: f32 = 1.0 / 700.0;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorldConfig {
     pub seed: u64,
-    /// Cells per side (square world). Each cell is 0.5 m.
     pub cells: usize,
     #[serde(alias = "hand")]
     pub noto: NotoConfig,
-    /// Part presets of the robot's body (`noto_core::parts`).
     #[serde(default)]
     pub body: BodyPlan,
-    /// The landscape: the open map, or the rugged one with sea, cliffs and ridges.
     #[serde(default)]
     pub terrain: TerrainKind,
-    /// The robot's dead reckoning (`odometry`): on, its believed pose drifts as a real one's does.
     #[serde(default)]
     pub odometry: OdomCfg,
-    /// Parcels lying in the world: `None` the default (scattered over the map
-    /// and one in front of the base camp), `Some(0)` none.
     #[serde(default)]
     pub parcels: Option<usize>,
-    /// How the scene is lit (`light`): the flat pre-v1.0 lighting by default, or a sun.
     #[serde(default)]
     pub lighting: crate::light::Lighting,
-    /// Houses with porch stairs and a logistics centre (`crate::site`); the
-    /// parcels then lie on porches, shelves and tables. `None` (the default)
-    /// is the map without them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub site: Option<SiteCfg>,
 }
@@ -111,17 +68,13 @@ impl Default for WorldConfig {
     }
 }
 
-/// A balance state the robot entered (or stayed in long enough to sample again).
 #[derive(Clone, Debug)]
 pub struct BalanceEvent {
     pub tick: u64,
     pub time_s: f64,
-    /// Terrain and phase bucket, such as `flat|mine` or `up_hi|move`.
     pub state: String,
     pub report: BalanceReport,
-    /// The joint dynamics of the change into this state (`None` for a re-sample).
     pub dynamics: Option<DynDigest>,
-    /// The posture itself (every cause acting, for the composite N:N phases).
     pub posture: Posture,
 }
 
@@ -131,13 +84,10 @@ pub struct Node {
     pub kind: NodeKind,
     pub x: f32,
     pub z: f32,
-    /// Remaining work in full-hand seconds.
     pub hp: f32,
     pub max_hp: f32,
 }
 
-/// An item lying on the ground. `amount` is how much of one item the piece
-/// is (1 = a whole stone; a stone broken in half leaves two pieces of 0.5).
 #[derive(Clone, Debug)]
 pub struct DropItem {
     pub id: u32,
@@ -145,19 +95,15 @@ pub struct DropItem {
     pub x: f32,
     pub z: f32,
     pub amount: f32,
-    /// What it rests on: the ground, or a site's porch, shelf deck or table.
     pub support: Support,
-    /// Height of the surface it rests on, metres (world y); used when `support` is not the ground.
     pub y_m: f32,
 }
 
 impl DropItem {
-    /// A whole item.
     pub fn whole(id: u32, kind: ItemKind, x: f32, z: f32) -> DropItem {
         DropItem { id, kind, x, z, amount: 1.0, support: Support::Ground, y_m: 0.0 }
     }
 
-    /// A whole item resting on a site's support whose top is `y_m` high.
     pub fn on(id: u32, kind: ItemKind, x: f32, z: f32, support: Support, y_m: f32) -> DropItem {
         DropItem { id, kind, x, z, amount: 1.0, support, y_m }
     }
@@ -174,7 +120,6 @@ pub struct Waypoint {
     pub label_ko: String,
     pub x: f32,
     pub z: f32,
-    /// What has been put down here, in items (fractions are broken pieces).
     pub stock: Vec<(ItemKind, f32)>,
 }
 
@@ -189,7 +134,6 @@ pub struct Agent {
     pub x: f32,
     pub z: f32,
     pub yaw: f32,
-    /// Items in the cargo bay, in items (fractions are broken pieces).
     pub carried: Vec<(ItemKind, f32)>,
     pub energy_used_j: f64,
     pub strikes: u32,
@@ -199,22 +143,13 @@ pub struct Agent {
     strike_acc: f32,
 }
 
-/// A command for the robot. One action runs at a time.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Action {
-    /// Drive until a free cell within `reach_m` of the point (0 = that cell).
     MoveTo { x: f32, z: f32, reach_m: f32 },
-    /// Turn in place to a heading, degrees (0 = +x, 90 = +z).
     Turn { yaw_deg: f32 },
-    /// Turn to face a point.
     Face { x: f32, z: f32 },
     Mine { node: u32 },
-    /// Pick an item up. The hand goes where the robot believes it is (`aim`,
-    /// in its believed frame; `None`: where it lies, seen as it reaches), in
-    /// front after facing it, or beside the right foot without turning
-    /// (`side`: the camera does not see it there). `memory_sigma_m` is the
-    /// 1σ the robot gives that memory (0 when it sees the item).
     PickUp {
         drop: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -224,18 +159,9 @@ pub enum Action {
         #[serde(default, skip_serializing_if = "is_zero")]
         memory_sigma_m: f32,
     },
-    /// Put carried items into a waypoint's stock; `item` limits it to one kind.
     Deliver { waypoint: u32, item: Option<ItemKind> },
-    /// Set carried items down here: into the pile of a waypoint within
-    /// [`DELIVER_REACH_M`], else on the ground in front of the robot. `item`
-    /// limits it to one kind, `amount` to that many items (all when `None`).
     Drop { item: Option<ItemKind>, amount: Option<f32> },
-    /// Break a divisible piece lying on the ground: a new piece with
-    /// `portion` of it appears beside it, the rest stays.
     Split { drop: u32, portion: f32 },
-    /// Push an item lying on the ground with the bumper (wheeled and tracked
-    /// bases) to within reach of a point; the robot must stand lined up behind
-    /// it (`World::push_route`).
     Push { drop: u32, x: f32, z: f32 },
 }
 
@@ -248,7 +174,6 @@ fn is_zero(x: &f32) -> bool {
 }
 
 impl Action {
-    /// A pick-up of an item the robot sees, in front of it (the pick before v0.7).
     pub fn pick(drop: u32) -> Action {
         Action::PickUp { drop, aim: None, side: false, memory_sigma_m: 0.0 }
     }
@@ -275,7 +200,6 @@ impl Action {
     }
 }
 
-/// An amount as people say it: `2`, `0.5`, `1.25`.
 pub fn amount_text(a: f32) -> String {
     if (a - a.round()).abs() < AMOUNT_EPS {
         format!("{}", a.round() as i64)
@@ -285,7 +209,6 @@ pub fn amount_text(a: f32) -> String {
     }
 }
 
-/// Why an action could not start. `code()` is stable and goes into logs.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum ActionError {
@@ -297,18 +220,12 @@ pub enum ActionError {
     GraspUnstable { margin: f32 },
     CapacityExceeded { carried_kg: f32, item_kg: f32, capacity_kg: f32 },
     NothingToDeliver,
-    /// The arms (or the balance) cannot lift the item: a joint over its peak, or a negative margin.
     LiftOverload { limiting: String, margin: f32 },
     NothingToDrop,
-    /// The item cannot be broken by hand (a log).
     NotDivisible,
-    /// The piece, or what would be left of it, is below [`MIN_PIECE`].
     PieceTooSmall { amount: f32 },
-    /// The body cannot bring its palm down to the item (`noto_core::act::reach`).
     CannotReach { lowest_m: f32, need_m: f32, reason: String },
-    /// This base cannot push (legs), or the item cannot be pushed there.
     CannotPush { reason: String },
-    /// The robot lies on the ground after a fall and is getting up.
     Fallen,
 }
 
@@ -341,16 +258,11 @@ pub enum WorldEvent {
     ActionDone { action: String, ok: bool, reason: Option<String> },
     CurbClimbed { height_m: f32 },
     NodeBroken { node: String, kind: NodeKind, drops: Vec<String> },
-    /// `amount` of one item was lifted into the bay (`mass_kg` is that piece's mass).
     ItemPicked { drop: String, item: ItemKind, mass_kg: f32, grip_margin: f32, amount: f32 },
     Delivered { waypoint: String, item: ItemKind, amount: f32 },
-    /// Carried items set down: on a waypoint's pile (`waypoint`) or on the ground as pieces (`drops`).
     ItemDropped { item: ItemKind, amount: f32, waypoint: Option<String>, drops: Vec<String> },
-    /// A piece broken off `drop`: the new piece `piece` holds `amount` items.
     ItemSplit { drop: String, piece: String, item: ItemKind, amount: f32, left: f32 },
     BatteryDepleted,
-    /// A moment of an action's physics (`noto_core::act`): a contact, a lift-off,
-    /// a slip, an impact, a heel strike, a fall. `parts` are the focus views it concerns.
     Act { act: String, kind: String, label: String, ok: bool, value: Option<f32>, parts: Vec<String> },
 }
 
@@ -365,19 +277,15 @@ pub struct TimedEvent {
 struct MoveState {
     edges: Vec<EdgePlan>,
     idx: usize,
-    /// Seconds of curb climbing left on the current edge.
     pause_left: f32,
-    /// Seconds of driving done on the current edge.
     progress_s: f32,
     announced_pause: bool,
-    /// Seconds since the move started (the first part is acceleration).
     elapsed_s: f32,
 }
 
 #[derive(Clone, Debug)]
 enum WorkKind {
     Mine { node: u32 },
-    /// `face`: where the robot turns before it bends (the item where it believes it is); `None` for a reach to the side.
     Pick { drop: u32, two_arms: bool, face: Option<(f32, f32)> },
     Deliver { waypoint: u32, item: Option<ItemKind> },
     Drop { item: Option<ItemKind>, amount: Option<f32>, waypoint: Option<u32> },
@@ -412,52 +320,32 @@ pub struct World {
     active: Option<(Action, Active)>,
     rng: Rng,
     next_drop: u32,
-    /// The robot's body built from the part presets.
     pub body: Body,
     limits: Mutex<Option<(u32, DriveLimits)>>,
-    /// Balance of the posture held right now, keyed `source|terrain|phase`.
     pub balance: Option<(String, BalanceReport)>,
     balance_since: u64,
     balance_events: Vec<BalanceEvent>,
-    /// Feed-forward gains per balance source, set by the runtime from the SDS.
     pub ff_gains: BTreeMap<Source, f32>,
     pub ff_enabled: bool,
-    /// Heat state per joint, `(τ/τ_cont)²` low-passed with the actuator's time constant.
     pub heat: BTreeMap<String, f32>,
-    /// Life used per joint (Miner damage over the reducer's rating, `noto_core::wear`; 1 = worn out).
     pub wear: BTreeMap<String, f32>,
-    /// Joint dynamics of the last posture change (`noto_core::dynamics`): the
-    /// presets' masses and actuators moving the joints, for the third-person view.
     pub motion: Option<Motion>,
     last_posture: Posture,
-    /// Where the rugged features went (`None` on the open map).
     pub layout: Option<RuggedLayout>,
-    /// The action being played out (`noto_core::act`), and the last one, kept for the focus views.
     pub act: Option<ActPlay>,
     pub last_act: Option<ActPlay>,
-    /// The actions' own draws (friction, aim, slips), apart from the world's stream.
     act_rng: Rng,
-    /// The robot lies on the ground after a fall until this time.
     pub fallen_until: Option<f64>,
-    /// A legged robot's steps along the current move.
     pub walk: WalkState,
-    /// The robot's dead reckoning: the pose it believes it has.
     pub odom: Odometry,
-    /// Share of this tick's distance the wheels counted without travelling it (their slip).
     odom_over: f32,
-    /// What the head camera tracks between ticks (`eye`).
     pub eye: EyeState,
-    /// Side reaches planned so far, by item, piece (thousandths) and cargo (tenths of a kg).
     side_cache: Mutex<std::collections::HashMap<(ItemKind, i32, i32), Option<(f32, f32)>>>,
-    /// Houses and the logistics centre (`WorldConfig::site`), `None` without them.
     pub site: Option<Site>,
-    /// Their walls, doors, stairs, shelves and tables (`crate::fixture`).
     pub fixtures: Vec<Fixture>,
 }
 
 impl Clone for World {
-    /// A copy that runs on its own: the integrated test replays a recorded
-    /// start state in it while the live world waits.
     fn clone(&self) -> World {
         World {
             cfg: self.cfg.clone(),
@@ -500,7 +388,6 @@ impl Clone for World {
     }
 }
 
-/// A simulated posture change and when it started.
 #[derive(Clone, Debug)]
 pub struct Motion {
     pub rollout: Rollout,
@@ -522,7 +409,6 @@ fn wrap_angle(a: f32) -> f32 {
 fn add_stock(list: &mut Vec<(ItemKind, f32)>, kind: ItemKind, n: f32) {
     if let Some(e) = list.iter_mut().find(|(k, _)| *k == kind) {
         e.1 += n;
-        // Two halves make a whole: keep sums free of float dust.
         if (e.1 - e.1.round()).abs() < AMOUNT_EPS {
             e.1 = e.1.round();
         }
@@ -542,20 +428,16 @@ impl World {
         let wall_cx = (0.46 * cells as f32).round() as usize;
         let wall_x = (wall_cx as f32 + 0.5) * CELL_M;
 
-        // Flat zones: the two waypoints, plus a chain along the curb wall so
-        // the wall stands on level ground.
         let mut zones: Vec<FlatZone> = vec![(base_pos.0, base_pos.1, 3.5), (wh_pos.0, wh_pos.1, 3.5)];
         let mut zc = 1.0;
         while zc < size {
             zones.push((wall_x, zc, 1.4));
             zc += 2.0;
         }
-        // The curb wall's open gap, and the way a wheel takes between the waypoints through it.
         let gap_from = (0.86 * cells as f32) as usize;
         let gap_to = gap_from + 2;
         let gap = (wall_x, (gap_from as f32 + 1.0) * CELL_M);
         let way = [base_pos, (base_pos.0, gap.1), gap, wh_pos];
-        // A site's buildings stand on flat ground: their places are chosen first (`site::plan`).
         let site_plan = cfg.site.as_ref().map(|sc| {
             let keep = site::Keep { base: base_pos, warehouse: wh_pos, wall_cx, way: way.to_vec(), way_m: 2.2 };
             site::plan(cfg.seed, cells, sc, &keep)
@@ -564,7 +446,6 @@ impl World {
         zones.extend(site_zones.iter().copied());
         let mut terrain = Terrain::generate(cfg.seed, cells, cells, &zones);
 
-        // Compacted gravel pads under the waypoints.
         for (px, pz) in [base_pos, wh_pos] {
             for cz in 0..cells {
                 for cx in 0..cells {
@@ -576,7 +457,6 @@ impl World {
             }
         }
 
-        // The curb wall: 5, 10 and 15 cm sections and one open gap.
         for cz in 0..cells {
             if (gap_from..gap_to).contains(&cz) {
                 continue;
@@ -592,14 +472,11 @@ impl World {
             terrain.set_curb_cm(wall_cx, cz, cm);
         }
 
-        // The rugged map: sea, cliffs and ridges away from the way a wheel
-        // takes between the waypoints (through the gap in the curb wall).
         let layout = (cfg.terrain == TerrainKind::Rugged).then(|| {
             let mut clear: Vec<FlatZone> = vec![(base_pos.0, base_pos.1, 3.5), (wh_pos.0, wh_pos.1, 3.5)];
             clear.extend(site_zones.iter().copied());
             terrain.stamp_rugged(cfg.seed, &clear, &way, 2.2)
         });
-        // The houses and the logistics centre: floors, porches, stairs and ramps, walls, shelves, tables.
         let mut next_fixture = 1u32;
         let (mut site, fixtures) = match &site_plan {
             Some(p) => {
@@ -657,9 +534,6 @@ impl World {
                 placed += 1;
             }
         }
-        // On the rugged map some nodes end up on mesas or behind water: seen
-        // from afar, out of reach. Every kind keeps two a wheel can get to, so
-        // a quest has a way to succeed (a decoy on a mesa is the hard part).
         let site_blocked: HashSet<Cell> = crate::fixture::blocked(&fixtures).collect();
         if layout.is_some() {
             let wheel = noto_core::BaseKind::Wheel.spec();
@@ -713,7 +587,6 @@ impl World {
             strike_acc: 0.0,
         };
 
-        // Which porches a walking and a wheeled robot get onto from the base camp.
         if let Some(s) = site.as_mut() {
             let taken: HashSet<Cell> = occupied.union(&site_blocked).copied().collect();
             let start = terrain.cell_of(base_pos.0, base_pos.1).unwrap_or((0, 0));
@@ -724,24 +597,19 @@ impl World {
                 h.reachable_legs = on(&legs, &h.porch);
                 h.reachable_wheels = on(&wheels, &h.porch);
             }
-            // A porch no robot gets onto keeps no parcel.
             let lost: Vec<u32> = s.houses.iter().filter(|h| !h.reachable_legs).map(|h| h.id).collect();
             s.slots.retain(|sl| !matches!(sl.owner, crate::fixture::Owner::House(id) if lost.contains(&id)));
         }
 
-        // Parcels: light boxes lying about, found by looking (no node yields them).
-        // Their own random stream, so the nodes and the game's draws stay as they were.
         let mut drops = Vec::new();
         let mut next_drop = 1u32;
         let n_parcels = cfg.parcels.unwrap_or(((cells * cells) as f32 * PARCELS_PER_CELL).round().max(3.0) as usize);
         if n_parcels > 0 {
             let mut prng = Rng::new(cfg.seed ^ 0x9A2C_E1B0_77D3_4F15);
-            // One in front of the base camp, a little right of the way to the warehouse.
             let (s, c) = yaw.sin_cos();
             let (px, pz) = (base_pos.0 + CAMP_PARCEL_AHEAD_M * c - CAMP_PARCEL_RIGHT_M * s, base_pos.1 + CAMP_PARCEL_AHEAD_M * s + CAMP_PARCEL_RIGHT_M * c);
             drops.push(DropItem::whole(next_drop, ItemKind::Parcel, px, pz));
             next_drop += 1;
-            // With a site, the others lie where parcels are left: a porch, a shelf, a table.
             if let Some(s) = &site {
                 for sl in site::choose_slots(s, n_parcels - drops.len(), &mut prng) {
                     drops.push(DropItem::on(next_drop, ItemKind::Parcel, sl.x, sl.z, sl.support, sl.y_m));
@@ -757,7 +625,6 @@ impl World {
                 tries += 1;
                 let (cx, cz) = (prng.below(cells as u32) as usize, prng.below(cells as u32) as usize);
                 let (x, z) = cell_center(cx, cz);
-                // On land a wheel can get to, off the waypoints' pads and the curb wall, one per cell.
                 if !times[terrain.idx(cx, cz)].is_finite() || occupied.contains(&(cx, cz)) || in_zone(x, z) || cx.abs_diff(wall_cx) <= 1 || terrain.curb_m(cx, cz) > 0.0 || on_site(cx, cz) {
                     continue;
                 }
@@ -812,10 +679,6 @@ impl World {
         })
     }
 
-    /// The world as the seed made it (terrain, nodes, nothing on the ground,
-    /// empty piles, the robot at the base camp), with the robot's body as it
-    /// is now: the battery charge, joint heat and wear stay. Nothing changes
-    /// if the world cannot be rebuilt.
     pub fn reset_world_keep_body(&mut self) -> Result<(), ConfigError> {
         let mut fresh = World::new(self.cfg.clone())?;
         fresh.agent.energy_used_j = self.agent.energy_used_j;
@@ -825,16 +688,12 @@ impl World {
         fresh.wear = std::mem::take(&mut self.wear);
         fresh.ff_gains = std::mem::take(&mut self.ff_gains);
         fresh.ff_enabled = self.ff_enabled;
-        // The clock keeps running: logs and records stay in order.
         fresh.tick = self.tick;
         fresh.time_s = self.time_s;
         *self = fresh;
         Ok(())
     }
 
-    /// The body back to rested: full battery, cold joints, no wear, the last
-    /// grasp and terrain readings forgotten. The robot stays where it is with
-    /// what it carries, and a running action goes on.
     pub fn reset_body(&mut self) {
         self.agent.energy_used_j = 0.0;
         self.agent.strikes = 0;
@@ -849,8 +708,6 @@ impl World {
         self.fallen_until = None;
     }
 
-    // ----- lookups -----
-
     pub fn grasp_info(&self, item: ItemKind) -> &GraspInfo {
         self.grasps.iter().find(|g| g.item == item).expect("every item has a grasp entry")
     }
@@ -859,9 +716,6 @@ impl World {
         &self.grasps
     }
 
-    // ----- the robot's own sense of where it is (`odometry`) -----
-
-    /// Where the robot believes it is: x, z, yaw (its dead reckoning).
     pub fn believed_pose(&self) -> (f32, f32, f32) {
         self.odom.pose()
     }
@@ -870,31 +724,22 @@ impl World {
         (self.agent.x, self.agent.z, self.agent.yaw)
     }
 
-    /// A point of the world in the robot's believed frame: where the robot
-    /// puts something its camera or its hand finds there.
     pub fn belief_of(&self, x: f32, z: f32) -> (f32, f32) {
         self.odom.belief_of(self.true_pose(), (x, z))
     }
 
-    /// A point of the believed frame in the world: where the robot's body
-    /// goes when it goes where it believes that point is.
     pub fn true_of(&self, x: f32, z: f32) -> (f32, f32) {
         self.odom.true_of(self.true_pose(), (x, z))
     }
 
-    /// A believed heading as the world's.
     pub fn true_yaw_of(&self, yaw: f32) -> f32 {
         self.odom.true_yaw(self.agent.yaw, yaw)
     }
 
-    /// How far the robot's belief is off its true position, metres. For the
-    /// record and the benchmark only: nothing that decides may read it.
     pub fn belief_error_m(&self) -> f32 {
         (self.odom.x - self.agent.x).hypot(self.odom.z - self.agent.z)
     }
 
-    /// The robot moves its believed position by what a landmark of the map
-    /// showed it (a waypoint seen where the map has it).
     pub fn relocalize(&mut self, dx: f32, dz: f32) {
         self.odom.correct(dx, dz);
     }
@@ -923,18 +768,14 @@ impl World {
         self.agent.carried.iter().map(|(k, n)| k.spec().mass_kg * *n).sum()
     }
 
-    /// Whole items of a kind in the bay (a half stone does not count).
     pub fn carried_count(&self, item: ItemKind) -> u32 {
         (self.carried_amount(item) + AMOUNT_EPS).floor() as u32
     }
 
-    /// Items of a kind in the bay, broken pieces included.
     pub fn carried_amount(&self, item: ItemKind) -> f32 {
         self.agent.carried.iter().filter(|(k, _)| *k == item).map(|e| e.1).sum()
     }
 
-    /// What one hand's grasp test says about a piece of `amount` items:
-    /// smaller pieces of a brittle item weigh less and are smaller.
     pub fn grasp_for(&self, item: ItemKind, amount: f32) -> GraspInfo {
         if (amount - 1.0).abs() < AMOUNT_EPS {
             return self.grasp_info(item).clone();
@@ -942,20 +783,15 @@ impl World {
         top_grasp_info(&self.hand, item, amount)
     }
 
-    /// Friction capacity of one hand for a piece, newtons.
     pub fn grip_capacity_for(&self, item: ItemKind, amount: f32) -> f32 {
         let g = self.grasp_for(item, amount);
         g.margin * item.spec().mass_kg * amount * noto_core::balance::G * GRIP_SAFETY
     }
 
-    /// Time to break a piece of `amount` items in two with this hand (est:
-    /// the fracture surface grows as the piece's cross-section, `amount^(2/3)`;
-    /// the hand strikes at the mining rate).
     pub fn split_time_s(&self, item: ItemKind, amount: f32) -> f32 {
         item.split_time_s() * amount.max(MIN_PIECE).powf(2.0 / 3.0) / self.mining_rate().max(0.05)
     }
 
-    /// The waypoint whose pile a drop here would go on.
     pub fn waypoint_in_reach(&self) -> Option<u32> {
         self.waypoints
             .iter()
@@ -965,18 +801,14 @@ impl World {
             .map(|(id, _)| id)
     }
 
-    /// Cargo limit: the base's own limit, lowered by what the legs or the
-    /// chassis can carry with this body (`Body::drive_limits`).
     pub fn capacity_kg(&self) -> f32 {
         self.limits().capacity_kg
     }
 
-    /// Battery energy of the chest preset.
     pub fn battery_capacity_j(&self) -> f64 {
         self.body.battery_j()
     }
 
-    /// Speed, slope, step and cargo limits for the current load (cached per load).
     pub fn limits(&self) -> DriveLimits {
         let key = self.carried_kg().to_bits();
         let mut cache = self.limits.lock().unwrap_or_else(|e| e.into_inner());
@@ -990,14 +822,10 @@ impl World {
         l
     }
 
-    /// The base spec the routes and the drive use: the mechanism's spec with the
-    /// body's limits applied, the drive power scaled with the mass, and the
-    /// chassis force over the loaded mass (each ground's climb limit).
     pub fn drive_spec(&self) -> noto_core::BaseSpec {
         self.drive_spec_for(self.carried_kg())
     }
 
-    /// The drive spec with `cargo_kg` aboard (the cargo decision asks before loading).
     pub fn drive_spec_for(&self, cargo_kg: f32) -> noto_core::BaseSpec {
         let l = if (cargo_kg - self.carried_kg()).abs() < 1e-6 { self.limits() } else { self.body.drive_limits(&self.hand.base, cargo_kg) };
         let mass = self.body.mass_kg() + cargo_kg;
@@ -1014,7 +842,6 @@ impl World {
         }
     }
 
-    /// The ground of a cell (gravel, as the pads, outside the map).
     pub fn ground_at(&self, cell: Cell) -> Ground {
         if cell.0 < self.terrain.w && cell.1 < self.terrain.d {
             self.terrain.ground_at(cell.0, cell.1)
@@ -1023,31 +850,24 @@ impl World {
         }
     }
 
-    /// The ground under the robot.
     pub fn ground_here(&self) -> Ground {
         self.ground_at(self.agent_cell())
     }
 
-    /// Time to reach cruise speed: at least [`ACCEL_TIME_S`], longer when the
-    /// body's acceleration limit (ZMP inside the support) is lower.
     pub fn accel_time_s(&self) -> f32 {
         let l = self.limits();
         (l.max_speed_mps / l.accel_limit_mps2.max(0.05)).max(ACCEL_TIME_S)
     }
 
-    /// The drive planner's start (`dir > 0`) or stop (`dir < 0`) acceleration on
-    /// `slope_deg` and `ground` with the current cargo (`Body::planned_accel`).
     pub fn planned_accel(&self, slope_deg: f32, ground: Ground, dir: f32) -> f32 {
         self.body.planned_accel_within(&self.limits(), slope_deg, self.carried_kg(), ground.surface(), dir, ACCEL_TIME_S)
     }
 
-    /// Distance to stop from cruise speed with the planned deceleration, metres.
     pub fn braking_distance_m(&self, slope_deg: f32, ground: Ground) -> f32 {
         let v = self.drive_spec().max_speed_mps;
         v * v / (2.0 * self.planned_accel(slope_deg, ground, -1.0))
     }
 
-    /// Path left on a move, metres.
     fn remaining_m(&self, m: &MoveState) -> f32 {
         let rest: f32 = m.edges.iter().skip(m.idx).map(|e| e.horizontal_m).sum();
         let done = m.edges.get(m.idx).map_or(0.0, |e| e.horizontal_m * (m.progress_s / e.move_time_s.max(1e-6)).clamp(0.0, 1.0));
@@ -1058,13 +878,11 @@ impl World {
         FeedForward { enabled: self.ff_enabled, gain: self.ff_gains.get(&s).copied().unwrap_or(1.0) }
     }
 
-    /// Friction capacity of one hand for an item, newtons (from the grasp table).
     pub fn grip_capacity_n(&self, item: ItemKind) -> f32 {
         let g = self.grasp_info(item);
         g.margin * item.spec().mass_kg * noto_core::balance::G * GRIP_SAFETY
     }
 
-    /// Balance states entered since the last call.
     pub fn take_balance_events(&mut self) -> Vec<BalanceEvent> {
         std::mem::take(&mut self.balance_events)
     }
@@ -1077,9 +895,6 @@ impl World {
         self.agent.energy_used_j >= self.battery_capacity_j()
     }
 
-    /// Mining progress per second: a full five-finger hand works at 1.0
-    /// (assumption: proportional to the finger count), slowed when the
-    /// working arm's joints run hot (heat above 1 derates by 1/heat).
     pub fn mining_rate(&self) -> f32 {
         let hot = ["shoulder_r", "elbow_r"].iter().map(|j| self.heat.get(*j).copied().unwrap_or(0.0)).fold(0.0f32, f32::max);
         u8::from(self.hand.config.fingers) as f32 / 5.0 / hot.max(1.0)
@@ -1097,16 +912,12 @@ impl World {
         self.terrain.cell_of(self.agent.x, self.agent.z).unwrap_or((0, 0))
     }
 
-    /// Cells that hold a resource node, or a site's wall, shelf or table
-    /// (the base cannot drive through them).
     pub fn blocked_cells(&self) -> HashSet<Cell> {
         let mut b: HashSet<Cell> = self.nodes.iter().filter_map(|n| self.terrain.cell_of(n.x, n.z)).collect();
         b.extend(crate::fixture::blocked(&self.fixtures));
         b
     }
 
-    /// Height of the surface an item rests on, metres (world y): its cell's
-    /// top on the ground, else its porch, shelf deck or table top.
     pub fn drop_base_m(&self, d: &DropItem) -> f32 {
         if d.support.is_ground() {
             self.surface_m(d.x, d.z)
@@ -1115,21 +926,14 @@ impl World {
         }
     }
 
-    /// Height of the surface a site's support offers, metres (world y):
-    /// a porch or stair tread, a shelf deck, a table top (`Site::support_top_m`);
-    /// `None` for the ground and without a site.
     pub fn support_top_m(&self, s: Support) -> Option<f32> {
         self.site.as_ref()?.support_top_m(&self.fixtures, s)
     }
 
-    /// The search prior per cell (`crate::explore::next_viewpoint_with`):
-    /// where the robot is told parcels are kept (porches, the logistics
-    /// centre); `None` without a site.
     pub fn search_prior(&self) -> Option<Vec<f32>> {
         self.site.as_ref().map(|s| s.prior(&self.terrain))
     }
 
-    /// Ground height under the robot, curb included.
     pub fn agent_ground_m(&self) -> f32 {
         match self.terrain.cell_of(self.agent.x, self.agent.z) {
             Some((cx, cz)) => self.terrain.height_m(cx, cz) + self.terrain.curb_m(cx, cz),
@@ -1137,7 +941,6 @@ impl World {
         }
     }
 
-    /// Ground height including any curb at a point.
     pub fn surface_m(&self, x: f32, z: f32) -> f32 {
         match self.terrain.cell_of(x, z) {
             Some((cx, cz)) => self.terrain.height_m(cx, cz) + self.terrain.curb_m(cx, cz),
@@ -1145,16 +948,11 @@ impl World {
         }
     }
 
-    /// Estimates a route for the current base without moving. `None` when no
-    /// route exists.
     pub fn plan_route(&self, goal: Goal) -> Option<nav::Plan> {
         let blocked = self.blocked_cells();
         nav::plan(&self.drive_spec(), &self.terrain, &|x, z| blocked.contains(&(x, z)), self.agent_cell(), goal)
     }
 
-    // ----- commands -----
-
-    /// Starts an action. Fails right away when it cannot start.
     pub fn command(&mut self, action: Action) -> Result<Vec<TimedEvent>, ActionError> {
         if self.active.is_some() {
             return Err(ActionError::Busy);
@@ -1196,7 +994,6 @@ impl World {
                 self.check_support(*drop)?;
                 let info = self.grasp_for(kind, amount);
                 self.agent.grip_margin = Some(info.margin);
-                // From above, the fingers' friction alone carries it: one hand, or both sharing it.
                 if !info.stable && 2.0 * info.margin < 1.0 {
                     return Err(ActionError::GraspUnstable { margin: info.margin });
                 }
@@ -1208,16 +1005,13 @@ impl World {
                         capacity_kg: self.capacity_kg(),
                     });
                 }
-                // Can the arms lift it, and does the robot stay balanced while they do?
                 let (rep, mut two_arms) = self.body.lift(item_kg, self.carried_kg(), &self.ff_for(Source::ArmLift), self.grip_capacity_for(kind, amount));
                 if !rep.feasible {
                     return Err(ActionError::LiftOverload { limiting: rep.limiting.clone().unwrap_or_default(), margin: rep.margin });
                 }
-                // A grip one hand cannot hold with its safety factor takes both hands.
                 if !info.stable {
                     two_arms = true;
                 }
-                // Bend down, close, lift, stow: the action's own time series (`noto_core::act::grasp`).
                 let (t, face) = self.start_grasp(*drop, two_arms, *aim, *side, *memory_sigma_m)?;
                 Active::Work(WorkState { kind: WorkKind::Pick { drop: *drop, two_arms, face }, remaining_s: t })
             }
@@ -1259,8 +1053,6 @@ impl World {
             }
             Action::Push { drop, x, z } => Active::Push(self.start_push(*drop, *x, *z)?),
         };
-        // A start can move the body at once (a pick's shuffle to its stand-off,
-        // a push lining up its heading): the odometry counts that too.
         let after = (self.agent.x, self.agent.z, self.agent.yaw);
         if after != before {
             self.odom.update(before, after, 0.0, 0.0);
@@ -1270,7 +1062,6 @@ impl World {
         Ok(vec![self.stamp(WorldEvent::ActionStarted { action: label })])
     }
 
-    /// Stops the current action.
     pub fn cancel(&mut self) -> Vec<TimedEvent> {
         self.end_act();
         match self.active.take() {
@@ -1283,10 +1074,6 @@ impl World {
         }
     }
 
-    /// The grasp model takes items from the floor the robot stands on. An item
-    /// on a porch is in reach once the robot stands on that porch; one on a
-    /// shelf deck or a table top is not (the reach to a raised support is
-    /// not modelled yet), and the pick is refused instead of played wrong.
     fn check_support(&self, drop: u32) -> Result<(), ActionError> {
         let Some(d) = self.drop_item(drop) else { return Err(ActionError::UnknownTarget) };
         let here = self.agent_ground_m();
@@ -1312,16 +1099,12 @@ impl World {
         TimedEvent { tick: self.tick, time_s: self.time_s, event }
     }
 
-    // ----- stepping -----
-
-    /// Advances one tick of [`TICK_S`].
     pub fn tick(&mut self) -> Vec<TimedEvent> {
         let ev = self.step(TICK_S);
         self.tick += 1;
         ev
     }
 
-    /// Advances the world by `dt` seconds.
     pub fn step(&mut self, dt: f32) -> Vec<TimedEvent> {
         self.update_balance(dt);
         let before = (self.agent.x, self.agent.z, self.agent.yaw);
@@ -1341,7 +1124,6 @@ impl World {
         if self.active.is_none() {
             self.agent.speed_mps = 0.0;
         }
-        // The robot's own sensors count the motion of this tick, with their errors.
         let after = (self.agent.x, self.agent.z, self.agent.yaw);
         self.odom.update(before, after, dt, self.odom_over);
         self.odom_over = 0.0;
@@ -1365,7 +1147,6 @@ impl World {
         turn / TURN_RATE_RAD_S
     }
 
-    /// Runs the active action for up to `remaining` seconds; returns time used.
     fn advance(&mut self, remaining: f32, events: &mut Vec<TimedEvent>) -> f32 {
         let (action, mut state) = self.active.take().expect("checked by the caller");
         let used;
@@ -1414,7 +1195,6 @@ impl World {
         self.agent.terrain_margin = Some(e.margin);
         let power = self.drive_spec().power_w as f64;
 
-        // Curb climb pause at the start of the edge.
         if e.pause_s > 0.0 && !m.announced_pause {
             m.announced_pause = true;
             m.pause_left = e.pause_s;
@@ -1431,7 +1211,6 @@ impl World {
         let heading = (tz - fz).atan2(tx - fx);
         let err = wrap_angle(heading - self.agent.yaw).abs();
         if !self.hand.base.holonomic && err > TURN_IN_PLACE_RAD {
-            // Turn until the heading error is small, then drive.
             let need = (err - TURN_DONE_RAD) / TURN_RATE_RAD_S;
             let t = need.min(remaining);
             self.rotate_toward(heading, t);
@@ -1440,7 +1219,6 @@ impl World {
             return t;
         }
 
-        // A slipping wheel or track counts distance it did not travel (the drive model's cruise slip on this ground).
         if !self.body.legged() {
             let props = self.ground_at(e.to).surface().props();
             self.odom_over = noto_core::act::cruise_slip(&self.drive_spec(), props, e.slope_deg).map_or(0.0, |s| s / (1.0 - s).max(0.05));
@@ -1455,12 +1233,10 @@ impl World {
         self.agent.x = fx + (tx - fx) * f;
         self.agent.z = fz + (tz - fz) * f;
         self.agent.speed_mps = e.horizontal_m / e.move_time_s;
-        // Legs: every step that comes down can slip; a slip the robot cannot catch is a fall.
         if let Some(why) = self.walk_steps((self.agent.x - px).hypot(self.agent.z - pz), &e, events) {
             *done = Some((false, Some(format!("fall: {why}"))));
             return t;
         }
-        // The ground being entered: rolling resistance or the walking terrain factor.
         self.add_energy(power * e.energy_factor as f64 * t as f64);
         if m.progress_s >= e.move_time_s - 1e-6 {
             self.agent.x = tx;
@@ -1476,7 +1252,6 @@ impl World {
     }
 
     fn advance_work(&mut self, w: &mut WorkState, remaining: f32, events: &mut Vec<TimedEvent>, done: &mut Option<(bool, Option<String>)>) -> f32 {
-        // Face the target first.
         let (tx, tz) = match w.kind {
             WorkKind::Mine { node } => match self.node(node) {
                 Some(n) => (n.x, n.z),
@@ -1485,7 +1260,6 @@ impl World {
                     return 0.0;
                 }
             },
-            // Toward the item where the robot believes it is; a reach to the side does not turn.
             WorkKind::Pick { drop, face, .. } => match (self.drop_item(drop), face) {
                 (Some(_), Some(p)) => p,
                 (Some(_), None) => (self.agent.x + self.agent.yaw.cos(), self.agent.z + self.agent.yaw.sin()),
@@ -1508,7 +1282,6 @@ impl World {
                     return 0.0;
                 }
             },
-            // Onto a pile: face it; onto the ground: set down ahead, no turn.
             WorkKind::Drop { waypoint, .. } => match waypoint.and_then(|w| self.waypoint(w)) {
                 Some(p) => (p.x, p.z),
                 None => (self.agent.x + self.agent.yaw.cos(), self.agent.z + self.agent.yaw.sin()),
@@ -1529,7 +1302,6 @@ impl World {
             WorkKind::Mine { node } => {
                 let rate = self.mining_rate();
                 let work = (t * rate).max(1e-6);
-                // Every full second of work counts as one strike on the joints.
                 self.agent.strike_acc += t;
                 while self.agent.strike_acc >= 1.0 {
                     self.agent.strike_acc -= 1.0;
@@ -1537,7 +1309,6 @@ impl World {
                 }
                 let n = self.nodes.iter_mut().find(|n| n.id == node).expect("looked up above");
                 n.hp -= work.min(n.hp);
-                // Remaining time at the current rate.
                 w.remaining_s = n.hp / rate;
                 if n.hp <= 1e-5 {
                     self.break_node(node, events);
@@ -1582,7 +1353,6 @@ impl World {
                 }
             }
             WorkKind::Split { drop, portion } => {
-                // Breaking a piece is striking: it wears the joints like mining.
                 self.agent.strike_acc += t;
                 while self.agent.strike_acc >= 1.0 {
                     self.agent.strike_acc -= 1.0;
@@ -1604,7 +1374,6 @@ impl World {
         let spec = node.kind.spec();
         let mut ids = Vec::new();
         for i in 0..spec.drop_count {
-            // Spread the drops on a small ring inside the node's cell.
             let a = (i as f32 / spec.drop_count as f32) * std::f32::consts::TAU + self.rng.range_f32(0.0, 1.0);
             let r = if spec.drop_count == 1 { 0.0 } else { 0.13 };
             let (x, z) = (node.x + r * a.cos(), node.z + r * a.sin());
@@ -1643,7 +1412,6 @@ impl World {
         }
     }
 
-    /// Takes up to `amount` (all when `None`) of the matching kinds out of the bay.
     fn take_cargo(&mut self, item: Option<ItemKind>, amount: Option<f32>) -> Vec<(ItemKind, f32)> {
         let mut left = amount.unwrap_or(f32::INFINITY);
         let mut taken: Vec<(ItemKind, f32)> = Vec::new();
@@ -1671,7 +1439,6 @@ impl World {
                 events.push(self.stamp(WorldEvent::ItemDropped { item: k, amount: a, waypoint: Some(waypoint_id(wid)), drops: vec![] }));
                 continue;
             }
-            // On the ground ahead: one piece per whole item and one for the rest.
             let ahead = (self.agent.x + DROP_AHEAD_M * self.agent.yaw.cos(), self.agent.z + DROP_AHEAD_M * self.agent.yaw.sin());
             let on_land = |w: &World, x: f32, z: f32| w.terrain.cell_of(x, z).is_some_and(|(cx, cz)| !w.terrain.is_water(cx, cz) && !w.blocked_cells().contains(&(cx, cz)));
             let (bx, bz) = if on_land(self, ahead.0, ahead.1) { ahead } else { (self.agent.x, self.agent.z) };
@@ -1685,7 +1452,6 @@ impl World {
             let mut ids = Vec::new();
             for (j, p) in pieces.iter().enumerate() {
                 let off = (j as f32 - (pieces.len() as f32 - 1.0) * 0.5) * 0.13;
-                // Where the release let it fall, rebound included; the old spread when there was no release.
                 let (lx, lz) = play
                     .and_then(|pl| self.release_landing(pl, piece_index))
                     .filter(|&(x, z)| on_land(self, x, z))
@@ -1705,7 +1471,6 @@ impl World {
         let piece = d.amount * portion;
         d.amount -= piece;
         let (kind, left, x, z, support, y_m) = (d.kind, d.amount, d.x, d.z, d.support, d.y_m);
-        // The broken-off piece lands beside the rest, toward the robot, on what the rest lies on.
         let (ax, az) = (self.agent.x - x, self.agent.z - z);
         let n = ax.hypot(az).max(1e-3);
         let new = DropItem { id: self.next_drop, kind, x: x + 0.12 * ax / n, z: z + 0.12 * az / n, amount: piece, support, y_m };
@@ -1713,8 +1478,6 @@ impl World {
         events.push(self.stamp(WorldEvent::ItemSplit { drop: drop_id(id), piece: drop_id(new.id), item: kind, amount: piece, left }));
         self.drops.push(new);
     }
-
-    // ----- views -----
 
     pub fn terrain_grid(&self) -> TerrainGrid {
         let t = &self.terrain;
@@ -1795,7 +1558,6 @@ impl World {
         }
     }
 
-    /// The posture the current action asks for, and its terrain/phase bucket.
     pub fn posture_now(&self) -> (Posture, String) {
         let (post, state) = self.posture_action();
         (Posture { ground: self.ground_here().surface(), ..post }, state)
@@ -1826,11 +1588,9 @@ impl World {
                     p.step_m = e.step_m;
                     p.single_support = self.body.legged();
                 } else if m.elapsed_s < self.drive_spec().max_speed_mps / self.planned_accel(slope, ground, 1.0) {
-                    // The planner starts no harder than the ZMP's room toward the back edge and the ground's friction allow on this slope.
                     p.source = Source::Accel;
                     p.accel_mps2 = self.planned_accel(slope, ground, 1.0);
                 } else if self.remaining_m(m) < self.braking_distance_m(slope, ground) {
-                    // The last stretch of a move is the stop, planned against the front edge.
                     p.source = Source::Accel;
                     p.accel_mps2 = -self.planned_accel(slope, ground, -1.0);
                     b_brake = true;
@@ -1849,7 +1609,6 @@ impl World {
                     (Posture::arm_lift(kg, *two_arms, cargo), "flat|pick".into())
                 }
                 WorkKind::Deliver { .. } | WorkKind::Drop { .. } => {
-                    // The heaviest single piece in the bay is the one the arms handle.
                     let kg = self.agent.carried.iter().map(|(k, n)| k.spec().mass_kg * n.min(1.0)).fold(0.0f32, f32::max);
                     let tag = if matches!(w.kind, WorkKind::Drop { .. }) { "flat|drop" } else { "flat|deliver" };
                     (Posture::arm_lift(kg, false, (cargo - kg).max(0.0)), tag.into())
@@ -1861,8 +1620,6 @@ impl World {
         }
     }
 
-    /// Solves the balance of the current posture, heats the joints and notes
-    /// a balance event when the state changed or lasted long enough to sample.
     fn update_balance(&mut self, dt: f32) {
         let (post, state) = self.posture_now();
         let grip = match &self.active {
@@ -1873,15 +1630,12 @@ impl World {
         let rep = self.body.solve(&post, &self.ff_for(post.source), grip);
         for j in &rep.joints {
             let Some(act) = self.joint_actuator(&j.joint) else { continue };
-            // Short term: heat follows effort² with the actuator's time constant.
             let h = self.heat.entry(j.joint.clone()).or_insert(0.0);
             *h += (dt / act.thermal_tau_s).min(1.0) * (j.effort * j.effort - *h);
-            // Long term: the reducer's life used at this torque.
             *self.wear.entry(j.joint.clone()).or_insert(0.0) += noto_core::wear::damage(&act, j.torque_nm, dt);
         }
         let key = format!("{}|{state}", post.source.id());
         let changed = self.balance.as_ref().map_or(true, |(k, _)| *k != key);
-        // A new posture: move the joints there with the presets' actuators.
         let digest = if changed {
             let roll = dynamics::simulate(&self.body, &self.last_posture, &post, &self.ff_for(post.source), grip, &DynCfg::default());
             let d = roll.digest();
@@ -1900,8 +1654,6 @@ impl World {
         self.balance = Some((key, rep));
     }
 
-    /// The whole body at this instant, as the joint dynamics move it (base
-    /// frame: x forward, y left, z up from the ground under the robot).
     pub fn body_pose(&self) -> Option<BodyPose> {
         if let Some(p) = self.act_body_pose() {
             return Some(p);
@@ -1916,7 +1668,6 @@ impl World {
         }
     }
 
-    /// The preset actuator that drives a joint of the balance model.
     pub fn joint_actuator(&self, joint: &str) -> Option<noto_core::parts::Actuator> {
         match joint {
             n if n.starts_with("shoulder") => Some(self.body.arm.shoulder),
@@ -1929,9 +1680,6 @@ impl World {
         }
     }
 
-    /// The joint closest to a limit: the larger of its torque over the peak
-    /// rating and its RMS over the continuous rating (`√heat`, the motor
-    /// sizing rules) — joint, that index, peak ratio, RMS ratio.
     pub fn joint_load(&self) -> Option<(String, f32, f32, f32)> {
         let (_, r) = self.balance.as_ref()?;
         r.joints
@@ -1944,12 +1692,10 @@ impl World {
             .max_by(|a, b| a.1.total_cmp(&b.1))
     }
 
-    /// The most worn joint and its Miner damage.
     pub fn most_worn(&self) -> Option<(String, f32)> {
         self.wear.iter().max_by(|a, b| a.1.total_cmp(b.1)).map(|(k, v)| (k.clone(), *v))
     }
 
-    /// Summary of the current balance for the body status.
     pub fn balance_summary(&self) -> Option<BalanceSummary> {
         let (key, r) = self.balance.as_ref()?;
         let worst = r.worst();
@@ -1978,8 +1724,6 @@ impl World {
         })
     }
 
-    /// Inputs for the body-status display. Perception numbers come from the
-    /// caller because the world does not know what the recogniser saw.
     pub fn body_inputs(&self, vision_confidence: Option<f32>, frame_ms: Option<f32>) -> BodyInputs {
         BodyInputs {
             base: self.hand.base.kind,
@@ -2006,7 +1750,6 @@ impl World {
         }
     }
 
-    /// Cargo the base carries on the ground and slope under it (`Body::capacity_on`).
     pub fn capacity_here(&self) -> f32 {
         let slope = self.posture_now().0.slope_deg;
         self.body.capacity_on(&self.hand.base, self.ground_here().surface(), slope).min(self.capacity_kg())
@@ -2016,7 +1759,6 @@ impl World {
         compute_body(&self.body_inputs(vision_confidence, frame_ms))
     }
 
-    /// The pieces a set-down takes out of the bay, in the order the hand takes them.
     fn pieces_to_set_down(&self, item: Option<ItemKind>, amount: Option<f32>) -> Vec<(ItemKind, f32)> {
         let mut left = amount.unwrap_or(f32::INFINITY);
         let mut out = Vec::new();
@@ -2035,9 +1777,6 @@ impl World {
     }
 }
 
-/// The grasp table entry of a hand for a piece lifted off the ground from above:
-/// the fingers' squeeze times the friction the controller believes, over the
-/// weight with the safety factor (`noto_core::act::grasp::top_grasp_ok`).
 fn top_grasp_info(hand: &Hand, item: ItemKind, amount: f32) -> GraspInfo {
     let s = item.spec();
     let mass = s.mass_kg * amount;
@@ -2053,7 +1792,6 @@ mod tests {
     use super::*;
     use noto_core::{BaseKind, FingerCount};
 
-    /// A world without the placed parcels: these tests are about the nodes and their drops.
     fn world(fingers: FingerCount, base: BaseKind) -> World {
         let mut hand = NotoConfig::preset(fingers);
         hand.base = base;
@@ -2067,7 +1805,6 @@ mod tests {
         let (ax, az) = (w.agent.x, w.agent.z);
         assert!(w.can_step_to(ax + 0.1, az), "within its own cell");
         assert!(w.can_step_to(ax + CELL_M, az), "onto a level neighbour");
-        // A rock column 0.9 m above the cell ahead: no step onto it, and not two cells away either.
         let h = (w.terrain.height_m(cx, cz) * 100.0).round() as i32;
         w.terrain.set_height_cm(cx + 1, cz, h + 90);
         assert!(!w.can_step_to(ax + CELL_M, az));
@@ -2082,20 +1819,16 @@ mod tests {
         let parcels: Vec<&DropItem> = w.drops.iter().filter(|d| d.kind == ItemKind::Parcel).collect();
         assert_eq!(parcels.len(), w.drops.len(), "only parcels lie about at the start");
         assert!(parcels.len() >= 3, "{}", parcels.len());
-        // The first one: ahead of the robot on its way to the warehouse, a little to its right.
         let p = parcels[0];
         let (s, c) = w.agent.yaw.sin_cos();
         let (rx, rz) = (p.x - w.agent.x, p.z - w.agent.z);
         let (ahead, right) = (rx * c + rz * s, -rx * s + rz * c);
         assert!((ahead - CAMP_PARCEL_AHEAD_M).abs() < 1e-3 && (right - CAMP_PARCEL_RIGHT_M).abs() < 1e-3, "{ahead} {right}");
-        // None on a node's cell or in the water; the same seed puts them in the same places.
         let blocked = w.blocked_cells();
         assert!(parcels.iter().all(|d| w.terrain.cell_of(d.x, d.z).is_some_and(|c| !blocked.contains(&c) && !w.terrain.is_water(c.0, c.1))));
         let again = World::new(WorldConfig { noto: hand, ..WorldConfig::default() }).unwrap();
         assert!(w.drops.iter().zip(&again.drops).all(|(a, b)| (a.x, a.z, a.id) == (b.x, b.z, b.id)));
-        // New drops get ids after them.
         assert!(w.next_drop > parcels.iter().map(|d| d.id).max().unwrap());
-        // The nodes do not move for them (their own random stream).
         let bare = World::new(WorldConfig { noto: hand, parcels: Some(0), ..WorldConfig::default() }).unwrap();
         assert!(w.nodes.iter().zip(&bare.nodes).all(|(a, b)| (a.x, a.z) == (b.x, b.z)));
     }
@@ -2111,14 +1844,12 @@ mod tests {
         let err = w.belief_error_m();
         assert!(err > 1e-4 && err < 0.5, "{err}");
         assert!((w.odom.travelled_m - 6.3).abs() < 1.5, "{}", w.odom.travelled_m);
-        // What it believes about itself is where it is in its own frame, and a point maps back.
         let (bx, bz, _) = w.believed_pose();
         let me = w.belief_of(w.agent.x, w.agent.z);
         assert!((me.0 - bx).abs() < 1e-4 && (me.1 - bz).abs() < 1e-4);
         let p = w.true_of(10.0, 9.0);
         let q = w.belief_of(p.0, p.1);
         assert!((q.0 - 10.0).abs() < 1e-3 && (q.1 - 9.0).abs() < 1e-3);
-        // Exact odometry: the belief is the truth.
         let mut e = World::new(WorldConfig { parcels: Some(0), odometry: OdomCfg::exact(), ..WorldConfig::default() }).unwrap();
         e.command(Action::MoveTo { x: goal.0, z: goal.1, reach_m: 0.0 }).unwrap();
         run(&mut e, 120.0);
@@ -2139,7 +1870,6 @@ mod tests {
         events.iter().any(|e| matches!(&e.event, WorldEvent::ActionDone { ok: true, .. }))
     }
 
-    /// Nearest tree that the given world can reach, as a node id.
     fn nearest_node(w: &World, kind: NodeKind) -> u32 {
         w.nodes
             .iter()
@@ -2201,7 +1931,6 @@ mod tests {
             let mut w = world(fingers, BaseKind::Track);
             let id = nearest_node(&w, NodeKind::Tree);
             let n = w.node(id).unwrap().clone();
-            // Teleport next to the tree so only mining time is measured.
             w.agent.x = n.x - 0.6;
             w.agent.z = n.z;
             w.agent.yaw = 0.0;
@@ -2250,14 +1979,12 @@ mod tests {
         let ev = run(&mut w, 120.0);
         assert!(ok_done(&ev));
         assert!((w.agent.x - cell_center(w.terrain.cell_of(goal.0, goal.1).unwrap().0, 0).0).abs() < 0.3);
-        // Turning is extra, so the real energy is at least the plan and close to it.
         assert!(w.agent.energy_used_j >= plan.energy_j as f64 - 1.0);
         assert!(w.agent.energy_used_j <= plan.energy_j as f64 * 1.15 + 20.0, "{} vs {}", w.agent.energy_used_j, plan.energy_j);
     }
 
     #[test]
     fn five_finger_legs_carry_a_log_to_the_warehouse() {
-        // Legs: the body bends to the ground (a wheeled or tracked mid body cannot).
         let mut w = world(FingerCount::Five, BaseKind::HumanFoot);
         let ev = mine_nearest(&mut w, NodeKind::Tree);
         assert!(ev.iter().any(|e| matches!(e.event, WorldEvent::NodeBroken { .. })));
@@ -2268,7 +1995,6 @@ mod tests {
         let ev = run(&mut w, 20.0);
         assert!(ev.iter().any(|e| matches!(e.event, WorldEvent::ItemPicked { .. })), "{ev:?}");
         assert_eq!(w.carried_count(ItemKind::Log), 1);
-        // The pick played its physics: the bend, the contact and the lift-off came out as events.
         for k in ["bend_bottom", "contact", "lift_off", "stowed"] {
             assert!(ev.iter().any(|e| matches!(&e.event, WorldEvent::Act { kind, .. } if kind == k)), "no {k}");
         }
@@ -2311,7 +2037,6 @@ mod tests {
             let b = two.grasp_info(k);
             assert!(a.margin.is_finite() && b.margin.is_finite());
         }
-        // The lightest item must be easier to hold than the heaviest one.
         let light = five.grasp_info(ItemKind::Coal).margin;
         let heavy = five.grasp_info(ItemKind::Stone).margin;
         assert!(light >= heavy * 0.99, "coal {light} vs stone {heavy}");
@@ -2319,9 +2044,6 @@ mod tests {
 
     #[test]
     fn item_catalogue_spans_what_the_hands_can_hold() {
-        // The item sizes and masses are assumptions chosen so that hands of
-        // different finger counts give different answers; check they still do.
-        // From above only the fingers' friction holds: one hand, or two sharing the item.
         let holdable = |f: FingerCount| {
             let w = world(f, BaseKind::Track);
             ItemKind::ALL.into_iter().filter(|&k| w.grasp_info(k).stable || 2.0 * w.grasp_info(k).margin >= 1.0).count()
@@ -2335,7 +2057,6 @@ mod tests {
     #[test]
     fn an_unstable_grasp_blocks_the_pickup() {
         let mut w = world(FingerCount::Two, BaseKind::HumanFoot);
-        // Force the situation: whichever item even two such hands cannot hold.
         let bad = ItemKind::ALL
             .into_iter()
             .find(|&k| 2.0 * w.grasp_info(k).margin < 1.0)
@@ -2373,7 +2094,6 @@ mod tests {
         let mut w = world(FingerCount::Five, BaseKind::Track);
         w.agent.energy_used_j = w.battery_capacity_j() + 1.0;
         assert_eq!(w.command(Action::Turn { yaw_deg: 10.0 }), Err(ActionError::BatteryDepleted));
-        // And mid-action:
         let mut w = world(FingerCount::Five, BaseKind::Track);
         w.command(Action::Turn { yaw_deg: 170.0 }).unwrap();
         w.agent.energy_used_j = w.battery_capacity_j() + 1.0;
@@ -2424,13 +2144,11 @@ mod tests {
         assert!(place(&mut mid, ItemKind::Log).is_ok());
         let ev = run(&mut mid, 20.0);
         assert!(ev.iter().any(|e| matches!(e.event, WorldEvent::ItemPicked { .. })), "{ev:?}");
-        // Iron ore (more than mid legs carry): a bend, a squeeze and a lift take seconds, not the old fixed second.
         let mut iron = world_with(BodyPlan::uniform(noto_core::Tier::Pro), BaseKind::HumanFoot);
         let t0 = iron.time_s;
         place(&mut iron, ItemKind::IronOre).unwrap();
         run(&mut iron, 20.0);
         assert!((iron.time_s - t0) as f32 >= PICKUP_TIME_S * TWO_ARM_LIFT_FACTOR - 0.15);
-        // A tracked mid body has no waist pitch: it cannot reach the ground at all.
         let mut track = world_with(BodyPlan::default(), BaseKind::Track);
         match place(&mut track, ItemKind::Log) {
             Err(ActionError::CannotReach { lowest_m, need_m, .. }) => assert!(lowest_m > need_m + 0.3, "{lowest_m} {need_m}"),
@@ -2464,14 +2182,11 @@ mod tests {
             let l = w.layout.as_ref().expect("rugged layout");
             assert!(l.water_cells > 20, "seed {seed}: a sea");
             assert!(!l.mesas.is_empty() && !l.ridges.is_empty(), "seed {seed}: {l:?}");
-            // The waypoints stay connected for the weakest common base.
             let wh = w.waypoint_by_key("warehouse").unwrap();
             assert!(w.plan_route(Goal::Within { x: wh.x, z: wh.z, reach_m: 1.0 }).is_some(), "seed {seed}: no wheel route to the warehouse");
-            // A cliff is a height jump no base climbs.
             let t = &w.terrain;
             let cliff = (0..t.d).any(|z| (0..t.w - 1).any(|x| (t.height_cm(x, z) - t.height_cm(x + 1, z)).abs() >= 100));
             assert!(cliff, "seed {seed}: no cliff");
-            // Every kind keeps two nodes a wheel can reach.
             let start = t.cell_of(w.agent.x, w.agent.z).unwrap();
             let blocked = w.blocked_cells();
             let times = nav::travel_times(&BaseKind::Wheel.spec(), t, &|x, z| blocked.contains(&(x, z)), start, f32::INFINITY);
@@ -2484,7 +2199,6 @@ mod tests {
                 assert!(w.nodes.iter().all(|n| !t.is_water(t.cell_of(n.x, n.z).unwrap().0, t.cell_of(n.x, n.z).unwrap().1)), "no node in the sea");
             }
         }
-        // Same seed, same map; the open map is untouched by the option.
         let (a, b) = (rugged(5, BaseKind::Track), rugged(5, BaseKind::Track));
         assert_eq!(a.terrain_grid(), b.terrain_grid());
         assert!(world(FingerCount::Five, BaseKind::Track).layout.is_none());
@@ -2508,10 +2222,8 @@ mod tests {
                 }
             }
         }
-        // Standing on the pad, the posture knows its ground and the friction it gets.
         let (p, _) = w.posture_now();
         assert_eq!(p.ground, noto_core::Surface::Gravel);
-        // The same move costs a wheel more on sand than on gravel.
         let mut flat = world(FingerCount::Five, BaseKind::Wheel);
         let cell = flat.terrain.cell_of(flat.agent.x, flat.agent.z).unwrap();
         let ahead = (cell.0 + 2, cell.1);
@@ -2543,7 +2255,6 @@ mod tests {
         let t = &w.terrain;
         let water = (0..t.d).flat_map(|z| (0..t.w).map(move |x| (x, z))).find(|&(x, z)| t.is_water(x, z)).unwrap();
         assert!(w.plan_route(Goal::Cell(water)).is_none());
-        // The ramp rises 15 cm a cell: a track climbs it, a wheel's 15° does not.
         let e = (0..t.d).flat_map(|z| (0..t.w - 1).map(move |x| (x, z))).find(|&(x, z)| {
             let d = t.height_cm(x + 1, z) - t.height_cm(x, z);
             d == crate::terrain::RAMP_RISE_CM && t.ground_at(x + 1, z) == Ground::Rock && t.height_cm(x + 1, z) > 0
@@ -2560,13 +2271,11 @@ mod tests {
         assert_eq!(w.command(Action::Drop { item: None, amount: None }), Err(ActionError::NothingToDrop));
         add_stock(&mut w.agent.carried, ItemKind::Log, 2.0);
         add_stock(&mut w.agent.carried, ItemKind::Coal, 1.0);
-        // At the base camp: onto its pile.
         w.command(Action::Drop { item: Some(ItemKind::Log), amount: Some(1.0) }).unwrap();
         let ev = run(&mut w, 15.0);
         assert!(ev.iter().any(|e| matches!(&e.event, WorldEvent::ItemDropped { waypoint: Some(_), .. })));
         assert_eq!(w.waypoint_by_key("base_camp").unwrap().stock_of(ItemKind::Log), 1.0);
         assert_eq!(w.carried_count(ItemKind::Log), 1);
-        // Away from the waypoints: on the ground ahead, one piece per item.
         w.agent.x += 5.0;
         w.agent.yaw = 0.0;
         let before = w.drops.len();
@@ -2577,7 +2286,6 @@ mod tests {
         assert!(w.agent.carried.is_empty() && w.carried_kg() == 0.0);
         let d = w.drops.last().unwrap();
         assert!((d.x - w.agent.x).abs() < DROP_AHEAD_M + 0.3 && d.x > w.agent.x, "ahead of the robot: {} vs {}", d.x, w.agent.x);
-        // A tracked body cannot bend: it lets go from hand height and the piece falls the rest.
         assert!(ev.iter().any(|e| matches!(&e.event, WorldEvent::Act { kind, .. } if kind == "impact")));
     }
 
@@ -2597,7 +2305,6 @@ mod tests {
         let ev = run(&mut w, 30.0);
         let split = ev.iter().find_map(|e| match &e.event { WorldEvent::ItemSplit { piece, amount, left, .. } => Some((piece.clone(), *amount, *left)), _ => None }).expect("split");
         assert!((split.1 - 0.5).abs() < 1e-5 && (split.2 - 0.5).abs() < 1e-5);
-        // Two fingers strike at 2/5 of the full hand's rate.
         assert!(((w.time_s - t0) as f32 - w.split_time_s(ItemKind::Stone, 1.0)).abs() < 0.3);
         let piece: u32 = split.0[1..].parse().unwrap();
         assert!((w.drop_item(piece).unwrap().amount - 0.5).abs() < 1e-5);
@@ -2672,9 +2379,7 @@ mod tests {
         let track = world_with(BodyPlan::default(), BaseKind::Track);
         assert!(foot.capacity_kg() < 6.0, "mid legs hold ~24 kg in total: {}", foot.capacity_kg());
         assert!(track.capacity_kg() > foot.capacity_kg());
-        // The chest preset sets the battery: 324 Wh for mid.
         assert!((foot.battery_capacity_j() - 324.0 * 3600.0).abs() < 1.0);
-        // Cargo makes the base slower and uses more power.
         let mut loaded = world_with(BodyPlan::default(), BaseKind::Track);
         let (v0, p0) = (loaded.drive_spec().max_speed_mps, loaded.drive_spec().power_w);
         add_stock(&mut loaded.agent.carried, ItemKind::IronOre, 3.0);

@@ -23,13 +23,11 @@ world-sim = { path = "../world-sim" }
 
 [dev-dependencies]
 candle-nn = { workspace = true }
-# The development server mirrors the test records into LanceDB like the app does.
 noto-data = { path = "../noto-data" }
 tokio = { workspace = true }
 
 [features]
 default = []
-# GPU backends of every model the runtime loads (SigLIP2, TIPS, SAM, Granite TTM).
 cuda = ["noto-vision/cuda", "noto-ml/cuda"]
 metal = ["noto-vision/metal", "noto-ml/metal"]
 vulkan = ["noto-vision/vulkan", "noto-ml/vulkan"]

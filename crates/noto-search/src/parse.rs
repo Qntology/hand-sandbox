@@ -1,18 +1,3 @@
-//! From a typed command to a plan.
-//!
-//! Stages, each recorded in the trace:
-//! 1. normalize and split into eojeol tokens;
-//! 2. read quantities ("두 개", "3개");
-//! 3. lexical matching (exact word, word behind a closed tail, unique prefix);
-//! 4. embedding span search over the tokens nothing else used (optional);
-//! 5. roles: which place is the destination (by its tail or preposition),
-//!    which is where the items lie (an origin: "집 앞에서", "창고 선반에서",
-//!    "선반에 있는"), which quantity belongs to which resource, what the verbs
-//!    ask for;
-//! 6. the plan, or a [`Problem`] saying what is missing. A fetch of placed
-//!    items (parcels) that names no destination brings them to the lexicon's
-//!    home place (the base camp); origins become search hints on the targets.
-
 use std::collections::HashSet;
 
 use anyhow::Result;
@@ -32,10 +17,7 @@ pub struct Target {
     pub quantity: u32,
     pub via: Via,
     pub score: f32,
-    /// The words as typed.
     pub text: String,
-    /// Where the command says the items lie, outermost first ("창고 선반에서":
-    /// the warehouse, then its shelf): a search hint, never a position.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub origin: Vec<PlaceRef>,
 }
@@ -45,23 +27,18 @@ pub struct PlaceRef {
     pub place: String,
     pub via: Via,
     pub score: f32,
-    /// The words as typed; empty when the place was implied, not said (the home
-    /// place of a fetch without a destination).
     pub text: String,
 }
 
 impl PlaceRef {
-    /// Whether the command named the place, or the parser filled it in.
     pub fn implied(&self) -> bool {
         self.text.is_empty()
     }
 }
 
-/// Something to set down from the robot's own cargo.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct DropTarget {
     pub resource: String,
-    /// Items to set down; `None` (no number said) sets down all of that kind.
     pub quantity: Option<u32>,
     pub via: Via,
     pub score: f32,
@@ -71,23 +48,16 @@ pub struct DropTarget {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Plan {
-    /// Gather the targets and bring them to a place.
     Fetch { targets: Vec<Target>, destination: PlaceRef },
-    /// Gather the targets and keep them in hand.
     Collect { targets: Vec<Target> },
-    /// Walk to a place.
     Goto { place: PlaceRef },
-    /// Set down what is already carried: the named items (everything when
-    /// `items` is empty), here or, with `place`, after going there.
     Drop { items: Vec<DropTarget>, place: Option<PlaceRef> },
-    /// Abort what is running.
     Stop,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Problem {
     pub code: String,
-    /// Korean explanation shown to the user.
     pub message: String,
 }
 
@@ -104,9 +74,7 @@ pub struct ParsedCommand {
     pub tokens: Vec<String>,
     pub hits: Vec<Hit>,
     pub quantities: Vec<(u32, usize, usize)>,
-    /// Words ruled out by "말고", "except", ...
     pub excluded: Vec<String>,
-    /// Content words nothing understood. They are ignored, and listed here.
     pub unmatched: Vec<String>,
     pub warnings: Vec<String>,
     pub plan: Option<Plan>,
@@ -135,13 +103,11 @@ enum Role {
 }
 
 impl Parser {
-    /// A parser that matches words only.
     pub fn new(lex: Lexicon) -> Parser {
         let matcher = LexMatcher::new(&lex);
         Parser { lex, matcher, bank: None, opts: SemanticOpts::default() }
     }
 
-    /// Embeds the lexicon's command phrases so unknown words can be matched by meaning.
     pub fn attach_embedder(&mut self, emb: &dyn PhraseEmbedder) -> Result<()> {
         self.bank = Some(SemanticBank::build(&self.lex, emb)?);
         Ok(())
@@ -155,7 +121,6 @@ impl Parser {
         &self.lex
     }
 
-    /// Parses one command. `emb` is used only when [`Parser::attach_embedder`] ran.
     pub fn parse(&self, text: &str, emb: Option<&dyn PhraseEmbedder>) -> ParsedCommand {
         let mut trace: Vec<TraceLine> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
@@ -181,7 +146,6 @@ impl Parser {
             return out;
         }
 
-        // 2. quantities
         let mut blocked = vec![false; tokens.len()];
         let mut quantities: Vec<Quantity> = Vec::new();
         let mut i = 0;
@@ -200,16 +164,13 @@ impl Parser {
             }
         }
 
-        // 3. lexical
         let mut hits = self.matcher.find(&tokens, &blocked, &mut trace);
 
-        // 4. embedding over what is left
         if let (Some(bank), Some(emb)) = (&self.bank, emb) {
             let mut free: Vec<bool> = blocked.iter().map(|b| !b).collect();
             for h in &hits {
                 (h.start..h.end).for_each(|k| free[k] = false);
             }
-            // Filler, verbs and negation words never reach the embedding stage.
             match search_spans(bank, emb, &tokens, &free, &self.opts, &mut trace) {
                 Ok(extra) => hits.extend(extra),
                 Err(e) => {
@@ -220,7 +181,6 @@ impl Parser {
             hits.sort_by_key(|h| h.start);
         }
 
-        // 5. roles
         let mut excluded = vec![false; hits.len()];
         for (k, h) in hits.iter().enumerate() {
             if h.category != Category::Negation {
@@ -239,7 +199,6 @@ impl Parser {
         let mut resources: Vec<usize> = (0..hits.len())
             .filter(|&k| hits[k].category == Category::Resource && !excluded[k])
             .collect();
-        // a resource named twice keeps its first mention
         let mut seen = HashSet::new();
         resources.retain(|&k| seen.insert(hits[k].node.clone()));
 
@@ -260,7 +219,6 @@ impl Parser {
                 .copied()
                 .find(|&k| hits[k].start >= q.end && qty[k].is_none() && between_is_light(q.end, hits[k].start));
             let chosen = before.or(after).or_else(|| {
-                // fall back to the nearest unassigned resource on either side
                 resources
                     .iter()
                     .copied()
@@ -302,7 +260,6 @@ impl Parser {
             });
         }
 
-        // places and their roles
         let mut places: Vec<(usize, Role)> = Vec::new();
         for (k, h) in hits.iter().enumerate() {
             if h.category != Category::Place || excluded[k] {
@@ -314,20 +271,17 @@ impl Parser {
                 _ => None,
             };
             let from_prep = || {
-                // the nearest earlier hit, skipping "the"-like filler, if adjacent to this place
                 (0..k).rev().find(|&j| hits[j].category != Category::Filler).and_then(|j| match hits[j].category {
                     Category::Direction => Some(Role::Destination),
                     Category::Source => Some(Role::Origin),
                     _ => None,
                 })
             };
-            // "선반에 있는 택배": a place at which the item lies, not one it goes to.
             let located = h.tail_kind == TailKind::Direction
                 && hits.get(k + 1).is_some_and(|n| n.start == h.end && n.category == Category::Filler && self.lex.located_words.contains(&n.text));
             let role = if located { Some(Role::Origin) } else { from_tail.or_else(from_prep) };
             places.push((k, role.unwrap_or(Role::Unspecified)));
         }
-        // A bare place right before an origin is part of it ("창고 선반에서", "물류센터 테이블에서").
         for i in (0..places.len().saturating_sub(1)).rev() {
             let (k, next) = (places[i].0, places[i + 1]);
             if places[i].1 == Role::Unspecified && next.1 == Role::Origin && hits[k].end == hits[next.0].start {
@@ -372,7 +326,6 @@ impl Parser {
             )));
         }
         if !origins.is_empty() && !targets.is_empty() {
-            // Where to look: every origin place once, in the order said (outermost first).
             let mut hint: Vec<PlaceRef> = Vec::new();
             for &k in &origins {
                 if !hint.iter().any(|p| p.place == hits[k].node) {
@@ -400,7 +353,6 @@ impl Parser {
             }
         }
 
-        // unmatched content words
         let mut covered = blocked.clone();
         for h in &hits {
             (h.start..h.end).for_each(|k| covered[k] = true);
@@ -410,7 +362,6 @@ impl Parser {
             warnings.push(format!("이해하지 못해 무시한 말: {}", out.unmatched.join(", ")));
         }
 
-        // 6. plan
         let gathers = ["harvest", "pickup", "deliver"].iter().any(|v| verbs.contains(v));
         let plan = if problem.is_some() {
             None
@@ -420,7 +371,6 @@ impl Parser {
             }
             Some(Plan::Stop)
         } else if verbs.contains("drop") && !gathers {
-            // Set down what is carried; a number limits it, no number means all of it.
             let items: Vec<DropTarget> = resources
                 .iter()
                 .map(|&k| DropTarget { resource: hits[k].node.clone(), quantity: qty[k].map(|n| n.min(MAX_QUANTITY)), via: hits[k].via, score: hits[k].score, text: hits[k].text.clone() })
@@ -431,7 +381,6 @@ impl Parser {
             let home = self.lex.home().filter(|_| targets.iter().all(|t| self.lex.is_placed(&t.resource)));
             match destination {
                 Some(k) => Some(Plan::Fetch { targets: targets.clone(), destination: place_ref(k) }),
-                // Parcels with nowhere said: back to the home place, where they are collected.
                 None if verbs.contains("deliver") && home.is_some() => {
                     let (home, name) = home.map(|n| (n.id.clone(), n.exact_match.first().cloned().unwrap_or_else(|| n.id.clone()))).unwrap_or_default();
                     warnings.push(format!("도착 지점을 말하지 않아 놓여 있던 물건을 {name}{} 가져옵니다.", crate::text::euro(&name)));
@@ -450,7 +399,6 @@ impl Parser {
         } else if destination.is_some() && !gathers {
             destination.map(|k| Plan::Goto { place: place_ref(k) })
         } else if gathers {
-            // The verbs ask to gather or carry something, but no known resource was named.
             let unknown = if out.unmatched.is_empty() {
                 String::new()
             } else {

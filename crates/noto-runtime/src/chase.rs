@@ -1,48 +1,21 @@
-//! The third-person view: the world from a chase camera with the robot's
-//! links drawn as the joint dynamics (`noto_core::dynamics`) move them, and
-//! an overlay of every joint (angle, torque, torque over the actuator's
-//! peak, saturation, stall), the centre of mass, the dynamic ZMP, the support
-//! polygon and the ground reaction, all projected to pixels.
-//!
-//! The first-person camera stays what the ML logic sees; this view is for
-//! people checking that the part presets reach the physics.
-//!
-//! Framing (v1.0): the camera's distance, height and aim come from the
-//! robot's link boxes (`world_sim::iso::RobotExtent`), so a small truck and
-//! a humanoid both fill the frame; the links are drawn with the chassis's
-//! pitch and roll on the ground under it. The overlay builder [`overlay`]
-//! takes any projector, so the isometric view (`views`) draws the same overlay.
-
 use noto_core::dynamics::BodyPose;
 use serde_json::{json, Value};
 use world_sim::iso::RobotExtent;
 use world_sim::render::{render_chase, ChaseView};
 use world_sim::{Camera, Frame, World};
 
-/// Distance of the chase camera behind the robot and its height, metres,
-/// when the robot has no pose to frame (the v0.9 fixed framing).
 pub const CHASE_DIST_M: f32 = 2.6;
 pub const CHASE_HEIGHT_M: f32 = 1.6;
-/// Share of the vertical field of view the robot's bounding sphere fills (design).
 pub const CHASE_FILL: f32 = 0.6;
-/// Elevation of the camera above its aim point, degrees (design: v0.9's
-/// fixed camera, 0.85 m above the aim at 2.6 m, `atan(0.85/2.6)`).
 pub const CHASE_ELEVATION_DEG: f32 = 18.1;
-/// Height of the aim point as a share of the robot's height (design: v0.9's
-/// 0.75 m on a robot about 1.25 m tall).
 pub const CHASE_TARGET_SHARE: f32 = 0.6;
-/// A projected point counts as visible when nothing in the depth buffer is
-/// nearer by more than this, metres.
 const VISIBLE_SLACK_M: f32 = 0.08;
-/// Ground reaction arrow: metres per newton.
 const GRF_M_PER_N: f32 = 0.004;
 
 fn r3(x: f32) -> f64 {
     (x as f64 * 1000.0).round() / 1000.0
 }
 
-/// Where the chase camera stands for a robot of a size: behind it, above
-/// it, and the height it aims at, metres.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ChaseFraming {
     pub dist_m: f32,
@@ -51,7 +24,6 @@ pub struct ChaseFraming {
 }
 
 impl ChaseFraming {
-    /// The framing that fits a robot of `extent` into `cam`'s vertical field of view.
     pub fn fit(extent: &RobotExtent, cam: &Camera) -> ChaseFraming {
         let range = extent.radius_m / (CHASE_FILL * 0.5 * cam.vfov_deg()).to_radians().tan();
         let (s, c) = CHASE_ELEVATION_DEG.to_radians().sin_cos();
@@ -60,7 +32,6 @@ impl ChaseFraming {
     }
 }
 
-/// Renders the chase view and its overlay.
 pub fn render(world: &World, cam: &Camera, orbit_deg: f32) -> (Frame, Option<Value>) {
     let Some(pose) = world.body_pose() else {
         let view = ChaseView::around(world, orbit_deg, CHASE_DIST_M, CHASE_HEIGHT_M);
@@ -79,11 +50,6 @@ pub fn render(world: &World, cam: &Camera, orbit_deg: f32) -> (Frame, Option<Val
     (frame, Some(overlay))
 }
 
-/// The overlay of a pose on a rendered frame: every joint, the CoM, the ZMP,
-/// the support polygon and the ground reaction, projected to pixels.
-/// `to_world` places a base-frame point in the world (with the chassis's
-/// tilt); `project` gives a world point's pixel and depth in `frame`'s
-/// camera (perspective or orthographic); `camera` describes that camera.
 pub fn overlay(
     world: &World,
     pose: &BodyPose,
@@ -120,7 +86,6 @@ pub fn overlay(
     let grf_tip = [zmp[0] + pose.grf[0] * GRF_M_PER_N, zmp[1] + pose.grf[1] * GRF_M_PER_N, pose.grf[2] * GRF_M_PER_N];
     let motion = world.motion.as_ref().map(|m| {
         let r = &m.rollout;
-        // The time series of the posture change, at most ~120 points.
         let stride = (r.samples.len() / 120).max(1);
         let picked: Vec<_> = r.samples.iter().step_by(stride).collect();
         let series: Vec<Value> = r
@@ -164,7 +129,6 @@ mod tests {
         let cam = Camera { width: 192, height: 128, fov_deg: 64.0, max_dist_m: 30.0, ..Camera::default() };
         let (f, o) = render(&w, &cam, 0.0);
         let o = o.expect("an overlay");
-        // The robot stands in the middle of the picture: its pixels carry id 0 and a near depth.
         let robot_px = (0..f.width * f.height).filter(|&i| f.ids[i] == 0 && f.depth[i] < CHASE_DIST_M + 1.0).count();
         assert!(robot_px > 200, "{robot_px} robot pixels");
         let joints = o["joints"].as_array().unwrap();
@@ -181,13 +145,10 @@ mod tests {
         let pose = w.body_pose().unwrap();
         let ext = RobotExtent::of(&w, &w.tilted_robot_boxes(&pose, &w.base_tilt(&pose)));
         let fr = ChaseFraming::fit(&ext, &cam);
-        // The default robot keeps about the v0.9 framing (2.6 m back, 1.6 m up, aim 0.75 m).
         assert!((fr.dist_m - CHASE_DIST_M).abs() < 0.6 && (fr.height_m - CHASE_HEIGHT_M).abs() < 0.35 && (fr.target_m - 0.75).abs() < 0.2, "{fr:?} for {ext:?}");
-        // Half the size: half the distance, half the heights.
         let small = RobotExtent { height_m: 0.5 * ext.height_m, half_span_m: 0.5 * ext.half_span_m, radius_m: 0.5 * ext.radius_m };
         let fs = ChaseFraming::fit(&small, &cam);
         assert!((fs.dist_m - 0.5 * fr.dist_m).abs() < 1e-4 && (fs.height_m - 0.5 * fr.height_m).abs() < 1e-4);
-        // The overlay names its camera.
         let (_, o) = render(&w, &cam, 30.0);
         let o = o.unwrap();
         assert_eq!(o["camera"]["kind"], "chase");

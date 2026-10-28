@@ -1,34 +1,3 @@
-//! The real recogniser: SigLIP2 on tiles of a WebP screenshot.
-//!
-//! What happens in one scan:
-//!
-//! 1. The frame is encoded to WebP and decoded again. The model sees what a
-//!    screenshot file holds, not the renderer's pixels.
-//! 2. The frame is cut into tiles (the whole frame, then grids with some
-//!    overlap). All tiles go through the vision tower in one batch call; that
-//!    is the parallel part (`noto_ml::parallel::embed_frame_tiles`).
-//! 3. Every tile is scored against every dictionary entity at once
-//!    (`noto_search::VisionBank`, the logis-center bias/prejudice scoring with
-//!    SigLIP's sigmoid as the calibration). The prompts were embedded once, in
-//!    parallel and deduplicated, by [`BankedPhrases`] (logis-center's
-//!    `PhraseBank` idea).
-//! 4. A tile that names an entity clearly enough becomes a [`Candidate`]. Its
-//!    box is the tile, its ground position comes from the simulated depth
-//!    buffer, and overlapping candidates of one label are merged (NMS).
-//!
-//! Everything from step 3 on is plain code and is tested with stand-in
-//! embedders. The thresholds are starting points, and the tile boxes are
-//! coarse (a tile is bigger than most objects), which is why the robot scans
-//! again as it nears.
-//!
-//! v1.0 measured the scan with real SigLIP2 weights on rendered frames
-//! (`tests/ml_ab.rs`, `docs/research/ml-ab.md`): with the raw score most
-//! candidates that pass the gates are wrong. With a calibration table
-//! ([`EmbeddingPerception::set_calibration`]) every entity's tile score is
-//! mapped through that label's Platt fit to the probability that a candidate
-//! of that score is right, so the gates' floor (`GateCfg::min_score`) means a
-//! precision for this recogniser as it does for any other.
-
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -46,39 +15,24 @@ use world_sim::{decode_webp, encode_webp, Camera, Frame};
 
 use crate::perception::{centre_from_surface, centre_offset_m, Candidate, EntityTable, Recognizer, ScanInput, ScanOutput};
 
-/// The calibration table of the tile scan in `data/ml_calib.json`.
 pub const SCAN_CALIB_MODE: &str = "embedding";
 
-/// Settings of the tile scan. Starting points, not tuned values.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EmbeddingCfg {
-    /// `(columns, rows)` of each grid laid over the frame, after the whole frame.
     pub grids: Vec<(u32, u32)>,
-    /// How far each tile grows into its neighbours, as a fraction of its size.
     pub overlap: f32,
-    /// Weight of the prejudice (look-alike) prompts when scoring an entity.
     pub prejudice_weight: f32,
-    /// A tile whose best entity scores below this reports nothing. Lower than
-    /// the gate's own floor, so the gates see the doubtful cases and say why
-    /// they held them.
     pub report_floor: f32,
-    /// Boxes of one label overlapping more than this are merged into the best.
     pub nms_iou: f32,
-    /// WebP quality of the screenshot the model sees (100 or more is lossless).
     pub webp_quality: f32,
 }
 
 impl Default for EmbeddingCfg {
     fn default() -> Self {
-        // The 6×4 tiles (64 px on a 384×256 frame) pick a 0.30 m parcel out of
-        // the grass up to 3 m away, the 4×3 ones up to 2 m (tests/siglip_parcel.rs).
         EmbeddingCfg { grids: vec![(2, 2), (4, 3), (6, 4)], overlap: 0.15, prejudice_weight: 0.5, report_floor: 0.10, nms_iou: 0.4, webp_quality: 80.0 }
     }
 }
 
-/// Phrase vectors from a text embedder, deduplicated and embedded in
-/// micro-batches, and kept (in memory, or on disk with a checksum) so a phrase
-/// is embedded once per model.
 pub struct BankedPhrases<E: TextEmbedder + Send + Sync> {
     embedder: Arc<E>,
     bank: PhraseBank,
@@ -86,7 +40,6 @@ pub struct BankedPhrases<E: TextEmbedder + Send + Sync> {
 }
 
 impl<E: TextEmbedder + Send + Sync> BankedPhrases<E> {
-    /// `dir` keeps the vectors between runs; without it they live in memory.
     pub fn new(embedder: Arc<E>, dir: Option<&Path>) -> Self {
         let bank = match dir {
             Some(d) => PhraseBank::open(d),
@@ -106,7 +59,6 @@ impl<E: TextEmbedder + Send + Sync> PhraseEmbedder for BankedPhrases<E> {
     }
 }
 
-/// SigLIP2 as the phrase embedder.
 pub type SiglipPhrases = BankedPhrases<Siglip2>;
 
 pub struct EmbeddingPerception {
@@ -116,14 +68,10 @@ pub struct EmbeddingPerception {
     calibrate: Arc<dyn Fn(f32) -> f32 + Send + Sync>,
     cfg: EmbeddingCfg,
     device: String,
-    /// Per-label Platt maps of the tile score (v1.0); `None` keeps the raw score.
     calib: Option<noto_vision::CalibTable>,
 }
 
 impl EmbeddingPerception {
-    /// `calibrate` turns a cosine into the scale the thresholds use; SigLIP2
-    /// passes its pair probability. The prompts of the dictionary are embedded
-    /// here, once.
     pub fn new(
         lex: &Lexicon,
         text: &dyn PhraseEmbedder,
@@ -135,8 +83,6 @@ impl EmbeddingPerception {
         EmbeddingPerception::new_with(lex, text, image, calibrate, device, cfg, None)
     }
 
-    /// [`EmbeddingPerception::new`] with the lexicon's prompt templates and
-    /// background set (`VisionBank::build_with`).
     pub fn new_with(
         lex: &Lexicon,
         text: &dyn PhraseEmbedder,
@@ -150,8 +96,6 @@ impl EmbeddingPerception {
         Ok(EmbeddingPerception { image, bank, table: EntityTable::from_lexicon(lex), calibrate, cfg, device: device.to_string(), calib: None })
     }
 
-    /// Maps tile scores through a calibration table (labels it lacks fall
-    /// back to its `*` entry, else keep the raw score); `None` turns it off.
     pub fn set_calibration(&mut self, table: Option<noto_vision::CalibTable>) {
         self.calib = table;
     }
@@ -160,10 +104,6 @@ impl EmbeddingPerception {
         self.calib.as_ref()
     }
 
-    /// The probability a tile score of `label` stands for, under the
-    /// calibration. Places (waypoints) were never part of the fit and keep
-    /// their raw score; other labels without a fit of their own use the
-    /// pooled `*` entry.
     fn calibrated(&self, label: &str, kind: &noto_search::EntityKind, score: f32) -> f32 {
         let Some(t) = &self.calib else { return score };
         if *kind == noto_search::EntityKind::Waypoint {
@@ -172,12 +112,10 @@ impl EmbeddingPerception {
         t.labels.get(label).or_else(|| t.labels.get("*")).and_then(|c| c.probability(score)).unwrap_or(score)
     }
 
-    /// SigLIP2 for both sides. Phrase vectors are cached under `bank_dir` when given.
     pub fn siglip(model: Arc<Siglip2>, lex: &Lexicon, bank_dir: Option<&Path>, cfg: EmbeddingCfg) -> Result<EmbeddingPerception> {
         EmbeddingPerception::siglip_with(model, lex, bank_dir, cfg, None)
     }
 
-    /// [`EmbeddingPerception::siglip`] with prompting.
     pub fn siglip_with(model: Arc<Siglip2>, lex: &Lexicon, bank_dir: Option<&Path>, cfg: EmbeddingCfg, prompting: Option<&noto_search::VisionPrompting>) -> Result<EmbeddingPerception> {
         let phrases = BankedPhrases::new(Arc::clone(&model), bank_dir);
         let device = noto_ml::device_label(model.device());
@@ -206,7 +144,6 @@ impl Recognizer for EmbeddingPerception {
     fn scan(&mut self, input: ScanInput<'_>) -> Result<ScanOutput> {
         let f = input.frame;
         let (w, h) = (f.width as u32, f.height as u32);
-        // The model sees what a screenshot file holds.
         let enc = encode_webp(&f.rgb, w, h, self.cfg.webp_quality).map_err(|e| anyhow!("스크린샷 WebP 인코딩 실패: {e}"))?;
         let (dw, dh, rgb) = decode_webp(&enc.bytes).map_err(|e| anyhow!("스크린샷 WebP 디코딩 실패: {e}"))?;
         let img = DynamicImage::ImageRgb8(RgbImage::from_raw(dw, dh, rgb).ok_or_else(|| anyhow!("디코딩한 프레임의 크기가 맞지 않습니다"))?);
@@ -247,7 +184,6 @@ fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
     }
 }
 
-/// Median of the finite depths in the middle half of the tile, if there are any.
 fn median_depth(f: &Frame, t: &Tile) -> Option<f32> {
     let (x0, x1) = (t.x + t.w / 4, (t.x + t.w * 3 / 4).max(t.x + t.w / 4 + 1));
     let (y0, y1) = (t.y + t.h / 4, (t.y + t.h * 3 / 4).max(t.y + t.h / 4 + 1));
@@ -267,8 +203,6 @@ fn median_depth(f: &Frame, t: &Tile) -> Option<f32> {
     Some(v[v.len() / 2])
 }
 
-/// Turns scored tiles into candidates. Tile 0 (the whole frame) only gives the
-/// scene scores; it is too big to be a box.
 #[allow(clippy::too_many_arguments)]
 pub fn candidates_from_tiles(
     tiles: &[Tile],
@@ -310,7 +244,6 @@ pub fn candidates_from_tiles(
             truth_label: None,
         });
     }
-    // Non-maximum suppression, per label.
     out.sort_by(|a, b| b.score.total_cmp(&a.score));
     let mut kept: Vec<Candidate> = Vec::new();
     for c in out {
@@ -349,7 +282,6 @@ mod tests {
         EntityScore { id: id.into(), kind: noto_search::EntityKind::Source, link: "log".into(), bias: s, prejudice: 0.0, score: s }
     }
 
-    /// The tile whose rectangle holds most tree pixels, found with the id buffer (test side only).
     fn tile_with_most_tree(tiles: &[Tile], f: &Frame, w: &World) -> usize {
         let target = w.visible_objects(f).into_iter().find(|v| v.label == "tree").expect("tree in view").bbox;
         let (cx, cy) = (((target[0] + target[2]) / 2) as f32, ((target[1] + target[3]) / 2) as f32);
@@ -392,7 +324,6 @@ mod tests {
         let f = w.render(&cam);
         let tiles = noto_ml::parallel::tile_layout(f.width as u32, f.height as u32, &[(4, 3)], 0.5);
         let table = EntityTable::from_lexicon(&lexicon());
-        // every tile says "tree", scores falling with the index; one tile also differs
         let scores: Vec<Vec<EntityScore>> = (0..tiles.len())
             .map(|i| if i == 5 { vec![score("boulder", 0.7), score("tree", 0.1)] } else { vec![score("tree", 0.9 - 0.01 * i as f32), score("boulder", 0.1)] })
             .collect();
@@ -418,9 +349,6 @@ mod tests {
         assert!(cands.is_empty());
     }
 
-    // ----- the whole scan with stand-in embedders -----
-
-    /// A text embedder with one axis per word: a phrase containing the word gets that axis.
     struct WordAxes;
 
     const AXES: [&str; 4] = ["tree", "boulder", "log", "warehouse"];
@@ -445,7 +373,6 @@ mod tests {
         }
     }
 
-    /// An image embedder that says "tree" when a crop is mostly green and "boulder" when it is grey.
     struct Greens;
 
     impl ImageEmbedder for Greens {
@@ -499,7 +426,6 @@ mod tests {
             assert!(c.bbox.iter().all(|v| (0.0..=1.0).contains(v)));
             assert!(c.score >= 0.2);
         }
-        // deterministic
         let again = p.scan(ScanInput { world: &w, frame: &f, camera: &cam }).unwrap();
         assert_eq!(again.candidates, out.candidates);
     }
@@ -511,7 +437,6 @@ mod tests {
         let mut p = perception();
         let raw = p.scan(ScanInput { world: &w, frame: &f, camera: &cam }).unwrap();
         assert_eq!(Recognizer::scope(&p), "embedding");
-        // Every tree score of s becomes σ(10·s − 10): the raw ones here are below 1, so all fall under 0.5.
         let mut t = noto_vision::CalibTable { mode: SCAN_CALIB_MODE.into(), statistic: "tile_score".into(), ..Default::default() };
         t.labels.insert("tree".into(), noto_vision::LabelCalib { threshold: 1.0, platt: Some((10.0, -10.0)), positives: 5, negatives: 5, precision: None, recall: None });
         p.set_calibration(Some(t));
@@ -520,7 +445,6 @@ mod tests {
         let top = |o: &ScanOutput, id: &str| o.scene.iter().find(|(l, _)| l == id).map(|x| x.1).unwrap();
         let (r, c) = (top(&raw, "tree"), top(&cal, "tree"));
         assert!((c - 1.0 / (1.0 + (-(10.0 * r - 10.0)).exp())).abs() < 1e-5, "{r} -> {c}");
-        // A place keeps its raw score; a label without a fit and no `*` entry too.
         assert_eq!(top(&raw, "warehouse"), top(&cal, "warehouse"));
         assert_eq!(top(&raw, "boulder"), top(&cal, "boulder"));
     }

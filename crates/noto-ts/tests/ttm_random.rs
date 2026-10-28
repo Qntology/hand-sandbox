@@ -1,12 +1,3 @@
-//! Smoke tests for the Granite TTM port with random weights.
-//!
-//! The real checkpoint (`ibm-granite/granite-timeseries-ttm-r3`, folder
-//! `52-16-dec-52-r3`) is not available in the development sandbox, so these
-//! tests only prove what random weights can prove: the tensor shapes of the
-//! copied model line up for a config of the same family, outputs are finite
-//! and deterministic, bad inputs are rejected, and the fusion accepts the
-//! model as one of its predictors. They say nothing about forecast accuracy.
-
 use candle_core::{DType, Device, Result, Shape, Tensor};
 use candle_nn::var_builder::SimpleBackend;
 use candle_nn::{Init, VarBuilder};
@@ -101,10 +92,8 @@ fn random_weight_model_forecasts_the_configured_horizon_with_finite_values() {
     let out = m.forecast(&series(52)).expect("forecast");
     assert_eq!(out.point.len(), 16);
     assert!(out.point.iter().all(|v| v.is_finite()), "{:?}", out.point);
-    // Same weights, same input, same output.
     let again = m.forecast(&series(52)).unwrap();
     assert_eq!(out.point, again.point);
-    // Different weights give a different forecast, so the output depends on the weights.
     let other = model(2, serde_json::json!({})).forecast(&series(52)).unwrap();
     assert_ne!(out.point, other.point);
 }
@@ -142,11 +131,9 @@ fn the_fusion_can_use_the_model_as_one_predictor() {
     assert!(f.point.iter().all(|v| v.is_finite()));
     let sum: f64 = f.weights.iter().map(|w| w.weight).sum();
     assert!((sum - 1.0).abs() < 1e-9);
-    // Random weights forecast badly, so a good built-in predictor outweighs it.
     let wt = f.weights.iter().find(|w| w.method == "ttm").unwrap().weight;
     let best_other = f.weights.iter().filter(|w| w.method != "ttm").map(|w| w.weight).fold(0.0, f64::max);
     assert!(best_other >= wt, "ttm {wt} vs best other {best_other}");
-    // A horizon beyond the model's prediction length leaves it out instead of failing.
     let long = forecast(&y, 20, &[&ttm], &[]);
     assert!(long.weights.iter().all(|w| w.method != "ttm"));
     assert!(long.notes.iter().any(|n| n.contains("ttm")), "{:?}", long.notes);

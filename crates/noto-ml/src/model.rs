@@ -1,6 +1,3 @@
-//! SigLIP2 facade: loads the checkpoint, embeds images and texts, and scores
-//! image-text pairs the way SigLIP does (sigmoid of scaled cosine similarity).
-
 use std::path::Path;
 
 use anyhow::{anyhow, Result};
@@ -16,16 +13,12 @@ use crate::text::TextTower;
 use crate::tokenizer::TextTokenizer;
 use crate::vision::VisionTower;
 
-/// Per-patch output of [`Siglip2::embed_dense`].
 #[derive(Clone, Debug)]
 pub struct DenseEmbedding {
     pub grid_h: usize,
     pub grid_w: usize,
-    /// `grid_h * grid_w` unit vectors, row-major.
     pub vectors: Vec<Vec<f32>>,
-    /// Pooling attention per patch (sums to one).
     pub attention: Vec<f32>,
-    /// The whole-image embedding (unit length), same as [`Siglip2::embed_image`].
     pub pooled: Vec<f32>,
 }
 
@@ -37,18 +30,12 @@ pub struct Siglip2 {
     logit_scale: f32,
     logit_bias: f32,
     device: Device,
-    /// Rows per forward pass on this device.
     policy: BatchPolicy,
-    /// Hash of the checkpoint alone (config, file sizes and times).
     checkpoint: u64,
-    /// Identifies the checkpoint and the device family, so cached text
-    /// vectors never cross models or backends.
     fingerprint: u64,
 }
 
 impl Siglip2 {
-    /// Loads `config.json`, `tokenizer.json` and `model.safetensors` from `dir`.
-    /// Without `config.json` the base NaFlex defaults are used.
     pub fn load(dir: &Path, device: &Device) -> Result<Self> {
         let weights = dir.join("model.safetensors");
         if !weights.exists() {
@@ -64,7 +51,6 @@ impl Siglip2 {
         } else {
             Siglip2Config::default()
         };
-        // SAFETY: the file is only read, and the mapping lives as long as the model.
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], DType::F32, device)? };
         let tokenizer = TextTokenizer::from_file(
             &dir.join("tokenizer.json"),
@@ -77,7 +63,6 @@ impl Siglip2 {
         Ok(model)
     }
 
-    /// Builds the model from any `VarBuilder`. Tests use a `VarMap` with random weights.
     pub fn from_var_builder(
         config: Siglip2Config,
         vb: VarBuilder,
@@ -105,14 +90,10 @@ impl Siglip2 {
         })
     }
 
-    /// Rows per forward pass on this model's device.
     pub fn batch_policy(&self) -> BatchPolicy {
         self.policy
     }
 
-    /// Resizes the vision tower's position table with the reference's
-    /// antialiased filter (`true`, the default) or plain bilinear (`false`,
-    /// this port before v1.0). Only images change; cached text vectors stay valid.
     pub fn set_position_antialias(&mut self, on: bool) {
         self.vision.set_position_antialias(on);
     }
@@ -121,14 +102,11 @@ impl Siglip2 {
         self.vision.position_antialias()
     }
 
-    /// Replaces the batch policy (tests, or a caller with its own memory budget).
-    /// The fingerprint follows, because fixed-shape text batches change the vectors.
     pub fn set_batch_policy(&mut self, policy: BatchPolicy) {
         self.fingerprint = device_salt(self.checkpoint, &self.device, &policy);
         self.policy = policy;
     }
 
-    /// Tokens one image of this patch grid sends through the tower.
     fn tokens_of(input: &NaflexInput) -> usize {
         input.grid_h * input.grid_w
     }
@@ -137,7 +115,6 @@ impl Siglip2 {
         &self.config
     }
 
-    /// Length of every embedding this model returns.
     pub fn embedding_dim(&self) -> usize {
         self.config.vision_hidden
     }
@@ -146,34 +123,24 @@ impl Siglip2 {
         &self.device
     }
 
-    /// Hash of the config, weight file size and modification time. Two
-    /// checkpoints that differ in any of these never share cached vectors.
     pub fn fingerprint(&self) -> u64 {
         self.fingerprint
     }
 
-    /// Image-text pair probability for a cosine similarity.
     pub fn pair_probability(&self, cosine: f32) -> f32 {
         sigmoid(self.logit_scale.exp() * cosine + self.logit_bias)
     }
 
-    /// The learned `(exp(t), b)` of `σ(exp(t)·cos + b)`, as the checkpoint has them.
     pub fn logit_scale_bias(&self) -> (f32, f32) {
         (self.logit_scale.exp(), self.logit_bias)
     }
 
-    /// Unit-length embedding of one image.
     pub fn embed_image(&self, image: &DynamicImage) -> Result<Vec<f32>> {
         let input = preprocess(image, &self.config);
         let emb = self.vision.forward(&input)?;
         Ok(l2_normalize(&emb)?.flatten_all()?.to_vec1()?)
     }
 
-    /// Unit-length embeddings of many images. Images are preprocessed in
-    /// parallel, grouped by patch grid, and each group runs through the vision
-    /// tower in micro-batches of at most `max_batch` images (`0`: as many as
-    /// the device's [`BatchPolicy`] allows for that grid). Output order
-    /// matches the input order.
     pub fn embed_images(&self, images: &[DynamicImage], max_batch: usize) -> Result<Vec<Vec<f32>>> {
         let inputs = self.preprocess_all(images);
         let mut out: Vec<Vec<f32>> = vec![Vec::new(); images.len()];
@@ -194,7 +161,6 @@ impl Siglip2 {
         images.par_iter().map(|image| preprocess(image, &self.config)).collect()
     }
 
-    /// Input indices grouped by patch grid and cut into forward passes.
     fn image_chunks(&self, inputs: &[NaflexInput], max_batch: usize) -> Vec<Vec<usize>> {
         use std::collections::BTreeMap;
         let mut groups: BTreeMap<(usize, usize), Vec<usize>> = BTreeMap::new();
@@ -212,10 +178,6 @@ impl Siglip2 {
         out
     }
 
-    /// [`Siglip2::embed_dense`] for many images, batched like
-    /// [`Siglip2::embed_images`]: images that share a patch grid go through the
-    /// tower together, and each result is the same as the single-image call
-    /// (rows never mix inside the tower). Output order matches the input.
     pub fn embed_dense_batch(&self, images: &[DynamicImage]) -> Result<Vec<DenseEmbedding>> {
         let inputs = self.preprocess_all(images);
         let mut out: Vec<Option<DenseEmbedding>> = (0..images.len()).map(|_| None).collect();
@@ -239,10 +201,6 @@ impl Siglip2 {
         Ok(out.into_iter().map(|d| d.expect("every input is in one chunk")).collect())
     }
 
-    /// Dense embedding of one image: a unit vector per patch in the same
-    /// space as the text embeddings, and where the pooling head looks. This is
-    /// what semantic location uses: the cosine of each patch with a label's
-    /// text vector is a heat map from one forward pass.
     pub fn embed_dense(&self, image: &DynamicImage) -> Result<DenseEmbedding> {
         let input = preprocess(image, &self.config);
         let (dense, attn, pooled) = self.vision.forward_dense(&input)?;
@@ -251,7 +209,6 @@ impl Siglip2 {
         Ok(DenseEmbedding { grid_h: input.grid_h, grid_w: input.grid_w, vectors, attention: attn.to_vec1()?, pooled })
     }
 
-    /// Unit-length embeddings of texts, in input order.
     pub fn embed_texts(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         let tokenizer = self
             .tokenizer
@@ -261,7 +218,6 @@ impl Siglip2 {
         self.embed_tokens(&ids, &mask, texts.len())
     }
 
-    /// Embeds pre-tokenized rows. `ids` and `mask` are `rows * text_max_len` long.
     pub fn embed_tokens(&self, ids: &[u32], mask: &[f32], rows: usize) -> Result<Vec<Vec<f32>>> {
         if rows == 0 {
             return Ok(Vec::new());
@@ -274,10 +230,6 @@ impl Siglip2 {
             trim_idle_pool(&self.device);
             return Ok(emb.to_vec2()?);
         }
-        // CUDA and ROCm: every pass is exactly `max_rows x len`; the last one is
-        // padded with copies of its first row, whose outputs are dropped. The
-        // vector of a phrase then does not depend on what shares its call
-        // (see `BatchPolicy`).
         let b = self.policy.max_rows.max(1);
         let mut out = Vec::with_capacity(rows);
         for start in (0..rows).step_by(b) {
@@ -297,8 +249,6 @@ impl Siglip2 {
         Ok(out)
     }
 
-    /// SigLIP pair score per text: `sigmoid(exp(logit_scale) * cos + logit_bias)`.
-    /// Each score is independent of the others, so several labels can be high at once.
     pub fn scores(&self, image: &[f32], texts: &[Vec<f32>]) -> Vec<f32> {
         let scale = self.logit_scale.exp();
         texts
@@ -331,8 +281,6 @@ fn checkpoint_fingerprint(dir: &Path, config: &Siglip2Config) -> u64 {
     h
 }
 
-/// Mixes the device family and the text batch shape into a fingerprint, so
-/// the phrase bank keeps CPU, CUDA, ROCm and Vulkan vectors apart.
 fn device_salt(h: u64, device: &Device, policy: &BatchPolicy) -> u64 {
     let h = fnv1a(h, device_family(device).as_bytes());
     if policy.fixed_shape {
@@ -351,7 +299,6 @@ fn l2_normalize(t: &Tensor) -> candle_core::Result<Tensor> {
     t.broadcast_div(&norm)
 }
 
-/// Reads a scalar stored as shape `(1,)` or `()`. Returns `None` when absent.
 fn read_scalar(vb: &VarBuilder, name: &str) -> Option<f32> {
     let t = vb
         .get(1usize, name)
@@ -433,7 +380,6 @@ mod tests {
     fn the_position_filter_changes_only_grids_the_table_is_shrunk_for() {
         let mut m = tiny_model();
         assert!(m.position_antialias(), "the reference's antialiased filter is the default");
-        // 64x32 at patch 4 within 16 patches is a 3x5 grid: the 4-row table shrinks to 3.
         let wide = test_image(64, 32);
         let square = test_image(16, 16);
         let (a_wide, a_sq) = (m.embed_image(&wide).unwrap(), m.embed_image(&square).unwrap());
@@ -445,7 +391,6 @@ mod tests {
 
     #[test]
     fn non_square_grids_use_resized_positions() {
-        // 64x32 at patch 4 gives a grid that is not 4x4, so the resize path runs.
         let m = tiny_model();
         let input = preprocess(&test_image(64, 32), m.config());
         assert_ne!((input.grid_h, input.grid_w), (4, 4));
@@ -457,7 +402,6 @@ mod tests {
         let m = tiny_model();
         let len = m.config().text_max_len;
         let ids: Vec<u32> = (0..len as u32).chain(0..len as u32).collect();
-        // Second row has the last four tokens padded.
         let mut mask = vec![1.0f32; 2 * len];
         for v in &mut mask[len + 4..] {
             *v = 0.0;
@@ -473,7 +417,6 @@ mod tests {
     #[test]
     fn batched_image_embeddings_match_one_by_one_in_input_order() {
         let m = tiny_model();
-        // Two shapes, interleaved, so grouping by patch grid has to restore the order.
         let images = vec![test_image(64, 32), test_image(32, 32), test_image(64, 32), test_image(32, 32)];
         let batched = m.embed_images(&images, 2).unwrap();
         assert_eq!(batched.len(), 4);
