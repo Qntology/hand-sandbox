@@ -587,16 +587,24 @@ impl Runtime {
         }))
     }
 
-    /// The pick-up as a person does it, stage by stage, for the first-person HUD: walk up, bend the head to look,
-    /// check with vision, lower the body, grip, lift. Read from the world's act phase (or held gaze) and the last
-    /// look-down check.
+    /// The pick-up stage by stage, for the first-person HUD. Legs do it as a person does: walk up, bend the head to
+    /// look, check with vision, lower the body, grip, lift. Wheels and tracks do it as a lift truck does: the rider
+    /// keeps looking ahead, the tines go down, the carriage camera checks the item, the base slides the tines under it
+    /// and the mast lifts it; setting down runs the other way. Read from the world's act phase (or held look) and the
+    /// last check.
     pub fn procedure_json(&self) -> Option<Value> {
         use noto_core::act::ActKind;
-        const STAGES: [(&str, &str); 6] = [("approach", "다가가기"), ("look", "고개 숙여 응시"), ("check", "비전 확인"), ("bend", "자세 낮춤"), ("grip", "쥐기"), ("lift", "들어올림")];
+        const HAND: [(&str, &str); 6] = [("approach", "다가가기"), ("look", "고개 숙여 응시"), ("check", "비전 확인"), ("bend", "자세 낮춤"), ("grip", "쥐기"), ("lift", "들어올림")];
+        const FORK: [(&str, &str); 6] = [("approach", "다가가기"), ("align", "정렬 (정면 응시)"), ("lower", "포크 내림"), ("check", "포크 카메라 확인"), ("insert", "포크 끼우기"), ("raise", "들어올림")];
+        const FORK_DOWN: [(&str, &str); 3] = [("lower_load", "짐 내림"), ("back_out", "후진해 포크 빼기"), ("rest", "포크 올림")];
         let w = self.world();
+        let forks = noto_core::act::fork::applies(&w.body);
         let action = w.current_action().unwrap_or_default();
         let target = action.split(['(', ')']).nth(1).filter(|s| s.starts_with('d')).and_then(|s| s.get(1..)?.parse::<u32>().ok());
-        let stage = match w.act_phase() {
+        let phase = w.act_phase();
+        let stage = match phase {
+            Some((ActKind::Fork, p @ ("align" | "lower" | "check" | "insert" | "raise" | "lower_load" | "back_out" | "rest"))) => p,
+            Some((ActKind::Look, "hold")) if forks => "check",
             Some((ActKind::Look, "look")) | Some((ActKind::Grasp, "look")) => "look",
             Some((ActKind::Look, _)) | Some((ActKind::Grasp, "check")) => "check",
             Some((ActKind::Grasp, "reach")) => "bend",
@@ -611,10 +619,12 @@ impl Runtime {
                 "approach"
             }
         };
+        let setting_down = matches!(stage, "lower_load" | "back_out" | "rest");
+        let list: &[(&str, &str)] = if setting_down { &FORK_DOWN } else if forks { &FORK } else { &HAND };
         let gazed = self.gaze_check.as_ref().map(|g| g.drop);
-        let drop = target.or(gazed).or_else(|| self.task.as_ref().and_then(|t| t.drops.get(t.drop_idx).copied()));
-        let at = STAGES.iter().position(|(id, _)| *id == stage).unwrap_or(0);
-        let stages: Vec<Value> = STAGES
+        let drop = if setting_down { None } else { target.or(gazed).or_else(|| self.task.as_ref().and_then(|t| t.drops.get(t.drop_idx).copied())) };
+        let at = list.iter().position(|(id, _)| *id == stage).unwrap_or(0);
+        let stages: Vec<Value> = list
             .iter()
             .enumerate()
             .map(|(i, (id, ko))| json!({"id": id, "label_ko": ko, "state": if i < at { "done" } else if i == at { "active" } else { "pending" }}))
@@ -624,9 +634,18 @@ impl Runtime {
         });
         let hv = w.head_view(&self.cam);
         let pose = w.current_kin_pose();
-        let label_ko = drop.and_then(|id| w.drop_item(id)).map(|d| d.kind.spec().label_ko.to_string()).or_else(|| self.gaze_check.as_ref().map(|g| g.label_ko.clone()));
+        let label_ko = drop
+            .and_then(|id| w.drop_item(id))
+            .map(|d| d.kind.spec().label_ko.to_string())
+            .or_else(|| setting_down.then(|| w.agent.carried.first().map(|(k, _)| k.spec().label_ko.to_string())).flatten())
+            .or_else(|| self.gaze_check.as_ref().map(|g| g.label_ko.clone()));
+        let tip = w.act.as_ref().or(w.last_act.as_ref()).filter(|_| forks).and_then(|p| p.rollout.metric("tip_ratio"));
         Some(json!({
-            "act": if matches!(w.act_phase(), Some((ActKind::Look, "look" | "check"))) { "look" } else { "pick" },
+            "act": if setting_down { "set_down" } else if matches!(phase, Some((ActKind::Look, "look" | "check")) | Some((ActKind::Fork, "align" | "lower" | "check"))) && action.starts_with("look") { "look" } else { "pick" },
+            "mechanism": if forks { "fork" } else { "hand" },
+            "camera": if forks && matches!(stage, "lower" | "check" | "insert") { "fork" } else { "head" },
+            "fork_m": forks.then(|| r3(w.fork_m_now())),
+            "tip_ratio": tip.map(r3),
             "target": drop.map(|d| format!("d{d}")),
             "label_ko": label_ko,
             "stage": stage,

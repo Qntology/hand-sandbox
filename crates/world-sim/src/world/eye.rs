@@ -200,6 +200,9 @@ impl World {
     }
 
     pub fn head_view(&self, cam: &Camera) -> HeadView {
+        if self.fork_cam && noto_core::act::fork::applies(&self.body) {
+            return self.fork_view(cam);
+        }
         let (mut pose, walking) = self.camera_pose();
         let (tilt, tilt_rate) = if self.body.legged() {
             ((0.0, 0.0), [0.0, 0.0])
@@ -234,6 +237,18 @@ impl World {
         let exposure = Exposure { rate, exposure_s: timing.exposure_s, readout_s: timing.readout_s };
         let tilt_deg = [tilt.0.to_degrees(), tilt.1.to_degrees()];
         HeadView { view, exposure, est, shake, eye_m: pos[2] + shake.dz_m, head_pitch_deg, pan_deg, blur_px: exposure.blur_px(cam), tilt_deg }
+    }
+
+    /// The fork carriage camera: between the tines, a little above them, looking ahead and down at what the tines
+    /// will go under. It rides the mast, so it is low when the tines are down.
+    pub fn fork_view(&self, cam: &Camera) -> HeadView {
+        let pos = noto_core::act::fork::camera_pos(&self.body, self.fork_m_now());
+        let at = self.body_to_world(pos);
+        let roll = self.chassis_attitude(self.agent.x, self.agent.z, self.agent.yaw).1;
+        let view = View { origin: at, yaw: self.agent.yaw - cam.pan_deg.to_radians(), pitch: -noto_core::act::fork::CAMERA_PITCH_DEG.to_radians(), roll };
+        let timing = sensor_timing_at(self.body.head.sensor, self.scene_lux());
+        let exposure = Exposure { rate: [self.eye.yaw_rate, 0.0, 0.0], exposure_s: timing.exposure_s, readout_s: timing.readout_s };
+        HeadView { view, exposure, est: view, shake: Shake::still(), eye_m: pos[2], head_pitch_deg: 0.0, pan_deg: cam.pan_deg, blur_px: exposure.blur_px(cam), tilt_deg: [0.0, roll.to_degrees()] }
     }
 
     pub fn chassis_attitude(&self, x: f32, z: f32, yaw: f32) -> (f32, f32) {

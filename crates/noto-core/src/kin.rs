@@ -85,6 +85,9 @@ pub struct KinPose {
     pub lift_m: f32,
     #[serde(default)]
     pub toe_deg: [f32; 2],
+    /// Fork tine height above the ground (m) on a wheeled or tracked base (`act::fork`); 0 on legs.
+    #[serde(default)]
+    pub fork_m: f32,
 }
 
 impl KinPose {
@@ -106,6 +109,7 @@ impl KinPose {
             closure: 0.0,
             lift_m: 0.0,
             toe_deg: [0.0, 0.0],
+            fork_m: 0.0,
         }
     }
 
@@ -133,6 +137,7 @@ impl KinPose {
             closure: l(a.closure, b.closure),
             lift_m: l(a.lift_m, b.lift_m),
             toe_deg: l2(a.toe_deg, b.toe_deg),
+            fork_m: l(a.fork_m, b.fork_m),
         }
     }
 }

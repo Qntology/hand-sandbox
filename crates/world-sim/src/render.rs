@@ -240,6 +240,20 @@ struct Scene<'a> {
 const SKY_TOP: [f32; 3] = [112.0, 168.0, 232.0];
 const SKY_HORIZON: [f32; 3] = [200.0, 222.0, 240.0];
 const CURB_YELLOW: [u8; 3] = [232, 196, 48];
+const FORK_YELLOW: [u8; 3] = [236, 172, 36];
+
+pub fn segment_color(s: noto_core::Segment) -> [u8; 3] {
+    use noto_core::Segment;
+    match s {
+        Segment::Head => [214, 218, 226],
+        Segment::Chest => [74, 110, 168],
+        Segment::Belly => [60, 72, 96],
+        Segment::Arm => [228, 136, 52],
+        Segment::Hand => [246, 206, 84],
+        Segment::Leg => [120, 126, 138],
+        Segment::Foot => [52, 56, 64],
+    }
+}
 const CURB_DARK: [u8; 3] = [48, 48, 52];
 const STONE: [u8; 3] = [120, 120, 124];
 const MAX_OBJECT_TOP_M: f32 = 1.7;
@@ -286,7 +300,11 @@ impl<'a> Scene<'a> {
             }
         }
 
+        let lifted = world.lifted_drop();
         for d in &world.drops {
+            if lifted == Some(d.id) {
+                continue;
+            }
             let Some((cx, cz)) = t.cell_of(d.x, d.z) else { continue };
             let (ccx, ccz) = cell_center(cx, cz);
             let g = world.drop_base_m(d);
@@ -692,6 +710,10 @@ fn basis_rpy(yaw: f32, pitch: f32, roll: f32) -> ([f32; 3], [f32; 3], [f32; 3]) 
 
 pub fn render(world: &World, cam: &Camera) -> Frame {
     let hv = world.head_view(cam);
+    if world.fork_cam && noto_core::act::fork::applies(&world.body) {
+        let casters = world.shadow_casters();
+        return render_rays(world, cam, &Rays::Pinhole { view: hv.view, exposure: hv.exposure }, &world.fork_boxes(), &casters, None);
+    }
     render_view(world, cam, &hv.view, &hv.exposure)
 }
 
@@ -1071,24 +1093,63 @@ impl World {
     }
 
     pub fn robot_boxes(&self, pose: &noto_core::dynamics::BodyPose) -> Vec<Obb> {
-        use noto_core::Segment;
-        pose.boxes
-            .iter()
+        let mut v: Vec<Obb> = self
+            .shown_boxes(pose)
             .map(|b| Obb {
                 center: self.body_to_world(b.center),
                 axes: [self.body_dir_to_world(b.axes[0]), self.body_dir_to_world(b.axes[1]), self.body_dir_to_world(b.axes[2])],
                 half: b.half,
-                color: match b.segment {
-                    Segment::Head => [214, 218, 226],
-                    Segment::Chest => [74, 110, 168],
-                    Segment::Belly => [60, 72, 96],
-                    Segment::Arm => [228, 136, 52],
-                    Segment::Hand => [246, 206, 84],
-                    Segment::Leg => [120, 126, 138],
-                    Segment::Foot => [52, 56, 64],
-                },
+                color: segment_color(b.segment),
             })
-            .collect()
+            .collect();
+        v.extend(self.fork_boxes());
+        v
+    }
+
+    /// The body's own boxes that are drawn: all of them on legs; on wheels and tracks only the chassis, wheels and
+    /// tracks, since the rest of the base is drawn as a lift truck (`fork_parts`).
+    pub fn shown_boxes<'a>(&self, pose: &'a noto_core::dynamics::BodyPose) -> impl Iterator<Item = &'a noto_core::dynamics::LinkBox> {
+        let truck = noto_core::act::fork::applies(&self.body);
+        pose.boxes.iter().filter(move |b| !truck || matches!(b.name, "chassis" | "wheel" | "track"))
+    }
+
+    /// The lift truck of a wheeled or tracked base (body, counterweight, seat and rider, overhead guard), its mast,
+    /// carriage and tines, and the load riding on the tines, as (centre in the body frame, half sizes along the body
+    /// axes, colour).
+    pub fn fork_parts(&self) -> Vec<([f32; 3], [f32; 3], [u8; 3])> {
+        if !noto_core::act::fork::applies(&self.body) {
+            return Vec::new();
+        }
+        let eye = self.standing_eye_m();
+        let mut v: Vec<([f32; 3], [f32; 3], [u8; 3])> = noto_core::act::fork::truck_boxes(&self.body, eye)
+            .iter()
+            .chain(noto_core::act::fork::boxes(&self.body, self.fork_m_now()).iter())
+            .map(|b| {
+                let color = match b.name {
+                    "truck_body" | "truck_cab" | "truck_dash" | "rider_helmet" => FORK_YELLOW,
+                    "truck_counterweight" => [58, 60, 66],
+                    "truck_seat" | "truck_steer" => [30, 30, 34],
+                    "truck_roof" | "truck_guard" => [44, 46, 52],
+                    "rider_torso" | "rider_arm" => [214, 92, 40],
+                    "rider_leg" => [52, 70, 112],
+                    "rider_head" => [222, 186, 150],
+                    "fork_tine" => [64, 66, 72],
+                    "fork_carriage" => [52, 54, 60],
+                    _ => [96, 100, 110],
+                };
+                (b.center, b.half, color)
+            })
+            .collect();
+        for (k, size, c) in self.fork_load() {
+            v.push((c, [0.5 * size[0], 0.5 * size[2], 0.5 * size[1]], k.spec().color));
+        }
+        v
+    }
+
+    /// `fork_parts` in the world.
+    pub fn fork_boxes(&self) -> Vec<Obb> {
+        let axes = [self.body_dir_to_world([1.0, 0.0, 0.0]), self.body_dir_to_world([0.0, 1.0, 0.0]), self.body_dir_to_world([0.0, 0.0, 1.0])];
+        self.fork_parts().into_iter().map(|(c, half, color)| Obb { center: self.body_to_world(c), axes, half, color }).collect()
     }
 
     pub fn shadow_casters(&self) -> Vec<Obb> {
@@ -1571,8 +1632,10 @@ mod tests {
             ("turn", 0xb3ce_dd00_33e7_2869),
             ("walk", 0x7b25_914d_aaa0_a85a),
             ("rugged", 0xd0ae_544e_dcbd_f643),
-            ("chase", 0x9450_bf96_efbd_49ea),
-            ("focus", 0x4633_c830_3896_1054),
+            // "chase" and "focus": the wheeled robot is drawn as a lift truck (`act::fork::truck_boxes`) since the
+            // forklift change.
+            ("chase", 0xac4f_38a9_b4a1_9759),
+            ("focus", 0x7ae1_9aba_c82f_7fc9),
             ("top", 0x1777_dd2f_41f0_963c),
         ];
         // "turn" and "walk" are poses after one tick of turning and seven of walking: they moved when the turn rate
@@ -1706,7 +1769,7 @@ mod tests {
     fn the_resting_shadow_pose_matches_the_dynamics() {
         let span = |pose: &noto_core::dynamics::BodyPose, w: &World| {
             let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
-            for (o, b) in w.robot_boxes(pose).iter().zip(&pose.boxes) {
+            for (o, b) in w.robot_boxes(pose).iter().zip(w.shown_boxes(pose)) {
                 if b.segment == noto_core::Segment::Foot {
                     continue;
                 }

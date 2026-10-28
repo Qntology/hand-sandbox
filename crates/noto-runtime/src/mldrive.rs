@@ -891,12 +891,17 @@ impl Runtime {
             Memory::seen(x, z, self.world.aim_sigma_m(), self.world.odom.travelled_m, self.world.tick)
         });
         let dist = self.dist_me(m.x, m.z);
-        if dist > PICKUP_REACH_M - 0.1 {
-            t.queue.push_back(Action::MoveTo { x: m.x, z: m.z, reach_m: 0.4 });
+        // Wheels and tracks lift with forks and stop with the tine tips short of the item.
+        let forks = noto_core::act::fork::applies(&self.world.body);
+        let size = d.kind.spec().piece_size_m(d.amount);
+        let stop_m = if forks { noto_core::act::fork::standoff_x(&self.world.body, size[0].max(size[2])) } else { 0.4 };
+        if dist > if forks { stop_m + 0.15 } else { PICKUP_REACH_M - 0.1 } {
+            t.queue.push_back(Action::MoveTo { x: m.x, z: m.z, reach_m: stop_m });
             return Flow::Continue;
         }
         let dest = t.destination.as_deref().and_then(|k| self.world.waypoint_by_key(k)).map(|w| (w.id, w.x, w.z));
-        if let Err(why) = self.world.reach_ground(d.kind, d.amount) {
+        let can_take = if forks { self.world.fork_check(d.kind, d.amount).map(|_| ()) } else { self.world.reach_ground(d.kind, d.amount) };
+        if let Err(why) = can_take {
             if dest.is_none() || self.world.body.legged() {
                 return fail("reach_ground", format!("[ML] {}을(를) 집을 수 없습니다: {why}", d.kind.spec().label_ko));
             }

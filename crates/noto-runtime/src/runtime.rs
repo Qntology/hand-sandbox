@@ -190,6 +190,8 @@ pub enum FrameView {
     Chase { orbit_deg: i16 },
     Focus(world_sim::render::FocusCam),
     Iso { az_step: u8, zoom_pct: u16, dimetric: bool },
+    /// The fork carriage camera of a wheeled or tracked base (the head camera on legs).
+    Fork,
 }
 
 struct WorldLabels<'a>(&'a World);
@@ -1124,6 +1126,13 @@ impl Runtime {
                     })
                     .unwrap_or_default();
                 (f, det)
+            }
+            FrameView::Fork => {
+                let cam = Camera { width: width.clamp(32, 2048) as usize, height: height.clamp(32, 2048) as usize, ..self.cam };
+                self.world.fork_cam = noto_core::act::fork::applies(&self.world.body);
+                let f = self.world.render(&cam);
+                self.world.fork_cam = false;
+                (f, Vec::new())
             }
             FrameView::Top => (self.world.render_top(height.clamp(32, 2048) as usize, 24.0), Vec::new()),
             FrameView::Chase { orbit_deg } => {

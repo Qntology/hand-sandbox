@@ -21,6 +21,8 @@ pub(crate) const TOUCH_PIECE_M: f32 = 0.25;
 pub(crate) const SIDE_SPOT_REACH_M: f32 = 0.36;
 pub(crate) const PLACE_REACH_M: f32 = DELIVER_REACH_M - 0.5;
 pub(crate) const INSPECT_STAND_M: f32 = 1.2;
+/// Half the width of the lane the tines and the base sweep going in (m): the base's half width and a margin.
+pub(crate) const FORK_LANE_HALF_M: f32 = 0.30;
 pub(crate) const SMALL_ITEM_SEE_M: f32 = 3.0;
 pub(crate) const GROUND_SWEEP_TILT_DEG: f32 = 30.0;
 pub(crate) const MAX_PLACE_FIXES: u32 = 2;
@@ -165,6 +167,8 @@ pub(crate) struct Task {
     pub deliver_retry: bool,
     pub look_turn: Option<u32>,
     pub gazed: Option<u32>,
+    /// The drop the forks last lined up in front of (once per drop).
+    pub lined_up: Option<u32>,
 }
 
 fn add_amount(list: &mut Vec<(String, f32)>, id: &str, a: f32) {
@@ -287,6 +291,7 @@ impl Task {
             deliver_retry: false,
             look_turn: None,
             gazed: None,
+            lined_up: None,
         })
     }
 
@@ -1008,9 +1013,26 @@ impl Runtime {
             });
             let side_here = t.side.is_some_and(|(sid, _)| sid == id);
             let dist = self.dist_me(m.x, m.z);
-            if dist > PICKUP_REACH_M - 0.1 && !side_here {
-                t.act_predicted_s = self.world.plan_route(Goal::Within { x: m.x, z: m.z, reach_m: 0.4 }).map(|p| p.time_s);
-                let r = match self.issue(t, Action::MoveTo { x: m.x, z: m.z, reach_m: 0.4 }, Act::Move(MoveFor::Drop)) {
+            // Wheels and tracks lift with forks and stop with the tine tips short of the item; legs bend down and
+            // pick by hand from close by.
+            let forks = noto_core::act::fork::applies(&self.world.body);
+            let size = d.kind.spec().piece_size_m(d.amount);
+            let stop_m = if forks { noto_core::act::fork::standoff_x(&self.world.body, size[0].max(size[2])) } else { 0.4 };
+            let far_m = if forks { stop_m + 0.15 } else { PICKUP_REACH_M - 0.1 };
+            // Tines go straight in: line up on a side where no other item lies in their way.
+            if forks && t.lined_up != Some(id) && (dist > far_m || self.fork_path_blocked(id, (m.x, m.z), self.me())) {
+                t.lined_up = Some(id);
+                if let Some((lx, lz)) = self.fork_lineup(id, (m.x, m.z), stop_m) {
+                    self.log("quest", Level::Info, format!("{name}: 포크가 곧게 들어갈 자리로 정렬 ({lx:.1}, {lz:.1})"), Some(json!({"drop": id, "x": lx, "z": lz})));
+                    match self.issue(t, Action::MoveTo { x: lx, z: lz, reach_m: 0.12 }, Act::Move(MoveFor::Drop)) {
+                        Ok(()) => return Flow::Continue,
+                        Err(_) => {}
+                    }
+                }
+            }
+            if dist > far_m && !side_here {
+                t.act_predicted_s = self.world.plan_route(Goal::Within { x: m.x, z: m.z, reach_m: stop_m }).map(|p| p.time_s);
+                let r = match self.issue(t, Action::MoveTo { x: m.x, z: m.z, reach_m: stop_m }, Act::Move(MoveFor::Drop)) {
                     Err(ActionError::NoPath) => self.issue(t, Action::MoveTo { x: m.x, z: m.z, reach_m: PICKUP_REACH_M - 0.1 }, Act::Move(MoveFor::Drop)),
                     r => r,
                 };
@@ -1024,15 +1046,19 @@ impl Runtime {
                     Err(e) => fail(e.code(), action_error_ko(&e)),
                 };
             }
-            if let Err(why) = self.world.reach_ground(d.kind, d.amount) {
-                if t.destination.is_none() {
+            let can_take =if forks { self.world.fork_check(d.kind, d.amount).map(|_| ()) } else { self.world.reach_ground(d.kind, d.amount) };
+            if let Err(why) = can_take {
+                if t.destination.is_none() || !forks {
                     return fail("reach_ground", format!("{name}{} 집을 수 없습니다: {why}", eul_reul(&name)));
                 }
-                if self.world.body.legged() {
-                    return fail("reach_ground", format!("{name}{} 집을 수 없습니다: {why}", eul_reul(&name)));
-                }
-                self.log("quest", Level::Info, format!("{name}: 바닥에 손이 닿지 않아 범퍼로 밀어 옮김 — {why}"), Some(json!({"drop": id})));
+                self.log("quest", Level::Info, format!("{name}: 포크로 들 수 없어 범퍼로 밀어 옮김 — {why}"), Some(json!({"drop": id})));
                 t.push = Some(PushJob { drop: id, tries: 0 });
+                if self.cfg.vision.gaze_before_pick && t.gazed != Some(id) {
+                    t.gazed = Some(id);
+                    if self.issue(t, Action::Look { x: m.x, z: m.z }, Act::Look(id)).is_ok() {
+                        return Flow::Continue;
+                    }
+                }
                 return self.push_step(t);
             }
             let ctx = CargoCtx { quest_cargo_kg: self.quest_cargo_kg(t), destination: self.waypoint_of(t).map(|(_, x, z, _)| (x, z)) };
@@ -1101,6 +1127,36 @@ impl Runtime {
         }
     }
 
+    /// Whether another item lies in the way of the tines going from where the base stands (`from`) to the item at `at`.
+    fn fork_path_blocked(&self, id: u32, at: (f32, f32), from: (f32, f32, f32)) -> bool {
+        let (dx, dz) = (at.0 - from.0, at.1 - from.1);
+        let len = dx.hypot(dz).max(1e-3);
+        let (ux, uz) = (dx / len, dz / len);
+        self.world.drops.iter().filter(|d| d.id != id).any(|d| {
+            let (px, pz) = self.world.belief_of(d.x, d.z);
+            let (rx, rz) = (px - from.0, pz - from.1);
+            let along = rx * ux + rz * uz;
+            let off = (rx * uz - rz * ux).abs();
+            along > 0.0 && along < len + 0.1 && off < FORK_LANE_HALF_M
+        })
+    }
+
+    /// A place `stop_m` from the item at `at` from which the tines go in with nothing else in their way, nearest the
+    /// side the base comes from first.
+    fn fork_lineup(&self, id: u32, at: (f32, f32), stop_m: f32) -> Option<(f32, f32)> {
+        let me = self.me();
+        let a0 = (me.1 - at.1).atan2(me.0 - at.0);
+        (0..8)
+            .map(|k| a0 + std::f32::consts::FRAC_PI_4 * if k % 2 == 0 { (k / 2) as f32 } else { -((k / 2 + 1) as f32) })
+            .map(|a| (at.0 + stop_m * a.cos(), at.1 + stop_m * a.sin(), a))
+            .find(|&(x, z, a)| {
+                let from = (x, z, a + std::f32::consts::PI);
+                let (tx, tz) = self.world.true_of(x, z);
+                self.world.terrain.cell_of(tx, tz).is_some_and(|c| !self.world.terrain.is_water(c.0, c.1) && !self.world.blocked_cells().contains(&c)) && !self.fork_path_blocked(id, at, from)
+            })
+            .map(|(x, z, _)| (x, z))
+    }
+
     fn pick_from_memory(&mut self, t: &mut Task, id: u32, kind: ItemKind, amount: f32) -> Result<Action, Flow> {
         let rate = self.drift_rate();
         let odo = self.world.odom.travelled_m;
@@ -1111,7 +1167,8 @@ impl Runtime {
         let me = self.me();
         let side = t.side.is_some_and(|(sid, _)| sid == id);
         let intermittent = self.cfg.vision.intermittent;
-        if !side && t.gazed != Some(id) && self.cfg.vision.gaze_before_pick && noto_core::act::gaze::can_aim(&self.world.body) {
+        let can_look = noto_core::act::gaze::can_aim(&self.world.body) || noto_core::act::fork::applies(&self.world.body);
+        if !side && t.gazed != Some(id) && self.cfg.vision.gaze_before_pick && can_look {
             t.gazed = Some(id);
             if self.issue(t, Action::Look { x: m.x, z: m.z }, Act::Look(id)).is_ok() {
                 return Err(Flow::Continue);
@@ -1192,10 +1249,18 @@ impl Runtime {
         }
     }
 
-    /// The look before the hand: the head is down over the item now, so the frame the scan sees is the close-up the
-    /// pick-up needs. The scan names it and fixes where it lies; the depth model, aligned to the ground under the tilted
-    /// camera, gives its range inside the scan's box.
+    /// The look before the hand: the head is down over the item now (or, on wheels and tracks, the tines are down and
+    /// the carriage camera between them looks at it while the rider keeps looking ahead), so the frame the scan sees is
+    /// the close-up the pick-up needs. The scan names it and fixes where it lies; the depth model, aligned to the ground
+    /// under that camera, gives its range inside the scan's box.
     fn check_gaze(&mut self, t: &mut Task, id: u32) {
+        let forks = noto_core::act::fork::applies(&self.world.body);
+        self.world.fork_cam = forks;
+        self.check_gaze_with(t, id, forks);
+        self.world.fork_cam = false;
+    }
+
+    fn check_gaze_with(&mut self, t: &mut Task, id: u32, forks: bool) {
         let Some(m) = t.mem.get(&id).copied() else { return };
         let Some(kind) = self.world.drop_item(id).map(|d| d.kind) else { return };
         let (rate, odo) = (self.drift_rate(), self.world.odom.travelled_m);
@@ -1229,19 +1294,20 @@ impl Runtime {
         let depth_m = nearest.and_then(|c| self.depth_in_box(c.1));
         let ok = nearest.is_some();
         let reason = match (nearest, matched) {
-            (None, _) => Some(format!("숙인 화면에서 {name}을 찾지 못함")),
+            (None, _) => Some(format!("{}에서 {name}을 찾지 못함", if forks { "포크 카메라 화면" } else { "숙인 화면" })),
             (Some(c), None) => Some(format!("{name}이 보이지만 기억과 {:.0} cm 떨어져 이웃 것으로 봄 — 기억 위치로 집음", off(c.2) * 100.0)),
             _ => None,
         };
         let depth = depth_m.map(|d| format!(" · 깊이 모델 {d:.2} m")).unwrap_or_default();
+        let how = if forks { format!("포크 {:.2} m · 포크 카메라로 (탑승자 시선 정면)", self.world.fork_m_now()) } else { format!("고개 {neck_deg:.0}° 숙여") };
         if let Some(c) = matched {
             let (f, innov) = m.fuse(c.2 .0, c.2 .1, mem.sigma_obs(c.3), odo, self.world.tick, rate);
             t.mem.insert(id, f);
             self.note_look("gaze", format!("d{id}"), Some(before), Some(f.sigma_m(odo, rate)), Some(innov));
-            let msg = format!("비전 확인 ✓ {name}: 고개 {neck_deg:.0}° 숙여 {:.2} m에서 봄{depth} — 기억 ±{:.0} → ±{:.0} cm", range_m.unwrap_or(f32::NAN), 2.0 * before * 100.0, 2.0 * f.sigma_m(odo, rate) * 100.0);
+            let msg = format!("비전 확인 ✓ {name}: {how} {:.2} m에서 봄{depth} — 기억 ±{:.0} → ±{:.0} cm", range_m.unwrap_or(f32::NAN), 2.0 * before * 100.0, 2.0 * f.sigma_m(odo, rate) * 100.0);
             self.log("vision", Level::Info, msg, Some(json!({"drop": id, "neck_deg": neck_deg, "pitch_deg": pitch_deg, "range_m": range_m, "depth_m": depth_m, "innovation_m": innov})));
         } else if ok {
-            let msg = format!("비전 확인 ✓ {name} 있음: 고개 {neck_deg:.0}° 숙여 봄{depth} · {}", reason.clone().unwrap_or_default());
+            let msg = format!("비전 확인 ✓ {name} 있음: {how} 봄{depth} · {}", reason.clone().unwrap_or_default());
             self.log("vision", Level::Info, msg, Some(json!({"drop": id, "neck_deg": neck_deg, "pitch_deg": pitch_deg, "range_m": range_m, "depth_m": depth_m})));
         } else {
             let msg = format!("비전 확인 실패: {} — 기억(±{:.0} cm)으로 집음", reason.clone().unwrap_or_default(), 2.0 * before * 100.0);

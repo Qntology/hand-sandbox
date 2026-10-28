@@ -187,7 +187,7 @@
           <button type="button" class="vt-btn active" id="tg-coop-agent" data-tip-title="순차 협동 활성 로봇" data-tip="현재 비전·AI 시뮬레이션을 수행 중인 로봇입니다. 누르면 로봇 1 ↔ 로봇 2의 시점과 제어 주체를 수동 전환하거나 순차 협동 모드를 토글합니다.">로봇 1 (협동 대기)</button>
           <div class="vt-sep"></div>
           <label class="vt-label" for="view-select">시점</label>
-          <select id="view-select" title="3인칭: 로봇 뒤 추적 카메라에 관절 동역학(프리셋 질량·액추에이터)으로 움직이는 몸과 관절 토크·ZMP를 겹쳐 그립니다. 포커스: 행위가 쓰는 부위의 근접 화면과 그 부위의 힘·관절 그림"><option value="agent">에이전트 시점 (1인칭)</option><option value="chase">3인칭 (관절 물리)</option><option value="top">탑뷰</option><option value="focus:hand">포커스 · 손 근접</option><option value="focus:side">포커스 · 옆 (허리·목·다리)</option><option value="focus:low">포커스 · 낮게 (발·바퀴·트랙)</option></select>
+          <select id="view-select" title="3인칭: 로봇 뒤 추적 카메라에 관절 동역학(프리셋 질량·액추에이터)으로 움직이는 몸과 관절 토크·ZMP를 겹쳐 그립니다. 포커스: 행위가 쓰는 부위의 근접 화면과 그 부위의 힘·관절 그림"><option value="agent">에이전트 시점 (1인칭)</option><option value="chase">3인칭 (관절 물리)</option><option value="top">탑뷰</option><option value="fork">포크 카메라 (지게차)</option><option value="focus:hand">포커스 · 손 근접</option><option value="focus:side">포커스 · 옆 (허리·목·다리)</option><option value="focus:low">포커스 · 낮게 (발·바퀴·트랙)</option></select>
           <label class="vt-label" for="orbit-range" id="orbit-label" hidden>궤도</label>
           <input type="range" id="orbit-range" min="-180" max="180" step="15" value="-30" hidden aria-label="3인칭 카메라 궤도 각도" title="3인칭 카메라를 로봇 둘레로 돌립니다 (0° = 뒤, 음수 = 오른쪽 · 작업 팔)" />
           <label class="vt-label" for="frame-preset">프레임</label>
@@ -260,6 +260,7 @@
               <ol class="ph-stages" id="ph-stages"></ol>
               <div id="ph-check"></div>
               <div class="ph-pose" id="ph-pose"></div>
+              <figure class="ph-forkcam" id="ph-forkcam-box" hidden><canvas id="ph-forkcam" aria-label="포크 카메라 화면"></canvas><figcaption>포크 카메라</figcaption></figure>
             </section>
             <div class="vp-glass vp-minimap" id="vp-minimap">
               <canvas id="minimap" width="148" height="148" aria-label="미니맵 (경로·웨이포인트)"></canvas>

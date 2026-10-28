@@ -160,11 +160,13 @@ impl World {
     }
 
     pub fn tilted_robot_boxes(&self, pose: &noto_core::dynamics::BodyPose, tilt: &BaseTilt) -> Vec<Obb> {
-        self.robot_boxes(pose)
-            .into_iter()
-            .zip(&pose.boxes)
-            .map(|(o, b)| Obb { center: self.tilted_body_to_world(b.center, tilt), axes: b.axes.map(|a| self.body_dir_to_world(tilt.apply(a))), ..o })
-            .collect()
+        let mut v: Vec<Obb> = self
+            .shown_boxes(pose)
+            .map(|b| Obb { center: self.tilted_body_to_world(b.center, tilt), axes: b.axes.map(|a| self.body_dir_to_world(tilt.apply(a))), half: b.half, color: crate::render::segment_color(b.segment) })
+            .collect();
+        let axes = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]].map(|a| self.body_dir_to_world(tilt.apply(a)));
+        v.extend(self.fork_parts().into_iter().map(|(c, half, color)| Obb { center: self.tilted_body_to_world(c, tilt), axes, half, color }));
+        v
     }
 }
 
@@ -318,7 +320,7 @@ mod tests {
         assert!((pose_chassis_pitch(&sloped).to_degrees() - 12.0).abs() < 1e-3);
         let t = BaseTilt { pitch: 12f32.to_radians(), roll: 0.0, pose_pitch: pose_chassis_pitch(&sloped) };
         let boxes = w.tilted_robot_boxes(&sloped, &t);
-        let chassis = sloped.boxes.iter().position(|b| b.name == "chassis").unwrap();
+        let chassis = w.shown_boxes(&sloped).position(|b| b.name == "chassis").unwrap();
         let fwd = boxes[chassis].axes[0];
         let (c, s) = (w.agent.yaw.cos(), w.agent.yaw.sin());
         let along = fwd[0] * c + fwd[2] * s;

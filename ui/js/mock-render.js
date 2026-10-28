@@ -137,6 +137,31 @@ function drawAgentView(ctx, w, h, W, dets) {
   ctx.fillRect(w / 2 - w * 0.05, h - h * 0.07, w * 0.1, h * 0.07);
 }
 
+// 지게차 포크 카메라: 포크 뒤꿈치(차체 앞 0.27 m), 포크 위 0.07 m 에서 25° 아래를 본다. 아래쪽에 두 포크가 보인다.
+function drawForkView(ctx, w, h, W, dets) {
+  const a = W.agent;
+  const keep = { pos: a.pos, eye_m: a.eye_m, pitch_deg: a.pitch_deg, pan_deg: a.pan_deg };
+  a.pos = [a.pos[0] + 0.27 * Math.cos(a.yaw), a.pos[1] + 0.27 * Math.sin(a.yaw), a.pos[2] ?? 0];
+  a.eye_m = (a.fork_m ?? 0.05) + 0.07;
+  a.pitch_deg = -25;
+  a.pan_deg = 0;
+  try {
+    drawAgentView(ctx, w, h, W, dets);
+  } finally {
+    Object.assign(a, keep);
+  }
+  ctx.fillStyle = '#3e4046';
+  for (const side of [-1, 1]) {
+    ctx.beginPath();
+    ctx.moveTo(w / 2 + side * w * 0.08, h * 0.42);
+    ctx.lineTo(w / 2 + side * w * 0.13, h * 0.42);
+    ctx.lineTo(w / 2 + side * w * 0.42, h);
+    ctx.lineTo(w / 2 + side * w * 0.2, h);
+    ctx.closePath();
+    ctx.fill();
+  }
+}
+
 function drawTopView(ctx, w, h, W, dets) {
   const span = 28;
   const s = w / span;
@@ -185,6 +210,7 @@ export function renderFrame({ width, height, quality, view }) {
   let encode_ms = 0;
   if (ctx) {
     if (view === 'top') drawTopView(ctx, w, h, W, hits);
+    else if (view === 'fork') drawForkView(ctx, w, h, W, hits);
     else drawAgentView(ctx, w, h, W, hits);
     const t0 = performance.now();
     const url = cv.toDataURL('image/webp', Math.max(0.05, Math.min(1, (Number(quality) || 75) / 100)));
@@ -198,7 +224,7 @@ export function renderFrame({ width, height, quality, view }) {
   const a = W.agent;
   const moving = (a.speed ?? 0) > 0.05;
   const shakePitch = moving ? Math.sin(W.tick * 0.9) * 0.35 : 0;
-  const camera = view === 'top' ? null : {
+  const camera = view === 'top' || view === 'fork' ? null : {
     eye_m: a.eye_m ?? 1.0,
     standing_eye_m: a.standing_eye_m ?? 1.0,
     mount_deg: a.mount_deg ?? -12.0,

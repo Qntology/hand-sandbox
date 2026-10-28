@@ -2,7 +2,7 @@ use super::*;
 use noto_core::act::focus::{self, FocusCtx, FocusFrame};
 use noto_core::act::material::{self, ItemMaterial};
 use noto_core::act::reach::ReachMode;
-use noto_core::act::{gait, grasp as agrasp, push as apush, ActEvent, ActKind, ActRollout};
+use noto_core::act::{fork, gait, grasp as agrasp, push as apush, ActEvent, ActKind, ActRollout};
 use noto_core::kin::{self as hkin, KinLoads, KinPose};
 
 pub const GET_UP_S: f32 = 6.0;
@@ -19,11 +19,27 @@ pub struct ActPlay {
     pub played_s: f32,
     pub object: Option<(ItemKind, f32)>,
     pub origin: (f32, f32, f32),
+    /// A fork act drives the base: it turns to `yaw_to` over `turn_s`, then keeps the item where the act's sample
+    /// says it is in the body frame, by moving along `yaw_to` from where it stood.
+    pub drive: Option<ActDrive>,
+    /// The drop the act is lifting off the ground (hidden from the scene while it rides the tines).
+    pub lifting: Option<u32>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ActDrive {
+    pub from: (f32, f32, f32),
+    pub yaw_to: f32,
+    pub turn_s: f32,
+    pub object_x0: f32,
+}
+
+/// How fast the base turns to face an item before the tines go to it (rad/s) [추정].
+pub const FORK_ALIGN_RAD_S: f32 = 1.2;
 
 impl ActPlay {
     fn new(rollout: ActRollout, start_s: f64, object: Option<(ItemKind, f32)>, origin: (f32, f32, f32)) -> ActPlay {
-        ActPlay { rollout, start_s, elapsed_s: 0.0, played_s: -1.0, object, origin }
+        ActPlay { rollout, start_s, elapsed_s: 0.0, played_s: -1.0, object, origin, drive: None, lifting: None }
     }
 
     pub fn t(&self) -> f32 {
@@ -180,11 +196,114 @@ impl World {
             .filter(|d| (d.x - x).hypot(d.z - z) < 0.35)
             .min_by(|a, b| (a.x - x).hypot(a.z - z).total_cmp(&(b.x - x).hypot(b.z - z)))
             .map_or(0.05, |d| self.drop_base_m(d) - here + 0.5 * d.kind.spec().piece_size_m(d.amount)[1]);
+        if fork::applies(&self.body) {
+            let size = self.drops.iter().filter(|d| (d.x - x).hypot(d.z - z) < 0.35).map(|d| d.kind.spec().piece_size_m(d.amount)).next().unwrap_or([0.1; 3]);
+            let base = (h - 0.5 * size[1]).max(0.0);
+            let turn_s = wrap_angle(heading - self.agent.yaw).abs() / FORK_ALIGN_RAD_S;
+            let r = fork::look(&self.body, self.fork_m_now(), dx.hypot(dz), size[0].max(size[2]), base, self.carried_kg(), turn_s);
+            let dur = r.duration_s;
+            let mut play = ActPlay::new(r, self.time_s, None, (self.agent.x, self.agent.z, heading));
+            play.drive = Some(ActDrive { from: (self.agent.x, self.agent.z, self.agent.yaw), yaw_to: heading, turn_s, object_x0: dx.hypot(dz) });
+            self.act = Some(play);
+            return dur;
+        }
         let from = self.body.stand(self.carried_kg());
         let r = noto_core::act::gaze::look(&self.body, &from, [dx.hypot(dz), 0.0, h]);
         let dur = r.duration_s;
         self.act = Some(ActPlay::new(r, self.time_s, None, (self.agent.x, self.agent.z, heading)));
         dur
+    }
+
+    /// Tine height now (m above the ground under the base): from the fork act playing, the tines held down after a
+    /// look, or travel height (loaded or empty).
+    pub fn fork_m_now(&self) -> f32 {
+        if let Some(p) = self.act.as_ref().filter(|p| p.rollout.kind == ActKind::Fork) {
+            if let Some(s) = p.rollout.sample_at(p.t()) {
+                return s.pose.fork_m;
+            }
+        }
+        if let Some(g) = self.gaze.filter(|_| fork::applies(&self.body)) {
+            return g.pose.fork_m;
+        }
+        if self.carried_kg() > AMOUNT_EPS {
+            fork::FORK_CARRY_M
+        } else {
+            fork::FORK_REST_M
+        }
+    }
+
+    /// The drop a fork act is lifting off the ground right now.
+    pub fn lifted_drop(&self) -> Option<u32> {
+        self.act.as_ref().filter(|p| p.rollout.sample_at(p.t()).is_some_and(|s| s.phase == "raise")).and_then(|p| p.lifting)
+    }
+
+    /// What rides on the tines now, as (kind, piece size, centre in the body frame), bottom first.
+    pub fn fork_load(&self) -> Vec<(ItemKind, [f32; 3], [f32; 3])> {
+        if !fork::applies(&self.body) {
+            return Vec::new();
+        }
+        let play = self.act.as_ref().filter(|p| p.rollout.kind == ActKind::Fork);
+        let sample = play.and_then(|p| p.rollout.sample_at(p.t()));
+        let mut out = Vec::new();
+        let mut z = self.fork_m_now() + fork::TINE_T_M;
+        match (play.and_then(|p| p.object), sample.and_then(|s| s.object), sample.map(|s| s.phase)) {
+            (Some((k, a)), Some(o), Some("raise")) => {
+                let size = k.spec().piece_size_m(a);
+                out.push((k, size, o));
+                z = o[2] + 0.5 * size[1];
+            }
+            (Some(_), Some(o), Some("lower_load" | "back_out" | "rest")) => {
+                let mut zz = o[2];
+                for (k, n) in self.agent.carried.iter().filter(|(_, n)| *n > AMOUNT_EPS) {
+                    let size = k.spec().piece_size_m(n.min(1.0));
+                    out.push((*k, size, [o[0], 0.0, zz]));
+                    zz += size[1];
+                }
+                return out;
+            }
+            _ => {}
+        }
+        for (k, n) in self.agent.carried.iter().filter(|(_, n)| *n > AMOUNT_EPS) {
+            let mut rest = *n;
+            while rest > AMOUNT_EPS && out.len() < 6 {
+                let a = rest.min(1.0);
+                let size = k.spec().piece_size_m(a);
+                out.push((*k, size, [fork::load_x(&self.body, size[0].max(size[2])), 0.0, z + 0.5 * size[1]]));
+                z += size[1];
+                rest -= a;
+            }
+        }
+        out
+    }
+
+    /// Picks the drop up on the tines (wheeled and tracked bases). Returns the act's length.
+    pub(super) fn start_fork_pick(&mut self, drop: u32) -> Result<f32, ActionError> {
+        let d = self.drop_item(drop).cloned().ok_or(ActionError::UnknownTarget)?;
+        let size = d.kind.spec().piece_size_m(d.amount);
+        let (dx, dz) = (d.x - self.agent.x, d.z - self.agent.z);
+        let dist = dx.hypot(dz);
+        let heading = dz.atan2(dx);
+        let base = (self.drop_base_m(&d) - self.agent_ground_m()).max(0.0);
+        let turn_s = wrap_angle(heading - self.agent.yaw).abs() / FORK_ALIGN_RAD_S;
+        let r = fork::pick(&self.body, self.fork_m_now(), dist, d.mass_kg(), size, base, self.carried_kg(), turn_s);
+        if !r.outcome.ok {
+            let why = r.outcome.reason_ko.clone().unwrap_or_default();
+            return Err(ActionError::CannotReach { lowest_m: base, need_m: base, reason: why });
+        }
+        let dur = r.duration_s;
+        self.agent.grip_margin = r.metric("tip_ratio").map(|t| ((t - 1.0) / t.max(1e-3)).clamp(0.0, 1.0));
+        let mut play = ActPlay::new(r, self.time_s, Some((d.kind, d.amount)), (self.agent.x, self.agent.z, heading));
+        play.drive = Some(ActDrive { from: (self.agent.x, self.agent.z, self.agent.yaw), yaw_to: heading, turn_s, object_x0: dist });
+        play.lifting = Some(drop);
+        self.act = Some(play);
+        // The pick starts from the look's lowered tines; the look is over.
+        self.gaze = None;
+        Ok(dur)
+    }
+
+    /// Whether the tines can lift the item here (wheeled and tracked bases), with what they carry already.
+    pub fn fork_check(&self, kind: ItemKind, amount: f32) -> Result<fork::ForkFit, String> {
+        fork::check(&self.body, kind.spec().mass_kg * amount, kind.spec().piece_size_m(amount), 0.0, self.carried_kg())
     }
 
     /// Keeps the head where the look left it until the base moves again (or a pick-up starts from it).
@@ -211,6 +330,24 @@ impl World {
     }
 
     pub(super) fn start_release(&mut self, pieces: &[(ItemKind, f32)], waypoint: Option<u32>) -> f32 {
+        if fork::applies(&self.body) && !pieces.is_empty() {
+            let pile_n = waypoint.and_then(|w| self.waypoint(w)).map_or(0usize, |w| render::stock_pieces(&w.stock).len());
+            let surface = if waypoint.is_some() { (pile_n / 4) as f32 * PILE_PIECE_H_M } else { 0.0 };
+            let mass: f32 = pieces.iter().map(|(k, a)| k.spec().mass_kg * a).sum();
+            let (k0, a0) = pieces[0];
+            let size = k0.spec().piece_size_m(a0.min(1.0));
+            let mut r = fork::set_down(&self.body, self.fork_m_now(), mass, size, surface, self.carried_kg());
+            let lx = fork::load_x(&self.body, size[0].max(size[2]));
+            for i in 0..pieces.len() {
+                r.metrics.push(("land_x", lx));
+                r.metrics.push(("land_y", (i as f32 - (pieces.len() as f32 - 1.0) * 0.5) * 0.13));
+            }
+            let dur = r.duration_s;
+            let mut play = ActPlay::new(r, self.time_s, Some((k0, a0)), (self.agent.x, self.agent.z, self.agent.yaw));
+            play.drive = Some(ActDrive { from: (self.agent.x, self.agent.z, self.agent.yaw), yaw_to: self.agent.yaw, turn_s: 0.0, object_x0: lx });
+            self.act = Some(play);
+            return dur;
+        }
         let mut all: Option<ActRollout> = None;
         let mut cargo = self.carried_kg();
         let pile_n = waypoint.and_then(|w| self.waypoint(w)).map_or(0usize, |w| render::stock_pieces(&w.stock).len());
@@ -255,8 +392,19 @@ impl World {
         let t = p.t();
         let out: Vec<WorldEvent> = p.rollout.events_between(p.played_s, t).map(|e| act_event(p.rollout.kind, e)).collect();
         p.played_s = t;
+        let to = p.drive.and_then(|d| {
+            let ox = p.rollout.sample_at(t)?.object?[0];
+            let u = if d.turn_s > 0.0 { (t / d.turn_s).min(1.0) } else { 1.0 };
+            let along = d.object_x0 - ox;
+            Some((d.from.0 + along * d.yaw_to.cos(), d.from.1 + along * d.yaw_to.sin(), d.from.2 + wrap_angle(d.yaw_to - d.from.2) * u))
+        });
         for ev in out {
             events.push(self.stamp(ev));
+        }
+        if let Some(to) = to {
+            let before = (self.agent.x, self.agent.z, self.agent.yaw);
+            (self.agent.x, self.agent.z, self.agent.yaw) = (to.0, to.1, wrap_angle(to.2));
+            self.odom.update(before, (self.agent.x, self.agent.z, self.agent.yaw), dt, 0.0);
         }
     }
 
@@ -355,7 +503,7 @@ impl World {
         if let Some(p) = &self.act {
             let s = p.rollout.sample_at(p.t())?;
             let src = match p.rollout.kind {
-                ActKind::Push | ActKind::Drive => Source::Quiet,
+                ActKind::Push | ActKind::Drive | ActKind::Fork => Source::Quiet,
                 _ => Source::ArmLift,
             };
             return Some((s.pose, s.loads, src));
