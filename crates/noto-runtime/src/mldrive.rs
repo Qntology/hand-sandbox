@@ -521,6 +521,7 @@ impl Runtime {
         }
         let kind = match &rep.decision {
             Decision::Search { .. } => "search",
+            Decision::LookDown { .. } => "look_down",
             Decision::Triangulate(_) => "triangulate",
             Decision::Approach { .. } => "approach",
             Decision::Arrive { .. } => "arrive",
@@ -567,6 +568,14 @@ impl Runtime {
         let mut arrive_at = None;
         match &rep.decision {
             Decision::Search { turn_deg } => t.queue.push_back(Action::Turn { yaw_deg: yaw_deg + turn_deg }),
+            Decision::LookDown { pitch_deg, turn_deg } => {
+                if let Err(e) = self.scan_gaze("ml_look_down", 0.0, *pitch_deg) {
+                    return fail("perception_failed", format!("인식기가 실패했습니다: {e}"));
+                }
+                if *turn_deg != 0.0 {
+                    t.queue.push_back(Action::Turn { yaw_deg: yaw_deg + turn_deg });
+                }
+            }
             Decision::Triangulate(s) => {
                 let (step, how) = self.feasible_step(s, (kf.pose.x, kf.pose.z));
                 if how == "mirrored" || how == "mirrored_short" {
@@ -613,7 +622,7 @@ impl Runtime {
                 t.queue.push_back(Action::MoveTo { x: to.0, z: to.1, reach_m: 0.3 });
                 t.queue.push_back(Action::Face { x: face.0, z: face.1 });
             }
-            Decision::Arrive { at } => arrive_at = Some(*at),
+            Decision::Arrive { at, .. } => arrive_at = Some(*at),
             Decision::Hold { .. } => {
                 t.holds += 1;
                 if t.holds > 3 {
@@ -679,7 +688,7 @@ impl Runtime {
                 t.queue.push_back(Action::Face { x: face.0, z: face.1 });
                 Some(Flow::Continue)
             }
-            Decision::Arrive { at } => Some(self.ml_arrive(t, at)),
+            Decision::Arrive { at, .. } => Some(self.ml_arrive(t, at)),
             _ => None,
         }
     }
