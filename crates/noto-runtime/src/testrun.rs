@@ -367,6 +367,7 @@ impl Runtime {
             } else if let Err(e) = res {
                 t.notes.push(format!("키프레임 {i}: {e}"));
             }
+            kf.truth.shed_pixels();
             if let Some(slot) = t.game.as_mut().and_then(|g| g.keyframes.get_mut(i)) {
                 *slot = kf;
             }
@@ -459,6 +460,7 @@ impl Runtime {
                 Some(r) => json!({
                     "run_id": r.run_id, "start_tick": r.started_tick, "end_tick": r.ended_tick,
                     "video": r.video.len(), "dropped": r.dropped_keyframes,
+                    "memory": memory_json(r),
                     "keyframes": r.keyframes.iter().map(Self::kf_brief).collect::<Vec<_>>(),
                     "vision": r.vision.iter().map(|m| json!({"tick": m.tick, "kind": m.kind, "what": m.what, "s0": m.sigma_before_m.map(r3), "s1": m.sigma_after_m.map(r3), "innov": m.innovation_m.map(r3)})).collect::<Vec<_>>(),
                     "belief_err": r.belief_err.iter().map(|(t, e)| json!([t, r3(*e)])).collect::<Vec<_>>(),
@@ -556,6 +558,11 @@ impl Runtime {
 
 const BELIEF_EVERY_TICKS: u64 = 5;
 const MAX_BELIEF_POINTS: usize = 6000;
+
+fn memory_json(r: &Recording) -> Value {
+    let (pixels, images, video) = r.memory();
+    json!({"truth_pixels": pixels, "images": images, "video": video})
+}
 
 fn placeholder(k: &Keyframe) -> Keyframe {
     Keyframe {

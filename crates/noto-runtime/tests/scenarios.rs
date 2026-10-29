@@ -465,3 +465,26 @@ fn wheels_and_tracks_lift_with_forks_and_check_the_item_with_the_rider_and_the_f
 {}", p.log);
     }
 }
+
+/// The map and quest of the run that froze on 2026-10-29: seed 1 on the rugged map (the window's default), wheels,
+/// "원목 1개를 창고로 가져와". There the felled tree's logs, remembered from the real models a few centimetres off,
+/// each counted as lying in front of the other and the pick-up swapped them without end inside one tick (the window
+/// froze, the session log grew to 450 MB); the driver's unit tests pin that. Here the whole fetch must run through:
+/// at most the one reorder the felled tree calls for, a log lifted and delivered. The quest runs on its own thread so
+/// that a tick that spins fails the test instead of hanging it.
+#[test]
+fn a_lift_truck_lifts_a_felled_trees_logs_without_swapping_them_forever() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let noto = NotoConfig { base: BaseKind::Wheel, ..RuntimeConfig::default().noto };
+        let cfg = RuntimeConfig { seed: 1, noto, terrain: world_sim::TerrainKind::Rugged, ..RuntimeConfig::default() };
+        let mut rt = Runtime::new(cfg, LEXICON, None).expect("runtime");
+        let q = run_command(&mut rt, "원목 1개를 창고로 가져와", 30_000);
+        let reorders = rt.log_tail(0, 5000, Some("quest")).0.iter().filter(|l| l.msg.contains("포크 길 앞에")).count();
+        let _ = tx.send((q.state, q.failure.clone(), reorders, stock(&rt, "warehouse", ItemKind::Log), quest_log(&rt)));
+    });
+    let (state, failure, reorders, stocked, log) = rx.recv_timeout(std::time::Duration::from_secs(900)).expect("the quest spins inside one tick");
+    assert!(reorders <= 1, "{reorders} reorders:\n{log}");
+    assert_eq!(state, State::Done, "{failure:?}\n{log}");
+    assert_eq!(stocked, 1, "{log}");
+}

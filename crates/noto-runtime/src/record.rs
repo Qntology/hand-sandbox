@@ -154,6 +154,15 @@ impl Recording {
     pub fn new(pass: &str, run_id: &str, tick: u64) -> Recording {
         Recording { pass: pass.into(), run_id: run_id.into(), keyframes: Vec::new(), video: Vec::new(), started_tick: tick, ended_tick: None, dropped_keyframes: 0, vision: Vec::new(), belief_err: Vec::new() }
     }
+
+    /// The bytes the recording holds: the keyframes' truth pixels (until each is analysed), their images (the frame,
+    /// the depth-and-mask overlay, the close-ups) and the video.
+    pub fn memory(&self) -> (usize, usize, usize) {
+        let pixels = self.keyframes.iter().map(|k| k.truth.pixel_bytes()).sum();
+        let images = self.keyframes.iter().map(|k| k.webp.len() + k.ml_webp.as_ref().map_or(0, Vec::len) + k.focus_webp.iter().map(|(_, w)| w.len()).sum::<usize>()).sum();
+        let video = self.video.iter().map(|v| v.webp.len()).sum();
+        (pixels, images, video)
+    }
 }
 
 pub fn odometry(world: &World, cam: &Camera) -> Pose {

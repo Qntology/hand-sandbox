@@ -251,6 +251,8 @@ pub const TOTE_X_M: f32 = 0.06;
 pub const RIM_RELEASE_M: f32 = 0.20;
 pub const COLUMN_TOP_M: f32 = SHOULDER_M + NECK_UP_M;
 pub const MAST_TILT_MAX_DEG: f32 = 83.0;
+/// A pan-tilt head's pan each way (a robot unit, not a neck).
+pub const MAST_PAN_MAX_DEG: f32 = 90.0;
 pub const STRETCH_CAMERA_H_MM: u16 = 1310;
 pub const DECK_CAMERA_H_MM: u16 = 200;
 pub const AMR_CAMERA_H_MM: u16 = 250;
@@ -533,7 +535,7 @@ impl Body {
     pub fn head_range_deg(&self) -> (f32, f32) {
         match self.morph.head {
             HeadMount::Neck => (crate::kin::NECK_PITCH_MAX_DEG, crate::kin::NECK_PAN_MAX_DEG),
-            HeadMount::MastCamera { pan_tilt: true, .. } => (MAST_TILT_MAX_DEG, crate::kin::NECK_PAN_MAX_DEG),
+            HeadMount::MastCamera { pan_tilt: true, .. } => (MAST_TILT_MAX_DEG, MAST_PAN_MAX_DEG),
             _ => (0.0, 0.0),
         }
     }

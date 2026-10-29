@@ -50,12 +50,44 @@ impl Welford {
         self.ring.iter().sum::<f64>() / self.ring.len() as f64
     }
 
+    /// How far the ring's mean sits from the values before it, in standard errors of that difference (a two-sample
+    /// z on the pooled spread). Measured against the whole history with one value's spread instead, the ring pulled
+    /// the mean and the spread its own way and its mean was taken as one value: a 3 sd shift over a ring of 8 never
+    /// passed 2.
     pub fn drift_z(&self) -> f64 {
-        let sd = self.sd();
-        if sd <= 0.0 || self.ring.is_empty() {
+        let (n, k) = (self.n as f64, self.ring.len() as f64);
+        if k < 1.0 || n < k + 2.0 {
             return 0.0;
         }
-        (self.recent_mean() - self.mean) / sd
+        let before = n - k;
+        let ring_mean = self.recent_mean();
+        let before_mean = (n * self.mean - k * ring_mean) / before;
+        let ring_m2: f64 = self.ring.iter().map(|x| (x - ring_mean).powi(2)).sum();
+        let gap = ring_mean - before_mean;
+        let within = (self.m2 - gap * gap * before * k / n).max(ring_m2);
+        let se = (within / (n - 2.0) * (1.0 / k + 1.0 / before)).sqrt();
+        if !(se > 0.0) {
+            return 0.0;
+        }
+        gap / se
+    }
+
+    /// The geometric mean of positive values from the moments alone, exact for a log-normal scatter: the arithmetic
+    /// mean over sqrt(1 + cv²). Ratios scatter multiplicatively, and their arithmetic mean sits above the typical
+    /// ratio by about half the squared relative spread (4.6 % for ±30 %).
+    pub fn geo_mean(&self) -> f64 {
+        if self.n == 0 || self.mean <= 0.0 {
+            return self.mean;
+        }
+        self.mean / (1.0 + self.variance() / (self.mean * self.mean)).sqrt()
+    }
+
+    /// The geometric mean of the ring (its arithmetic mean if a value is not positive).
+    pub fn recent_geo_mean(&self) -> f64 {
+        if self.ring.is_empty() || self.ring.iter().any(|x| *x <= 0.0) {
+            return self.recent_mean();
+        }
+        (self.ring.iter().map(|x| x.ln()).sum::<f64>() / self.ring.len() as f64).exp()
     }
 
     pub fn merge(&mut self, other: &Welford, ring_len: usize) {

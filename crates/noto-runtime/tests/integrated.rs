@@ -42,6 +42,12 @@ fn three_passes_record_keyframes_ml_tracks_decisions_and_success_rates() {
     assert!(tracked > 0, "the target was tracked on some keyframes");
     let dec = st["decide"]["keyframes"].as_array().unwrap();
     assert!(!dec.is_empty());
+    for pass in ["game", "decide"] {
+        let m = &st[pass]["memory"];
+        let n = st[pass]["keyframes"].as_array().map_or(0, Vec::len);
+        println!("[MEM] {pass}: {n} keyframes · truth pixels {} B (kept, they were {} B) · images {} B · video {} B", m["truth_pixels"], n * 192 * 128 * 8, m["images"], m["video"]);
+        assert_eq!(m["truth_pixels"], 0, "{pass}: an analysed keyframe keeps no truth pixels: {m}");
+    }
     let kinds: Vec<&str> = dec.iter().filter_map(|k| k["decision"]["kind"].as_str()).collect();
     let first_tracked = kinds.iter().position(|k| *k != "search").expect("a target was found");
     assert_eq!(kinds[first_tracked], "triangulate", "{kinds:?}");

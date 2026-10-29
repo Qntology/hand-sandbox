@@ -150,6 +150,18 @@ impl KeyTruth {
         DepthMap { width: self.width, height: self.height, kind: DepthKind::Metric, data: self.depth.clone() }
     }
 
+    /// Drops the per-pixel ids and depth once the keyframe is analysed, the only step that reads them; the objects
+    /// and positions stay for the keyframe view. Kept, they held 196 KB a keyframe (u32 ids and f32 depth at half
+    /// of 384 × 256) for the whole session: 79 MB for a pass at the 400-keyframe cap.
+    pub fn shed_pixels(&mut self) {
+        (self.ids, self.depth, self.width, self.height) = (Vec::new(), Vec::new(), 0, 0);
+    }
+
+    /// The bytes the per-pixel buffers hold.
+    pub fn pixel_bytes(&self) -> usize {
+        self.ids.capacity() * std::mem::size_of::<u32>() + self.depth.capacity() * std::mem::size_of::<f32>()
+    }
+
     /// The mask's bit over the truth pixel (x, y): the same pixel when both have one size, else the mask pixel under
     /// the truth pixel's centre (a pyramid mask is 288 × 192 on a 384 × 256 frame, the truth 192 × 128).
     fn mask_at(&self, mask: &Mask, x: u32, y: u32) -> bool {

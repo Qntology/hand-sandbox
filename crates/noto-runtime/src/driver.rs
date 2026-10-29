@@ -994,6 +994,9 @@ impl Runtime {
         if t.push.is_some() {
             return self.push_step(t);
         }
+        // Each reorder takes an item strictly nearer than the last, so there are fewer than there are drops; the cap
+        // keeps one tick from spinning should that ever stop holding.
+        let mut reorders = 0;
         loop {
             let (need_more, name) = {
                 let x = t.target();
@@ -1032,8 +1035,9 @@ impl Runtime {
             let far_m = if forks { stop_m + 0.15 } else { PICKUP_REACH_M - 0.1 };
             // A lift truck takes the wanted item nearest in front first, as an operator does, rather than run its tines
             // through it to the one behind.
-            if forks {
+            if forks && reorders < t.drops.len() {
                 if let Some(k) = self.fork_front_pick(t, id, (m.x, m.z)) {
+                    reorders += 1;
                     let other = t.drops[k];
                     self.log("quest", Level::Info, format!("{name}: 포크 길 앞에 있는 {name}(d{other})부터 듦 — 뒤의 것(d{id})에 포크를 밀어 넣지 않음"), Some(json!({"drop": other, "instead_of": id})));
                     t.drops.swap(t.drop_idx, k);
@@ -1150,12 +1154,21 @@ impl Runtime {
     }
 
     /// The index in the task's drops of a wanted item lying in the tines' way from where the base stands to the item
-    /// `id` at `at` (the nearest one), which a lift truck takes first.
+    /// `id` at `at` (the nearest one), which a lift truck takes first. In the way means in the lane and nearer than
+    /// `id` by more than half of each item, so the tines meet it first. Two items about as far away side by side (a
+    /// felled tree drops its logs 0.13 m around the trunk) are not in front of each other: counted so, each was swapped
+    /// for the other without end inside one tick. The forks line up past such a neighbour instead (`fork_lineup`).
+    /// Every item is placed where the task remembers it, as `at` is, else where the robot believes it lies.
     fn fork_front_pick(&self, t: &Task, id: u32, at: (f32, f32)) -> Option<usize> {
         let from = self.me();
         let (dx, dz) = (at.0 - from.0, at.1 - from.1);
         let len = dx.hypot(dz).max(1e-3);
         let (ux, uz) = (dx / len, dz / len);
+        let half = |d: &world_sim::world::DropItem| {
+            let s = d.kind.spec().piece_size_m(d.amount);
+            0.5 * s[0].max(s[2])
+        };
+        let own = self.world.drop_item(id).map_or(0.0, half);
         t.drops
             .iter()
             .enumerate()
@@ -1163,11 +1176,11 @@ impl Runtime {
             .filter(|(_, &o)| o != id)
             .filter_map(|(k, &o)| {
                 let d = self.world.drop_item(o)?;
-                let (px, pz) = self.world.belief_of(d.x, d.z);
+                let (px, pz) = t.mem.get(&o).map_or_else(|| self.world.belief_of(d.x, d.z), |m| (m.x, m.z));
                 let (rx, rz) = (px - from.0, pz - from.1);
                 let along = rx * ux + rz * uz;
                 let off = (rx * uz - rz * ux).abs();
-                (along > 0.0 && along < len && off < FORK_LANE_HALF_M).then_some((k, along))
+                (along > 0.0 && off < FORK_LANE_HALF_M && rx.hypot(rz) + own + half(d) < len).then_some((k, along))
             })
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(k, _)| k)
@@ -1320,7 +1333,10 @@ impl Runtime {
         let name = kind.spec().label_ko.to_string();
         let hv = self.world.head_view(&self.cam);
         let (neck_deg, pitch_deg) = (self.world.current_kin_pose().neck_deg, hv.view.pitch.to_degrees());
-        let scanned = self.scan_now("gaze").is_ok();
+        // One frame for the scan and the depth model: rendering it again for the depth drew the same view twice.
+        let t0 = std::time::Instant::now();
+        let frame = self.world.render(&self.cam);
+        let scanned = self.scan_frame("gaze", &frame, t0).is_ok();
         t.looks += 1;
         self.vstats.looks += 1;
         let mem = self.mem_ctx();
@@ -1343,7 +1359,7 @@ impl Runtime {
         // nearest one outside that gate is a neighbour, and the memory stays as it was.
         let matched = nearest.filter(|c| off(c.2) <= (3.0 * before.hypot(mem.sigma_obs(c.3))).max(0.06));
         let range_m = nearest.map(|c| self.dist_me(c.2 .0, c.2 .1));
-        let depth_m = nearest.and_then(|c| self.depth_in_box(c.1));
+        let depth_m = nearest.and_then(|c| self.depth_in_box(&frame, c.1));
         let screen = match camera {
             "fork" => "포크 카메라 화면",
             _ if noto_core::act::fork::applies(&self.world.body) => "탑승자가 숙여 본 화면",
@@ -1483,17 +1499,15 @@ impl Runtime {
     }
 
     /// How far from the robot's feet the thing filling the middle of `bbox` (normalised) lies, by the depth model
-    /// aligned under the current camera pose.
-    fn depth_in_box(&mut self, bbox: [f32; 4]) -> Option<f32> {
-        let frame = self.world.render(&self.cam);
-        let rgb = noto_vision::Rgb::new(frame.width as u32, frame.height as u32, frame.rgb.clone());
+    /// aligned under the current camera pose, on `frame` (the current camera's).
+    fn depth_in_box(&mut self, frame: &world_sim::Frame, bbox: [f32; 4]) -> Option<f32> {
         let intr = crate::record::intrinsics(&self.world, &self.cam);
         let pose = crate::record::odometry(&self.world, &self.cam);
-        let truth = crate::ml::KeyTruth::capture(&self.world, &frame);
         let fix = self.ml.fix.clone();
         let depth = match &mut self.ml.depth {
             crate::ml::DepthEngine::Model(m) => {
                 let max = m.max_depth_m();
+                let rgb = noto_vision::Rgb::new(frame.width as u32, frame.height as u32, frame.rgb.clone());
                 let s = m.infer_scene(&rgb, crate::ml::scene_heads(&fix)).ok()?;
                 let mut d = s.depth;
                 if let Some(cfg) = &fix.align {
@@ -1501,7 +1515,8 @@ impl Runtime {
                 }
                 d
             }
-            crate::ml::DepthEngine::StandIn(s) => s.run(&truth),
+            // Only the stand-in reads the renderer's truth; a model has no use for the two half-size buffers.
+            crate::ml::DepthEngine::StandIn(s) => s.run(&crate::ml::KeyTruth::capture(&self.world, frame)),
         };
         let (w, h) = (frame.width as f32, frame.height as f32);
         let mut mask = noto_vision::Mask::empty(depth.width, depth.height);
@@ -2229,5 +2244,77 @@ impl Runtime {
             }
             self.log("quest", Level::Warn, format!("퀘스트 {id} 취소"), None);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::RuntimeConfig;
+    use noto_core::{BaseKind, NotoConfig};
+    use world_sim::world::DropItem;
+
+    const LEX: &str = include_str!("../../../data/world_lexicon.json");
+
+    /// A lift truck collecting logs for "원목 1개를 창고로 가져와", the logs `(id, ahead, aside)` metres from the base.
+    fn collecting(logs: &[(u32, f32, f32)]) -> (Runtime, Task) {
+        let cfg = RuntimeConfig { noto: NotoConfig { base: BaseKind::Wheel, ..RuntimeConfig::default().noto }, ..RuntimeConfig::default() };
+        let mut rt = Runtime::new(cfg, LEX, None).expect("runtime");
+        assert!(rt.submit("원목 1개를 창고로 가져와").ok);
+        rt.begin_next();
+        let mut t = rt.task.take().expect("the quest's task");
+        let (x, z, yaw) = rt.me();
+        let (s, c) = yaw.sin_cos();
+        for &(id, ahead, aside) in logs {
+            let (bx, bz) = (x + ahead * c - aside * s, z + ahead * s + aside * c);
+            let (wx, wz) = rt.world.true_of(bx, bz);
+            rt.world.drops.push(DropItem::whole(id, ItemKind::Log, wx, wz));
+        }
+        t.phase = Phase::Collect;
+        t.drops = logs.iter().map(|l| l.0).collect();
+        (rt, t)
+    }
+
+    fn at(rt: &Runtime, id: u32) -> (f32, f32) {
+        let d = rt.world.drop_item(id).expect("the log");
+        rt.world.belief_of(d.x, d.z)
+    }
+
+    #[test]
+    fn logs_side_by_side_are_not_in_front_of_each_other_and_a_nearer_one_is() {
+        // Two logs of a felled tree, 0.22 m apart and as far away as each other; the old test counted each as in
+        // the lane short of the other.
+        let (rt, mut t) = collecting(&[(901, 1.2, 0.11), (902, 1.21, -0.11)]);
+        assert_eq!(rt.fork_front_pick(&t, 901, at(&rt, 901)), None);
+        t.drops.swap(0, 1);
+        assert_eq!(rt.fork_front_pick(&t, 902, at(&rt, 902)), None);
+        let (rt, t) = collecting(&[(901, 1.6, 0.05), (902, 1.0, 0.0)]);
+        assert_eq!(rt.fork_front_pick(&t, 901, at(&rt, 901)), Some(1), "a log 0.6 m nearer in the lane is taken first");
+    }
+
+    fn reorders_in_one_step(rt: &mut Runtime, t: &mut Task) -> usize {
+        let before = rt.audit.last_seq();
+        let _ = rt.do_collect(t);
+        rt.audit.tail(before, 500, Some("quest")).0.iter().filter(|l| l.msg.contains("포크 길 앞에")).count()
+    }
+
+    #[test]
+    fn the_collect_step_never_spins_on_logs_side_by_side() {
+        let (mut rt, mut t) = collecting(&[(901, 1.2, 0.11), (902, 1.21, -0.11), (903, 1.3, 0.0)]);
+        let n = reorders_in_one_step(&mut rt, &mut t);
+        assert!(n < 3, "{n} reorders in one step");
+    }
+
+    #[test]
+    fn a_log_remembered_a_little_far_does_not_make_its_neighbours_trade_places() {
+        // How the run of 2026-10-29 froze: the logs' places came from the real models, some centimetres off, and the
+        // old test put the target where it was remembered but its neighbour where it really lay, so with the target
+        // remembered 10 cm too far each log was short of the other.
+        let (mut rt, mut t) = collecting(&[(901, 1.2, 0.11), (902, 1.27, -0.11), (903, 1.4, 0.0)]);
+        let ((x, z), (mx, mz, _)) = (at(&rt, 901), rt.me());
+        let k = 1.0 + 0.1 / (x - mx).hypot(z - mz);
+        t.mem.insert(901, Memory::seen(mx + (x - mx) * k, mz + (z - mz) * k, 0.03, rt.world.odom.travelled_m, rt.world.tick));
+        let n = reorders_in_one_step(&mut rt, &mut t);
+        assert!(n < 3, "{n} reorders in one step");
     }
 }

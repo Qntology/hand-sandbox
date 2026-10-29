@@ -1147,6 +1147,19 @@ mod tests {
     }
 
     #[test]
+    fn a_scan_through_another_gaze_draws_no_boxes_on_the_first_person_frame() {
+        let mut rt = rt();
+        let boxes = |rt: &mut Runtime| rt.api_world_frame(320, 200, 70.0, "agent").unwrap()["detections"].as_array().map_or(0, Vec::len);
+        let ahead = rt.scan_now("test").unwrap().judged.len();
+        assert!(ahead > 0, "the oracle sees something ahead");
+        assert_eq!(boxes(&mut rt), ahead, "a scan through the camera as it is draws its boxes");
+        rt.scan_gaze("glance", 40.0, 0.0).unwrap();
+        assert_eq!(boxes(&mut rt), 0, "a glance 40° aside put its boxes on the wrong part of the frame");
+        rt.scan_gaze("glance", 0.0, 30.0).unwrap();
+        assert_eq!(boxes(&mut rt), 0, "so did a look 30° down");
+    }
+
+    #[test]
     fn forecast_asks_for_a_history_that_exists() {
         let mut rt = rt();
         assert!(rt.api_ts_forecast("vision|tree|", "score").is_err());

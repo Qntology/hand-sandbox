@@ -14,6 +14,9 @@ const AUTO_FLUSH_EVERY: u32 = 8;
 const AUTO_FLUSH_MIN_GAP_MS: u128 = 5_000;
 const DEFAULT_CAP_BYTES: usize = 2 * 1024 * 1024;
 const CALIBRATION_SHRINK_K: f64 = 5.0;
+/// The ring's `drift_z` past which a calibration centres on the ring alone. At 2 a steady scatter recentred one look in
+/// twenty on a handful of values; at 3 it does not, and a 2 sd shift over a ring of 6 still passes 94 % of the time.
+const RECENTRE_Z: f64 = 3.0;
 
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -570,7 +573,7 @@ impl SdsStore {
         self.resolve(scope, |st| {
             st.calibration.get(axis).map(|w| {
                 let drift = w.drift_z();
-                let center = if drift.abs() > 2.0 { w.recent_mean() } else { w.mean };
+                let center = if drift.abs() > RECENTRE_Z { w.recent_geo_mean() } else { w.geo_mean() };
                 let shrunk = 1.0 + (center - 1.0) * (w.n as f64 / (w.n as f64 + CALIBRATION_SHRINK_K));
                 ((shrunk.clamp(0.25, 4.0), w.n, drift), w.n)
             })
