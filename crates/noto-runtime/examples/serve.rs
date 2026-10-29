@@ -13,7 +13,8 @@ const SHIM: &str = r#"<script>
 (() => {
   const WORLD = new Set(['world_new','sim_step','world_frame','command_submit','quest_list','perception_scan','body_status','sds_status','ts_forecast','log_tail','models_status',
     'test_start','test_step','test_status','test_keyframe','test_video','test_stats','test_cancel','body_presets','body_plan_eval','body_plan_set','world_body','test_db_mirror',
-    'inventory_drop','world_reset','body_reset','world_terrain','nn_status','physics_status','depth_view']);
+    'inventory_drop','world_reset','body_reset','world_terrain','nn_status','physics_status','depth_view',
+    'crew_add','crew_clear','crew_mode','crew_status','camera_rig']);
   let mock = null;
   window.__TAURI__ = { core: { invoke: async (cmd, args) => {
     if (!WORLD.has(cmd)) {

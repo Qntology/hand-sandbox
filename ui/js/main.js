@@ -23,6 +23,7 @@ import { initDepthView } from './depth-view.js';
 import { initTimeseries } from './timeseries.js';
 import { initTestTimeline } from './test-timeline.js';
 import { initPresets } from './presets.js';
+import { initCrewPanel } from './crew-panel.js';
 
 const recentErrors = new Map();
 
@@ -83,6 +84,7 @@ async function main() {
   await initModels().catch(() => {});
   await modelsReady();
   await regenerate();
+  await initCrewPanel().catch(() => {});
   setStatus(mock
     ? '모의 백엔드로 실행 중입니다. 입력줄에 "철광석 3개 캐서 베이스캠프로 가져와"를 입력해 보세요'
     : '준비됨. 입력줄에 명령을 입력하고 Enter 를 누르세요');

@@ -31,8 +31,10 @@ export const state = {
   grasp: null,
   topPrediction: null,
 
-  teamSize: 2,
+  // 서브 작업자가 있으면 2 (모의 백엔드의 옛 순차 협동 모형이 읽는다); crew 는 crew_status 그대로.
+  teamSize: 1,
   activeRobot: 1,
+  crew: null,
   centerTab: 'world',
   mock: false,
   playing: false,

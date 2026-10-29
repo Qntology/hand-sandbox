@@ -734,8 +734,30 @@ fn basis_rpy(yaw: f32, pitch: f32, roll: f32) -> ([f32; 3], [f32; 3], [f32; 3]) 
 }
 
 pub fn render(world: &World, cam: &Camera) -> Frame {
-    let hv = world.head_view(cam);
+    render_shifted(world, cam, 0.0)
+}
+
+/// The right camera of the eye when the eye is a stereo pair: the same view moved `baseline_m` along the camera's
+/// right axis, with the same exposure, rolling shutter and own-body boxes, so that it and `render` are a rectified
+/// pair (the left camera is the eye itself).
+pub fn render_right(world: &World, cam: &Camera, baseline_m: f32) -> Frame {
+    render_shifted(world, cam, baseline_m)
+}
+
+fn render_shifted(world: &World, cam: &Camera, right_m: f32) -> Frame {
+    let mut hv = world.head_view(cam);
+    if right_m != 0.0 {
+        let (_, right, _) = basis_rpy(hv.view.yaw, hv.view.pitch, hv.view.roll);
+        for (o, r) in hv.view.origin.iter_mut().zip(right) {
+            *o += r * right_m;
+        }
+    }
     if world.fork_cam && noto_core::act::fork::applies(&world.body) {
+        let casters = world.shadow_casters();
+        return render_rays(world, cam, &Rays::Pinhole { view: hv.view, exposure: hv.exposure }, &world.fork_boxes(), &casters, None);
+    }
+    if world.rider.is_some_and(|r| r.off()) {
+        // The rider on foot: the head camera sees the truck it stepped down from.
         let casters = world.shadow_casters();
         return render_rays(world, cam, &Rays::Pinhole { view: hv.view, exposure: hv.exposure }, &world.fork_boxes(), &casters, None);
     }
@@ -1000,6 +1022,19 @@ impl Pass<'_> {
 }
 
 pub fn render_rays(world: &World, cam: &Camera, rays: &Rays, robot: &[Obb], casters: &[Obb], cut: Option<&Cutaway>) -> Frame {
+    // Every camera sees the sub-workers' bodies and a rider on foot, as it sees the first worker's own; a rider's own
+    // eye does not see its own body.
+    let with_crew: Vec<Obb>;
+    let origin = match rays {
+        Rays::Pinhole { view, .. } => Some(view.origin),
+        Rays::Ortho { .. } => None,
+    };
+    let robot = if world.crew.is_empty() && world.rider.is_none() {
+        robot
+    } else {
+        with_crew = robot.iter().copied().chain(world.crew_boxes()).chain(world.rider_boxes(origin)).collect();
+        &with_crew
+    };
     let scene = Scene::build(world);
     let (w, h) = (cam.width.max(1), cam.height.max(1));
     let half_w = (cam.fov_deg.to_radians() * 0.5).tan();
@@ -1106,6 +1141,11 @@ impl World {
         render(self, cam)
     }
 
+    /// The right camera's frame of a stereo eye (`render_right`).
+    pub fn render_right(&self, cam: &Camera, baseline_m: f32) -> Frame {
+        render_right(self, cam, baseline_m)
+    }
+
     pub fn visible_objects(&self, frame: &Frame) -> Vec<VisibleObject> {
         visible_objects(self, frame)
     }
@@ -1167,7 +1207,10 @@ impl World {
         }
         let eye = self.standing_eye_m();
         let level = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-        let body = if truck { noto_core::act::fork::truck_boxes_posed(&self.body, eye, &self.current_kin_pose()) } else { Vec::new() };
+        let mut body = if truck { noto_core::act::fork::truck_boxes_posed(&self.body, eye, &self.current_kin_pose()) } else { Vec::new() };
+        if self.rider.is_some_and(|r| r.off()) {
+            body.retain(|b| !b.name.starts_with("rider_"));
+        }
         let mut v: Vec<([f32; 3], [[f32; 3]; 3], [f32; 3], [u8; 3])> = body
             .iter()
             .chain(noto_core::act::fork::boxes(&self.body, self.fork_m_now()).iter())
@@ -1191,6 +1234,13 @@ impl World {
             v.push((c, level, [0.5 * size[0], 0.5 * size[2], 0.5 * size[1]], k.spec().color));
         }
         v
+    }
+
+    /// Riders on foot (the first worker's and the sub-workers'), but not the one whose eye is at `origin`.
+    pub fn rider_boxes(&self, origin: Option<[f32; 3]>) -> Vec<Obb> {
+        let mine = |x: f32, z: f32| origin.is_some_and(|o| (o[0] - x).hypot(o[2] - z) < 0.3);
+        let riders = self.rider.iter().chain(self.crew.iter().filter_map(|w| w.rider.as_ref()));
+        riders.filter(|r| r.off() && !mine(r.x, r.z)).flat_map(|r| r.boxes(self.surface_m(r.x, r.z))).collect()
     }
 
     /// `fork_parts` in the world.

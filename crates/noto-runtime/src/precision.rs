@@ -70,18 +70,27 @@ pub struct MemCtx {
     pub base: String,
     pub camera: (f32, f32, f32),
     pub obs_floor_m: f32,
+    /// The scope the observation scatter (`obs_floor_m`) is learned under: the base, and the eye's rig when it is a
+    /// stereo pair — what one rig's looks scatter by says nothing about the other's.
+    pub obs_key: String,
 }
 
 impl MemCtx {
     pub fn still() -> MemCtx {
-        MemCtx { odo_m: 0.0, rate: DriftRate { per_m: 0.0, walk_m: 0.0, source: "spec" }, base: String::new(), camera: (424.0, 0.050, 0.08), obs_floor_m: 0.0 }
+        MemCtx { odo_m: 0.0, rate: DriftRate { per_m: 0.0, walk_m: 0.0, source: "spec" }, base: String::new(), camera: (424.0, 0.050, 0.08), obs_floor_m: 0.0, obs_key: String::new() }
     }
 
     pub fn sigma_obs(&self, depth_m: f32) -> f32 {
+        self.sigma_law(depth_m).max(self.obs_floor_m).max(0.005)
+    }
+
+    /// The camera's own law at `depth_m`, without the scatter learned on top: `stereo_depth_sigma` along the ray and
+    /// a pixel's bearing across it.
+    pub fn sigma_law(&self, depth_m: f32) -> f32 {
         let (f, b, sub) = self.camera;
         let along = noto_core::act::material::stereo_depth_sigma(depth_m, f, b, sub);
         let across = depth_m / f.max(1.0);
-        (along * along + across * across).sqrt().max(self.obs_floor_m).max(0.005)
+        (along * along + across * across).sqrt()
     }
 }
 
@@ -181,7 +190,8 @@ fn record_memory(sds: &mut SdsStore, mem: &MemCtx, label: &str, travelled: f32, 
     if travelled >= 2.0 {
         sds.record_baseline(&Scope::new(Track::Memory, &mem.base, "drift"), "drift_var_per_m2", ((sq - scatter - 2.0 * walk_var) / (travelled * travelled)) as f64);
     } else if travelled < 0.2 {
-        sds.record_baseline(&Scope::new(Track::Memory, &mem.base, "obs"), "scatter_var_m2", (0.5 * sq - sigma0 * sigma0) as f64);
+        let key = if mem.obs_key.is_empty() { &mem.base } else { &mem.obs_key };
+        sds.record_baseline(&Scope::new(Track::Memory, key, "obs"), "scatter_var_m2", (0.5 * sq - sigma0 * sigma0) as f64);
     }
     let spread = (sigma0 * sigma0 + predicted * predicted + 2.0 * sigma_obs * sigma_obs + walk_var).sqrt().max(1e-4);
     sds.record_baseline(&Scope::new(Track::Memory, label, &mem.base), "innovation_z", (innov / spread) as f64);

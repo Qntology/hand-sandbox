@@ -73,34 +73,14 @@ export async function resetBody() {
   }
 }
 
-function syncCoopButton(snap) {
-  const btn = $('tg-coop-agent');
-  if (!btn) return;
-  const team = snap?.team_size ?? state.teamSize ?? 1;
-  const active = snap?.agent?.active_robot ?? state.activeRobot ?? 1;
-  const phase = snap?.agent?.co_phase;
-  if (team <= 1) {
-    btn.textContent = '로봇 1 (단독)';
-    btn.classList.remove('active');
-    btn.setAttribute('aria-pressed', 'false');
-  } else {
-    const phaseNote = phase === 1 ? '1차 시뮬레이션' : phase === 2 ? '2차 시뮬레이션(중첩 수렴)' : '순차 협동 대기';
-    btn.textContent = `로봇 ${active}/2 (${phaseNote})`;
-    btn.classList.add('active');
-    btn.setAttribute('aria-pressed', 'true');
-  }
-}
-
 export function initWorldPanel() {
   state.terrain = $('world-terrain').value;
-  state.teamSize = Number($('world-team')?.value || 2);
   const run = async () => {
     const btn = $('world-new');
     btn.disabled = true;
     try {
       const seed = Math.max(0, Math.floor(Number($('world-seed').value) || 0));
       state.terrain = $('world-terrain').value;
-      state.teamSize = Number($('world-team')?.value || 2);
       await newWorld(seed, Number($('world-size').value), state.terrain);
     } finally {
       btn.disabled = false;
@@ -109,37 +89,14 @@ export function initWorldPanel() {
   $('world-new').addEventListener('click', run);
   $('world-seed').addEventListener('keydown', (e) => { if (e.key === 'Enter') run(); });
   $('world-terrain').addEventListener('change', (e) => { state.terrain = e.target.value; });
-  $('world-team')?.addEventListener('change', (e) => {
-    state.teamSize = Number(e.target.value) || 1;
-    call('set_team_mode', { teamSize: state.teamSize, activeRobot: state.activeRobot }, { quiet: true }).catch(() => {});
-    syncCoopButton(state.snapshot);
-    toast('로봇 운용 변경', state.teamSize === 2 ? '순차 협동(2대 · 중첩 물리) 모드가 켜졌습니다.' : '단독 운용(1대) 모드로 전환했습니다.');
-  });
-  $('tg-coop-agent')?.addEventListener('click', async () => {
-    if (state.teamSize <= 1) {
-      state.teamSize = 2;
-      if ($('world-team')) $('world-team').value = '2';
-    } else {
-      state.activeRobot = state.activeRobot === 1 ? 2 : 1;
-    }
-    try {
-      const r = await call('set_team_mode', { teamSize: state.teamSize, activeRobot: state.activeRobot }, { quiet: true });
-      if (r?.snapshot) bus.emit('snapshot', r.snapshot);
-    } catch {}
-    syncCoopButton(state.snapshot);
-    setStatus(`활성 시뮬레이션 주체: 로봇 ${state.activeRobot} (팀 ${state.teamSize}대)`);
-  });
   $('world-reset').addEventListener('click', resetWorld);
   $('body-reset').addEventListener('click', resetBody);
   bus.on('snapshot', (snap) => {
-    if (snap?.agent?.active_robot) state.activeRobot = snap.agent.active_robot;
     renderInfo(snap);
     updateDirty();
-    syncCoopButton(snap);
   });
   bus.on('config', updateDirty);
   bus.on('world-new', updateDirty);
   renderInfo(null);
-  syncCoopButton(null);
   return run;
 }

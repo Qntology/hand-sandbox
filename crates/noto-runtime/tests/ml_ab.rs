@@ -474,7 +474,7 @@ fn run_arm(book: &mut Book, a: &mut Arm, shot: &Shot, scene: &Scene, height: Opt
     }
     let floor_default = if a.locate == Src::StandIn && a.honest.is_none() { 0.35 } else { 0.0 };
     let wanted = vec![scene.query.to_string()];
-    let out = a.pipe.analyse_with(&shot.rgb, &shot.intr, &shot.pose, Some(&shot.truth), &wanted, &|_| floor_default, None, height).expect("analyse");
+    let out = a.pipe.analyse_with(&shot.rgb, None, &shot.intr, &shot.pose, Some(&shot.truth), &wanted, &|_| floor_default, None, height).expect("analyse");
     let name = a.name;
     let present = shot.target_raw.and_then(|raw| shot.truth.objects.iter().find(|o| pack_raw(o) == Some(raw))).map_or(0, |o| o.pixels);
     let tracked = out.target.is_some();

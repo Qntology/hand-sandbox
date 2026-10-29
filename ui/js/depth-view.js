@@ -46,11 +46,13 @@ function render(d) {
   const tta = d.flip_tta ? ' · 좌우 반전 평균' : '';
   $('depth-meta').textContent = `틱 ${d.tick} · ${d.mode} · ${d.device} · 추론 ${fmt.n(d.infer_ms, 0)} ms${tta}${d.max_depth_m ? ` · 모델 상한 ${fmt.n(d.max_depth_m, 0)} m` : ''}`;
   const [lo, hi] = d.scale_m ?? [0, 1];
+  const st = d.stereo;
   const figs = [
-    el('figure', {}, img(d.rgb_webp_base64, '머리 카메라 원본'), el('figcaption', { text: '머리 카메라 (흔들림·블러 포함)' })),
-    el('figure', {}, img(d.pred_webp_base64, '깊이 모델 추정 (정렬)'), el('figcaption', { text: d.align ? `추정 깊이 — 지면 정렬 · 하늘 제외 (${d.mode})` : `추정 깊이 — ${d.mode}` })),
+    el('figure', {}, img(d.rgb_webp_base64, '머리 카메라 원본'), el('figcaption', { text: st ? '왼쪽 카메라 (기준 · SigLIP2 · SAM이 봄)' : '머리 카메라 (흔들림·블러 포함)' })),
+    st && d.right_webp_base64 ? el('figure', {}, img(d.right_webp_base64, '오른쪽 카메라'), el('figcaption', { text: `오른쪽 카메라 (기선 ${fmt.n(st.baseline_m * 100, 1)} cm 옆)` })) : null,
+    el('figure', {}, img(d.pred_webp_base64, '깊이 추정'), el('figcaption', { text: st ? `SGBM 깊이 — Z = f·b/d, 매칭 못 한 화소는 비움(어둡게) · ${st.grid[0]}×${st.grid[1]}` : d.align ? `추정 깊이 — 지면 정렬 · 하늘 제외 (${d.mode})` : `추정 깊이 — ${d.mode}` })),
     el('figure', {}, img(d.truth_webp_base64, '렌더러 정답 깊이'), el('figcaption', { text: '정답 깊이 (렌더러)' })),
-  ];
+  ].filter(Boolean);
   if (d.raw_webp_base64) figs.push(el('figure', {}, img(d.raw_webp_base64, '모델 원출력'), el('figcaption', { text: '모델 원출력 (실내 NYU 척도, 정렬 전)' })));
   if (d.seg_webp_base64) figs.push(el('figure', {}, img(d.seg_webp_base64, 'ADE20K 분할'), el('figcaption', { text: `분할 (ADE20K) — 하늘 ${fmt.pct(d.sky?.frac ?? 0, 0)} 깊이에서 제외` })));
   if (d.normals_webp_base64) figs.push(el('figure', {}, img(d.normals_webp_base64, '표면 법선'), el('figcaption', { text: `표면 법선 — 지면 아닌 후보 ${d.align?.off_ground_normals ?? 0}개를 정렬에서 뺌` })));
@@ -66,7 +68,10 @@ function render(d) {
       ['δ1 (< 1.25)', m ? `${fmt.pct(m.delta1, 1)} · ${r ? fmt.pct(r.delta1, 1) : '—'}` : '—'],
       ['RMSE', m ? `${fmt.n(m.rmse_m, 2)} m · ${r ? `${fmt.n(r.rmse_m, 2)} m` : '—'}` : '—'],
       ['중앙 축척 (정답/추정)', m ? fmt.n(m.median_scale, 2) : '—'],
-      ['지면 정렬', fit ? `1/Z = ${fmt.n(fit.a, 3)}/Z모델 + ${fmt.n(fit.b, 3)} · 내층 ${fit.inliers}/${fit.candidates} · 잔차 중앙 ${fmt.pct(fit.median_rel_err, 1)} · 지면 ${fmt.n(fit.span_m?.[0], 1)}–${fmt.n(fit.span_m?.[1], 1)} m` : '맞춤 없음 (지면이 충분히 보이지 않음)'],
+      st
+        ? ['SGBM (카메라 2대)', `유효 ${fmt.pct(st.valid, 0)} · 사거리 밖 ${fmt.pct(st.far, 0)} · 비움: 민무늬 ${fmt.pct(st.rejected.no_texture, 0)} · 고유성 ${fmt.pct(st.rejected.not_unique, 0)} · 좌우 불일치 ${fmt.pct(st.rejected.lr_mismatch, 0)} · 반사 ${fmt.pct(st.rejected.saturated, 0)} · 얼룩 ${fmt.pct(st.rejected.speckle, 0)} · 가장자리 ${fmt.pct(st.rejected.border, 0)} · 시차 ${st.disparities} · 초점 ${fmt.n(st.focal_px, 0)} px · ${fmt.n(st.ms, 0)} ms`]
+        : ['지면 정렬', fit ? `1/Z = ${fmt.n(fit.a, 3)}/Z모델 + ${fmt.n(fit.b, 3)} · 내층 ${fit.inliers}/${fit.candidates} · 잔차 중앙 ${fmt.pct(fit.median_rel_err, 1)} · 지면 ${fmt.n(fit.span_m?.[0], 1)}–${fmt.n(fit.span_m?.[1], 1)} m` : '맞춤 없음 (지면이 충분히 보이지 않음)'],
+      ...(st ? [['지면 정렬', '건너뜀 — 스테레오 깊이는 이미 미터 (1/Z = a/Z + b 정렬 안 함)']] : []),
       ...cameraRows(d.camera),
     ]),
   );

@@ -82,13 +82,6 @@
                 <option value="rugged" selected>복합 지형 (바다 · 절벽 · 암벽)</option>
                 <option value="open">열린 평지 (언덕 · 연석 벽)</option>
               </select></div>
-            <div class="form-group span-2">
-              <label for="world-team">로봇 운용 (협동 시나리오)</label>
-              <select id="world-team" title="순차 협동(2대): 물리 엔진은 두 로봇이 함께 힘을 쓴다고 가정하고, 비전/AI 시뮬레이션은 로봇 1 → 로봇 2 순서로 하나씩 진행하여 스펙 부하를 단일 로봇 수준으로 유지합니다.">
-                <option value="1">단독 운용 (로봇 1대)</option>
-                <option value="2" selected>순차 협동 (로봇 2대 · 중첩 물리)</option>
-              </select>
-            </div>
           </div>
           <button type="button" class="btn btn-block" id="world-new">월드 재생성</button>
           <div class="btn-row reset-row">
@@ -97,6 +90,33 @@
           </div>
           <p class="hint err" id="world-dirty" hidden>손·발 구성이 현재 월드와 다릅니다. 재생성하면 적용됩니다.</p>
           <div id="world-info" class="pv-kv"></div>
+        </div>
+
+        <!-- 작업자 · 협업 트랙 -->
+        <div class="panel-section-header" data-section="secCrew" role="button" tabindex="0" aria-expanded="true" aria-controls="secCrew">
+          <span class="sec-title"><span class="step-no sec-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="8" cy="7" r="3"/><circle cx="17" cy="9" r="2.5"/><path d="M3 20c0-3.3 2.2-6 5-6s5 2.7 5 6M13 20c.4-2.6 2-4.5 4-4.5s3.6 1.9 4 4.5"/></svg></span><span class="sec-name">작업자 · 협업 트랙</span><span class="help" tabindex="0" data-tip="최초 작업자 주위에 서브 작업자를 추가합니다(최대 8명). 개별 트랙은 명령 수량을 작업자 수로 나눠 각자 탐색 → 채취 → 줍기 → 운반 → 인도까지 진행하고, 협업 트랙은 휴머노이드가 채취해 상차장에 적치하고 지게차가 포크로 실어 목적지로 운반합니다. 지게차는 채취할 때 탑승자가 내려서 캐고 다시 탑니다. 로봇끼리는 경로 계획과 이동 중 시야 검사로 부딪히지 않습니다. 무거운 비전은 최초 작업자만 돌립니다.">?</span></span>
+          <span class="step-sum" id="sum-crew"></span><span class="chevron" aria-hidden="true">▼</span>
+        </div>
+        <div class="panel-section-body" id="secCrew">
+          <div class="form-grid">
+            <div class="form-group"><label for="crew-count">인원</label><input type="number" id="crew-count" min="1" max="8" step="1" value="2" /></div>
+            <div class="form-group"><label for="crew-form">형태</label>
+              <select id="crew-form">
+                <option value="mixed" selected>혼합 (지게차 1 + 휴머노이드)</option>
+                <option value="humanoid">휴머노이드</option>
+                <option value="forklift">지게차 (탑승자 하차 채취)</option>
+              </select></div>
+            <div class="form-group span-2"><label for="crew-mode">트랙</label>
+              <select id="crew-mode">
+                <option value="solo" selected>개별 트랙 — 수량을 나눠 각자 채취 · 운반</option>
+                <option value="team">협업 트랙 — 휴머노이드 채취·적치 → 지게차 상차·운반</option>
+              </select></div>
+          </div>
+          <div class="btn-row">
+            <button type="button" class="btn btn-sm" id="crew-add" data-tip-title="작업자 추가" data-tip="최초 작업자 주위의 빈 칸(그 발이 갈 수 있는 곳)에 서브 작업자를 놓습니다. 카메라 대수는 ⑤의 카메라 선택을 따릅니다.">작업자 추가</button>
+            <button type="button" class="btn btn-sm btn-outline" id="crew-clear">모두 빼기</button>
+          </div>
+          <div class="crew-list" id="crew-list"></div>
         </div>
 
         <!-- ④ 사전·모델 -->
@@ -108,7 +128,7 @@
           <div class="form-group"><label for="device-select">연산 장치</label><select id="device-select" aria-label="연산 장치"></select></div>
           <div class="status-line"><span class="k">SigLIP2 (비전)</span><span class="v" id="model-siglip">미확인</span></div>
           <div class="status-line"><span class="k">TTM (시계열)</span><span class="v" id="model-ttm">미확인</span></div>
-          <div class="status-line"><span class="k">깊이 (TIPSv2)</span><span class="v" id="model-depth">미확인</span></div>
+          <div class="status-line"><span class="k" id="model-depth-k">깊이 (TIPSv2)</span><span class="v" id="model-depth">미확인</span></div>
           <div class="status-line"><span class="k">마스크 (SAM)</span><span class="v" id="model-mask">미확인</span></div>
           <div class="status-line"><span class="k">명령 임베더</span><span class="v" id="model-embed">미확인</span></div>
           <div class="status-line"><span class="k">SDS 레시피</span><span class="v" id="model-sds">미확인</span></div>
@@ -137,6 +157,11 @@
           <div class="form-group"><label for="pp-named">조합</label><select id="pp-named"></select></div>
           <div class="form-grid">
             <div class="form-group"><label for="pp-head">머리 (목·카메라)</label><select id="pp-head"></select></div>
+            <div class="form-group"><label for="pp-cameras">카메라 (머리·포크)</label>
+              <select id="pp-cameras" title="1대: 단안 RGB — 깊이는 TIPSv2(지면 정렬). 2대: 좌우 스테레오 쌍 — 깊이는 SGBM(Z = f·b/d, 매칭 못 한 화소는 비움), TIPSv2는 불러오지도 돌리지도 않습니다. 지게차는 탑승자 머리와 포크 카메라 둘 다 이 대수를 따릅니다.">
+                <option value="1" selected>1대 — 단안 (TIPSv2)</option>
+                <option value="2">2대 — 스테레오 (SGBM)</option>
+              </select></div>
             <div class="form-group"><label for="pp-chest">가슴 (연산·배터리)</label><select id="pp-chest"></select></div>
             <div class="form-group"><label for="pp-belly">배 (허리·골반)</label><select id="pp-belly"></select></div>
             <div class="form-group"><label for="pp-arm">팔 (어깨·팔꿈치)</label><select id="pp-arm"></select></div>
@@ -184,7 +209,7 @@
           <button type="button" class="vt-btn active" id="tg-quest" aria-pressed="true">퀘스트</button>
           <button type="button" class="vt-btn active" id="tg-pip" aria-pressed="true">PiP</button>
           <div class="vt-sep"></div>
-          <button type="button" class="vt-btn active" id="tg-coop-agent" data-tip-title="순차 협동 활성 로봇" data-tip="현재 비전·AI 시뮬레이션을 수행 중인 로봇입니다. 누르면 로봇 1 ↔ 로봇 2의 시점과 제어 주체를 수동 전환하거나 순차 협동 모드를 토글합니다.">로봇 1 (협동 대기)</button>
+          <button type="button" class="vt-btn" id="tg-coop-agent" data-tip-title="작업자 · 트랙" data-tip="최초 작업자와 서브 작업자 수, 지금 트랙입니다. 누르면 개별 트랙 ↔ 협업 트랙을 바꿉니다(다음 명령부터). 작업자 추가는 왼쪽 '작업자 · 협업 트랙'에서 합니다.">작업자 1명 · 개별</button>
           <div class="vt-sep"></div>
           <label class="vt-label" for="view-select">시점</label>
           <select id="view-select" title="3인칭: 로봇 뒤 추적 카메라에 관절 동역학(프리셋 질량·액추에이터)으로 움직이는 몸과 관절 토크·ZMP를 겹쳐 그립니다. 포커스: 행위가 쓰는 부위의 근접 화면과 그 부위의 힘·관절 그림"><option value="agent">에이전트 시점 (1인칭)</option><option value="chase">3인칭 (관절 물리)</option><option value="top">탑뷰</option><option value="fork">포크 카메라 (지게차)</option><option value="focus:hand">포커스 · 손 근접</option><option value="focus:side">포커스 · 옆 (허리·목·다리)</option><option value="focus:low">포커스 · 낮게 (발·바퀴·트랙)</option></select>
@@ -328,6 +353,12 @@
       <button type="button" class="panel-toggle-btn" data-toggle="panelRight" title="우측 패널 접기" aria-label="우측 패널 접기" aria-expanded="true">▶</button>
       <div class="panel-title"><b>작업</b><small>퀘스트 · 인벤토리 · 시험 결과</small></div>
       <div class="panel-scroll">
+        <div class="panel-section-header" data-section="secFlow" role="button" tabindex="0" aria-expanded="true" aria-controls="secFlow">
+          <span class="sec-title"><span class="step-no sec-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 6h5v4H4zM15 6h5v4h-5zM9.5 16h5v4h-5zM9 8h6M17.5 10v3.5H12V16M6.5 10v3.5H12"/></svg></span><span class="sec-name">협업 플로우</span><span class="help" tabindex="0" data-tip="협업 트랙의 ① 편성 ② 상차장 ③ 채취 ④ 적치 ⑤ 상차 ⑥ 운반 ⑦ 인도를 단계별 수로, 작업자마다 지금 하는 일을 레인으로, 흐름의 기록을 보여 줍니다. 개별 트랙에서는 작업자별 몫을 보여 줍니다.">?</span></span>
+          <span class="step-sum" id="sum-flow"></span><span class="chevron" aria-hidden="true">▼</span>
+        </div>
+        <div class="panel-section-body" id="secFlow"><div class="crew-flow" id="crew-flow"></div></div>
+
         <div class="panel-section-header" data-section="secQuests" role="button" tabindex="0" aria-expanded="true" aria-controls="secQuests">
           <span class="sec-title"><span class="step-no sec-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M6 4h12v16l-6-3.5L6 20z"/></svg></span><span class="sec-name">퀘스트</span><span class="help" tabindex="0" data-tip="명령을 입력하면 탐색 → 접근 → 채취 → 줍기 → 운반 → 인도 단계의 퀘스트가 만들어집니다. 단계별 상태와 진행률이 여기에 보입니다. 완료하면 소요 틱·에너지·정밀도 요약이 남습니다.">?</span></span>
           <span class="step-sum" id="sum-quests"></span><span class="chevron" aria-hidden="true">▼</span>

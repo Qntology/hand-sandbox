@@ -28,6 +28,8 @@ pub struct AppState {
     world: Mutex<Option<Runtime>>,
     pub downloads: Arc<crate::models::Downloads>,
     models_ready: AtomicBool,
+    /// The robot's eye is a stereo pair (two cameras): its depth is SGBM's, and TIPSv2 is neither needed nor loaded.
+    stereo: AtomicBool,
     loading: Mutex<Option<String>>,
     load_error: Mutex<Option<String>>,
     live_devices: Mutex<std::collections::BTreeMap<String, String>>,
@@ -44,6 +46,7 @@ impl AppState {
             world: Mutex::new(None),
             downloads: Arc::default(),
             models_ready: AtomicBool::new(false),
+            stereo: AtomicBool::new(false),
             loading: Mutex::new(None),
             load_error: Mutex::new(None),
             live_devices: Mutex::new(Default::default()),
@@ -54,8 +57,16 @@ impl AppState {
         if self.models_ready() {
             Ok(())
         } else {
-            Err(crate::models::not_ready_message())
+            Err(crate::models::not_ready_message(self.stereo()))
         }
+    }
+
+    pub fn stereo(&self) -> bool {
+        self.stereo.load(Ordering::Acquire)
+    }
+
+    pub fn set_stereo(&self, on: bool) {
+        self.stereo.store(on, Ordering::Release);
     }
 
     pub fn models_ready(&self) -> bool {

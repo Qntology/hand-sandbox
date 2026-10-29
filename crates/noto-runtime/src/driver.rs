@@ -12,7 +12,7 @@ use world_sim::{amount_text, Action, ActionError, ItemKind, NodeKind, TimedEvent
 use noto_search::text::eul_reul;
 
 use crate::cargo::{self, CargoAction, CargoCtx, CargoDecision};
-use crate::vision::{gaze_to_see, memory_ok, Memory, EYE_LEAD_S};
+use crate::vision::{gaze_to_see, memory_ok, Memory, ASSOC_RATIO, ASSOC_REACH_M, EYE_LEAD_S};
 
 pub(crate) const MAX_GRASP_TRIES: u32 = 3;
 pub(crate) const MAX_PUSH_TRIES: u32 = 3;
@@ -169,8 +169,9 @@ pub(crate) struct Task {
     pub deliver_retry: bool,
     pub look_turn: Option<u32>,
     pub gazed: Option<u32>,
-    /// The drop the forks last lined up in front of (once per drop).
+    /// The drop the forks last lined up in front of (once per drop), and the one looked at again once lined up.
     pub lined_up: Option<u32>,
+    pub lineup_looked: Option<u32>,
     /// The act (by its start time) whose rider look and whose re-check a lift truck already made: once per act.
     pub rider_looked: Option<f64>,
     pub rechecked: Option<f64>,
@@ -299,6 +300,7 @@ impl Task {
             rechecked: None,
             gazed: None,
             lined_up: None,
+            lineup_looked: None,
         })
     }
 
@@ -384,13 +386,16 @@ impl Runtime {
             return;
         }
         match Task::from_plan(&id, &plan, &self.world) {
-            Ok(task) => {
+            Ok(mut task) => {
                 let tick = self.world.tick;
                 if let Some(q) = self.quests.get_mut(&id) {
                     let _ = q.start(tick);
                 }
                 let title = self.quests.get(&id).map(|q| q.title.clone()).unwrap_or_default();
                 self.log("quest", Level::Info, format!("퀘스트 {id} 시작: {title}"), Some(json!({"quest": id, "tick": tick})));
+                if let Some(staged) = self.crew.staged_pick.remove(&id) {
+                    self.take_staged(&mut task, staged);
+                }
                 self.task = Some(task);
             }
             Err((code, msg)) => {
@@ -400,6 +405,25 @@ impl Runtime {
                 self.log("quest", Level::Warn, format!("퀘스트 {id} 시작 실패: {msg}"), Some(json!({"quest": id, "code": code})));
             }
         }
+    }
+
+    /// A batch the humanoids put down at the loading bay, for the first worker as a lift truck: the task starts at
+    /// its collect step with those drops where the bay's row lies, and takes each with the fork procedure — rider
+    /// look, carriage camera, cross-check, insert, re-check — on the eye's depth (SGBM or TIPSv2).
+    fn take_staged(&mut self, t: &mut Task, staged: Vec<u32>) {
+        let sigma = self.world.aim_sigma_m();
+        let odo = self.world.odom.travelled_m;
+        let ids: Vec<u32> = staged.into_iter().filter(|id| self.world.drop_item(*id).is_some()).collect();
+        for &id in &ids {
+            if let Some(d) = self.world.drop_item(id) {
+                let (x, z) = self.world.belief_of(d.x, d.z);
+                t.mem.insert(id, Memory::seen(x, z, sigma, odo, self.world.tick));
+            }
+        }
+        let list = ids.iter().map(|d| format!("d{d}")).collect::<Vec<_>>().join(", ");
+        t.drops = ids;
+        t.drop_idx = 0;
+        self.goto_phase(t, Phase::Collect, &format!("상차장 적치분 {list}"));
     }
 
     pub(crate) fn drive(&mut self, events: &[TimedEvent]) {
@@ -744,15 +768,18 @@ impl Runtime {
         if t.placed() {
             return self.approach_placed(t, id, (x, z), dist);
         }
-        if dist <= MINE_REACH_M - 0.1 {
-            self.goto_phase(t, Phase::Mine, "");
+        // A lift truck stops short of the node with its tines clear of the trunk; its rider walks the rest.
+        let forks = noto_core::act::fork::applies(&self.world.body);
+        let (mine_at, reach) = if forks { (world_sim::world::RIDER_STOP_M + 0.3, world_sim::world::RIDER_STOP_M) } else { (MINE_REACH_M - 0.1, self.cfg.approach_reach_m) };
+        if dist <= mine_at {
+            self.goto_phase(t, Phase::Mine, if forks { "지게차를 세우고 탑승자가 내려서 채취" } else { "" });
             return Flow::Continue;
         }
-        t.act_predicted_s = self.world.plan_route(Goal::Within { x, z, reach_m: self.cfg.approach_reach_m }).map(|p| p.time_s);
+        t.act_predicted_s = self.world.plan_route(Goal::Within { x, z, reach_m: reach }).map(|p| p.time_s);
         t.act_distance0 = dist;
         t.look_cd = self.cfg.vision.look_every_ticks;
         t.pre_looked = false;
-        match self.issue(t, Action::MoveTo { x, z, reach_m: self.cfg.approach_reach_m }, Act::Move(MoveFor::Approach(id))) {
+        match self.issue(t, Action::MoveTo { x, z, reach_m: reach }, Act::Move(MoveFor::Approach(id))) {
             Ok(()) => Flow::Continue,
             Err(ActionError::NoPath) | Err(ActionError::UnknownTarget) => {
                 self.gates.note_unreachable(id);
@@ -767,10 +794,12 @@ impl Runtime {
     fn touch_node(&self, believed: (f32, f32)) -> Option<u32> {
         let (ax, az) = (self.world.agent.x, self.world.agent.z);
         let at = self.world.true_of(believed.0, believed.1);
+        // A lift truck's rider walks over: the nodes within its walk, the one nearest where the eye put it.
+        let reach = if noto_core::act::fork::applies(&self.world.body) { world_sim::world::RIDER_REACH_M } else { MINE_REACH_M };
         self.world
             .nodes
             .iter()
-            .filter(|n| ((n.x - ax).powi(2) + (n.z - az).powi(2)).sqrt() <= MINE_REACH_M)
+            .filter(|n| ((n.x - ax).powi(2) + (n.z - az).powi(2)).sqrt() <= reach)
             .min_by(|a, b| {
                 let da = (a.x - at.0).powi(2) + (a.z - at.1).powi(2);
                 let db = (b.x - at.0).powi(2) + (b.z - at.1).powi(2);
@@ -1072,6 +1101,23 @@ impl Runtime {
                     Err(e) => fail(e.code(), action_error_ko(&e)),
                 };
             }
+            // Lined up, a lift truck looks at the item once more before its fork procedure, as an operator does once
+            // aligned: the odometry since it was remembered (the rider's fell on foot, the turns of the line-up) has
+            // moved it, and the rider's and the carriage camera's looks are judged against this memory.
+            if forks && t.lined_up == Some(id) && t.lineup_looked != Some(id) {
+                t.lineup_looked = Some(id);
+                if let Some((pan, tilt)) = gaze_to_see(&self.cam, self.world.standing_eye_m(), self.me(), m.x, m.z) {
+                    if self.scan_gaze("lineup", pan, tilt).is_ok() {
+                        let (rate, odo) = (self.drift_rate(), self.world.odom.travelled_m);
+                        if let Some((fused, innov)) = self.refresh_memory(&m, d.kind, odo) {
+                            t.mem.insert(id, fused);
+                            self.log("vision", Level::Info, format!("{name}: 정렬 뒤 한 번 봄 — 기억이 {:.0} cm 어긋나 있었음 (±{:.0} → ±{:.0} cm)", innov * 100.0, 2.0 * m.sigma_m(odo, rate) * 100.0, 2.0 * fused.sigma_m(odo, rate) * 100.0), Some(json!({"drop": id, "innovation_m": innov})));
+                            self.note_look("lineup", format!("d{id}"), Some(m.sigma_m(odo, rate)), Some(fused.sigma_m(odo, rate)), Some(innov));
+                            continue;
+                        }
+                    }
+                }
+            }
             let can_take =if forks { self.world.fork_check(d.kind, d.amount).map(|_| ()) } else { self.world.reach_ground(d.kind, d.amount) };
             if let Err(why) = can_take {
                 if t.destination.is_none() || !forks {
@@ -1354,20 +1400,46 @@ impl Runtime {
             .unwrap_or_default();
         let off = |w: (f32, f32)| (w.0 - m.x).hypot(w.1 - m.z);
         let nearest = seen.iter().copied().min_by(|a, b| off(a.2).total_cmp(&off(b.2)));
-        // Data association: the look fixes the memory only with what lies inside the memory's and the look's own
-        // uncertainty. Several of one kind lie close together (a felled tree drops its logs a hand apart); the
-        // nearest one outside that gate is a neighbour, and the memory stays as it was.
-        let matched = nearest.filter(|c| off(c.2) <= (3.0 * before.hypot(mem.sigma_obs(c.3))).max(0.06));
-        let range_m = nearest.map(|c| self.dist_me(c.2 .0, c.2 .1));
-        let depth_m = nearest.and_then(|c| self.depth_in_box(&frame, c.1));
+        let boxd = nearest.map(|c| self.depth_in_box(&frame, c.1, crate::perception::centre_offset_m(EntKind::Drop)));
+        // Where the look puts the item, by the eye's depth procedure. Two cameras (SGBM): the pair's metric depth in
+        // the box places it, with the stereo law's σ, and a box SGBM could not match places nothing — the look saw
+        // the item but makes up no distance. One camera (TIPSv2): the scan's place, the monocular range logged beside
+        // it.
+        let placed: Option<((f32, f32), f32)> = match (nearest, &boxd) {
+            (Some(_), Some(b)) if b.stereo() => b.at.zip(b.sigma_m),
+            (Some(c), _) => Some((c.2, mem.sigma_obs(c.3))),
+            (None, _) => None,
+        };
+        // Data association: the look fixes the memory with what lies inside the memory's and the look's own
+        // uncertainty, or — beyond that, within `ASSOC_REACH_M` — with a match that is plainly this item: `ASSOC_RATIO`
+        // times nearer the memory than any other match of its kind in view, and nearer to it than to any other item of
+        // its kind remembered. Several of one kind lie close together (a felled tree drops its logs 0.22 m apart, a bay
+        // stages them 0.35 m apart); a match outside both is a neighbour, and the memory stays as it was. The second
+        // arm is for a memory off by more than its σ says (wheels slip on soft ground by more than the drift spec, until
+        // the SDS has learned the rate), where a precise look — SGBM's ±1–3 cm — was thrown away as a neighbour.
+        let mut offs: Vec<f32> = seen.iter().map(|c| off(c.2)).collect();
+        offs.sort_by(f32::total_cmp);
+        let alone = offs.get(1).map_or(true, |&d2| d2 >= ASSOC_RATIO * offs[0]);
+        let others: Vec<(f32, f32)> = t.mem.iter().filter(|(j, _)| **j != id && self.world.drop_item(**j).is_some_and(|d| d.kind == kind)).map(|(_, o)| (o.x, o.z)).collect();
+        let plainly = |p: (f32, f32)| alone && off(p) <= ASSOC_REACH_M && others.iter().all(|o| (p.0 - o.0).hypot(p.1 - o.1) > off(p));
+        let matched = placed.filter(|(p, sig)| off(*p) <= (3.0 * before.hypot(*sig)).max(0.06) || plainly(*p));
+        let range_m = placed.map(|(p, _)| self.dist_me(p.0, p.1));
         let screen = match camera {
             "fork" => "포크 카메라 화면",
             _ if noto_core::act::fork::applies(&self.world.body) => "탑승자가 숙여 본 화면",
             _ => "숙인 화면",
         };
-        let reason = match (nearest, matched) {
-            (None, _) => Some(format!("{screen}에서 {name}을 찾지 못함")),
-            (Some(c), None) => Some(format!("{name}이 보이지만 기억과 {:.0} cm 떨어져 이웃 것으로 봄 — 기억 위치로 집음", off(c.2) * 100.0)),
+        let reason = match (nearest, placed, matched) {
+            (None, _, _) => Some(format!("{screen}에서 {name}을 찾지 못함")),
+            (Some(_), None, _) => {
+                let b = boxd.as_ref();
+                Some(format!(
+                    "{name}이 보이지만 스테레오 깊이가 없음 ({}, 상자 유효 {:.0}%) — 거리를 만들지 않고 기억 위치로 집음",
+                    b.and_then(|b| b.reason.clone()).unwrap_or_else(|| "민무늬·반사·근접".into()),
+                    b.map_or(0.0, |b| b.valid_frac) * 100.0
+                ))
+            }
+            (Some(_), Some((p, _)), None) => Some(format!("{name}이 보이지만 기억과 {:.0} cm 떨어져 이웃 것으로 봄 — 기억 위치로 집음", off(p) * 100.0)),
             _ => None,
         };
         Some(crate::vision::Sighting {
@@ -1378,14 +1450,17 @@ impl Runtime {
             ok: nearest.is_some(),
             matched: matched.is_some(),
             score: nearest.map(|c| c.0),
-            at: nearest.map(|c| c.2),
-            sigma_m: nearest.map(|c| mem.sigma_obs(c.3)),
+            at: placed.map(|(p, _)| p),
+            sigma_m: placed.map(|(_, sig)| sig),
             range_m,
-            depth_m,
+            depth_m: boxd.as_ref().and_then(|b| b.range_m),
             bbox: nearest.map(|c| c.1),
             reason,
             neck_deg,
             pitch_deg,
+            depth_source: boxd.as_ref().map(|b| b.source.clone()),
+            depth_sigma_m: boxd.as_ref().and_then(|b| b.sigma_m),
+            depth_valid: boxd.as_ref().map(|b| b.valid_frac),
         })
     }
 
@@ -1406,11 +1481,16 @@ impl Runtime {
         let Some(m) = t.mem.get(&id).copied() else { return };
         let (rate, odo) = (self.drift_rate(), self.world.odom.travelled_m);
         let before = m.sigma_m(odo, rate);
-        let depth = s.depth_m.map(|d| format!(" · 깊이 모델 {d:.2} m")).unwrap_or_default();
-        let data = json!({"drop": id, "camera": s.camera, "neck_deg": s.neck_deg, "pitch_deg": s.pitch_deg, "range_m": s.range_m, "depth_m": s.depth_m});
+        let source = match s.depth_source.as_deref() {
+            Some("sgbm") => "SGBM 스테레오",
+            Some("tipsv2+ground") => "TIPSv2+지면",
+            _ => "깊이 모델",
+        };
+        let depth = s.depth_m.map(|d| format!(" · {source} {d:.2} m{}", s.depth_sigma_m.map(|e| format!(" ±{:.0} mm", e * 1000.0)).unwrap_or_default())).unwrap_or_default();
+        let data = json!({"drop": id, "camera": s.camera, "neck_deg": s.neck_deg, "pitch_deg": s.pitch_deg, "range_m": s.range_m, "depth_m": s.depth_m, "depth_source": s.depth_source, "depth_sigma_m": s.depth_sigma_m, "depth_valid": s.depth_valid});
         match (s.matched, s.at, s.sigma_m) {
             (true, Some((x, z)), Some(sigma)) => {
-                let (f, innov) = m.fuse(x, z, sigma, odo, self.world.tick, rate);
+                let (f, innov) = m.fuse_adaptive(x, z, sigma, odo, self.world.tick, rate);
                 t.mem.insert(id, f);
                 self.note_look("gaze", format!("d{id}"), Some(before), Some(f.sigma_m(odo, rate)), Some(innov));
                 let msg = format!("비전 확인 ✓ {}: {how} {:.2} m에서 봄{depth} — 기억 ±{:.0} → ±{:.0} cm", s.label_ko, s.range_m.unwrap_or(f32::NAN), 2.0 * before * 100.0, 2.0 * f.sigma_m(odo, rate) * 100.0);
@@ -1445,8 +1525,19 @@ impl Runtime {
         self.world.fork_cam = true;
         let s = self.sight_again(t, id, "fork");
         self.world.fork_cam = false;
-        let Some(s) = s else { return };
+        let Some(mut s) = s else { return };
         let mut x = self.fork_cross.take().filter(|c| c.drop == id).unwrap_or_else(|| crate::vision::CrossCheck::new(id));
+        // Both eyes put the item in one place, away from where it was remembered: the memory drifted with the
+        // odometry on the way (a lift truck that stopped short for its rider turns and lines up after the fell) —
+        // two eyes that agree are believed over it, and the memory is fixed from the nearer one.
+        if let Some(r) = x.rider.as_mut().filter(|r| r.ok && !r.matched && s.ok && !s.matched) {
+            if let Some((d, g)) = crate::vision::cross_gap(r, &s).filter(|(d, g)| d <= g) {
+                let off = t.mem.get(&id).zip(s.at).map_or(0.0, |(m, a)| (a.0 - m.x).hypot(a.1 - m.z));
+                (r.matched, s.matched) = (true, true);
+                s.reason = None;
+                self.log("vision", Level::Info, format!("두 시점이 {} 같은 자리를 봄 ({:.0} cm 차이 ≤ {:.0} cm): 기억이 {:.0} cm 밀려 있었음 — 두 눈을 믿고 기억을 고침", s.label_ko, d * 100.0, g * 100.0, off * 100.0), Some(json!({"drop": id, "apart_m": d, "memory_off_m": off})));
+            }
+        }
         x.fork_vs_rider = x.rider.as_ref().filter(|r| r.ok && r.matched && s.ok && s.matched).and_then(|r| crate::vision::cross_gap(r, &s));
         x.fork = Some(s.clone());
         let how = format!("포크 {:.2} m · 포크 카메라로 (탑승자 시선 정면)", self.world.fork_m_now());
@@ -1456,6 +1547,8 @@ impl Runtime {
             ("agree", None) => (Level::Info, format!("교차 검증 ✓ {}: 탑승자 시선과 포크 카메라 모두 봄", s.label_ko)),
             ("disagree", Some((d, g))) => (Level::Warn, format!("교차 검증 ✗ {}: 두 시점이 {:.0} cm 어긋남 (> {:.0} cm) — 가까운 포크 카메라를 믿음", s.label_ko, d * 100.0, g * 100.0)),
             ("fork_only", _) => (Level::Warn, format!("교차 검증 △ {}: 탑승자 시선에는 없고 포크 카메라만 봄 — 포크 카메라를 믿음", s.label_ko)),
+            ("rider_only", _) if s.ok && s.at.is_none() => (Level::Warn, format!("교차 검증 △ {}: 포크 카메라는 보았지만 거리를 재지 못함 ({}) — 탑승자 시선으로 끼움", s.label_ko, s.reason.as_deref().and_then(|r| r.split(" — ").next()).unwrap_or("깊이 없음"))),
+            ("rider_only", _) if s.ok => (Level::Warn, format!("교차 검증 △ {}: 포크 카메라가 본 것은 이웃 것 — 탑승자 시선으로 끼움", s.label_ko)),
             ("rider_only", _) => (Level::Warn, format!("교차 검증 △ {}: 포크 카메라에는 없고 탑승자만 봄 — 탑승자 시선으로 끼움", s.label_ko)),
             _ => (Level::Warn, format!("교차 검증 ✗ {}: 두 시점 모두 보지 못함 — 기억으로 끼움", s.label_ko)),
         };
@@ -1498,40 +1591,60 @@ impl Runtime {
         f.ids.iter().filter(|&&i| i == want).count() as f32 / f.ids.len().max(1) as f32
     }
 
-    /// How far from the robot's feet the thing filling the middle of `bbox` (normalised) lies, by the depth model
-    /// aligned under the current camera pose, on `frame` (the current camera's).
-    fn depth_in_box(&mut self, frame: &world_sim::Frame, bbox: [f32; 4]) -> Option<f32> {
+    /// The range inside the middle of `bbox` (normalised) on `frame` (the current camera's), by the eye's depth
+    /// procedure (`crate::stereo`): SGBM on the camera's stereo pair — the right frame rendered here, one baseline
+    /// along the camera's right axis — metric and with the stereo law's σ, or TIPSv2 aligned to the ground under the
+    /// camera's pose, with the fit's relative error.
+    fn depth_in_box(&mut self, frame: &world_sim::Frame, bbox: [f32; 4], centre_m: f32) -> crate::stereo::BoxDepth {
+        use crate::stereo::BoxDepth;
         let intr = crate::record::intrinsics(&self.world, &self.cam);
         let pose = crate::record::odometry(&self.world, &self.cam);
         let fix = self.ml.fix.clone();
-        let depth = match &mut self.ml.depth {
+        let rgb = noto_vision::Rgb::new(frame.width as u32, frame.height as u32, frame.rgb.clone());
+        let right = self.stereo_baseline().filter(|_| self.ml.stereo_rig().is_some()).map(|b| self.world.render_right(&self.cam, b));
+        let (depth, source, rel) = match &mut self.ml.depth {
+            crate::ml::DepthEngine::Model(m) if m.stereo_rig().is_some() => {
+                let Some(r) = right else { return BoxDepth::none("sgbm", "오른쪽 화면 없음") };
+                let pair = noto_vision::Rgb::new(r.width as u32, r.height as u32, r.rgb);
+                match m.infer_pair(&rgb, &pair) {
+                    Ok(d) => (d, "sgbm", None),
+                    Err(e) => return BoxDepth::none("sgbm", format!("SGBM 실패: {e}")),
+                }
+            }
             crate::ml::DepthEngine::Model(m) => {
                 let max = m.max_depth_m();
-                let rgb = noto_vision::Rgb::new(frame.width as u32, frame.height as u32, frame.rgb.clone());
-                let s = m.infer_scene(&rgb, crate::ml::scene_heads(&fix)).ok()?;
+                let Ok(s) = m.infer_scene(&rgb, crate::ml::scene_heads(&fix)) else { return BoxDepth::none("tipsv2+ground", "TIPSv2 추론 실패") };
                 let mut d = s.depth;
+                let mut rel = fix.depth_rel_sigma;
                 if let Some(cfg) = &fix.align {
-                    noto_vision::ground_align_with(&mut d, s.normals.as_ref().filter(|_| fix.normals), &intr, &pose, None, max, cfg)?;
+                    match noto_vision::ground_align_with(&mut d, s.normals.as_ref().filter(|_| fix.normals), &intr, &pose, None, max, cfg) {
+                        Some(f) => rel = f.median_rel_err.max(fix.depth_rel_sigma),
+                        None => return BoxDepth::none("tipsv2+ground", "지면 정렬 실패 (화면에 지면이 모자람)"),
+                    }
                 }
-                d
+                (d, "tipsv2+ground", Some(rel))
             }
             // Only the stand-in reads the renderer's truth; a model has no use for the two half-size buffers.
-            crate::ml::DepthEngine::StandIn(s) => s.run(&crate::ml::KeyTruth::capture(&self.world, frame)),
+            crate::ml::DepthEngine::StandIn(s) => (s.run(&crate::ml::KeyTruth::capture(&self.world, frame)), "stand-in", Some(fix.depth_rel_sigma)),
         };
-        let (w, h) = (frame.width as f32, frame.height as f32);
-        let mut mask = noto_vision::Mask::empty(depth.width, depth.height);
-        let (sx, sy) = (depth.width as f32 / w, depth.height as f32 / h);
-        let (x0, x1) = ((((bbox[0] * 0.75 + bbox[2] * 0.25) * w) * sx) as u32, (((bbox[0] * 0.25 + bbox[2] * 0.75) * w) * sx) as u32);
-        let (y0, y1) = ((((bbox[1] * 0.75 + bbox[3] * 0.25) * h) * sy) as u32, (((bbox[1] * 0.25 + bbox[3] * 0.75) * h) * sy) as u32);
-        for y in y0..=y1.min(depth.height - 1) {
-            for x in x0..=x1.min(depth.width - 1) {
-                mask.set(x, y);
-            }
+        let (d, valid_frac, at) = crate::stereo::in_box(&depth, &intr, &pose, bbox, centre_m);
+        let box_px = {
+            let (sx, sy) = (depth.width as f32, depth.height as f32);
+            (((bbox[2] - bbox[0]) * 0.5 * sx) * ((bbox[3] - bbox[1]) * 0.5 * sy)).max(1.0)
+        };
+        let stereo = source == "sgbm";
+        if stereo && !crate::stereo::enough_stereo(valid_frac, (valid_frac * box_px) as u32) {
+            return BoxDepth { valid_frac, ..BoxDepth::none("sgbm", "민무늬·반사·근접으로 매칭 안 됨") };
         }
-        let d = depth.median_in(&mask)?;
-        let (cx, cy) = ((bbox[0] + bbox[2]) * 0.5 * w, (bbox[1] + bbox[3]) * 0.5 * h);
-        let (x, z) = intr.ground_point(&pose, cx, cy, d)?;
-        Some(self.dist_me(x, z))
+        let (Some(d), Some(at)) = (d, at) else { return BoxDepth { valid_frac, ..BoxDepth::none(source, "상자에 깊이 없음") } };
+        let range_m = self.dist_me(at.0, at.1);
+        let sigma_m = match rel {
+            Some(r) => r * range_m,
+            // The stereo law on the SGBM rig's grid (`stereo_depth_sigma`, and a pixel's bearing across): the box's own
+            // measurement, not the scatter the scan's looks were learned to have.
+            None => self.mem_ctx().sigma_law(d).max(0.002),
+        };
+        BoxDepth { source: source.into(), depth_m: Some(d), at: Some(at), range_m: Some(range_m), sigma_m: Some(sigma_m), valid_frac, reason: None }
     }
 
     pub(crate) fn refresh_memory(&self, m: &Memory, kind: ItemKind, odo: f32) -> Option<(Memory, f32)> {
@@ -1547,7 +1660,7 @@ impl Runtime {
             .filter(|((x, z), _)| (x - m.x).hypot(z - m.z) <= reach)
             .min_by(|a, b| (a.0 .0 - m.x).hypot(a.0 .1 - m.z).total_cmp(&(b.0 .0 - m.x).hypot(b.0 .1 - m.z)))?;
         let ((x, z), depth) = best;
-        Some(m.fuse(x, z, mem.sigma_obs(depth), odo, self.world.tick, rate))
+        Some(m.fuse_adaptive(x, z, mem.sigma_obs(depth), odo, self.world.tick, rate))
     }
 
     fn push_step(&mut self, t: &mut Task) -> Flow {
@@ -2233,6 +2346,7 @@ impl Runtime {
             let ev = self.world.cancel();
             self.log_world_events(&ev);
         }
+        self.crew_stop("사용자가 중지했습니다");
         match t {
             Some(t) => self.fail_task(t, "cancelled", "사용자가 중지했습니다"),
             None => {}

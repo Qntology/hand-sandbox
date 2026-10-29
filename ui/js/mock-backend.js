@@ -142,6 +142,11 @@ const handlers = {
   world_reset: mw.worldReset,
   body_reset: mw.bodyReset,
   set_team_mode: mw.setTeamMode,
+  crew_add: mw.crewAdd,
+  crew_clear: mw.crewClear,
+  crew_mode: mw.crewMode,
+  crew_status: mw.crewStatusCall,
+  camera_rig: mw.cameraRig,
   world_terrain: async () => { throw '모의 백엔드에는 지형 격자가 없습니다'; },
 };
 

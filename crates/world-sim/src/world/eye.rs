@@ -203,6 +203,9 @@ impl World {
         if self.fork_cam && noto_core::act::fork::applies(&self.body) {
             return self.fork_view(cam);
         }
+        if let Some(r) = self.rider.filter(|r| r.off()) {
+            return self.rider_view(cam, &r);
+        }
         let (mut pose, walking) = self.camera_pose();
         let (tilt, tilt_rate) = if self.body.legged() {
             ((0.0, 0.0), [0.0, 0.0])
@@ -237,6 +240,17 @@ impl World {
         let exposure = Exposure { rate, exposure_s: timing.exposure_s, readout_s: timing.readout_s };
         let tilt_deg = [tilt.0.to_degrees(), tilt.1.to_degrees()];
         HeadView { view, exposure, est, shake, eye_m: pos[2] + shake.dz_m, head_pitch_deg, pan_deg, blur_px: exposure.blur_px(cam), tilt_deg }
+    }
+
+    /// A lift truck's rider on foot: the head camera standing at the rider's eye height, looking where it walks or
+    /// down at the node it fells.
+    pub fn rider_view(&self, cam: &Camera, r: &super::traffic::Rider) -> HeadView {
+        let ground = self.surface_m(r.x, r.z);
+        let tilt = if r.phase == super::traffic::RiderPhase::Mine { 20.0f32 } else { 0.0 };
+        let view = View { origin: [r.x, ground + super::traffic::RIDER_EYE_M, r.z], yaw: r.yaw - cam.pan_deg.to_radians(), pitch: (cam.pitch_deg - tilt).to_radians(), roll: 0.0 };
+        let timing = sensor_timing_at(self.body.head.sensor, self.scene_lux());
+        let exposure = Exposure { rate: [0.0; 3], exposure_s: timing.exposure_s, readout_s: timing.readout_s };
+        HeadView { view, exposure, est: view, shake: Shake::still(), eye_m: super::traffic::RIDER_EYE_M, head_pitch_deg: tilt, pan_deg: cam.pan_deg, blur_px: 0.0, tilt_deg: [0.0, 0.0] }
     }
 
     /// The fork carriage camera: between the tines, a little above them, looking ahead and down at what the tines

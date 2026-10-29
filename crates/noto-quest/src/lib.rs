@@ -12,7 +12,16 @@ pub enum StepKind {
     Deliver,
     Goto,
     Unload,
+    /// A team quest's flow (the crew dispatcher's): roles handed out, items put down at a loading bay, items taken
+    /// onto a lift truck's tines.
+    Assign,
+    Stage,
+    Load,
 }
+
+/// Who runs a quest: the first worker's driver, a sub-worker's lane, or the crew dispatcher for a team.
+pub const FIRST_WORKER: u32 = 1;
+pub const TEAM: u32 = 0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -74,6 +83,15 @@ pub struct Quest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<Failure>,
     pub plan: Plan,
+    /// `FIRST_WORKER` (its driver), a sub-worker's id (2, 3, …: the crew dispatcher's lane) or `TEAM` (a team's
+    /// collaboration flow).
+    pub owner: u32,
+    /// "solo" (개별 트랙) or "team" (협업 트랙) when the quest belongs to a crew's command.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub track: Option<String>,
+    /// The team quest a role quest serves.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
 }
 
 pub trait Labels {
@@ -207,7 +225,49 @@ impl Quest {
             result: None,
             failure: None,
             plan: plan.clone(),
+            owner: FIRST_WORKER,
+            track: None,
+            parent: None,
         })
+    }
+
+    /// A quest whose steps are given rather than read off the plan: a team's collaboration flow.
+    pub fn custom(id: String, title: String, steps: &[(StepKind, String)], plan: &Plan, tick: u64, owner: u32) -> Quest {
+        Quest {
+            id,
+            title,
+            state: State::Pending,
+            created_tick: tick,
+            started_tick: None,
+            steps: steps.iter().map(|(k, l)| step(*k, l.clone(), None)).collect(),
+            result: None,
+            failure: None,
+            plan: plan.clone(),
+            owner,
+            track: None,
+            parent: None,
+        }
+    }
+
+    /// Completes every step up to (not including) `i` and makes `i` the active one; a step already past stays.
+    pub fn advance_to(&mut self, i: usize) -> Result<(), QuestError> {
+        while let Some(at) = self.current() {
+            if at >= i {
+                break;
+            }
+            if self.complete_step(at)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Completes whatever steps are left and finishes the quest.
+    pub fn finish_all(&mut self, result: QuestResult) -> Result<(), QuestError> {
+        while let Some(at) = self.current() {
+            self.complete_step(at)?;
+        }
+        self.finish(result)
     }
 
     pub fn is_finished(&self) -> bool {
@@ -336,6 +396,28 @@ impl QuestBook {
         Ok(id)
     }
 
+    /// A quest of a crew's command: run by `owner`, on `track`, serving `parent`, its title led by `tag`.
+    pub fn add_owned(&mut self, plan: &Plan, labels: &dyn Labels, tick: u64, owner: u32, track: &str, parent: Option<&str>, tag: &str) -> Result<String, QuestError> {
+        let id = self.add(plan, labels, tick)?;
+        let q = self.get_mut(&id).expect("just added");
+        q.owner = owner;
+        q.track = Some(track.into());
+        q.parent = parent.map(String::from);
+        if !tag.is_empty() {
+            q.title = format!("{tag} {}", q.title);
+        }
+        Ok(id)
+    }
+
+    pub fn add_custom(&mut self, title: String, steps: &[(StepKind, String)], plan: &Plan, tick: u64, owner: u32, track: &str) -> String {
+        let id = format!("q{}", self.next.max(1));
+        self.next = self.next.max(1) + 1;
+        let mut q = Quest::custom(id.clone(), title, steps, plan, tick, owner);
+        q.track = Some(track.into());
+        self.quests.push(q);
+        id
+    }
+
     pub fn all(&self) -> &[Quest] {
         &self.quests
     }
@@ -348,12 +430,14 @@ impl QuestBook {
         self.quests.iter_mut().find(|q| q.id == id)
     }
 
+    /// The first worker's quest to run now: its active one, else the oldest pending one.
     pub fn current_id(&self) -> Option<String> {
-        self.quests
-            .iter()
-            .find(|q| q.state == State::Active)
-            .or_else(|| self.quests.iter().find(|q| q.state == State::Pending))
-            .map(|q| q.id.clone())
+        self.current_id_for(FIRST_WORKER)
+    }
+
+    pub fn current_id_for(&self, owner: u32) -> Option<String> {
+        let mine = || self.quests.iter().filter(move |q| q.owner == owner);
+        mine().find(|q| q.state == State::Active).or_else(|| mine().find(|q| q.state == State::Pending)).map(|q| q.id.clone())
     }
 
     pub fn clear(&mut self) {

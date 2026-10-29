@@ -1,5 +1,6 @@
 pub mod capture;
 pub mod clear;
+pub mod crew;
 pub mod explore;
 pub mod fixture;
 pub mod iso;
@@ -16,6 +17,7 @@ pub mod terrain;
 pub mod world;
 
 pub use capture::{decode_webp, encode_webp, Encoded};
+pub use crew::{Form, Job, Worker};
 pub use kinds::{Ground, ItemKind, ItemSpec, NodeKind, NodeSpec};
 pub use light::Lighting;
 pub use odometry::{OdomCfg, Odometry};

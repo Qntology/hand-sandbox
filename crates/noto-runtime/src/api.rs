@@ -14,8 +14,13 @@ use crate::runtime::{label_ko, FrameView, Runtime, Submission};
 pub const MIN_CELLS: usize = 32;
 pub const MAX_CELLS: usize = 160;
 
-pub const COMMANDS: [&str; 33] = [
+pub const COMMANDS: [&str; 38] = [
     "act_status",
+    "crew_add",
+    "crew_clear",
+    "crew_mode",
+    "crew_status",
+    "camera_rig",
     "inventory_drop",
     "world_reset",
     "body_reset",
@@ -55,6 +60,11 @@ const FORECAST_HORIZON: usize = 16;
 fn r3(x: f32) -> f64 {
     let v = ((x as f64) * 1000.0).round() / 1000.0;
     if v == 0.0 { 0.0 } else { v }
+}
+
+/// Millimetre resolution, for the stereo σ of a near look.
+fn r4f(x: f32) -> f64 {
+    (x as f64 * 10_000.0).round() / 10_000.0
 }
 
 fn r4(x: f64) -> f64 {
@@ -176,6 +186,22 @@ pub fn snapshot_json(s: &WorldSnapshot) -> Value {
     });
     if let Some(site) = &s.site {
         v["site"] = site_json(site, d);
+    }
+    if !s.crew.is_empty() {
+        v["crew"] = json!(s
+            .crew
+            .iter()
+            .map(|c| json!({
+                "id": c.id, "form": c.form, "form_ko": c.form.label_ko(), "cameras": c.cameras,
+                "pos": pos(&c.pos, d), "yaw_deg": r3(wrap_deg(-c.yaw_deg)), "speed_mps": r3(c.speed_mps),
+                "carrying": c.carrying.iter().map(carry).collect::<Vec<_>>(), "carried_kg": r3(c.carried_kg), "capacity_kg": r3(c.capacity_kg),
+                "job": c.job, "status_ko": c.status_ko,
+                "rider": c.rider.as_ref().map(|r| json!([r3(r.x), r3(d - r.z)])),
+            }))
+            .collect::<Vec<_>>());
+    }
+    if let Some(r) = &s.rider {
+        v["rider"] = json!([r3(r.x), r3(d - r.z)]);
     }
     v
 }
@@ -361,6 +387,16 @@ fn num(args: &Value, key: &str) -> Option<f64> {
 
 fn text<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(Value::as_str)
+}
+
+pub fn stereo_json(st: noto_vision::StereoStats) -> Value {
+    let px = st.pixels().max(1) as f32;
+    let share = |n: u32| r3(n as f32 / px);
+    json!({
+        "grid": [st.width, st.height], "disparities": st.disparities, "focal_px": r3(st.focal_px), "baseline_m": r3(st.baseline_m), "ms": r3(st.ms),
+        "valid": share(st.valid), "far": share(st.far),
+        "rejected": {"border": share(st.border), "saturated": share(st.saturated), "no_texture": share(st.no_texture), "not_unique": share(st.not_unique), "lr_mismatch": share(st.lr_mismatch), "speckle": share(st.speckle)},
+    })
 }
 
 pub fn device_json(sel: &noto_ml::Selection) -> Value {
@@ -643,7 +679,7 @@ impl Runtime {
             .map(|(i, (id, ko))| json!({"id": id, "label_ko": ko, "state": if i < at { "done" } else if i == at { "active" } else { "pending" }}))
             .collect();
         let check = self.gaze_check.as_ref().filter(|g| Some(g.drop) == drop && w.tick.saturating_sub(g.tick) < 600).map(|g| {
-            json!({"ok": g.ok, "label_ko": g.label_ko, "score": g.score.map(r3), "range_m": g.range_m.map(r3), "depth_m": g.depth_m.map(r3), "bbox": g.bbox.map(|b| b.map(r3)), "reason": g.reason})
+            json!({"ok": g.ok, "label_ko": g.label_ko, "score": g.score.map(r3), "range_m": g.range_m.map(r3), "depth_m": g.depth_m.map(r3), "bbox": g.bbox.map(|b| b.map(r3)), "reason": g.reason, "depth_source": g.depth_source, "depth_sigma_m": g.depth_sigma_m.map(r4f)})
         });
         let hv = w.head_view(&self.cam);
         let pose = w.current_kin_pose();
@@ -654,7 +690,8 @@ impl Runtime {
             .or_else(|| self.gaze_check.as_ref().map(|g| g.label_ko.clone()));
         let tip = w.act.as_ref().or(w.last_act.as_ref()).filter(|_| forks).and_then(|p| p.rollout.metric("tip_ratio"));
         let sight = |s: &crate::vision::Sighting| {
-            json!({"camera": s.camera, "ok": s.ok, "matched": s.matched, "label_ko": s.label_ko, "score": s.score.map(r3), "range_m": s.range_m.map(r3), "depth_m": s.depth_m.map(r3), "bbox": s.bbox.map(|b| b.map(r3)), "neck_deg": r3(s.neck_deg), "reason": s.reason})
+            json!({"camera": s.camera, "ok": s.ok, "matched": s.matched, "label_ko": s.label_ko, "score": s.score.map(r3), "range_m": s.range_m.map(r3), "depth_m": s.depth_m.map(r3), "bbox": s.bbox.map(|b| b.map(r3)), "neck_deg": r3(s.neck_deg), "reason": s.reason,
+                   "depth_source": s.depth_source, "depth_sigma_m": s.depth_sigma_m.map(r4f), "depth_valid": s.depth_valid.map(r3), "sigma_m": s.sigma_m.map(r4f)})
         };
         let cross = self.fork_cross.as_ref().filter(|c| forks && !setting_down && Some(c.drop) == drop).map(|c| {
             json!({
@@ -673,6 +710,8 @@ impl Runtime {
         Some(json!({
             "act": if setting_down { "set_down" } else if matches!(phase, Some((ActKind::Look, "look" | "check")) | Some((ActKind::Fork, "align" | "rider_look" | "rider_check" | "lower" | "check"))) && action.starts_with("look") { "look" } else { "pick" },
             "mechanism": if forks { "fork" } else { "hand" },
+            "cameras": self.cameras(),
+            "depth_procedure": if self.stereo() { "sgbm" } else { "tipsv2" },
             "camera": if forks && matches!(stage, "lower" | "check" | "insert") { "fork" } else { "head" },
             "cross": cross,
             "fork_m": forks.then(|| r3(w.fork_m_now())),
@@ -725,6 +764,9 @@ impl Runtime {
             "sky": d.sky_frac.map(|f| json!({"frac": r3(f)})),
             "flip_tta": d.flip_tta,
             "camera": self.head_view_json(),
+            "cameras": self.cameras(),
+            "right_webp_base64": d.right_webp.as_ref().map(|b| STANDARD.encode(b)),
+            "stereo": d.stereo.map(stereo_json),
         }))
     }
 
@@ -881,7 +923,21 @@ impl Runtime {
             "devices": {"depth": self.ml.depth_device(), "locate": self.ml.locate_device(), "track": self.ml.tracker.device(), "ttm": self.gates.ttm().map(|t| noto_ml::device_label(t.device()))},
             "ml": {"depth": self.ml.depth_mode(), "locate": self.ml.locate_mode(), "track": self.ml.track_mode()},
             "stand_ins": self.stand_ins(),
+            "cameras": self.cameras(),
+            "stereo": self.ml.stereo_rig().map(|r| {
+                let (f, b, sub) = self.sigma_camera();
+                json!({"baseline_m": r3(r.baseline_m), "focal_px": r3(r.focal_px), "grid_focal_px": r3(f), "subpixel_px": r3(sub), "sigma_m_at": [[1.0, r4f(noto_core::act::material::stereo_depth_sigma(1.0, f, b, sub))], [2.0, r4f(noto_core::act::material::stereo_depth_sigma(2.0, f, b, sub))], [4.0, r4f(noto_core::act::material::stereo_depth_sigma(4.0, f, b, sub))]]})
+            }),
+            "tips_needed": !self.stereo(),
         }))
+    }
+
+    /// Cameras per eye: `{cameras: 1}` monocular (TIPSv2), `{cameras: 2}` stereo pair (SGBM, TIPSv2 not loaded).
+    pub fn api_camera_rig(&mut self, args: &Value) -> Result<Value, String> {
+        if let Some(n) = num(args, "cameras") {
+            self.set_cameras(n as u8).map_err(|e| format!("{e:#}"))?;
+        }
+        self.api_models_status()
     }
 
     pub fn api_call(&mut self, cmd: &str, args: &Value) -> Result<Value, String> {
@@ -906,6 +962,9 @@ impl Runtime {
                 if let Some(t) = text(args, "terrain").filter(|t| !t.is_empty()) {
                     self.cfg.terrain = world_sim::TerrainKind::from_id(t).ok_or_else(|| format!("알 수 없는 지형 '{t}' (open 또는 rugged)"))?;
                 }
+                if let Some(n) = num(args, "cameras") {
+                    self.set_cameras(n as u8).map_err(|e| format!("{e:#}"))?;
+                }
                 self.api_world_new(seed, size, config, text(args, "base"))
             }
             "sim_step" => self.api_sim_step(num(args, "ticks").unwrap_or(1.0).max(1.0) as u32),
@@ -928,6 +987,28 @@ impl Runtime {
             "tips_use" => self.api_model_use("tips", args),
             "sam_use" => self.api_model_use("sam", args),
             "devices" => Ok(device_json(&noto_ml::preferred())),
+            "camera_rig" => self.api_camera_rig(args),
+            "crew_status" => Ok(self.crew_json()),
+            "crew_add" => {
+                let n = num(args, "count").unwrap_or(1.0).max(1.0) as usize;
+                let form = text(args, "form").unwrap_or("mixed");
+                let cameras = num(args, "cameras").map(|c| c.clamp(1.0, 2.0) as u8);
+                self.crew_add(n, form, cameras)?;
+                if let Some(m) = text(args, "mode").and_then(crate::crew::TrackMode::from_id) {
+                    self.set_track(m);
+                }
+                Ok(json!({"crew": self.crew_json(), "snapshot": snapshot_json(&self.snapshot())}))
+            }
+            "crew_clear" => {
+                let removed = self.crew_clear();
+                Ok(json!({"removed": removed, "crew": self.crew_json(), "snapshot": snapshot_json(&self.snapshot())}))
+            }
+            "crew_mode" => {
+                let m = text(args, "mode").ok_or("mode 가 필요합니다 (solo 또는 team)")?;
+                let mode = crate::crew::TrackMode::from_id(m).ok_or_else(|| format!("알 수 없는 작업 방식 '{m}' (solo 또는 team)"))?;
+                self.set_track(mode);
+                Ok(self.crew_json())
+            }
             "nn_status" => Ok(json!({"scenarios": self.nn_live.summary(), "phases": self.nn_live.phases().collect::<Vec<_>>()})),
             "physics_status" => Ok(self.api_physics_status()),
             "act_status" => Ok(self.api_act_status()),

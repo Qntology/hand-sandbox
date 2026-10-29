@@ -653,9 +653,11 @@ impl MlPipeline {
             self.tracker.prepare(&sel)?;
         }
         let heads = scene_heads(&self.fix);
+        // A stereo engine needs each frame's right image, which a batch of left frames does not carry; it runs per
+        // keyframe in `analyse_with`, on the CPU.
         let depths = match &mut self.depth {
-            DepthEngine::Model(m) => Some(m.infer_scene_batch(&sel, heads)?),
-            DepthEngine::StandIn(_) => None,
+            DepthEngine::Model(m) if m.stereo_rig().is_none() => Some(m.infer_scene_batch(&sel, heads)?),
+            DepthEngine::Model(_) | DepthEngine::StandIn(_) => None,
         };
         let points = match &mut self.locate {
             LocateEngine::Model(m) => Some(m.locate_batch(&sel, &self.labels)?),
@@ -695,7 +697,7 @@ impl MlPipeline {
 
     pub fn depth_mode(&self) -> String {
         match &self.depth {
-            DepthEngine::Model(m) if self.fix.align.is_some() => format!("{}+ground", m.mode()),
+            DepthEngine::Model(m) if self.fix.align.is_some() && m.stereo_rig().is_none() => format!("{}+ground", m.mode()),
             DepthEngine::Model(m) => m.mode().to_string(),
             DepthEngine::StandIn(s) if s.err.is_some() => "stand-in(tipsv2-measured)".into(),
             DepthEngine::StandIn(_) => "stand-in(tipsv2-like)".into(),
@@ -737,13 +739,30 @@ impl MlPipeline {
     }
 
     pub fn analyse(&mut self, rgb: &Rgb, intr: &Intrinsics, pose: &Pose, truth: Option<&KeyTruth>, wanted: &[String], floor: &dyn Fn(&str) -> f32, prefer_track: Option<u32>) -> Result<MlFrame> {
-        self.analyse_with(rgb, intr, pose, truth, wanted, floor, prefer_track, None)
+        self.analyse_with(rgb, None, intr, pose, truth, wanted, floor, prefer_track, None)
+    }
+
+    /// The stereo rig of the depth slot's engine, when it is a stereo pair's (SGBM) rather than one camera's.
+    pub fn stereo_rig(&self) -> Option<noto_vision::StereoRig> {
+        match &self.depth {
+            DepthEngine::Model(m) => m.stereo_rig(),
+            DepthEngine::StandIn(_) => None,
+        }
+    }
+
+    /// What the stereo engine's last pair gave (grid, share with depth, why the rest has none).
+    pub fn stereo_stats(&self) -> Option<noto_vision::StereoStats> {
+        match &self.depth {
+            DepthEngine::Model(m) => m.stereo_stats(),
+            DepthEngine::StandIn(_) => None,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn analyse_with(
         &mut self,
         rgb: &Rgb,
+        right: Option<&Rgb>,
         intr: &Intrinsics,
         pose: &Pose,
         truth: Option<&KeyTruth>,
@@ -758,6 +777,12 @@ impl MlPipeline {
         self.pre_order.retain(|k| *k != key);
         let heads = scene_heads(&self.fix);
         let scene = match (pre.depth, &mut self.depth, truth) {
+            // Two cameras: SGBM on the pair, metric, NaN where it could not match. No right image is an error, not a
+            // reason to guess from the left one.
+            (_, DepthEngine::Model(m), _) if m.stereo_rig().is_some() => match right {
+                Some(r) => noto_vision::DepthScene::depth_only(m.infer_pair(rgb, r)?),
+                None => anyhow::bail!("스테레오 깊이(SGBM)에 오른쪽 화면이 없습니다"),
+            },
             (Some(d), DepthEngine::Model(_), _) => d,
             (_, DepthEngine::Model(m), _) => m.infer_scene(rgb, heads)?,
             (_, DepthEngine::StandIn(s), Some(t)) => noto_vision::DepthScene::depth_only(s.run(t)),
@@ -766,8 +791,11 @@ impl MlPipeline {
         let mut depth = scene.depth;
         let seg = scene.segmentation;
         let normals = scene.normals.filter(|_| self.fix.normals);
+        // The ground fit turns a monocular model's relative depth into metres; a stereo pair's already is, and it
+        // skips the fit (and its clipping at the model's saturation).
+        let stereo = self.stereo_rig().zip(self.stereo_stats());
         let align = match (&self.depth, &self.fix.align) {
-            (DepthEngine::Model(m), Some(cfg)) => noto_vision::ground_align_with(&mut depth, normals.as_ref(), intr, pose, height, m.max_depth_m(), cfg),
+            (DepthEngine::Model(m), Some(cfg)) if m.stereo_rig().is_none() => noto_vision::ground_align_with(&mut depth, normals.as_ref(), intr, pose, height, m.max_depth_m(), cfg),
             _ => None,
         };
         let mut points = match (pre.points, &mut self.locate, truth) {
@@ -803,9 +831,16 @@ impl MlPipeline {
             let d = depth.median_in(&t.mask);
             let mut range = d.map(|d| intr.ground_range(pose.yaw, t.cx, t.cy, d));
             let mut sigma = None;
-            if model_depth && (self.fix.align.is_some() || self.fix.contact_range) {
-                let rel = align.map_or(0.5, |f| f.median_rel_err.max(self.fix.depth_rel_sigma));
-                sigma = range.map(|r| rel * r);
+            if model_depth && (stereo.is_some() || self.fix.align.is_some() || self.fix.contact_range) {
+                sigma = match (stereo, d, range) {
+                    // The stereo law on the grid SGBM matched on: σ_Z = Z²·σ_d / (f·b), carried to the ground range.
+                    (Some((rig, st)), Some(z), Some(r)) => Some(noto_core::act::material::stereo_depth_sigma(z, st.focal_px, st.baseline_m, rig.subpixel_px) * r / z.max(1e-3)),
+                    (Some(_), _, _) => None,
+                    (None, _, _) => {
+                        let rel = align.map_or(0.5, |f| f.median_rel_err.max(self.fix.depth_rel_sigma));
+                        range.map(|r| rel * r)
+                    }
+                };
                 if self.fix.contact_range && self.drops.contains(&t.label) {
                     if let Some((rc, sc)) = noto_vision::contact_range(intr, pose, &t.mask, height, self.fix.pitch_sigma_deg, 20.0) {
                         (range, sigma) = match (range, sigma) {

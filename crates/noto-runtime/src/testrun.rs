@@ -187,7 +187,7 @@ impl Runtime {
         self.ml_task = None;
         let mut rec = Recording::new(pass, &self.run_id, self.world.tick);
         if pass == "game" {
-            if let Ok(kf) = capture_keyframe(&self.world, &self.cam, self.test_cfg.record.quality, 0) {
+            if let Ok(kf) = capture_keyframe(&self.world, &self.cam, self.test_cfg.record.quality, 0, self.stereo_baseline()) {
                 rec.keyframes.push(kf);
             }
         }
@@ -223,7 +223,7 @@ impl Runtime {
                 }
                 return;
             }
-            if let Ok(mut kf) = capture_keyframe(&self.world, &self.cam, cfg.quality, index) {
+            if let Ok(mut kf) = capture_keyframe(&self.world, &self.cam, cfg.quality, index, self.stereo_baseline()) {
                 kf.step = self.current_step_label();
                 if let Some(r) = self.recording.as_mut() {
                     r.keyframes.push(kf);
@@ -572,6 +572,7 @@ fn placeholder(k: &Keyframe) -> Keyframe {
         pose: k.pose,
         intr: k.intr,
         webp: Vec::new(),
+        webp_right: None,
         truth: crate::ml::KeyTruth { width: 0, height: 0, ids: vec![], depth: vec![], objects: vec![], positions: vec![], src_width: 0, src_height: 0 },
         step: None,
         action: None,

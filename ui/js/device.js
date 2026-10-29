@@ -2,7 +2,7 @@
 // 모델 받기·삭제·불러오기는 models.js 가 맡는다(네 모델은 필수라 끄는 스위치가 없다).
 import { call } from './api.js';
 import { bus, state } from './state.js';
-import { $, clear, el } from './util.js';
+import { $, clear, el, fmt } from './util.js';
 import { openSection } from './layout.js';
 import { setStatus } from './toast.js';
 
@@ -96,7 +96,13 @@ export function updateModelLines() {
   $('model-ttm').textContent = `${ttmText(f?.method, state.models)}${ttmDev ? ` · ${ttmDev}` : ''}`;
   const ml = state.models?.ml;
   const dev = state.models?.devices;
-  $('model-depth').textContent = ml ? `${ml.depth} · ${dev?.depth ?? '-'}` : '미확인';
+  const stereo = state.models?.cameras === 2;
+  if ($('model-depth-k')) $('model-depth-k').textContent = stereo ? '깊이 (SGBM 스테레오)' : '깊이 (TIPSv2)';
+  $('model-depth').textContent = ml
+    ? stereo
+      ? `${ml.depth} · CPU · 기선 ${fmt.n((state.models.stereo?.baseline_m ?? 0) * 100, 1)} cm · TIPSv2 안 씀`
+      : `${ml.depth} · ${dev?.depth ?? '-'}`
+    : '미확인';
   $('model-mask').textContent = ml ? `${ml.track} · ${dev?.track ?? '-'}` : '미확인';
   $('model-embed').textContent = c ? (c.mode === 'embedding' ? '임베딩 + 어휘' : '어휘 전용 (lexical)') : state.models ? (state.models.parser_embedding ? '임베딩 + 어휘 (연결됨)' : '어휘 전용 (lexical)') : '미확인 — 명령 실행 시 갱신';
   $('model-sds').textContent = sds?.recipe ?? '미확인';

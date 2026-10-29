@@ -47,7 +47,8 @@ function modelRow(m, compact) {
   const loadingNow = cat.loading === m.id;
   let stateText;
   const dev = cat.live_devices?.[m.id];
-  if (m.present) stateText = loadingNow ? '불러오는 중…' : cat.ready ? `사용 중${dev ? ` · ${dev}` : ''}` : '받음';
+  if (m.needed === false) stateText = m.present ? '받음 · 카메라 2대라 쓰지 않음 (SGBM)' : '카메라 2대라 필요 없음 (SGBM)';
+  else if (m.present) stateText = loadingNow ? '불러오는 중…' : cat.ready ? `사용 중${dev ? ` · ${dev}` : ''}` : '받음';
   else if (active) stateText = dl.phase === 'verify' ? '검사 중 (SHA-256)…' : `받는 중 ${pct.toFixed(1)}%`;
   else if (queued) stateText = '대기';
   else if (m.have > 0) stateText = `일부만 받음 ${pct.toFixed(0)}% — 이어 받기 가능`;
@@ -96,7 +97,7 @@ function summaryLine() {
   if (cat.load_error) return { pct: 0, text: cat.load_error, err: true };
   if (dl.phase === 'cancelled') return { pct: 0, text: '받기를 취소했습니다. 받은 부분(.part)은 남아 있어 이어 받을 수 있습니다.' };
   const hint = cat.gpu_hint ? ` ${cat.gpu_hint}` : '';
-  if (cat.ready) return { pct: 100, text: `네 모델 모두 ${cat.device.backend.toUpperCase()} #${cat.device.ordinal} 에 올라가 있습니다.${hint}`, err: !!cat.gpu_hint };
+  if (cat.ready) return { pct: 100, text: `${cat.cameras === 2 ? '필요한 세 모델(카메라 2대: 깊이는 SGBM)이' : '네 모델 모두'} ${cat.device.backend.toUpperCase()} #${cat.device.ordinal} 에 올라가 있습니다.${hint}`, err: !!cat.gpu_hint };
   if (cat.all_present) return { pct: 100, text: '모든 파일을 받았습니다. 불러오기를 누르면 장치에 올립니다.' };
   return { pct: 0, text: `받아야 할 용량 ${size(missingBytes())} — 받기 전에는 시뮬레이터가 실행되지 않습니다.` };
 }

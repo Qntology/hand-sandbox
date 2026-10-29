@@ -85,6 +85,61 @@ function drawSite(ctx, site, X, Y, s) {
   }
 }
 
+// 서브 작업자: 휴머노이드는 주황 원, 지게차는 노란 네모와 포크 — 번호를 붙이고, 짐을 들었으면 테두리를 두른다.
+// 하차한 탑승자(최초 작업자의 것 포함)는 작은 사람 점으로 따로 그린다.
+function drawCrew(ctx, snap, X, Y) {
+  ctx.font = `8px ${cssVar('--font-sans')}`;
+  ctx.textAlign = 'center';
+  const rider = (p) => {
+    if (!Array.isArray(p)) return;
+    ctx.fillStyle = '#d65c28';
+    ctx.strokeStyle = 'rgba(0,0,0,0.7)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(X(p[0]), Y(p[1]), 2.2, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  };
+  rider(snap.rider);
+  for (const c of snap.crew ?? []) {
+    const [cx, cy] = c.pos;
+    const yaw = ((c.yaw_deg ?? 0) * Math.PI) / 180;
+    const loaded = (c.carrying ?? []).length > 0;
+    ctx.save();
+    ctx.translate(X(cx), Y(cy));
+    ctx.rotate(-yaw);
+    ctx.lineWidth = loaded ? 1.8 : 1;
+    ctx.strokeStyle = loaded ? cssVar('--text-bright') : 'rgba(0,0,0,0.65)';
+    if (c.form === 'forklift') {
+      ctx.fillStyle = '#e8c028';
+      ctx.fillRect(-4.5, -3.2, 7, 6.4);
+      ctx.strokeRect(-4.5, -3.2, 7, 6.4);
+      ctx.strokeStyle = '#3c3c44';
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.moveTo(2.5, -2);
+      ctx.lineTo(7, -2);
+      ctx.moveTo(2.5, 2);
+      ctx.lineTo(7, 2);
+      ctx.stroke();
+    } else {
+      ctx.fillStyle = '#ec8034';
+      ctx.beginPath();
+      ctx.arc(0, 0, 3.3, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(3.3, 0);
+      ctx.lineTo(6, 0);
+      ctx.stroke();
+    }
+    ctx.restore();
+    rider(c.rider);
+    ctx.fillStyle = cssVar('--text-bright');
+    ctx.fillText(String(c.id), X(cx), Y(cy) - 6);
+  }
+}
+
 function draw() {
   const canvas = $('minimap');
   if (!canvas.offsetParent) return;
@@ -185,36 +240,8 @@ function draw() {
     ctx.stroke();
     ctx.restore();
   }
+  drawCrew(ctx, snap, X, Y);
   // 움직임: 후진이면 꽁무니 쪽으로 화살 꼬리를, 3점 회전·제자리 회전이면 몸 둘레에 호를 그린다.
-const partner = snap.agent.partner;
-  if (partner && Array.isArray(partner.pos)) {
-    const [px, py] = partner.pos;
-    const pyaw = ((partner.yaw_deg ?? 0) * Math.PI) / 180;
-    if (partner.holding) {
-      ctx.strokeStyle = cssVar('--signal');
-      ctx.lineWidth = 1.2;
-      ctx.setLineDash([3, 2]);
-      ctx.beginPath();
-      ctx.moveTo(X(ax), Y(ay));
-      ctx.lineTo(X(px), Y(py));
-      ctx.stroke();
-      ctx.setLineDash([]);
-    }
-    ctx.save();
-    ctx.translate(X(px), Y(py));
-    ctx.rotate(-pyaw);
-    ctx.strokeStyle = cssVar('--signal');
-    ctx.fillStyle = partner.holding ? cssVar('--signal') : 'rgba(80, 180, 220, 0.35)';
-    ctx.lineWidth = 1.3;
-    ctx.beginPath();
-    ctx.moveTo(5.5, 0);
-    ctx.lineTo(-3.8, 3.2);
-    ctx.lineTo(-3.8, -3.2);
-    ctx.closePath();
-    ctx.fill();
-    ctx.stroke();
-    ctx.restore();
-  }
 
   const motion = snap.agent.motion;
   ctx.save();

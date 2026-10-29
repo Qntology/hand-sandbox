@@ -41,6 +41,7 @@ impl Runtime {
 
     pub(crate) fn ml_analyse(&mut self, kf: &mut Keyframe, wanted: &[String], prefer: Option<u32>) -> Result<MlOut> {
         let rgb = kf.rgb()?;
+        let right = kf.rgb_right()?;
         let lmode = self.ml.locate_mode();
         let floor_default = default_floor(&lmode);
         let floors: BTreeMap<String, f32> = wanted
@@ -55,7 +56,7 @@ impl Runtime {
         let ground0 = self.world.surface_m(kf.pose.x, kf.pose.z);
         let world = &self.world;
         let height = move |x: f32, z: f32| world.surface_m(x, z) - ground0;
-        let frame = self.ml.analyse_with(&rgb, &kf.intr, &kf.pose, Some(&kf.truth), wanted, &|l| floors.get(l).copied().unwrap_or(floor_default), prefer, Some(&height))?;
+        let frame = self.ml.analyse_with(&rgb, right.as_ref(), &kf.intr, &kf.pose, Some(&kf.truth), wanted, &|l| floors.get(l).copied().unwrap_or(floor_default), prefer, Some(&height))?;
         let (dmode, tmode) = (self.ml.depth_mode(), self.ml.track_mode());
         let label = frame.target.as_ref().map(|t| t.label.clone()).or_else(|| wanted.first().cloned()).unwrap_or_default();
 
@@ -63,6 +64,10 @@ impl Runtime {
         if let Some(m) = &frame.depth_metrics {
             self.sds.record_baseline(&dscope, "absrel", m.absrel as f64);
             self.sds.record_baseline(&dscope, "delta1", m.delta1 as f64);
+        }
+        if let Some(st) = self.ml.stereo_stats() {
+            // How much of each stereo keyframe SGBM could match: a drop shows a decalibrated rig or a darker scene.
+            self.sds.record_baseline(&dscope, "stereo_valid", st.valid_frac() as f64);
         }
         if let Some(f) = &frame.align {
             self.sds.record_baseline(&dscope, "align_a", f.a as f64);

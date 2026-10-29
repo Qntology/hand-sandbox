@@ -57,12 +57,20 @@ pub struct CameraCfg {
     pub fov_deg: f32,
     pub pitch_deg: f32,
     pub max_dist_m: f32,
+    /// Cameras per eye (the head, and a lift truck's carriage camera): 1 is a monocular RGB camera whose depth comes
+    /// from TIPSv2, 2 a rectified stereo pair whose depth comes from SGBM (TIPSv2 is then neither loaded nor run).
+    #[serde(default = "one_camera")]
+    pub cameras: u8,
+}
+
+fn one_camera() -> u8 {
+    1
 }
 
 impl Default for CameraCfg {
     fn default() -> Self {
         let c = Camera::default();
-        CameraCfg { width: c.width, height: c.height, fov_deg: c.fov_deg, pitch_deg: c.pitch_deg, max_dist_m: c.max_dist_m }
+        CameraCfg { width: c.width, height: c.height, fov_deg: c.fov_deg, pitch_deg: c.pitch_deg, max_dist_m: c.max_dist_m, cameras: one_camera() }
     }
 }
 

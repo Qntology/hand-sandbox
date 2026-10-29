@@ -480,7 +480,7 @@ impl Runtime {
             look_cam.pitch_deg -= applied_tilt;
         }
         let index = self.recording.as_ref().map_or(0, |r| r.keyframes.len()) as u32;
-        let mut kf = match capture_keyframe(&self.world, &look_cam, self.test_cfg.record.quality, index) {
+        let mut kf = match capture_keyframe(&self.world, &look_cam, self.test_cfg.record.quality, index, self.stereo_baseline()) {
             Ok(k) => k,
             Err(e) => return fail("capture_failed", e.to_string()),
         };

@@ -60,12 +60,9 @@ function buildCard(q) {
   const open = isOpen(q);
   const finished = q.state === 'done' || q.state === 'failed';
   const pct = Math.round(overall(q) * 100);
-  const coopTag = (state.teamSize ?? 1) >= 2
-    ? (q.state === 'active'
-      ? ` · 순차 협동 (로봇 ${state.activeRobot ?? 1}/2 연산 중)`
-      : q.state === 'pending'
-        ? ' · 순차 협동 대기열 (로봇 1→2)'
-        : ' · 순차 협동')
+  // 누가 하는가: 0 팀의 협업 흐름, 1 최초 작업자(전체 비전), 2… 서브 작업자 레인.
+  const coopTag = q.owner === 0 ? ' · 협업 흐름 (팀)'
+    : q.track ? ` · ${q.track === 'team' ? '협업' : '개별'} · ${q.owner === 1 ? '작업자 1 (전체 비전)' : `작업자 ${q.owner}`}`
     : '';
   return el('article', { class: `quest-card ${q.state}`, dataset: { quest: q.id }, aria: { label: `퀘스트 ${q.title}` } },
     el('div', { class: 'quest-head' },

@@ -116,6 +116,31 @@ pub struct WorldSnapshot {
     pub terrain: TerrainKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub site: Option<SiteView>,
+    /// Sub-workers around the first worker (`crew`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub crew: Vec<CrewView>,
+    /// The first worker's lift-truck rider while it is on foot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rider: Option<Pos3>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CrewView {
+    pub id: u32,
+    pub form: crate::crew::Form,
+    pub cameras: u8,
+    pub pos: Pos3,
+    pub yaw_deg: f32,
+    pub speed_mps: f32,
+    pub carrying: Vec<CarryView>,
+    pub carried_kg: f32,
+    pub capacity_kg: f32,
+    pub job: crate::crew::Job,
+    pub status_ko: String,
+    pub energy_j: f64,
+    /// Its rider while on foot (a lift truck felling).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rider: Option<Pos3>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
