@@ -6,6 +6,7 @@ use noto_core::dynamics::{self, BodyPose, DynCfg, DynDigest, Rollout};
 use noto_core::{compute_body, BalanceSummary, BodyInputs, BodyLimits, BodyPlan, BodyStatus, ConfigError, Hand, NotoConfig};
 use serde::{Deserialize, Serialize};
 
+use crate::clear::{self, ClearMap, Footprint};
 use crate::fixture::Fixture;
 use crate::kinds::{Ground, ItemKind, NodeKind, MIN_PIECE};
 use crate::nav::{self, Cell, EdgePlan, Goal};
@@ -350,6 +351,8 @@ pub struct World {
     pub gaze: Option<GazeHold>,
     /// The eye is the fork carriage camera instead of the rider's head (a wheeled base checking an item at the floor).
     pub fork_cam: bool,
+    /// The clearance map for the nodes standing now (`clear::ClearMap`), keyed by them.
+    room: Mutex<Option<(u64, std::sync::Arc<ClearMap>)>>,
 }
 
 impl Clone for World {
@@ -393,6 +396,7 @@ impl Clone for World {
             fixtures: self.fixtures.clone(),
             gaze: self.gaze,
             fork_cam: self.fork_cam,
+            room: Mutex::new(self.room.lock().unwrap_or_else(|e| e.into_inner()).clone()),
         }
     }
 }
@@ -687,6 +691,7 @@ impl World {
             fixtures,
             gaze: None,
             fork_cam: false,
+            room: Mutex::new(None),
         })
     }
 
@@ -958,9 +963,35 @@ impl World {
         }
     }
 
+    /// A route that keeps the body clear of trees, rocks, walls and water: the half width and `clear::MIN_GAP_M` where
+    /// it can, `clear::TIGHT_GAP_M` where nothing roomier gets there, and no route where the body does not fit.
     pub fn plan_route(&self, goal: Goal) -> Option<nav::Plan> {
         let blocked = self.blocked_cells();
-        nav::plan(&self.drive_spec(), &self.terrain, &|x, z| blocked.contains(&(x, z)), self.agent_cell(), goal)
+        let map = self.clear_map();
+        let (spec, fp) = (self.drive_spec(), self.footprint());
+        [clear::MIN_GAP_M, clear::TIGHT_GAP_M].into_iter().find_map(|gap| {
+            let room = nav::Room { map: &map, need_m: fp.half_w_m + gap, soft_m: fp.half_w_m + clear::COMFORT_GAP_M };
+            nav::plan_room(&spec, &self.terrain, &|x, z| blocked.contains(&(x, z)), Some(&room), self.agent_cell(), goal, None)
+        })
+    }
+
+    /// The body's outline on the ground (`clear::Footprint`).
+    pub fn footprint(&self) -> Footprint {
+        Footprint::of(&self.body)
+    }
+
+    /// How far everything the body can hit is from each point (`clear::ClearMap`), built again when a node goes.
+    pub fn clear_map(&self) -> std::sync::Arc<ClearMap> {
+        let key = self.nodes.iter().fold(self.nodes.len() as u64 ^ (self.fixtures.len() as u64) << 32, |h, n| (h ^ n.id as u64).wrapping_mul(0x0000_0100_0000_01B3));
+        let mut slot = self.room.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((k, m)) = slot.as_ref() {
+            if *k == key {
+                return m.clone();
+            }
+        }
+        let map = std::sync::Arc::new(ClearMap::build(&self.terrain, &self.nodes, &self.fixtures, self.standing_eye_m() + 0.2));
+        *slot = Some((key, map.clone()));
+        map
     }
 
     pub fn command(&mut self, action: Action) -> Result<Vec<TimedEvent>, ActionError> {

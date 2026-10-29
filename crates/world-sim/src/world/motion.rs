@@ -4,6 +4,13 @@
 //! path bends more than it can steer, turns there the way the base can (scrub pivot, K-turn, step turn), and reaches
 //! a goal close behind it in reverse. The cell edges keep their physics (speed on the ground and slope, curb pauses,
 //! footsteps, slip): the edge under the base sets the speed at each moment.
+//!
+//! The body keeps clear of what it can hit (`clear`): the route's corners are pushed to the middle of the gaps, a step
+//! that would bring the body's outline against a tree, a rock or a wall follows the route line instead of cutting the
+//! corner, and a turn in place is taken only where its sweep is clear. Where there is no room to turn and the way on is
+//! behind (a dead end between obstacles), the base does not spin on the spot: it backs straight out the way it came
+//! in, as a driver reverses out of a blind alley, to the first place it can turn, turns there and goes on forward. A
+//! turn asked for in such a place (the search looking about, facing an item) backs out first the same way.
 
 use super::*;
 use crate::steer::{self, Seg, TurnCaps, TurnKind};
@@ -24,6 +31,10 @@ pub const STALL_S: f32 = 2.5;
 pub const FINAL_APPROACH_M: f32 = 0.45;
 pub const STEER_MAX_RAD: f32 = 0.75;
 pub const STEER_RATE_RAD_S: f32 = 1.0;
+/// How far apart the places a backing base tries to turn at are (m).
+pub const BACK_OUT_STEP_M: f32 = 0.1;
+/// The farthest a base backs straight out of a dead end looking for room to turn (m) [추정].
+pub const BACK_OUT_MAX_M: f32 = 6.0;
 
 #[derive(Clone, Debug)]
 pub(crate) struct SegRun {
@@ -82,6 +93,14 @@ impl Follow {
         (a.0 + (b.0 - a.0) * u, a.1 + (b.1 - a.1) * u)
     }
 
+    /// Lengths along the route again after its points moved.
+    pub fn measure(&mut self) {
+        self.cum = vec![0.0];
+        for w in self.path.windows(2) {
+            self.cum.push(self.cum.last().unwrap() + (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1));
+        }
+    }
+
     pub fn edge_index(&self, s: f32) -> usize {
         let k = self.cum.partition_point(|c| *c <= s.max(0.0)).clamp(1, self.path.len().max(2) - 1);
         self.edge_at.get(k - 1).copied().unwrap_or(0)
@@ -124,11 +143,42 @@ pub(crate) fn follow_of(start: (f32, f32), edges: &[EdgePlan]) -> Follow {
         path.push(p);
         edge_at.push(i);
     }
-    let mut cum = vec![0.0];
-    for w in path.windows(2) {
-        cum.push(cum.last().unwrap() + (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1));
+    let mut f = Follow { path, edge_at, ..Follow::default() };
+    f.measure();
+    f
+}
+
+/// Whether the base may take a pose: its centre on dry ground of the map, off blocked cells and no curb or ledge
+/// away from the height it measures from, and its outline `clear::TOUCH_GAP_M` off anything it can hit (or no
+/// closer than it already is, when it starts closer).
+pub(crate) struct PoseCheck {
+    map: std::sync::Arc<ClearMap>,
+    fp: Footprint,
+    blocked: HashSet<Cell>,
+    here: Cell,
+    pub h0: f32,
+    step: f32,
+    gap: f32,
+}
+
+impl PoseCheck {
+    pub fn ok(&self, t: &Terrain, x: f32, z: f32, yaw: f32) -> bool {
+        self.ok_from(t, x, z, yaw, self.h0)
     }
-    Follow { path, cum, edge_at, ..Follow::default() }
+
+    pub fn ok_from(&self, t: &Terrain, x: f32, z: f32, yaw: f32, h_ref: f32) -> bool {
+        let centre = match t.cell_of(x, z) {
+            Some(c) if c == self.here && (h_ref - self.h0).abs() < 1e-6 => true,
+            Some(c) => !t.is_water(c.0, c.1) && !self.blocked.contains(&c) && (t.height_m(c.0, c.1) + t.curb_m(c.0, c.1) - h_ref).abs() <= self.step + 0.01,
+            None => false,
+        };
+        centre && self.fp.room(&self.map, x, z, yaw) >= self.gap
+    }
+
+    /// How high the ground stands at the cell under (`x`, `z`) (m).
+    pub fn ground_m(t: &Terrain, x: f32, z: f32) -> f32 {
+        t.cell_of(x, z).map_or(0.0, |c| t.height_m(c.0, c.1) + t.curb_m(c.0, c.1))
+    }
 }
 
 impl World {
@@ -140,31 +190,131 @@ impl World {
         self.hand.base.kind == noto_core::BaseKind::Track
     }
 
-    /// Ground the base may stand on while it manoeuvres: on the map, dry, unobstructed, and no curb or ledge away
-    /// from where it stands now.
-    pub(crate) fn free_at(&self, x: f32, z: f32) -> bool {
+    /// What the base may do with its body here (`PoseCheck`), measured from where it stands now.
+    pub(crate) fn pose_check(&self) -> PoseCheck {
         let here = self.agent_cell();
-        let blocked = self.blocked_cells();
-        let h0 = self.terrain.height_m(here.0, here.1) + self.terrain.curb_m(here.0, here.1);
-        let step = self.drive_spec().max_step_m;
-        match self.terrain.cell_of(x, z) {
-            Some(c) if c == here => true,
-            Some(c) => !self.terrain.is_water(c.0, c.1) && !blocked.contains(&c) && (self.terrain.height_m(c.0, c.1) + self.terrain.curb_m(c.0, c.1) - h0).abs() <= step + 0.01,
-            None => false,
+        let map = self.clear_map();
+        let fp = self.footprint();
+        let now = fp.room(&map, self.agent.x, self.agent.z, self.agent.yaw);
+        PoseCheck {
+            gap: clear::TOUCH_GAP_M.min(now - 0.005).max(0.0),
+            map,
+            fp,
+            blocked: self.blocked_cells(),
+            here,
+            h0: self.terrain.height_m(here.0, here.1) + self.terrain.curb_m(here.0, here.1),
+            step: self.drive_spec().max_step_m,
         }
     }
 
+    /// Whether the base, at (`x`, `z`) facing `yaw`, has room to turn in place to face `to` (a pivot or a K-turn whose
+    /// sweep is clear). `h_ref` is the ground height the manoeuvre measures curbs from.
+    pub(crate) fn room_to_turn(&self, check: &PoseCheck, x: f32, z: f32, yaw: f32, to: f32, h_ref: f32) -> bool {
+        let caps = self.turn_caps();
+        let v = self.drive_spec().max_speed_mps;
+        steer::turn_in_place((x, z, yaw), wrap_angle(to - yaw), &caps, self.is_track(), v, &|px, pz, pyaw| check.ok_from(&self.terrain, px, pz, pyaw, h_ref)).is_some()
+    }
+
+    /// The first spot straight behind the base (every `BACK_OUT_STEP_M`, at most `BACK_OUT_MAX_M`, over ground it may
+    /// back across) where it has room to turn to face `want(x, z)`: how far back it is, and the turn there (none when
+    /// `want` is within `ok_rad` of the heading). `None` when the way back is blocked first.
+    fn back_out_spot(&self, check: &PoseCheck, ok_rad: f32, want: &dyn Fn(f32, f32) -> f32) -> Option<(f32, steer::Maneuver)> {
+        let caps = self.turn_caps();
+        let v = self.drive_spec().max_speed_mps;
+        let (x0, z0, yaw) = (self.agent.x, self.agent.z, self.agent.yaw);
+        let (sn, c) = yaw.sin_cos();
+        let mut h_prev = check.h0;
+        let n = (BACK_OUT_MAX_M / steer::SAMPLE_M).ceil() as usize;
+        let per_try = (BACK_OUT_STEP_M / steer::SAMPLE_M).round().max(1.0) as usize;
+        for k in 1..=n {
+            let d = k as f32 * steer::SAMPLE_M;
+            let (x, z) = (x0 - c * d, z0 - sn * d);
+            if !check.ok_from(&self.terrain, x, z, yaw, h_prev) {
+                return None;
+            }
+            h_prev = PoseCheck::ground_m(&self.terrain, x, z);
+            if k % per_try != 0 {
+                continue;
+            }
+            let delta = wrap_angle(want(x, z) - yaw);
+            if delta.abs() <= ok_rad {
+                return Some((d, steer::Maneuver { kind: "none", label_ko: String::new(), segs: vec![], time_s: 0.0 }));
+            }
+            let h = h_prev;
+            if let Some(m) = steer::turn_in_place((x, z, yaw), delta, &caps, self.is_track(), v, &|px, pz, pyaw| check.ok_from(&self.terrain, px, pz, pyaw, h)) {
+                return Some((d, m));
+            }
+        }
+        None
+    }
+
+    /// Backing `d` m straight out, then `turn`, as one manoeuvre from where the base stands.
+    fn backed_turn(&self, d: f32, turn: steer::Maneuver, label_ko: String) -> SegRun {
+        let caps = self.turn_caps();
+        let mut segs = steer::reverse_line(d);
+        segs.extend(turn.segs);
+        let time_s = steer::maneuver_time(&segs, &caps, self.drive_spec().max_speed_mps);
+        SegRun::new(steer::Maneuver { kind: "reverse", label_ko, segs, time_s }, (self.agent.x, self.agent.z, self.agent.yaw))
+    }
+
+    fn back_word(&self) -> &'static str {
+        if self.turn_caps().kind == TurnKind::Legs {
+            "뒷걸음"
+        } else {
+            "후진"
+        }
+    }
+
+    /// A dead end: there is no room to turn here and the way on is behind. The base backs straight out, the way it
+    /// came in, as a driver reverses out of a blind alley, to the first spot where its sweep is clear to turn toward
+    /// the route, and turns there (`back_out_spot`); with no such spot it reverses along the route instead. Returns
+    /// whether it found the spot.
+    pub(crate) fn back_out(&self, f: &mut Follow, check: &PoseCheck) -> bool {
+        let caps = self.turn_caps();
+        let stop = if caps.kind == TurnKind::Legs { ALPHA_STOP_LEGS_RAD } else { ALPHA_STOP_SKID_RAD };
+        let total = f.total_m();
+        let how = self.back_word();
+        let route = |x: f32, z: f32| {
+            let near = f.project((x, z), 0.0, total);
+            let ahead = f.point_at((near + LOOKAHEAD_MAX_M).min(total));
+            (ahead.1 - z).atan2(ahead.0 - x)
+        };
+        let spot = self.back_out_spot(check, stop, &route);
+        f.steer = 0.0;
+        match spot {
+            Some((d, turn)) => {
+                let label_ko = format!("막다른 길: 돌 자리가 없어 {d:.1} m 곧게 {how}해 빠져나온 뒤 돎");
+                f.note = Some(("dead_end", label_ko.clone()));
+                f.man = Some(self.backed_turn(d, turn, label_ko));
+                true
+            }
+            None => {
+                f.reverse = true;
+                f.note = Some(("dead_end", format!("막다른 길: 돌 자리가 없어 길을 따라 끝까지 {total:.1} m {how}")));
+                false
+            }
+        }
+    }
+
+    /// How to turn to face `target` where the base stands: in place when its sweep is clear, else backed straight out
+    /// of the tight spot first (a dead end between obstacles: no spinning against them), and only when even that is
+    /// blocked, a forced scrub on the spot.
     pub(crate) fn turn_run(&self, target: f32) -> SegRun {
         let pose = (self.agent.x, self.agent.z, self.agent.yaw);
         let delta = wrap_angle(target - self.agent.yaw);
         let caps = self.turn_caps();
         let v = self.drive_spec().max_speed_mps;
-        match steer::turn_in_place(pose, delta, &caps, self.is_track(), v, &|x, z| self.free_at(x, z)) {
-            Some(m) => SegRun::new(m, pose),
-            None => SegRun {
-                forced: true,
-                ..SegRun::new(steer::Maneuver { kind: "pivot", label_ko: format!("자리가 좁아 제자리에서 억지로 {:.0}° 비벼 돎 (스키드 조향 힘 부족)", delta.abs().to_degrees()), segs: vec![Seg::Pivot { angle: delta }], time_s: 0.0 }, pose)
-            },
+        let check = self.pose_check();
+        if let Some(m) = steer::turn_in_place(pose, delta, &caps, self.is_track(), v, &|x, z, yaw| check.ok(&self.terrain, x, z, yaw)) {
+            return SegRun::new(m, pose);
+        }
+        if let Some((d, turn)) = self.back_out_spot(&check, FACE_DONE_RAD, &|_, _| target) {
+            let how = self.back_word();
+            return self.backed_turn(d, turn, format!("자리가 좁아 제자리에서 {:.0}° 돌지 않고 {d:.1} m 곧게 {how}한 뒤 돎", delta.abs().to_degrees()));
+        }
+        SegRun {
+            forced: true,
+            ..SegRun::new(steer::Maneuver { kind: "pivot", label_ko: format!("자리가 좁아 제자리에서 억지로 {:.0}° 비벼 돎 (스키드 조향 힘 부족)", delta.abs().to_degrees()), segs: vec![Seg::Pivot { angle: delta }], time_s: 0.0 }, pose)
         }
     }
 
@@ -222,16 +372,26 @@ impl World {
 
     pub(crate) fn start_follow(&self, edges: &[EdgePlan]) -> Follow {
         let mut f = follow_of((self.agent.x, self.agent.z), edges);
+        let map = self.clear_map();
+        let fp = self.footprint();
+        clear::centre_path(&map, &mut f.path, fp.half_w_m + clear::MIN_GAP_M, fp.half_w_m + clear::COMFORT_GAP_M);
+        f.measure();
         let caps = self.turn_caps();
         if f.path.len() < 2 || caps.kind == TurnKind::Holonomic {
             return f;
         }
         let first = (f.path[1].1 - f.path[0].1).atan2(f.path[1].0 - f.path[0].0);
         let delta = wrap_angle(first - self.agent.yaw);
+        let stop = if caps.kind == TurnKind::Legs { ALPHA_STOP_LEGS_RAD } else { ALPHA_STOP_SKID_RAD };
         if delta.abs() > REVERSE_BEHIND_RAD && f.total_m() <= caps.reverse_max_m && f.turning() <= REVERSE_STRAIGHT_RAD {
             f.reverse = true;
             let how = if caps.kind == TurnKind::Legs { "뒷걸음" } else { "후진" };
             f.note = Some(("reverse", format!("목표가 뒤쪽 {:.1} m: 돌지 않고 {how}", f.total_m())));
+        } else if delta.abs() > stop {
+            let check = self.pose_check();
+            if !self.room_to_turn(&check, self.agent.x, self.agent.z, self.agent.yaw, first, check.h0) {
+                self.back_out(&mut f, &check);
+            }
         }
         f
     }
@@ -240,10 +400,11 @@ impl World {
     pub(super) fn advance_follow(&mut self, m: &mut MoveState, remaining: f32, events: &mut Vec<TimedEvent>, done: &mut Option<(bool, Option<String>)>) -> f32 {
         if let Some(run) = m.follow.man.as_mut() {
             let mut r = run.clone();
+            let span: f32 = r.segs.iter().map(|s| s.length_m()).sum();
             let t = self.advance_run(&mut r, remaining);
             m.follow.man = (!r.done() || r.wait_left > 0.0).then_some(r);
             if m.follow.man.is_none() {
-                m.follow.s = m.follow.project((self.agent.x, self.agent.z), m.follow.s, 1.5);
+                m.follow.s = m.follow.project((self.agent.x, self.agent.z), m.follow.s, 1.5 + span);
             }
             m.elapsed_s += t;
             return t.max(1e-4);
@@ -295,6 +456,7 @@ impl World {
         if m.follow.on_rails {
             return self.advance_on_rails(m, &e, remaining, left, v_edge, events, done);
         }
+        let check = self.pose_check();
         let to_goal = (pos.0 - goal.0).hypot(pos.1 - goal.1);
         let ld = (v_edge * LOOKAHEAD_S).clamp(LOOKAHEAD_MIN_M, LOOKAHEAD_MAX_M).min(if caps.kind == TurnKind::Legs { 0.6 } else { LOOKAHEAD_MAX_M });
         let target = if to_goal < FINAL_APPROACH_M { goal } else { m.follow.point_at(m.follow.s + ld) };
@@ -312,8 +474,13 @@ impl World {
                 m.follow.on_rails = true;
                 return 1e-4;
             }
-            m.follow.turns += 1;
             let want = tz.atan2(tx) - if m.follow.reverse { std::f32::consts::PI } else { 0.0 };
+            if !m.follow.reverse && !near_end && alpha.abs() > stop_at && !self.room_to_turn(&check, pos.0, pos.1, self.agent.yaw, wrap_angle(want), check.h0) {
+                // No room to turn round between the obstacles and the way on is behind: back out instead of spinning.
+                self.back_out(&mut m.follow, &check);
+                return 1e-4;
+            }
+            m.follow.turns += 1;
             let run = self.turn_run(wrap_angle(want));
             m.follow.note = Some((run.kind, run.label_ko.clone()));
             self.agent.speed_mps = 0.0;
@@ -350,7 +517,8 @@ impl World {
             _ if m.follow.reverse => steer::along(before, &Seg::Drive { dir: -1.0, kappa: -kappa, len: ds }, 1.0),
             _ => steer::along(before, &Seg::Drive { dir: 1.0, kappa, len: ds }, 1.0),
         };
-        let (nx, nz, nyaw) = if self.free_ahead(nx, nz) {
+        // The pursuit arc cuts corners: where it would bring the body against something, keep to the route line.
+        let (nx, nz, nyaw) = if self.free_ahead(nx, nz) && check.ok(&self.terrain, nx, nz, nyaw) {
             (nx, nz, nyaw)
         } else {
             let p = m.follow.point_at(m.follow.s + ds);
@@ -527,5 +695,121 @@ mod tests {
         let mut walker = world(BaseKind::HumanFoot);
         walker.command(Action::Turn { yaw_deg: 150.0 }).unwrap();
         assert_eq!(walker.motion_view().map(|m| m.kind), Some("pivot".into()), "legs step round where they stand");
+    }
+
+    fn plant(w: &mut World, kind: crate::kinds::NodeKind, c: Cell) {
+        let (x, z) = cell_center(c.0, c.1);
+        let id = 900 + w.nodes.len() as u32;
+        w.nodes.push(Node { id, kind, x, z, hp: 3.0, max_hp: 3.0 });
+    }
+
+    /// The least room the body's outline had at any tick of the run (m; 0 is touching or inside something).
+    fn drive_room(w: &mut World, max_ticks: usize) -> (f32, Vec<(f32, f32, f32, f32, bool, String)>) {
+        let mut worst = f32::INFINITY;
+        let mut trace = Vec::new();
+        for _ in 0..max_ticks {
+            w.tick();
+            let map = w.clear_map();
+            worst = worst.min(w.footprint().room(&map, w.agent.x, w.agent.z, w.agent.yaw));
+            let m = w.motion_view();
+            trace.push((w.agent.x, w.agent.z, w.agent.yaw, w.agent.speed_mps, m.as_ref().is_some_and(|m| m.reversing), m.map(|m| m.kind).unwrap_or_default()));
+            if !w.busy() {
+                break;
+            }
+        }
+        (worst, trace)
+    }
+
+    /// A pocket one cell wide round the base: trees left and right of it and across its end, open behind it. Returns
+    /// where the pocket opens (x).
+    fn pocket(w: &mut World) -> f32 {
+        use crate::kinds::NodeKind;
+        let (cx, cz) = w.agent_cell();
+        for x in cx - 3..=cx + 2 {
+            plant(w, NodeKind::Tree, (x, cz - 1));
+            plant(w, NodeKind::Tree, (x, cz + 1));
+        }
+        plant(w, NodeKind::Tree, (cx + 2, cz));
+        cell_center(cx - 3, cz).0
+    }
+
+    #[test]
+    fn in_a_dead_end_between_trees_the_base_backs_out_instead_of_spinning() {
+        for base in [BaseKind::Wheel, BaseKind::Track, BaseKind::HumanFoot] {
+            let mut w = world(base);
+            let pocket_end_x = pocket(&mut w);
+            let (x0, z0) = (w.agent.x, w.agent.z);
+            let fp = w.footprint();
+            assert!(fp.room(&w.clear_map(), x0, z0, 0.0) > 0.0 && w.clear_map().at(x0, z0) < fp.sweep_m(), "{base:?}: it fits, but cannot turn round in it");
+            let goal = (x0 - 3.5, z0 + 2.0);
+            w.command(Action::MoveTo { x: goal.0, z: goal.1, reach_m: 0.0 }).unwrap();
+            assert_eq!(w.motion_view().map(|m| m.kind), Some("reverse".into()), "{base:?} backs out at once");
+            let (worst, tr) = drive_room(&mut w, 900);
+            assert!(!w.busy(), "{base:?} got out");
+            assert!((w.agent.x - goal.0).hypot(w.agent.z - goal.1) < 0.3, "{base:?} arrived: {:?}", (w.agent.x, w.agent.z));
+            let inside: Vec<_> = tr.iter().filter(|t| t.0 > pocket_end_x).collect();
+            assert!(inside.iter().all(|t| t.4 || t.3 < 1e-3), "{base:?} only reverses while in the pocket");
+            assert!(inside.iter().all(|t| wrap_angle(t.2).abs() < 0.35), "{base:?} does not turn round in the pocket: {:?}", inside.iter().map(|t| t.2).collect::<Vec<_>>());
+            assert!(inside.iter().all(|t| t.5 != "pivot" && t.5 != "kturn"));
+            assert!(tr.iter().any(|t| !t.4 && t.3 > 0.05), "{base:?} drives forward again once out");
+            assert!(worst > 0.0, "{base:?} never touches a tree: {worst}");
+        }
+    }
+
+    #[test]
+    fn a_turn_asked_for_in_a_dead_end_backs_out_of_it_first() {
+        // The search turns the base round in steps to look about; in a pocket it must not spin against the trees.
+        for (base, deg) in [(BaseKind::Wheel, 45.0f32), (BaseKind::Track, 180.0), (BaseKind::HumanFoot, 180.0), (BaseKind::Wheel, -120.0)] {
+            let mut w = world(base);
+            let pocket_end_x = pocket(&mut w);
+            w.command(Action::Turn { yaw_deg: deg }).unwrap();
+            let m = w.motion_view().unwrap();
+            assert!(m.kind == "reverse" && m.reversing, "{base:?} {deg}°: it backs out first: {m:?}");
+            let (worst, tr) = drive_room(&mut w, 600);
+            assert!(!w.busy(), "{base:?} {deg}° turned");
+            assert!((wrap_angle(w.agent.yaw - deg.to_radians())).abs() < 0.06, "{base:?} {deg}°: faces {:.0}°", w.agent.yaw.to_degrees());
+            let inside: Vec<_> = tr.iter().filter(|t| t.0 > pocket_end_x).collect();
+            assert!(inside.iter().all(|t| wrap_angle(t.2).abs() < 0.05), "{base:?} {deg}°: no turning inside the pocket");
+            assert!(worst > 0.0, "{base:?} {deg}°: never touches a tree: {worst}");
+            let mut free = world(base);
+            free.command(Action::Turn { yaw_deg: deg }).unwrap();
+            assert_ne!(free.motion_view().map(|m| m.kind), Some("reverse".into()), "{base:?} {deg}°: in the open it turns where it stands");
+        }
+    }
+
+    #[test]
+    fn the_body_keeps_clear_of_trees_and_rocks_it_passes_between() {
+        use crate::kinds::NodeKind;
+        for base in [BaseKind::Wheel, BaseKind::Track, BaseKind::HumanFoot] {
+            let mut w = world(base);
+            let (cx, cz) = w.agent_cell();
+            // A grove the straight line runs through: trees and boulders a cell apart, staggered, with roomier lanes.
+            for (k, dx) in (2..12).step_by(2).enumerate() {
+                for dz in [-4i32, -2, 0, 2, 4] {
+                    let kind = if (dz / 2 + k as i32) % 2 == 0 { NodeKind::Tree } else { NodeKind::Boulder };
+                    plant(&mut w, kind, (cx + dx, (cz as i32 + dz + (k as i32 % 2)) as usize));
+                }
+            }
+            let (x0, z0) = (w.agent.x, w.agent.z);
+            let goal = cell_center(cx + 14, cz);
+            let fp = w.footprint();
+            // What the old planner did: cell centres past the trunks, the body's outline into them.
+            let blocked = w.blocked_cells();
+            let old = nav::plan(&w.drive_spec(), &w.terrain, &|a, b| blocked.contains(&(a, b)), (cx, cz), Goal::Cell(w.terrain.cell_of(goal.0, goal.1).unwrap())).unwrap();
+            let map = w.clear_map();
+            let old_room = old.cells.windows(2).map(|p| {
+                let (a, b) = (cell_center(p[0].0, p[0].1), cell_center(p[1].0, p[1].1));
+                fp.room(&map, b.0, b.1, (b.1 - a.1).atan2(b.0 - a.0))
+            }).fold(f32::INFINITY, f32::min);
+            let new = w.plan_route(Goal::Cell(w.terrain.cell_of(goal.0, goal.1).unwrap())).unwrap();
+            let new_room = new.cells.iter().skip(1).map(|c| map.best_in(*c)).fold(f32::INFINITY, f32::min);
+            assert!(new_room >= fp.half_w_m + clear::TIGHT_GAP_M, "{base:?}: every cell of the route has room for the body: {new_room}");
+            w.command(Action::MoveTo { x: goal.0, z: goal.1, reach_m: 0.0 }).unwrap();
+            let (worst, _) = drive_room(&mut w, 1500);
+            assert!(!w.busy() && (w.agent.x - goal.0).hypot(w.agent.z - goal.1) < 0.3, "{base:?} arrived");
+            println!("[CLEAR] {base:?}: old route outline room {old_room:.3} m, driven {worst:.3} m (from {:.1},{:.1})", x0, z0);
+            assert!(old_room < clear::MIN_GAP_M, "{base:?}: the old route brushed the grove ({old_room})");
+            assert!(worst >= clear::TOUCH_GAP_M - 1e-3, "{base:?}: the body kept clear all the way: {worst}");
+        }
     }
 }

@@ -588,14 +588,25 @@ impl Runtime {
     }
 
     /// The pick-up stage by stage, for the first-person HUD. Legs do it as a person does: walk up, bend the head to
-    /// look, check with vision, lower the body, grip, lift. Wheels and tracks do it as a lift truck does: the rider
-    /// keeps looking ahead, the tines go down, the carriage camera checks the item, the base slides the tines under it
-    /// and the mast lifts it; setting down runs the other way. Read from the world's act phase (or held look) and the
-    /// last check.
+    /// look, check with vision, lower the body, grip, lift with the eyes on the item. Wheels and tracks do it as a lift
+    /// truck does, with two eyes checked against each other: the rider looks down at the item, looks ahead again while
+    /// the tines go down and the carriage camera checks it, the base slides the tines under it with the carriage camera
+    /// on it until the item blocks that camera, the rider looks down once more to see it ride on, and the mast lifts
+    /// it; setting down runs the other way. Read from the world's act phase (or held look) and the last checks.
     pub fn procedure_json(&self) -> Option<Value> {
         use noto_core::act::ActKind;
-        const HAND: [(&str, &str); 6] = [("approach", "다가가기"), ("look", "고개 숙여 응시"), ("check", "비전 확인"), ("bend", "자세 낮춤"), ("grip", "쥐기"), ("lift", "들어올림")];
-        const FORK: [(&str, &str); 6] = [("approach", "다가가기"), ("align", "정렬 (정면 응시)"), ("lower", "포크 내림"), ("check", "포크 카메라 확인"), ("insert", "포크 끼우기"), ("raise", "들어올림")];
+        const HAND: [(&str, &str); 6] = [("approach", "다가가기"), ("look", "고개 숙여 응시"), ("check", "비전 확인"), ("bend", "자세 낮춤"), ("grip", "쥐기"), ("lift", "시선 따라 들어올림")];
+        const FORK: [(&str, &str); 9] = [
+            ("approach", "다가가기"),
+            ("align", "정렬"),
+            ("rider", "탑승자 시선 내려 확인"),
+            ("lower", "포크 내림 · 시선 정면"),
+            ("check", "포크 카메라 확인 · 교차 검증"),
+            ("insert", "포크 끼우기 · 포크 카메라 추적"),
+            ("recheck", "포크 카메라 가림 → 탑승자 재확인"),
+            ("seat", "안착"),
+            ("raise", "들어올림"),
+        ];
         const FORK_DOWN: [(&str, &str); 3] = [("lower_load", "짐 내림"), ("back_out", "후진해 포크 빼기"), ("rest", "포크 올림")];
         let w = self.world();
         let forks = noto_core::act::fork::applies(&w.body);
@@ -603,7 +614,9 @@ impl Runtime {
         let target = action.split(['(', ')']).nth(1).filter(|s| s.starts_with('d')).and_then(|s| s.get(1..)?.parse::<u32>().ok());
         let phase = w.act_phase();
         let stage = match phase {
-            Some((ActKind::Fork, p @ ("align" | "lower" | "check" | "insert" | "raise" | "lower_load" | "back_out" | "rest"))) => p,
+            Some((ActKind::Fork, "rider_look" | "rider_check")) => "rider",
+            Some((ActKind::Fork, "recheck_look" | "recheck")) => "recheck",
+            Some((ActKind::Fork, p @ ("align" | "lower" | "check" | "insert" | "seat" | "raise" | "lower_load" | "back_out" | "rest"))) => p,
             Some((ActKind::Look, "hold")) if forks => "check",
             Some((ActKind::Look, "look")) | Some((ActKind::Grasp, "look")) => "look",
             Some((ActKind::Look, _)) | Some((ActKind::Grasp, "check")) => "check",
@@ -640,10 +653,28 @@ impl Runtime {
             .or_else(|| setting_down.then(|| w.agent.carried.first().map(|(k, _)| k.spec().label_ko.to_string())).flatten())
             .or_else(|| self.gaze_check.as_ref().map(|g| g.label_ko.clone()));
         let tip = w.act.as_ref().or(w.last_act.as_ref()).filter(|_| forks).and_then(|p| p.rollout.metric("tip_ratio"));
+        let sight = |s: &crate::vision::Sighting| {
+            json!({"camera": s.camera, "ok": s.ok, "matched": s.matched, "label_ko": s.label_ko, "score": s.score.map(r3), "range_m": s.range_m.map(r3), "depth_m": s.depth_m.map(r3), "bbox": s.bbox.map(|b| b.map(r3)), "neck_deg": r3(s.neck_deg), "reason": s.reason})
+        };
+        let cross = self.fork_cross.as_ref().filter(|c| forks && !setting_down && Some(c.drop) == drop).map(|c| {
+            json!({
+                "rider": c.rider.as_ref().map(sight),
+                "fork": c.fork.as_ref().map(sight),
+                "recheck": c.recheck.as_ref().map(sight),
+                "verdict": c.fork.as_ref().map(|_| c.verdict()),
+                "apart_m": c.fork_vs_rider.map(|v| r3(v.0)),
+                "gate_m": c.fork_vs_rider.map(|v| r3(v.1)),
+                "recheck_apart_m": c.recheck_vs_fork.map(|v| r3(v.0)),
+                "recheck_gate_m": c.recheck_vs_fork.map(|v| r3(v.1)),
+                "seated": c.seated(),
+                "blocked_share": c.blocked_share.map(r3),
+            })
+        });
         Some(json!({
-            "act": if setting_down { "set_down" } else if matches!(phase, Some((ActKind::Look, "look" | "check")) | Some((ActKind::Fork, "align" | "lower" | "check"))) && action.starts_with("look") { "look" } else { "pick" },
+            "act": if setting_down { "set_down" } else if matches!(phase, Some((ActKind::Look, "look" | "check")) | Some((ActKind::Fork, "align" | "rider_look" | "rider_check" | "lower" | "check"))) && action.starts_with("look") { "look" } else { "pick" },
             "mechanism": if forks { "fork" } else { "hand" },
             "camera": if forks && matches!(stage, "lower" | "check" | "insert") { "fork" } else { "head" },
+            "cross": cross,
             "fork_m": forks.then(|| r3(w.fork_m_now())),
             "tip_ratio": tip.map(r3),
             "target": drop.map(|d| format!("d{d}")),

@@ -266,6 +266,8 @@ pub struct Runtime {
     pub(crate) task: Option<Task>,
     pub(crate) last_scan: Option<ScanReport>,
     pub(crate) gaze_check: Option<crate::vision::GazeCheck>,
+    /// A lift truck's rider and carriage camera on the item it is picking up, each checked against the other.
+    pub(crate) fork_cross: Option<crate::vision::CrossCheck>,
     pub(crate) pending_fix: Option<PoseFix>,
     scan_seq: u64,
     last_device: String,
@@ -317,6 +319,7 @@ impl Runtime {
             task: None,
             last_scan: None,
             gaze_check: None,
+            fork_cross: None,
             pending_fix: None,
             scan_seq: 0,
             last_device: String::new(),
@@ -639,6 +642,8 @@ impl Runtime {
         self.quests.clear();
         self.gates.clear();
         self.last_scan = None;
+        self.gaze_check = None;
+        self.fork_cross = None;
         self.focus = None;
         self.eval = EvalCounters::default();
         self.flush_sds();
@@ -662,6 +667,8 @@ impl Runtime {
         self.quests.clear();
         self.gates.clear();
         self.last_scan = None;
+        self.gaze_check = None;
+        self.fork_cross = None;
         self.focus = None;
         self.eval = EvalCounters::default();
         self.flush_sds();

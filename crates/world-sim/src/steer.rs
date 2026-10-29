@@ -26,6 +26,7 @@ pub const STEP_TURN_RAD: f32 = 0.6;
 pub const SHIFT_S: f32 = 0.5;
 pub const MAX_RADIUS_M: f32 = 4.0;
 pub const SAMPLE_M: f32 = 0.05;
+pub const SAMPLE_RAD: f32 = 0.15;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -188,14 +189,18 @@ pub fn end_of(p: Pose2, segs: &[Seg]) -> Pose2 {
     segs.iter().fold(p, |q, s| along(q, s, 1.0))
 }
 
-/// Whether every pose along `segs` from `p` stands on ground the base may occupy.
-pub fn clear(p: Pose2, segs: &[Seg], free: &dyn Fn(f32, f32) -> bool) -> bool {
+/// Whether every pose along `segs` from `p` is one the base may take (`free(x, z, yaw)`: its ground and its outline):
+/// every `SAMPLE_M` along a drive, every `SAMPLE_RAD` round a pivot.
+pub fn clear(p: Pose2, segs: &[Seg], free: &dyn Fn(f32, f32, f32) -> bool) -> bool {
     let mut q = p;
     for s in segs {
-        let n = (s.length_m() / SAMPLE_M).ceil().max(1.0) as usize;
+        let n = match *s {
+            Seg::Pivot { angle } => (angle.abs() / SAMPLE_RAD).ceil().max(1.0) as usize,
+            Seg::Drive { .. } => (s.length_m() / SAMPLE_M).ceil().max(1.0) as usize,
+        };
         for i in 1..=n {
             let r = along(q, s, i as f32 / n as f32);
-            if !free(r.0, r.1) {
+            if !free(r.0, r.1, r.2) {
                 return false;
             }
         }
@@ -242,8 +247,9 @@ pub fn maneuver_time(segs: &[Seg], caps: &TurnCaps, v_fwd: f32) -> f32 {
 }
 
 /// How to turn by `delta` rad where the base stands: a pivot (wheels scrub, legs step), or a K-turn when the base
-/// cannot pivot or a track would tear soft ground. `None` when the base cannot turn there at all.
-pub fn turn_in_place(p: Pose2, delta: f32, caps: &TurnCaps, track: bool, v_fwd: f32, free: &dyn Fn(f32, f32) -> bool) -> Option<Maneuver> {
+/// cannot pivot, a track would tear soft ground, or the pivot's sweep would hit something. `None` when the base
+/// cannot turn there at all (no room for any of them: a dead end, which the base backs out of).
+pub fn turn_in_place(p: Pose2, delta: f32, caps: &TurnCaps, track: bool, v_fwd: f32, free: &dyn Fn(f32, f32, f32) -> bool) -> Option<Maneuver> {
     if delta.abs() < 1e-3 {
         return Some(Maneuver { kind: "none", label_ko: String::new(), segs: vec![], time_s: 0.0 });
     }
@@ -256,7 +262,8 @@ pub fn turn_in_place(p: Pose2, delta: f32, caps: &TurnCaps, track: bool, v_fwd: 
         };
         Maneuver { kind: "pivot", label_ko, time_s: maneuver_time(&segs, caps, v_fwd), segs }
     };
-    if caps.can_pivot() && !caps.prefers_kturn(track) {
+    let pivot_clear = || clear(p, &[Seg::Pivot { angle: delta }], free);
+    if caps.can_pivot() && !caps.prefers_kturn(track) && pivot_clear() {
         return Some(pivot());
     }
     let r0 = caps.min_radius_m.max(if track { 0.6 } else { 0.4 });
@@ -272,7 +279,7 @@ pub fn turn_in_place(p: Pose2, delta: f32, caps: &TurnCaps, track: bool, v_fwd: 
             }
         }
     }
-    caps.can_pivot().then(pivot)
+    (caps.can_pivot() && pivot_clear()).then(pivot)
 }
 
 /// Backs `dist_m` straight along the current heading reversed (the target is behind).
@@ -345,7 +352,7 @@ mod tests {
         assert_eq!(c.kind, TurnKind::Legs);
         assert!(c.speed_on_radius(0.3, 1.2) < c.speed_on_radius(2.0, 1.2), "v = K·R^(1/3)");
         assert!((c.speed_on_radius(1.0, 1.2) - 1.0).abs() < 1e-5);
-        let m = turn_in_place((0.0, 0.0, 0.0), 2.0, &c, false, 1.0, &|_, _| true).unwrap();
+        let m = turn_in_place((0.0, 0.0, 0.0), 2.0, &c, false, 1.0, &|_, _, _| true).unwrap();
         assert_eq!(m.kind, "pivot");
         assert!(m.label_ko.contains("걸음") && (m.time_s - 2.0 / LEG_SPIN_RAD_S).abs() < 1e-4, "{m:?}");
     }
@@ -365,13 +372,13 @@ mod tests {
     fn a_base_that_cannot_pivot_backs_and_fills_and_gives_up_without_room() {
         let firm = Surface::Firm.props();
         let weak = caps(&spec(BaseKind::Wheel, 30.0), 0.30, 0.40, 46.0, firm);
-        let open = turn_in_place((0.0, 0.0, 0.0), 1.6, &weak, false, 1.0, &|_, _| true).unwrap();
+        let open = turn_in_place((0.0, 0.0, 0.0), 1.6, &weak, false, 1.0, &|_, _, _| true).unwrap();
         assert_eq!(open.kind, "kturn");
         assert!(open.segs.iter().any(|s| matches!(s, Seg::Drive { dir, .. } if *dir < 0.0)), "it reverses on the way round");
-        let walled = turn_in_place((0.0, 0.0, 0.0), 1.6, &weak, false, 1.0, &|x, z| x.hypot(z) < 0.05);
+        let walled = turn_in_place((0.0, 0.0, 0.0), 1.6, &weak, false, 1.0, &|x, z, _| x.hypot(z) < 0.05);
         assert!(walled.is_none(), "no room and no pivot: {walled:?}");
         let mid = caps(&spec(BaseKind::Wheel, 30.0), 0.30, 0.40, 240.0, firm);
-        let pv = turn_in_place((0.0, 0.0, 0.0), 1.6, &mid, false, 1.0, &|x, z| x.hypot(z) < 0.05).unwrap();
+        let pv = turn_in_place((0.0, 0.0, 0.0), 1.6, &mid, false, 1.0, &|x, z, _| x.hypot(z) < 0.05).unwrap();
         assert_eq!(pv.kind, "pivot");
     }
 

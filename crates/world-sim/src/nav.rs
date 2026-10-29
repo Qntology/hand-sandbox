@@ -4,6 +4,7 @@ use std::collections::BinaryHeap;
 use noto_core::surface::{climb_limit_deg, energy_factor};
 use noto_core::{simulate_drive, BaseSpec, Terrain as Segment};
 
+use crate::clear::{ClearMap, CLEAR_COST};
 use crate::terrain::{cell_center, Terrain, CELL_M};
 
 pub type Cell = (usize, usize);
@@ -118,11 +119,38 @@ pub fn edge_with(spec: &BaseSpec, t: &Terrain, a: Cell, b: Cell, load: Option<Pu
 
 const NEIGHBORS: [(i32, i32); 8] = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)];
 
-fn reached(goal: &Goal, c: Cell, blocked: &dyn Fn(usize, usize) -> bool) -> bool {
+/// The room a route keeps around the body (`clear`): it enters a cell only where the body's half width and a gap fit in
+/// the cell and through the way into it (`need_m`, from the body's centre line), and a cell with less than the
+/// comfortable berth (`soft_m`) costs more, the more so the tighter it is. Leaving the start and entering an exact
+/// goal cell are allowed however tight they are.
+#[derive(Clone, Copy)]
+pub struct Room<'a> {
+    pub map: &'a ClearMap,
+    pub need_m: f32,
+    pub soft_m: f32,
+}
+
+impl Room<'_> {
+    /// The travel-time factor of the step from `a` into `b`, or `None` when the body does not fit.
+    fn step(&self, a: Cell, b: Cell, exempt: bool) -> Option<f32> {
+        let here = self.map.best_in(b);
+        if !exempt && here.min(self.map.gate(a, b)) < self.need_m {
+            return None;
+        }
+        let k = ((self.soft_m - here) / (self.soft_m - self.need_m).max(1e-3)).clamp(0.0, 1.0);
+        Some(1.0 + CLEAR_COST * k * k)
+    }
+
+    fn stands(&self, c: Cell) -> bool {
+        self.map.best_in(c) >= self.need_m
+    }
+}
+
+fn reached(goal: &Goal, c: Cell, blocked: &dyn Fn(usize, usize) -> bool, room: Option<&Room>) -> bool {
     match *goal {
         Goal::Cell(g) => c == g,
         Goal::Within { x, z, reach_m } => {
-            if blocked(c.0, c.1) {
+            if blocked(c.0, c.1) || room.is_some_and(|r| !r.stands(c)) {
                 return false;
             }
             let (cx, cz) = cell_center(c.0, c.1);
@@ -148,11 +176,20 @@ pub fn plan(spec: &BaseSpec, t: &Terrain, blocked: &dyn Fn(usize, usize) -> bool
 }
 
 pub fn plan_with(spec: &BaseSpec, t: &Terrain, blocked: &dyn Fn(usize, usize) -> bool, start: Cell, goal: Goal, load: Option<PushLoad>) -> Option<Plan> {
+    plan_room(spec, t, blocked, None, start, goal, load)
+}
+
+/// `plan_with` keeping `room` around the body when given.
+pub fn plan_room(spec: &BaseSpec, t: &Terrain, blocked: &dyn Fn(usize, usize) -> bool, room: Option<&Room>, start: Cell, goal: Goal, load: Option<PushLoad>) -> Option<Plan> {
     if let Goal::Cell(g) = goal {
         if blocked(g.0, g.1) {
             return None;
         }
     }
+    let exact = match goal {
+        Goal::Cell(g) => Some(g),
+        Goal::Within { .. } => None,
+    };
     let n = t.w * t.d;
     let mut best = vec![f32::INFINITY; n];
     let mut came: Vec<Option<(usize, EdgePlan)>> = vec![None; n];
@@ -165,7 +202,7 @@ pub fn plan_with(spec: &BaseSpec, t: &Terrain, blocked: &dyn Fn(usize, usize) ->
 
     while let Some((_, ci)) = heap.pop() {
         let c = (ci % t.w, ci / t.w);
-        if reached(&goal, c, blocked) {
+        if reached(&goal, c, blocked, room) {
             return Some(rebuild(&came, t, ci, si, spec));
         }
         let g = best[ci];
@@ -183,8 +220,15 @@ pub fn plan_with(spec: &BaseSpec, t: &Terrain, blocked: &dyn Fn(usize, usize) ->
                     continue;
                 }
             }
+            let tight = match room {
+                Some(r) => match r.step(c, nc, c == start || Some(nc) == exact) {
+                    Some(k) => k,
+                    None => continue,
+                },
+                None => 1.0,
+            };
             let Some(e) = edge_with(spec, t, c, nc, load) else { continue };
-            let cost = g + e.move_time_s + e.pause_s;
+            let cost = g + e.move_time_s * tight + e.pause_s;
             let ni = t.idx(nc.0, nc.1);
             if cost < best[ni] {
                 best[ni] = cost;

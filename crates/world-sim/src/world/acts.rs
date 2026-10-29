@@ -181,7 +181,9 @@ impl World {
             self.agent.z += step_z;
         }
         let dur = rollout.duration_s;
-        self.act = Some(ActPlay::new(rollout, self.time_s, Some((d.kind, d.amount)), (self.agent.x, self.agent.z, heading)));
+        let mut play = ActPlay::new(rollout, self.time_s, Some((d.kind, d.amount)), (self.agent.x, self.agent.z, heading));
+        play.lifting = Some(drop);
+        self.act = Some(play);
         Ok((dur, (!side).then_some(at)))
     }
 
@@ -200,7 +202,7 @@ impl World {
             let size = self.drops.iter().filter(|d| (d.x - x).hypot(d.z - z) < 0.35).map(|d| d.kind.spec().piece_size_m(d.amount)).next().unwrap_or([0.1; 3]);
             let base = (h - 0.5 * size[1]).max(0.0);
             let turn_s = wrap_angle(heading - self.agent.yaw).abs() / FORK_ALIGN_RAD_S;
-            let r = fork::look(&self.body, self.fork_m_now(), dx.hypot(dz), size[0].max(size[2]), base, self.carried_kg(), turn_s);
+            let r = fork::look(&self.body, self.fork_m_now(), dx.hypot(dz), size, base, self.carried_kg(), turn_s);
             let dur = r.duration_s;
             let mut play = ActPlay::new(r, self.time_s, None, (self.agent.x, self.agent.z, heading));
             play.drive = Some(ActDrive { from: (self.agent.x, self.agent.z, self.agent.yaw), yaw_to: heading, turn_s, object_x0: dx.hypot(dz) });
@@ -232,9 +234,22 @@ impl World {
         }
     }
 
-    /// The drop a fork act is lifting off the ground right now.
+    /// The drop an act is lifting off the ground right now: on the tines while the mast raises it, or in the hands
+    /// from lift-off until it goes into the bay.
     pub fn lifted_drop(&self) -> Option<u32> {
-        self.act.as_ref().filter(|p| p.rollout.sample_at(p.t()).is_some_and(|s| s.phase == "raise")).and_then(|p| p.lifting)
+        self.act
+            .as_ref()
+            .filter(|p| p.rollout.sample_at(p.t()).is_some_and(|s| matches!((p.rollout.kind, s.phase), (ActKind::Fork, "raise") | (ActKind::Grasp, "lift" | "stow"))))
+            .and_then(|p| p.lifting)
+    }
+
+    /// What the hands hold off the ground now, as (kind, piece size, centre in the body frame): the item from
+    /// lift-off until it goes into the bay, where the eyes follow it.
+    pub fn hand_load(&self) -> Option<(ItemKind, [f32; 3], [f32; 3])> {
+        let p = self.act.as_ref().filter(|p| p.rollout.kind == ActKind::Grasp && p.lifting.is_some())?;
+        let s = p.rollout.sample_at(p.t()).filter(|s| matches!(s.phase, "lift" | "stow"))?;
+        let (k, amount) = p.object?;
+        Some((k, k.spec().piece_size_m(amount), s.object?))
     }
 
     /// What rides on the tines now, as (kind, piece size, centre in the body frame), bottom first.
@@ -401,10 +416,9 @@ impl World {
         for ev in out {
             events.push(self.stamp(ev));
         }
+        // The odometry takes this motion with the rest of the step (`World::step`), once.
         if let Some(to) = to {
-            let before = (self.agent.x, self.agent.z, self.agent.yaw);
             (self.agent.x, self.agent.z, self.agent.yaw) = (to.0, to.1, wrap_angle(to.2));
-            self.odom.update(before, (self.agent.x, self.agent.z, self.agent.yaw), dt, 0.0);
         }
     }
 

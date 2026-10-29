@@ -552,7 +552,7 @@ export const PICK_STAGES = [
   ['check', '비전 확인'],
   ['bend', '자세 낮춤'],
   ['grip', '쥐기'],
-  ['lift', '들어올림'],
+  ['lift', '시선 따라 들어올림'],
 ];
 
 function gazeAt(a, targetPos, neckFrac, crouchFrac) {
@@ -570,16 +570,34 @@ function startPick(rt, drop) {
   rt.pick = { drop, stage: 'approach', t: 0, check: null };
 }
 
-// ── 지게차: 바퀴·메카넘·트랙 몸은 탑승자가 정면을 보고, 포크를 내려 포크 카메라로 확인한 뒤 끼워 들어올린다 ──
-// (Rust noto_core::act::fork 와 같은 순서·값의 모의판)
+// ── 지게차: 바퀴·메카넘·트랙 몸은 두 눈으로 교차 검증하며 든다 ──────────────────────────────
+// 탑승자가 고개를 숙여 물건을 보고(①) → 다시 정면을 보며 포크를 내리고 → 포크 카메라로 본 뒤(②) 두 시점을 맞춰 보고 →
+// 포크 카메라로 물건을 따라가며 끼우다가 물건이 포크 카메라를 가리면 멈추고 → 탑승자가 다시 숙여 본다(③) → 안착 → 들어올림.
+// (Rust noto_core::act::fork 와 런타임 driver 의 교차 검증과 같은 순서의 모의판)
 export const FORK_STAGES = [
   ['approach', '다가가기'],
-  ['align', '정렬 (정면 응시)'],
-  ['lower', '포크 내림'],
-  ['check', '포크 카메라 확인'],
-  ['insert', '포크 끼우기'],
+  ['align', '정렬'],
+  ['rider', '탑승자 시선 내려 확인'],
+  ['lower', '포크 내림 · 시선 정면'],
+  ['check', '포크 카메라 확인 · 교차 검증'],
+  ['insert', '포크 끼우기 · 포크 카메라 추적'],
+  ['recheck', '포크 카메라 가림 → 탑승자 재확인'],
+  ['seat', '안착'],
   ['raise', '들어올림'],
 ];
+const FORK_BLOCKED_SHARE = 0.6;
+const CROSS_MIN_M = 0.08;
+const FORK_INSERT_MPS = 0.12;
+
+// 포크를 끼우는 동안은 차체를 곧게, 아주 천천히(0.12 m/s) 민다.
+function creepToward(target, reach) {
+  const a = W.agent;
+  const d = dist2(a.pos, target);
+  const step = Math.min(FORK_INSERT_MPS * DT, Math.max(0, d - reach));
+  W.lastMoved = 0;
+  if (step > 0) drive(1, step, 0);
+  return Math.max(0, d - reach - step);
+}
 const FORK_REST_M = 0.05;
 const FORK_CARRY_M = 0.10;
 const FORK_MPS = 0.10;
@@ -587,51 +605,142 @@ const FORK_STANDOFF_M = 0.58;
 const FORK_LOAD_X_M = 0.34;
 export const usesForks = () => !!W && ['wheel', 'mecanum', 'track'].includes(W.base);
 
+// 한 눈의 비전 확인(모의): 탑승자(머리) 또는 포크 카메라가 본 자리와 점수. 보이면 실제 자리에 작은 오차를 더한다.
+function forkSight(a, drop, camera, label) {
+  const range = dist2(a.pos, drop.pos);
+  const bearing = Math.abs(wrapAngle(Math.atan2(drop.pos[1] - a.pos[1], drop.pos[0] - a.pos[0]) - a.yaw));
+  const seen = range < 1.8 && bearing < 0.6;
+  const err = camera === 'fork' ? 0.012 : 0.025;
+  if (!seen) return { camera, ok: false, reason: camera === 'fork' ? '포크 카메라 화면 안에 대상이 없음' : '탑승자가 숙여 본 화면에 대상이 없음', neck_deg: a.neck_deg ?? 0 };
+  return {
+    camera, ok: true, label_ko: label,
+    score: Number((0.86 + W.rng() * 0.1).toFixed(2)),
+    range_m: Number(range.toFixed(2)),
+    depth_m: Number((range * (1 + (W.rng() - 0.5) * 0.04)).toFixed(2)),
+    at: [drop.pos[0] + (W.rng() - 0.5) * 2 * err, drop.pos[1] + (W.rng() - 0.5) * 2 * err],
+    sigma_m: err,
+    neck_deg: Number((a.neck_deg ?? 0).toFixed(1)),
+  };
+}
+
+function crossGap(a, b) {
+  if (!a?.ok || !b?.ok) return null;
+  return { apart: Math.hypot(a.at[0] - b.at[0], a.at[1] - b.at[1]), gate: Math.max(CROSS_MIN_M, 3 * Math.hypot(a.sigma_m, b.sigma_m)) };
+}
+
+function crossVerdict(x) {
+  if (x.rider?.ok && x.fork?.ok) return x.fork_vs_rider && x.fork_vs_rider.apart > x.fork_vs_rider.gate ? 'disagree' : 'agree';
+  if (x.fork?.ok) return 'fork_only';
+  if (x.rider?.ok) return 'rider_only';
+  return 'none';
+}
+
 function forkStep(q, rt, needsCoCarry = false, coPhase = 1) {
   const a = W.agent;
   const p = rt.pick;
   const drop = p.drop;
+  const tag = `[로봇 ${coPhase}]`;
   a.fork_m = a.fork_m ?? FORK_REST_M;
-  a.neck_deg = 0;
-  a.trunk_deg = 0;
-  applyCameraPose(a, 0, 0);
-  if (p.stage !== 'raise' && !W.drops.includes(drop)) {
+  p.cross = p.cross ?? {};
+  // 탑승자의 고개: 확인할 때만 숙이고(gazeAt, 몸은 낮추지 않음) 나머지는 정면.
+  const ahead = (k = 1) => {
+    const n = (a.neck_deg ?? 0) * (1 - k);
+    a.neck_deg = n;
+    a.trunk_deg = 0;
+    applyCameraPose(a, n, 0);
+  };
+  if (!['seat', 'raise'].includes(p.stage) && !W.drops.includes(drop)) {
     rt.pick = null;
+    a.fork_blocked = 0;
     return 'lost';
   }
   switch (p.stage) {
     case 'approach': {
+      ahead();
       const left = moveToward(drop.pos, FORK_STANDOFF_M);
       if (left <= 0) Object.assign(p, { stage: 'align', t: 0 });
       break;
     }
     case 'align': {
+      ahead();
       const rem = turnToward(drop.pos);
-      if (Math.abs(rem) < 0.06) Object.assign(p, { stage: 'lower', t: 0 });
+      if (Math.abs(rem) < 0.06) Object.assign(p, { stage: 'rider', t: 0 });
+      break;
+    }
+    case 'rider': {
+      p.t += 1;
+      gazeAt(a, drop.pos, Math.min(1, 0.5 * p.t), 0);
+      if (p.t === 2) {
+        p.cross.rider = forkSight(a, drop, 'head', rt.it.ko);
+        p.check = p.cross.rider;
+        const r = p.cross.rider;
+        log('vision', r.ok ? 'info' : 'warn', r.ok ? `${tag} ① 탑승자 시선 ✓ ${rt.it.ko} ${r.range_m} m — 고개 ${r.neck_deg}° 숙여 봄 (포크 ${a.fork_m.toFixed(2)} m)` : `${tag} ① 탑승자 시선 실패: ${r.reason}`, { robot_index: coPhase, check: r });
+      }
+      if (p.t >= 3) Object.assign(p, { stage: 'lower', t: 0 });
       break;
     }
     case 'lower': {
+      ahead(0.5);
       a.fork_m = Math.max(0, a.fork_m - FORK_MPS * DT);
       if (a.fork_m <= 0) {
+        ahead();
         Object.assign(p, { stage: 'check', t: 0 });
-        log('vision', 'info', `[로봇 ${coPhase}] 포크를 바닥까지 내림: ${rt.it.ko} — 탑승자는 정면, 포크 카메라로 확인`, { robot_index: coPhase, fork_m: 0 });
+        log('vision', 'info', `${tag} 포크를 바닥까지 내림: ${rt.it.ko} — 탑승자는 다시 정면, 포크 카메라로 확인`, { robot_index: coPhase, fork_m: 0 });
       }
       break;
     }
     case 'check': {
+      ahead();
       p.t += 1;
       if (p.t === 1) {
-        const range = dist2(a.pos, drop.pos);
-        const bearing = Math.abs(wrapAngle(Math.atan2(drop.pos[1] - a.pos[1], drop.pos[0] - a.pos[0]) - a.yaw));
-        const seen = range < 1.5 && bearing < 0.5;
-        p.check = seen ? { ok: true, label_ko: rt.it.ko, score: Number((0.86 + W.rng() * 0.1).toFixed(2)), range_m: Number(range.toFixed(2)), depth_m: Number((range * (1 + (W.rng() - 0.5) * 0.04)).toFixed(2)) } : { ok: false, reason: '포크 카메라 화면 안에 대상이 없음' };
-        log('vision', p.check.ok ? 'info' : 'warn', p.check.ok ? `[로봇 ${coPhase}] 비전 확인 ✓ ${rt.it.ko} ${p.check.range_m} m (깊이 ${p.check.depth_m} m) · 포크 카메라` : `[로봇 ${coPhase}] 비전 확인 실패: ${p.check.reason}`, { robot_index: coPhase, check: p.check });
+        const x = p.cross;
+        x.fork = forkSight(a, drop, 'fork', rt.it.ko);
+        const g = crossGap(x.rider, x.fork);
+        x.fork_vs_rider = g;
+        x.verdict = crossVerdict(x);
+        x.apart_m = g ? Number(g.apart.toFixed(3)) : null;
+        x.gate_m = g ? Number(g.gate.toFixed(3)) : null;
+        p.check = x.fork;
+        const ok = x.verdict === 'agree';
+        const msg = ok ? `${tag} ② 포크 카메라 ✓ ${rt.it.ko} ${x.fork.range_m} m · 교차 검증 ✓ 탑승자 시선과 ${(x.apart_m * 100).toFixed(0)} cm 차이 ≤ ${(x.gate_m * 100).toFixed(0)} cm` : `${tag} ② 포크 카메라 ${x.fork.ok ? '✓' : '✗'} · 교차 검증 ${x.verdict}`;
+        log('vision', ok ? 'info' : 'warn', msg, { robot_index: coPhase, cross: { verdict: x.verdict, apart_m: x.apart_m, gate_m: x.gate_m } });
       }
-      if (p.t >= 2) Object.assign(p, p.check?.ok ? { stage: 'insert', t: 0 } : { stage: 'approach', t: 0, check: null });
+      if (p.t >= 2) Object.assign(p, p.cross.fork?.ok || p.cross.rider?.ok ? { stage: 'insert', t: 0 } : { stage: 'approach', t: 0, check: null, cross: {} });
       break;
     }
     case 'insert': {
-      const left = moveToward(drop.pos, FORK_LOAD_X_M);
+      ahead();
+      const left = creepToward(drop.pos, FORK_LOAD_X_M);
+      // 물건의 앞면이 포크 카메라(포크 뒤꿈치)에 다가올수록 화면을 채운다: 앞면이 25 cm 앞이면 거의 비고, 10 cm 앞이면 60%.
+      const gap = Math.max(0, dist2(a.pos, drop.pos) - FORK_LOAD_X_M);
+      a.fork_blocked = Math.max(0, Math.min(1, (0.25 - gap) / 0.25));
+      a.fork_blocked_item = rt.key;
+      if (a.fork_blocked >= FORK_BLOCKED_SHARE || left <= 0) {
+        p.cross.blocked_share = Number(a.fork_blocked.toFixed(3));
+        Object.assign(p, { stage: 'recheck', t: 0 });
+        log('vision', 'info', `${tag} 포크 카메라 화면 ${(a.fork_blocked * 100).toFixed(0)}%가 ${rt.it.ko}에 가려짐 — 멈추고 탑승자가 다시 확인`, { robot_index: coPhase, blocked_share: p.cross.blocked_share });
+      }
+      break;
+    }
+    case 'recheck': {
+      p.t += 1;
+      gazeAt(a, drop.pos, Math.min(1, 0.5 * p.t), 0);
+      if (p.t === 2) {
+        const x = p.cross;
+        x.recheck = forkSight(a, drop, 'head', rt.it.ko);
+        const g = crossGap(x.fork?.ok ? x.fork : x.rider, x.recheck);
+        x.recheck_apart_m = g ? Number(g.apart.toFixed(3)) : null;
+        x.recheck_gate_m = g ? Number(g.gate.toFixed(3)) : null;
+        x.seated = x.recheck.ok && (!g || g.apart <= g.gate);
+        p.check = x.recheck;
+        log('vision', x.seated ? 'info' : 'warn', x.seated ? `${tag} ③ 재확인 ✓ ${rt.it.ko}: 탑승자가 고개 ${x.recheck.neck_deg}° 숙여 봄 — 포크 위로 오는 중${g ? `, 포크 카메라와 ${(g.apart * 100).toFixed(0)} cm` : ''}` : `${tag} ③ 재확인 ✗ ${x.recheck.reason ?? '자리가 어긋남'}`, { robot_index: coPhase, check: x.recheck });
+      }
+      if (p.t >= 3) Object.assign(p, { stage: 'seat', t: 0 });
+      break;
+    }
+    case 'seat': {
+      gazeAt(a, drop.pos, 1, 0);
+      const left = creepToward(drop.pos, FORK_LOAD_X_M);
       if (left <= 0) {
         if (needsCoCarry && coPhase === 1) return 'phase1_ready';
         W.drops.splice(W.drops.indexOf(drop), 1);
@@ -640,9 +749,12 @@ function forkStep(q, rt, needsCoCarry = false, coPhase = 1) {
       break;
     }
     case 'raise': {
+      ahead(0.4);
+      a.fork_blocked = 0;
       a.fork_m = Math.min(FORK_CARRY_M, a.fork_m + FORK_MPS * DT);
       W.energy += (needsCoCarry ? 6 : 12) * DT;
       if (a.fork_m >= FORK_CARRY_M) {
+        ahead();
         a.carrying.push({ item_id: rt.key, label_ko: rt.it.ko, mass_kg: rt.it.mass });
         rt.pick = null;
         return 'picked';
@@ -660,7 +772,7 @@ function pickStep(q, rt, needsCoCarry = false, coPhase = 1) {
   const a = W.agent;
   const p = rt.pick;
   const drop = p.drop;
-  if (!['grip', 'lift'].includes(p.stage) && !W.drops.includes(drop)) {
+  if (!['grip', 'lift', 'look_up'].includes(p.stage) && !W.drops.includes(drop)) {
     rt.pick = null;
     return 'lost';
   }
@@ -723,15 +835,34 @@ function pickStep(q, rt, needsCoCarry = false, coPhase = 1) {
       break;
     }
     case 'lift': {
+      // 몸을 펴며 들어 올리는 동안 시선이 물건을 따라간다: 물건이 화면 가운데에 있도록 목(모자라면 허리)을 맞춘다.
       p.t += 1;
       const u = Math.min(1, p.t / 4);
+      const crouch = p.from.crouch * (1 - u);
+      const eye = Math.max(0.35, (a.standing_eye_m ?? 1.0) - crouch);
+      const objZ = 0.06 + 0.7 * u;
+      const ahead = 0.55 - 0.2 * u;
+      const wantPitch = -(Math.atan2(Math.max(0.02, eye - objZ), ahead) * 180) / Math.PI;
+      const total = Math.max(0, (a.mount_deg ?? -12.0) - wantPitch);
+      a.neck_deg = Math.min(NECK_MAX_DEG, total);
+      a.trunk_deg = Math.max(0, total - NECK_MAX_DEG);
+      applyCameraPose(a, total, crouch);
+      a.held = { item_id: rt.key, label_ko: rt.it.ko, forward: ahead, z: objZ };
+      W.energy += (needsCoCarry ? 12.5 : 25) * DT;
+      if (u >= 1) Object.assign(p, { stage: 'look_up', t: 0, from: { ...p.from, total, neck: a.neck_deg } });
+      break;
+    }
+    case 'look_up': {
+      // 물건이 손에 들리면 다시 정면을 본다.
+      p.t += 1;
+      const u = Math.min(1, p.t / 2);
       a.neck_deg = p.from.neck * (1 - u);
       a.trunk_deg = Math.max(0, (p.from.total - p.from.neck) * (1 - u));
-      applyCameraPose(a, p.from.total * (1 - u), p.from.crouch * (1 - u));
-      W.energy += (needsCoCarry ? 12.5 : 25) * DT;
+      applyCameraPose(a, p.from.total * (1 - u), 0);
       if (u >= 1) {
         a.neck_deg = 0;
         a.trunk_deg = 0;
+        a.held = null;
         applyCameraPose(a, 0, 0);
         if (needsCoCarry && coPhase === 1) {
           return 'phase1_ready';
@@ -756,8 +887,9 @@ export function procedureView() {
   const a = W.agent;
   if (usesForks()) {
     const at = FORK_STAGES.findIndex(([id]) => id === p.stage);
+    const x = p.cross ?? {};
     return {
-      act: ['align', 'lower', 'check'].includes(p.stage) ? 'look' : 'pick',
+      act: ['align', 'rider', 'lower', 'check'].includes(p.stage) ? 'look' : 'pick',
       mechanism: 'fork',
       camera: ['lower', 'check', 'insert'].includes(p.stage) ? 'fork' : 'head',
       target: p.drop.id,
@@ -765,22 +897,35 @@ export function procedureView() {
       stage: p.stage,
       stages: FORK_STAGES.map(([id, label_ko], i) => ({ id, label_ko, state: i < at ? 'done' : i === at ? 'active' : 'pending' })),
       fork_m: a.fork_m ?? FORK_REST_M,
-      neck_deg: 0,
-      trunk_deg: 0,
+      neck_deg: a.neck_deg ?? 0,
+      trunk_deg: a.trunk_deg ?? 0,
       eye_m: a.eye_m,
       standing_eye_m: a.standing_eye_m,
       pitch_deg: a.pitch_deg,
       check: p.check,
+      cross: {
+        rider: x.rider ?? null,
+        fork: x.fork ?? null,
+        recheck: x.recheck ?? null,
+        verdict: x.verdict ?? null,
+        apart_m: x.apart_m ?? null,
+        gate_m: x.gate_m ?? null,
+        recheck_apart_m: x.recheck_apart_m ?? null,
+        recheck_gate_m: x.recheck_gate_m ?? null,
+        seated: x.seated ?? null,
+        blocked_share: x.blocked_share ?? null,
+      },
     };
   }
-  const at = PICK_STAGES.findIndex(([id]) => id === p.stage);
+  const shown = p.stage === 'look_up' ? 'lift' : p.stage;
+  const at = PICK_STAGES.findIndex(([id]) => id === shown);
   const teamCoop = (W.teamSize ?? 2) >= 2;
   const phaseLabel = teamCoop ? ` [로봇 ${rt.coPhase ?? 1}/2]` : '';
   return {
     act: 'pick',
     target: p.drop.id,
     label_ko: `${rt.it.ko}${phaseLabel}`,
-    stage: p.stage,
+    stage: shown,
     stages: PICK_STAGES.map(([id, label_ko], i) => ({
       id,
       label_ko,
@@ -903,6 +1048,7 @@ function runStep(q, rt) {
         a.yaw = Math.atan2(rt.pick.drop.pos[1] - a.pos[1], rt.pick.drop.pos[0] - a.pos[0]);
         a.neck_deg = 0;
         a.trunk_deg = 0;
+        a.held = null;
         applyCameraPose(a, 0, 0);
         Object.assign(rt.pick, { stage: 'approach', t: 0, check: null });
         log('world', 'info', `[로봇 1/2] 1차 파지 및 들어올림 대기 완료 → [로봇 2/2] 시점으로 전환하여 고개 숙여 응시 → 자세 낮춤 → 협동 들어올림 진행`, { co_phase: 2 });

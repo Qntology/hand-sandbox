@@ -694,6 +694,10 @@ pub fn grasp(inp: &GraspInput) -> ActRollout {
     let lift_s = path.duration();
     metrics.push(("curl_s", path.curl_s));
     let at = |t: f32| path.at(body, t);
+    // The eyes that led the hand down stay on the item while it comes up and goes to the bay: the neck keeps it in the
+    // middle of the head camera's image as the body straightens (Land & Hayhoe 2001: fixation holds until the object
+    // is placed).
+    let track = |pose: KinPose, obj: [f32; 3]| if eyes_lead { KinPose { neck_deg: super::gaze::aim_neck(body, &pose, obj[0], obj[2]), ..pose } } else { pose };
     let n = (lift_s / SAMPLE_S).ceil().max(2.0) as usize;
     let dt = lift_s / n as f32;
     let palm = |u: f32| kin::solve_fast(body, &at(u * lift_s), &KinLoads::default()).hands[0];
@@ -733,8 +737,11 @@ pub fn grasp(inp: &GraspInput) -> ActRollout {
             twist_max = twist_max.max(load * lever / st.torsion_cap_nm);
         }
         let f_obj = [-inp.mass_kg * acc[0], -inp.mass_kg * acc[1], -inp.mass_kg * (G + acc[2])];
-        let pose = at(i as f32 / n as f32 * lift_s);
-        let ok = s.push(body, t, "lift", KinPose { closure: held_closure, ..pose }, KinLoads { hand_force: hand_force(two_arms, f_obj), ..KinLoads::default() }, Some(gr), Some([p[0], p[1], p[2] - 0.5 * inp.size_m[1] - reach::PALM_CLEARANCE_M]));
+        // The arm solves in its own plane, so the palm sits off the shoulder; the item stays in line with where it
+        // was picked up.
+        let obj = [p[0], obj_ground[1], p[2] - 0.5 * inp.size_m[1] - reach::PALM_CLEARANCE_M];
+        let pose = track(at(i as f32 / n as f32 * lift_s), obj);
+        let ok = s.push(body, t, "lift", KinPose { closure: held_closure, ..pose }, KinLoads { hand_force: hand_force(two_arms, f_obj), ..KinLoads::default() }, Some(gr), Some(obj));
         if st.shared.gross_slip || gr.slip_ratio < 1.0 {
             failed = Some(("grasp_slip", format!("들어 올리다 미끄러짐: 패드 마찰 {:.2} × 쥠 {:.0} N로 하중 {:.0} N를 못 버팀 (가속 {:+.1} m/s²)", st.mu_mean, g, load, acc[2]), t));
             dropped_at = Some(p);
@@ -807,6 +814,10 @@ pub fn grasp(inp: &GraspInput) -> ActRollout {
             s.events.push(ActEvent::new(t_hold, "stow_unreachable", format!("손이 {} 위로 가지 못함 (내려놓을 점 {:.2} m): 손에 든 채 운반", c.cargo.label_ko(), c.release[1]), &[Part::Hand], Some(c.release[1]), false));
         }
         notes.push(if body.cargo_geom().is_some() { "적재 위치 위로 손이 가지 못함: 물건을 손(집게)에 든 채 운반" } else { "적재 공간 없음: 물건을 손(집게)에 든 채 운반" }.to_string());
+        if eyes_lead {
+            let last = s.samples.last().cloned();
+            look_up(body, &mut s, stand.neck_deg, KinLoads::holding(inp.mass_kg, two_arms, 0.0), last.as_ref().and_then(|x| x.grip), last.and_then(|x| x.object));
+        }
         let dur = s.end();
         metrics.push(("duration_s", dur));
         metrics.push(("peak_ratio", s.peak_ratio));
@@ -823,9 +834,11 @@ pub fn grasp(inp: &GraspInput) -> ActRollout {
         let u = min_jerk(i as f32 / n as f32);
         let pose = KinPose::lerp(&hold, &bay, u);
         let p = kin::solve_fast(body, &pose, &KinLoads::default()).hands[0];
-        s.push(body, t_hold + i as f32 * SAMPLE_S, "stow", pose, KinLoads::holding(inp.mass_kg, two_arms, 0.0), Some(grip_stow), Some([p[0], p[1], p[2] - 0.5 * inp.size_m[1]]));
+        let obj = [p[0], obj_ground[1] * (1.0 - u), p[2] - 0.5 * inp.size_m[1]];
+        s.push(body, t_hold + i as f32 * SAMPLE_S, "stow", track(pose, obj), KinLoads::holding(inp.mass_kg, two_arms, 0.0), Some(grip_stow), Some(obj));
     }
     let t_open = s.end();
+    let bay = KinPose { neck_deg: s.samples.last().map_or(bay.neck_deg, |x| x.pose.neck_deg), ..bay };
     let (drop_m, place_ko) = match body.cargo_geom() {
         Some(c) if !c.on_pelvis => {
             let h = (c.release[1] - reach::PALM_CLEARANCE_M - inp.size_m[1] - c.floor_z_m).max(0.0);
@@ -841,11 +854,29 @@ pub fn grasp(inp: &GraspInput) -> ActRollout {
         s.push(body, t_open + i as f32 * SAMPLE_S, "release", KinPose { closure: held_closure * (1.0 - u), ..bay }, KinLoads::default(), None, Some(stowed_at(body)));
     }
     s.events.push(ActEvent::new(s.end(), "stowed", format!("{place_ko}에 놓음 · {:.0} N", f_bay), &[Part::Hand], Some(f_bay), true));
+    if eyes_lead {
+        look_up(body, &mut s, stand.neck_deg, KinLoads::default(), None, Some(stowed_at(body)));
+    }
     let dur = s.end();
     metrics.push(("duration_s", dur));
     metrics.push(("peak_ratio", s.peak_ratio));
     metrics.push(("min_margin", s.min_margin));
     ActRollout { kind: ActKind::Grasp, samples: s.samples, events: s.events, outcome: Outcome::ok(), duration_s: dur, metrics, notes }
+}
+
+/// The head back to `to_neck` once the item is in: one head shift ("look_up") from the last sample's pose.
+fn look_up(body: &Body, s: &mut Series, to_neck: f32, loads: KinLoads, grip: Option<Grip>, object: Option<[f32; 3]>) {
+    let Some(from) = s.samples.last().map(|x| x.pose) else { return };
+    if (from.neck_deg - to_neck).abs() < 1.0 {
+        return;
+    }
+    let to = KinPose { neck_deg: to_neck, ..from };
+    let dur = super::gaze::shift_s(body, &from, &to);
+    let t0 = s.end();
+    let n = (dur / SAMPLE_S).ceil().max(1.0) as usize;
+    for i in 1..=n {
+        s.push(body, t0 + dur * i as f32 / n as f32, "look_up", KinPose::lerp(&from, &to, min_jerk(i as f32 / n as f32)), loads, grip, object);
+    }
 }
 
 fn rise_time(pts: &[(f32, f32)], level: f32) -> Option<f32> {
@@ -1040,12 +1071,36 @@ mod tests {
             .map(|s| camera_off_object_deg(&b, &s.pose, obj[0], obj[2]))
             .fold(0.0f32, f32::max);
         assert!(worst < 2.0, "the log stays in the middle of the image while the body bends: {worst:.1}°");
-        let extra = r.duration_s - plain.duration_s;
+        let up_s = r.duration_s - r.samples.iter().filter(|s| s.phase != "look_up").last().unwrap().t;
+        let extra = r.duration_s - up_s - plain.duration_s;
         assert!(extra > 0.4 && extra < 1.5, "a look and a fixation add under a second and a half: {extra}");
+        assert!(up_s > 0.1 && up_s < 1.0, "the head comes back up in one shift once the log is in: {up_s}");
         let lead = r.samples.iter().filter(|s| s.phase == "check").last().unwrap().pose;
         let held = grasp(&GraspInput { lead: Some(lead), ..log_input(&b, &h, 3) });
         assert_eq!(held.samples[0].phase, "reach", "a robot already looking starts bending at once");
         assert!((held.samples[0].pose.neck_deg - lead.neck_deg).abs() < 1.0);
+    }
+
+    #[test]
+    fn the_eyes_follow_the_log_up_while_it_is_lifted_and_stowed() {
+        let (b, h) = setup(BaseKind::HumanFoot, FingerCount::Five);
+        let r = grasp(&GraspInput { look_first: true, ..log_input(&b, &h, 3) });
+        assert!(r.outcome.ok, "{:?}", r.outcome);
+        let moving: Vec<&ActSample> = r.samples.iter().filter(|s| matches!(s.phase, "lift" | "stow")).collect();
+        assert!(moving.len() > 10);
+        let first = moving.first().unwrap().object.unwrap();
+        let last = moving.last().unwrap().object.unwrap();
+        assert!(last[2] > first[2] + 0.2, "the log comes up: {first:?} -> {last:?}");
+        let worst = moving
+            .iter()
+            .filter(|s| s.pose.neck_deg.abs() < crate::kin::NECK_PITCH_MAX_DEG - 0.5)
+            .map(|s| camera_off_object_deg(&b, &s.pose, s.object.unwrap()[0], s.object.unwrap()[2]))
+            .fold(0.0f32, f32::max);
+        assert!(worst < 2.0, "the log stays in the middle of the head camera's image as it rises: {worst:.1}°");
+        let plain = grasp(&log_input(&b, &h, 3));
+        let lifted = |r: &ActRollout| r.samples.iter().filter(|s| s.phase == "lift").last().unwrap().pose.neck_deg;
+        assert!(lifted(&r) > lifted(&plain) + 10.0, "without the eyes leading the head comes up with the body: {} vs {}", lifted(&r), lifted(&plain));
+        assert!(r.samples.last().unwrap().pose.neck_deg.abs() < 0.5 && r.samples.last().unwrap().phase == "look_up", "and looks ahead again once it is in");
     }
 
     #[test]

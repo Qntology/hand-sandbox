@@ -1,7 +1,8 @@
-// 줍기 절차 HUD: 다리 몸은 사람처럼 "고개를 숙여 응시 → 비전 확인 → 자세 낮춤 → 쥐기 → 들어올림",
-// 바퀴·메카넘·트랙 몸은 지게차처럼 "정렬(탑승자는 정면) → 포크 내림 → 포크 카메라 확인 → 포크 끼우기 → 들어올림" 순서를
-// 1인칭 화면 위에 보인다. world_frame 의 procedure(Rust 런타임 또는 모의 월드)를 그대로 그리며,
-// 비전 확인 결과가 있으면 대상에 조준점을 겹친다. 지게차 절차에서는 포크 카메라 화면을 작게 함께 보인다.
+// 줍기 절차 HUD: 다리 몸은 사람처럼 "고개를 숙여 응시 → 비전 확인 → 자세 낮춤 → 쥐기 → 시선 따라 들어올림",
+// 바퀴·메카넘·트랙 몸은 지게차처럼 두 눈으로 교차 검증한다: "탑승자 시선 내려 확인 → 포크 내림(시선 정면) →
+// 포크 카메라 확인·교차 검증 → 포크 끼우기(포크 카메라 추적) → 포크 카메라 가림 → 탑승자 재확인 → 안착 → 들어올림".
+// world_frame 의 procedure(Rust 런타임 또는 모의 월드)를 그대로 그리며, 1인칭(머리·탑승자) 화면의 비전 확인에는
+// 대상에 조준점을 겹친다. 지게차 절차에서는 포크 카메라 화면을 작게 함께 보이고, 가려지면 그렇게 표시한다.
 import { $, clear, el, fmt } from './util.js';
 
 const STATE_KO = { done: '완료', active: '진행', pending: '대기', failed: '실패' };
@@ -13,21 +14,66 @@ function stageRow(s) {
     el('span', { class: 'ph-st', text: STATE_KO[s.state] ?? s.state }));
 }
 
+function sightText(c) {
+  const depth = c.depth_m != null ? ` · 깊이 ${fmt.n(c.depth_m, 2)} m` : '';
+  return `${c.label_ko ?? ''} ${c.score != null ? Math.round(c.score * 100) : '—'} · ${fmt.n(c.range_m, 2)} m${depth}`;
+}
+
 function checkLine(p) {
   const c = p.check;
-  const fork = p.mechanism === 'fork';
-  if (!c) return el('div', { class: 'ph-check wait', text: fork ? '비전 확인 대기 — 포크를 내리고 포크 카메라로 대상을 봅니다 (탑승자는 정면)' : '비전 확인 대기 — 고개를 숙여 대상을 화면 가운데에 둡니다' });
+  if (p.mechanism === 'fork') return crossLines(p);
+  if (!c) return el('div', { class: 'ph-check wait', text: '비전 확인 대기 — 고개를 숙여 대상을 화면 가운데에 둡니다' });
   if (!c.ok) return el('div', { class: 'ph-check fail', text: `비전 확인 실패 · ${c.reason ?? '대상이 보이지 않음'}` });
-  const depth = c.depth_m != null ? ` · 깊이 모델 ${fmt.n(c.depth_m, 2)} m` : '';
-  const how = fork ? ' · 포크 카메라' : '';
-  return el('div', { class: 'ph-check ok', text: `비전 확인 ✓ ${c.label_ko ?? ''} ${c.score != null ? Math.round(c.score * 100) : '—'} · 거리 ${fmt.n(c.range_m, 2)} m${depth}${how}` });
+  return el('div', { class: 'ph-check ok', text: `비전 확인 ✓ ${sightText(c)}` });
+}
+
+const VERDICT = {
+  agree: ['ok', '교차 검증 ✓ 두 시점이 같은 자리'],
+  disagree: ['fail', '교차 검증 ✗ 두 시점이 어긋남 — 포크 카메라를 믿음'],
+  fork_only: ['wait', '교차 검증 △ 포크 카메라만 봄'],
+  rider_only: ['wait', '교차 검증 △ 탑승자만 봄'],
+  none: ['fail', '교차 검증 ✗ 두 시점 모두 못 봄'],
+};
+
+// 지게차의 두 눈: ① 탑승자 시선(머리 카메라) ② 포크 카메라, 둘의 교차 검증, ③ 포크 카메라가 가려진 뒤 탑승자 재확인.
+function crossLines(p) {
+  const x = p.cross ?? {};
+  const box = el('div', { class: 'ph-cross' });
+  const line = (cls, text) => box.append(el('div', { class: `ph-check ${cls}`, text }));
+  const sight = (n, who, s, wait) => {
+    if (!s) return line('wait', `${n} ${who} 대기 — ${wait}`);
+    if (!s.ok) return line('fail', `${n} ${who} 실패 · ${s.reason ?? '대상이 보이지 않음'}`);
+    if (s.matched === false) return line('wait', `${n} ${who} △ ${s.reason ?? '대상이 아닌 이웃 것만 보임'}`);
+    const neck = s.camera === 'head' && s.neck_deg != null ? ` · 고개 ${fmt.n(s.neck_deg, 0)}°` : '';
+    return line('ok', `${n} ${who} ✓ ${sightText(s)}${neck}`);
+  };
+  sight('①', '탑승자 시선', x.rider, '고개를 숙여 물건을 봅니다');
+  sight('②', '포크 카메라', x.fork, '포크를 내리고 포크 카메라로 봅니다 (탑승자는 정면)');
+  if (x.verdict) {
+    const [cls, text] = VERDICT[x.verdict] ?? ['wait', x.verdict];
+    const gap = x.apart_m != null ? ` (${fmt.n(x.apart_m * 100, 0)} cm, 허용 ${fmt.n(x.gate_m * 100, 0)} cm)` : '';
+    line(cls, `${text}${gap}`);
+  }
+  if (x.recheck || ['recheck', 'seat', 'raise'].includes(p.stage)) {
+    const blocked = x.blocked_share != null ? `포크 카메라 ${fmt.n(x.blocked_share * 100, 0)}% 가림 → ` : '포크 카메라 가림 → ';
+    if (!x.recheck) line('wait', `③ ${blocked}탑승자 재확인 대기`);
+    else if (!x.recheck.ok) line('fail', `③ ${blocked}재확인 실패 · ${x.recheck.reason ?? '대상이 보이지 않음'}`);
+    else if (x.recheck.matched === false) line('wait', `③ ${blocked}재확인 △ ${x.recheck.reason ?? '대상이 아닌 이웃 것만 보임'}`);
+    else {
+      const gap = x.recheck_apart_m != null ? ` · 포크 카메라와 ${fmt.n(x.recheck_apart_m * 100, 0)} cm` : '';
+      line(x.seated === false ? 'fail' : 'ok', `③ ${blocked}탑승자 재확인 ${x.seated === false ? '✗' : '✓'} 포크 위 ${x.recheck.label_ko ?? ''}${gap}`);
+    }
+  }
+  return box;
 }
 
 function pose(p) {
   const bits = [];
   if (p.mechanism === 'fork') {
     if (p.fork_m != null) bits.push(`포크 ${fmt.n(p.fork_m, 2)} m`);
-    bits.push(`탑승자 시선 정면 (카메라 ${fmt.n(p.pitch_deg, 0)}°)`);
+    const down = (p.neck_deg ?? 0) > 1 || (p.trunk_deg ?? 0) > 1;
+    bits.push(down ? `탑승자 고개 ${fmt.n(p.neck_deg, 0)}°${(p.trunk_deg ?? 0) > 1 ? ` · 몸 ${fmt.n(p.trunk_deg, 0)}°` : ''} 숙임 (카메라 ${fmt.n(p.pitch_deg, 0)}°)` : `탑승자 시선 정면 (카메라 ${fmt.n(p.pitch_deg, 0)}°)`);
+    bits.push(p.camera === 'fork' ? '보는 눈: 포크 카메라' : '보는 눈: 탑승자');
     if (p.tip_ratio != null) bits.push(`전도 여유 ${fmt.n(p.tip_ratio, 2)}`);
     return bits.join(' · ');
   }
@@ -60,16 +106,32 @@ export function wantsForkCam(p) {
   return !!p && p.act != null && p.mechanism === 'fork' && p.act !== 'set_down';
 }
 
+/** 1인칭(머리·탑승자) 화면에 겹칠 비전 확인: 사람은 응시·확인 동안의 확인, 지게차는 탑승자가 숙여 본 확인(재확인 우선). */
+function headCheck(p) {
+  if (p.mechanism !== 'fork') return ['look', 'check'].includes(p.stage) ? p.check : null;
+  if (p.camera === 'fork') return null;
+  const x = p.cross ?? {};
+  if (['recheck', 'seat'].includes(p.stage)) return x.recheck ?? null;
+  return p.stage === 'rider' ? x.rider ?? null : null;
+}
+
 /** world_frame 응답의 procedure 를 HUD 로 그린다. 없으면 숨긴다. */
 export function renderPickHud(p) {
   const hud = $('pick-hud');
   if (!hud) return;
   const show = !!p && p.act != null;
   hud.hidden = !show;
-  // 지게차는 비전 확인이 포크 카메라 화면에서 일어나므로, 1인칭(탑승자) 화면에는 조준점을 겹치지 않는다.
-  reticle(show && p.mechanism !== 'fork' ? p.check : null);
+  reticle(show ? headCheck(p) : null);
   const cam = $('ph-forkcam-box');
-  if (cam) cam.hidden = !wantsForkCam(p);
+  if (cam) {
+    cam.hidden = !wantsForkCam(p);
+    const live = show && p.camera === 'fork';
+    const blocked = show && (p.cross?.blocked_share ?? 0) > 0 && ['recheck', 'seat'].includes(p.stage);
+    cam.classList.toggle('live', live);
+    cam.classList.toggle('blocked', blocked);
+    const cap = cam.querySelector('figcaption');
+    if (cap) cap.textContent = blocked ? `포크 카메라 · ${fmt.n(p.cross.blocked_share * 100, 0)}% 가려짐` : live ? '포크 카메라 · 보는 중' : '포크 카메라';
+  }
   if (!show) return;
   $('ph-title').textContent = title(p);
   $('ph-pose').textContent = pose(p);
