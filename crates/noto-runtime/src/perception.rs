@@ -128,9 +128,15 @@ impl EntityTable {
 }
 
 pub fn centre_from_surface(view: &View, p: [f32; 3], r: f32) -> (f32, f32) {
-    let (dx, dz) = (p[0] - view.origin[0], p[2] - view.origin[2]);
+    centre_from_surface_at(view.origin, p, r)
+}
+
+/// The ground point of an item's centre, `r` behind the surface point `p` an eye at `origin` sees of it: on along the
+/// line of sight, less of `r` the steeper the eye looks down.
+pub fn centre_from_surface_at(origin: [f32; 3], p: [f32; 3], r: f32) -> (f32, f32) {
+    let (dx, dz) = (p[0] - origin[0], p[2] - origin[2]);
     let ground = dx.hypot(dz).max(1e-4);
-    let theta = (view.origin[1] - p[1]).atan2(ground).max(0.0);
+    let theta = (origin[1] - p[1]).atan2(ground).max(0.0);
     let front = if theta > 0.45 {
         (theta.cos() / (theta.cos() + 1.5 * theta.sin())).max(0.15)
     } else {

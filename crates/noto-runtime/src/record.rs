@@ -107,6 +107,8 @@ pub struct Keyframe {
     pub pose: Pose,
     pub intr: Intrinsics,
     pub webp: Vec<u8>,
+    /// The right camera's frame when the eye is a stereo pair (`webp` is then the left one); SGBM matches the two.
+    pub webp_right: Option<Vec<u8>>,
     pub truth: KeyTruth,
     pub step: Option<String>,
     pub action: Option<String>,
@@ -134,6 +136,13 @@ impl Keyframe {
         let (w, h, data) = decode_webp(&self.webp).map_err(|e| anyhow!("키프레임 WebP 해독 실패: {e}"))?;
         Ok(Rgb::new(w, h, data))
     }
+
+    /// The stereo pair's right image, when the keyframe has one.
+    pub fn rgb_right(&self) -> Result<Option<Rgb>> {
+        let Some(webp) = &self.webp_right else { return Ok(None) };
+        let (w, h, data) = decode_webp(webp).map_err(|e| anyhow!("키프레임 오른쪽 화면 WebP 해독 실패: {e}"))?;
+        Ok(Some(Rgb::new(w, h, data)))
+    }
 }
 
 pub struct Recording {
@@ -159,7 +168,7 @@ impl Recording {
     /// the depth-and-mask overlay, the close-ups) and the video.
     pub fn memory(&self) -> (usize, usize, usize) {
         let pixels = self.keyframes.iter().map(|k| k.truth.pixel_bytes()).sum();
-        let images = self.keyframes.iter().map(|k| k.webp.len() + k.ml_webp.as_ref().map_or(0, Vec::len) + k.focus_webp.iter().map(|(_, w)| w.len()).sum::<usize>()).sum();
+        let images = self.keyframes.iter().map(|k| k.webp.len() + k.webp_right.as_ref().map_or(0, Vec::len) + k.ml_webp.as_ref().map_or(0, Vec::len) + k.focus_webp.iter().map(|(_, w)| w.len()).sum::<usize>()).sum();
         let video = self.video.iter().map(|v| v.webp.len()).sum();
         (pixels, images, video)
     }
@@ -192,9 +201,19 @@ pub fn capture_focus(world: &World, quality: f32) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
-pub fn capture_keyframe(world: &World, cam: &Camera, quality: f32, index: u32) -> Result<Keyframe> {
+/// A keyframe of the eye's frame; with `stereo_baseline_m` (a stereo eye) the right camera's frame too, both kept at
+/// `STEREO_KEYFRAME_QUALITY` at least, for SGBM to match what the cameras saw rather than the codec's artefacts.
+pub fn capture_keyframe(world: &World, cam: &Camera, quality: f32, index: u32, stereo_baseline_m: Option<f32>) -> Result<Keyframe> {
     let frame = world.render(cam);
+    let quality = if stereo_baseline_m.is_some() { quality.max(crate::stereo::STEREO_KEYFRAME_QUALITY) } else { quality };
     let enc = encode_webp(&frame.rgb, frame.width as u32, frame.height as u32, quality).map_err(|e| anyhow!("WebP 인코딩 실패: {e}"))?;
+    let webp_right = match stereo_baseline_m {
+        Some(b) => {
+            let right = world.render_right(cam, b);
+            Some(encode_webp(&right.rgb, right.width as u32, right.height as u32, quality).map_err(|e| anyhow!("오른쪽 화면 WebP 인코딩 실패: {e}"))?.bytes)
+        }
+        None => None,
+    };
     Ok(Keyframe {
         index,
         tick: world.tick,
@@ -202,6 +221,7 @@ pub fn capture_keyframe(world: &World, cam: &Camera, quality: f32, index: u32) -
         pose: odometry(world, cam),
         intr: intrinsics(world, cam),
         webp: enc.bytes,
+        webp_right,
         truth: KeyTruth::capture(world, &frame),
         step: None,
         action: world.current_action(),

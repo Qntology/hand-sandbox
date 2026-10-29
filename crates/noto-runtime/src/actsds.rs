@@ -71,7 +71,7 @@ impl Runtime {
             return;
         }
         let quality = self.test_cfg.record.quality;
-        if let Ok(mut kf) = capture_keyframe(&self.world, &self.cam, quality, n as u32) {
+        if let Ok(mut kf) = capture_keyframe(&self.world, &self.cam, quality, n as u32, self.stereo_baseline()) {
             kf.step = self.current_step_label();
             kf.event = Some(KeyEvent { act: act.clone(), kind: kind.clone(), label, ok, parts });
             let value = events.iter().find_map(|e| match &e.event {

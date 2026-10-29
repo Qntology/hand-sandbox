@@ -46,37 +46,22 @@ function showToast(kind, text) {
   toastTimer = setTimeout(() => { t.hidden = true; }, kind === 'err' ? 9000 : 7000);
 }
 
+/** 통합 테스트 기록(게임 → ML 인식 → ML 결정)은 로봇 한 대의 통과를 다시 돌리므로 서브 작업자가 없을 때만. */
 export function recordOn() {
-  return !state.mock && !!$('tl-record')?.checked && (state.teamSize ?? 1) <= 1;
-}
-
-function splitCoopCommands(text) {
-  if ((state.teamSize ?? 1) < 2 || state.mock) return [text];
-  const m = text.match(/^(.*?)(?:(\d+)\s*개|(두|둘|세|셋|네|넷)\s*개)(.*)$/);
-  if (!m) return [text];
-  const korMap = { 두: 2, 둘: 2, 세: 3, 셋: 3, 네: 4, 넷: 4 };
-  const n = m[2] ? Number(m[2]) : korMap[m[3]] ?? 1;
-  if (n <= 1 || n > 6) return [text];
-  const prefix = m[1].trim();
-  const suffix = m[4].trim();
-  return Array.from({ length: n }, () => `${prefix} 1개${suffix ? ` ${suffix}` : ''}`.trim());
+  return !state.mock && !!$('tl-record')?.checked && !(state.crew?.count > 0);
 }
 
 export async function submitCommand(raw, opts = {}) {
   const text = raw.trim();
   if (!text) return null;
   try {
-    const queueTexts = splitCoopCommands(text);
+    // 서브 작업자가 있으면 런타임이 트랙대로 나눈다 (개별: 작업자마다 퀘스트, 협업: 흐름 퀘스트 하나).
     const record = recordOn();
-    let lastRes = null;
-    for (const subText of queueTexts) {
-      lastRes = await call('command_submit', { text: subText, record }, { quiet: true });
-    }
-    const r = lastRes;
+    const r = await call('command_submit', { text, record }, { quiet: true });
     state.lastCommand = { ...r, text };
     bus.emit('command', state.lastCommand);
     if (r.ok) {
-      const splitNote = queueTexts.length > 1 ? ` (협동 대기열 ${queueTexts.length}건 분할 등록)` : '';
+      const splitNote = state.crew?.count > 0 ? ` (${state.crew.mode === 'team' ? '협업 트랙' : '개별 트랙'} · 작업자 ${state.crew.count + 1}명)` : '';
       const head = r.queued
         ? `⏳ 대기 ${r.queued}번째 — 순차 진행 대기 중`
         : `✓ ${summarize(r.parsed)}${splitNote} · 퀘스트 ${r.quest_id ?? '—'}`;

@@ -179,6 +179,9 @@ pub struct DepthView {
     pub align: Option<noto_vision::AlignFit>,
     pub sky_frac: Option<f32>,
     pub flip_tta: bool,
+    /// The right camera's frame and what SGBM made of the pair, when the eye is a stereo pair.
+    pub right_webp: Option<Vec<u8>>,
+    pub stereo: Option<noto_vision::StereoStats>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -206,7 +209,11 @@ pub enum FrameView {
     Fork,
 }
 
-struct WorldLabels<'a>(&'a World);
+pub(crate) struct WorldLabels<'a>(&'a World);
+
+pub(crate) fn world_labels(w: &World) -> WorldLabels<'_> {
+    WorldLabels(w)
+}
 
 impl Labels for WorldLabels<'_> {
     fn resource_ko(&self, id: &str) -> String {
@@ -299,6 +306,8 @@ pub struct Runtime {
     pub(crate) live_queue: std::collections::VecDeque<String>,
     pub(crate) vstats: VisionStats,
     pub(crate) iso: crate::views::IsoFollow,
+    /// Sub-workers' lanes and the team flow (`crew`).
+    pub(crate) crew: crate::crew::Crew,
 }
 
 impl Runtime {
@@ -352,6 +361,7 @@ impl Runtime {
             live_queue: std::collections::VecDeque::new(),
             vstats: VisionStats::default(),
             iso: crate::views::IsoFollow::default(),
+            crew: crate::crew::Crew::default(),
         };
         let msg = format!(
             "월드 시작: seed {} · {}×{}칸 · 베이스 {:?} · 손가락 {} · 인식기 {}",
@@ -402,6 +412,9 @@ impl Runtime {
                 }
                 WorldEvent::BatteryDepleted => (Level::Error, "배터리 방전".to_string()),
                 WorldEvent::Act { act, kind, label, ok, .. } => (if *ok { Level::Debug } else { Level::Warn }, format!("[{act}:{kind}] {label}")),
+                WorldEvent::Crew { worker, label, ok, .. } => (if *ok { Level::Info } else { Level::Warn }, format!("[작업자 {worker}] {label}")),
+                WorldEvent::Rider { worker, label, .. } => (Level::Info, format!("[작업자 {worker}] {label}")),
+                WorldEvent::Hold { worker, label, .. } => (Level::Info, format!("[작업자 {worker}] {label}")),
             };
             self.audit.log("world", level, msg, Some(tidy(json!({"tick": te.tick, "time_s": te.time_s, "event": te.event}))));
         }
@@ -495,7 +508,12 @@ impl Runtime {
     }
 
     pub fn busy(&self) -> bool {
-        self.task.is_some() || self.ml_task.is_some() || self.quests.current_id().is_some()
+        self.task.is_some() || self.ml_task.is_some() || self.quests.current_id().is_some() || self.crew_busy()
+    }
+
+    /// A sub-worker's quest or a team's flow is still running.
+    pub fn crew_busy(&self) -> bool {
+        self.crew.team.as_ref().is_some_and(|t| !t.done) || self.quests.all().iter().any(|q| q.owner != noto_quest::FIRST_WORKER && !q.is_finished())
     }
 
     pub fn ml_pipeline(&self) -> &crate::ml::MlPipeline {
@@ -519,6 +537,9 @@ impl Runtime {
     }
 
     pub fn use_tips(&mut self, dir: &Path, device: &candle_core::Device) -> Result<()> {
+        if self.stereo() {
+            anyhow::bail!("카메라 2대(스테레오)에서는 깊이를 SGBM이 재므로 TIPSv2를 불러오지 않습니다. 단안으로 쓰려면 카메라를 1대로 바꾸세요");
+        }
         let t0 = Instant::now();
         let m = noto_vision::TipsDepth::load(dir, device)?;
         self.ml.depth = crate::ml::DepthEngine::Model(Box::new(m));
@@ -540,9 +561,74 @@ impl Runtime {
     }
 
     pub fn use_depth_stand_in(&mut self) {
+        if self.stereo() {
+            // Two cameras measure depth themselves: there is nothing to stand in for.
+            self.use_stereo();
+            return;
+        }
         self.ml.depth = crate::ml::DepthEngine::StandIn(crate::ml::DepthStandIn::new(self.cfg.seed));
         self.ml.sync_pyramid();
         self.log("embed", Level::Info, "깊이: 대역 모델(stand-in)", None);
+    }
+
+    /// Cameras per eye: 1 (monocular, TIPSv2) or 2 (stereo pair, SGBM).
+    pub fn cameras(&self) -> u8 {
+        self.cfg.camera.cameras.clamp(1, 2)
+    }
+
+    pub fn stereo(&self) -> bool {
+        self.cameras() == 2
+    }
+
+    /// The baseline the renderer puts the right camera at, when the eye is a stereo pair.
+    pub(crate) fn stereo_baseline(&self) -> Option<f32> {
+        self.stereo().then(|| world_sim::world::camera_of(self.world.body.head.sensor).1)
+    }
+
+    /// Puts SGBM in the depth slot, on the rig of the head sensor the body has now. A monocular model that was there
+    /// (TIPSv2) is dropped, which frees its memory: two cameras do not load or run it.
+    pub fn use_stereo(&mut self) {
+        let rig = crate::stereo::rig_for(&self.cam, self.world.body.head.sensor);
+        let had_model = matches!(&self.ml.depth, crate::ml::DepthEngine::Model(m) if m.stereo_rig().is_none());
+        self.ml.depth = crate::ml::DepthEngine::Model(Box::new(noto_vision::SgbmDepth::new(rig, noto_vision::SgbmCfg::default())));
+        self.ml.sync_pyramid();
+        let (gw, gh) = noto_vision::stereo_grid(self.cam.width as u32, self.cam.height as u32, self.ml.fix.pyramid.as_ref(), noto_vision::SgbmCfg::default().per_l2);
+        let msg = format!(
+            "깊이: SGBM 스테레오 (카메라 2대 · 기선 {:.1} cm · 초점 {:.0} px · 매칭 격자 {gw}×{gh}){}",
+            rig.baseline_m * 100.0,
+            rig.focal_px,
+            if had_model { " — TIPSv2를 내려놓음" } else { "" }
+        );
+        self.log("embed", Level::Info, msg, Some(json!({"baseline_m": rig.baseline_m, "focal_px": rig.focal_px, "grid": [gw, gh], "subpixel_px": rig.subpixel_px})));
+    }
+
+    /// Switches the eye between one camera and a stereo pair. Going to two puts SGBM in the depth slot at once; going
+    /// back to one leaves the stand-in there until TIPSv2 is loaded again (the app's model step does that).
+    pub fn set_cameras(&mut self, n: u8) -> Result<()> {
+        if !(1..=2).contains(&n) {
+            anyhow::bail!("카메라는 1대(단안) 또는 2대(스테레오)입니다: {n}");
+        }
+        if n == self.cameras() {
+            return Ok(());
+        }
+        self.cfg.camera.cameras = n;
+        if n == 2 {
+            self.use_stereo();
+        } else {
+            self.ml.depth = crate::ml::DepthEngine::StandIn(crate::ml::DepthStandIn::new(self.cfg.seed));
+            self.ml.sync_pyramid();
+            self.log("embed", Level::Info, "깊이: 카메라 1대(단안) — TIPSv2를 불러와야 합니다 (그 전에는 대역 모델)", None);
+        }
+        Ok(())
+    }
+
+    /// The camera `MemCtx::sigma_obs` hands to `stereo_depth_sigma`: the SGBM rig on its matching grid when the eye
+    /// is a stereo pair, else the head sensor's own.
+    pub(crate) fn sigma_camera(&self) -> (f32, f32, f32) {
+        match self.ml.stereo_rig() {
+            Some(rig) if self.stereo() => crate::stereo::sigma_camera(&rig, &self.cam, &noto_vision::SgbmCfg::default()),
+            _ => world_sim::world::camera_of(self.world.body.head.sensor),
+        }
     }
 
     pub fn use_region_tracker(&mut self) {
@@ -654,6 +740,7 @@ impl Runtime {
         let world = new_world(&next)?;
         self.cfg = next;
         self.world = world;
+        self.crew = crate::crew::Crew { mode: self.crew.mode, ..crate::crew::Crew::default() };
         self.task = None;
         self.ml_task = None;
         self.quests.clear();
@@ -664,6 +751,10 @@ impl Runtime {
         self.focus = None;
         self.eval = EvalCounters::default();
         self.flush_sds();
+        if self.stereo() {
+            // The head preset (its sensor's baseline) may have changed with the body.
+            self.use_stereo();
+        }
         let msg = format!(
             "월드 다시 만듦: seed {} · {}×{}칸 · 베이스 {:?} · 손가락 {}",
             self.cfg.seed,
@@ -679,6 +770,11 @@ impl Runtime {
     pub fn reset_world(&mut self) -> Result<()> {
         self.cancel();
         self.world.reset_world_keep_body().map_err(|e| anyhow!("월드를 되돌릴 수 없습니다: {e}"))?;
+        let mode = self.crew.mode;
+        self.crew = crate::crew::Crew { mode, ..crate::crew::Crew::default() };
+        for w in &self.world.crew {
+            self.crew.lanes.insert(w.id, crate::crew::Lane::idle(w.id, w.form));
+        }
         self.task = None;
         self.ml_task = None;
         self.quests.clear();
@@ -717,6 +813,7 @@ impl Runtime {
         let events = self.world.tick();
         self.log_world_events(&events);
         self.drive(&events);
+        self.crew_tick(&events);
         self.record_balance_events();
         self.record_tick();
         self.record_act_keyframes(&events);
@@ -778,7 +875,12 @@ impl Runtime {
             }
             Some(plan) => {
                 let tick = self.world.tick;
-                match self.quests.add(&plan, &WorldLabels(&self.world), tick) {
+                // With sub-workers the command runs over the crew, split (개별) or as a team (협업).
+                let added = match self.crew_submit(&plan) {
+                    Some(r) => r,
+                    None => self.quests.add(&plan, &WorldLabels(&self.world), tick).map_err(|e| e.to_string()),
+                };
+                match added {
                     Ok(id) => {
                         let title = self.quests.get(&id).map(|q| q.title.clone()).unwrap_or_default();
                         self.log("quest", Level::Info, format!("퀘스트 {id} 접수: {title}"), Some(json!({"quest": id})));
@@ -786,7 +888,7 @@ impl Runtime {
                         out.quest_id = Some(id);
                     }
                     Err(e) => {
-                        out.error = Some(e.to_string());
+                        out.error = Some(e);
                         out.error_code = Some("quest".into());
                     }
                 }
@@ -879,8 +981,9 @@ impl Runtime {
 
     pub(crate) fn mem_ctx(&self) -> MemCtx {
         let base = self.base_id();
-        let floor = self.sds.adaptive_baseline(&Scope::new(Track::Memory, &base, "obs"), "scatter_var_m2").map_or(0.0, |b| (b.0 as f32).max(0.0).sqrt());
-        MemCtx { odo_m: self.world.odom.travelled_m, rate: self.drift_rate(), base, camera: world_sim::world::camera_of(self.world.body.head.sensor), obs_floor_m: floor }
+        let obs_key = if self.stereo() { format!("{base}|stereo") } else { base.clone() };
+        let floor = self.sds.adaptive_baseline(&Scope::new(Track::Memory, &obs_key, "obs"), "scatter_var_m2").map_or(0.0, |b| (b.0 as f32).max(0.0).sqrt());
+        MemCtx { odo_m: self.world.odom.travelled_m, rate: self.drift_rate(), base, camera: self.sigma_camera(), obs_floor_m: floor, obs_key }
     }
 
     fn relocalize_from(&mut self, judged: &[Judged]) {
@@ -1085,20 +1188,27 @@ impl Runtime {
         let pose = crate::record::odometry(&self.world, &self.cam);
         let t0 = Instant::now();
         let fix = self.ml.fix.clone();
-        let (scene, max_depth_m) = match &mut self.ml.depth {
-            crate::ml::DepthEngine::Model(m) => (m.infer_scene(&rgb, noto_vision::SceneHeads::ALL)?, m.max_depth_m()),
-            crate::ml::DepthEngine::StandIn(s) => (noto_vision::DepthScene::depth_only(s.run(&truth)), None),
+        let right = self.stereo_baseline().map(|b| self.world.render_right(&self.cam, b));
+        let (scene, max_depth_m, stereo) = match &mut self.ml.depth {
+            crate::ml::DepthEngine::Model(m) if m.stereo_rig().is_some() => {
+                let r = right.as_ref().ok_or_else(|| anyhow!("스테레오 깊이(SGBM)에 오른쪽 화면이 없습니다"))?;
+                let pair = noto_vision::Rgb::new(r.width as u32, r.height as u32, r.rgb.clone());
+                (noto_vision::DepthScene::depth_only(m.infer_pair(&rgb, &pair)?), m.max_depth_m(), m.stereo_stats())
+            }
+            crate::ml::DepthEngine::Model(m) => (m.infer_scene(&rgb, noto_vision::SceneHeads::ALL)?, m.max_depth_m(), None),
+            crate::ml::DepthEngine::StandIn(s) => (noto_vision::DepthScene::depth_only(s.run(&truth)), None, None),
         };
         let infer_ms = t0.elapsed().as_secs_f32() * 1000.0;
         let raw = scene.depth.clone();
         let mut pred = scene.depth.clone();
+        // A stereo pair's depth is metric already: no ground fit, and the raw panel would be the same map.
         let align = match (max_depth_m, &fix.align) {
-            (Some(max), Some(cfg)) => noto_vision::ground_align_with(&mut pred, scene.normals.as_ref().filter(|_| fix.normals), &intr, &pose, None, Some(max), cfg),
+            (Some(max), Some(cfg)) if stereo.is_none() => noto_vision::ground_align_with(&mut pred, scene.normals.as_ref().filter(|_| fix.normals), &intr, &pose, None, Some(max), cfg),
             _ => None,
         };
         let true_map = truth.depth_map();
         let metrics = noto_vision::depth_metrics(&pred, &true_map, 24.0, false);
-        let metrics_raw = max_depth_m.and_then(|_| noto_vision::depth_metrics(&raw, &true_map, 24.0, false));
+        let metrics_raw = max_depth_m.filter(|_| stereo.is_none()).and_then(|_| noto_vision::depth_metrics(&raw, &true_map, 24.0, false));
         let (lo, hi) = true_map.range();
         let enc = |img: &noto_vision::Rgb| encode_webp(&img.data, img.width, img.height, quality).map(|e| e.bytes).map_err(|e| anyhow!("WebP 인코딩 실패: {e}"));
         Ok(DepthView {
@@ -1115,7 +1225,9 @@ impl Runtime {
             pred_webp: enc(&pred.colorize_in(lo, hi))?,
             truth_webp: enc(&true_map.colorize_in(lo, hi))?,
             metrics_raw,
-            raw_webp: max_depth_m.map(|_| enc(&raw.colorize_in(lo, hi))).transpose()?,
+            raw_webp: max_depth_m.filter(|_| stereo.is_none()).map(|_| enc(&raw.colorize_in(lo, hi))).transpose()?,
+            right_webp: right.as_ref().map(|r| encode_webp(&r.rgb, r.width as u32, r.height as u32, quality).map(|e| e.bytes).map_err(|e| anyhow!("WebP 인코딩 실패: {e}"))).transpose()?,
+            stereo,
             seg_webp: scene.segmentation.as_ref().map(|s| enc(&s.colorize())).transpose()?,
             normals_webp: scene.normals.as_ref().map(|n| enc(&n.colorize())).transpose()?,
             align,

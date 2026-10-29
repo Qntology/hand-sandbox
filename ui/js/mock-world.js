@@ -107,6 +107,7 @@ export function worldNew({ seed, size, config, base }) {
       roll_deg: 0.0,
     },
     energy: 0, fatigue: 0, heat: 0, visionMargin: 0.72, slipMargin: 0.8, lastMoved: 0, idleTicks: 0,
+    teamSize: 1, crew: [], crewMode: 'solo', cameras: 1,
   };
   log('world', 'info', `월드 생성: 시드 ${seed}, ${half} × ${half} m, 노드 ${nodes.length}개`, { seed, size, base: W.base, nodes: nodes.length });
   log('device', 'info', '모의 백엔드: 실제 Rust 백엔드가 아닙니다 (UI 개발용 가짜 데이터)');
@@ -146,7 +147,7 @@ export function setTeamMode({ teamSize = 2, activeRobot = 1 } = {}) {
 
 export function snapshot() {
   const w = need();
-  const teamSize = w.teamSize ?? 2;
+  const teamSize = w.teamSize ?? 1;
   const activeRt = w.rt.get(w.quests.find((q) => q.state === 'active')?.id);
   const coPhase = activeRt?.coPhase ?? null;
   const activeRobot = coPhase ?? w.agent.activeRobot ?? 1;
@@ -182,6 +183,67 @@ export function snapshot() {
     waypoints: w.waypoints.map((p) => ({ ...p, stock: stack(p.pile ?? []) })),
     nodes: w.nodes.filter((n) => n.hp > 0).map(({ id, kind, label_ko, pos, hp }) => ({ id, kind, label_ko, pos, hp })),
     drops: w.drops,
+    crew: (w.crew ?? []).map((c) => ({ ...c, carrying: [] })),
+  };
+}
+
+// ── 서브 작업자 (모의): 최초 작업자 주위에 서 있기만 한다. 실제 협업 흐름은 Rust 런타임(개발 서버·Tauri)에서 돈다. ──
+function crewStatus() {
+  const w = need();
+  const FORM_KO = { humanoid: '휴머노이드', forklift: '지게차' };
+  const first = ['wheel', 'mecanum', 'track'].includes(w.base) ? 'forklift' : 'humanoid';
+  return {
+    mode: w.crewMode, mode_ko: w.crewMode === 'team' ? '협업 트랙' : '개별 트랙', max: 8, count: w.crew.length,
+    workers: [
+      { id: 1, form: first, form_ko: FORM_KO[first], first: true, cameras: w.cameras, pos: [...w.agent.pos], role_ko: '최초 작업자 (전체 비전)', status_ko: '대기', carried: w.agent.carrying.length },
+      ...w.crew.map((c) => ({ id: c.id, form: c.form, form_ko: FORM_KO[c.form], first: false, cameras: c.cameras, pos: c.pos, role_ko: '대기 (모의)', stage_ko: '대기', status_ko: '모의 백엔드: 서 있기만 함', carried: 0 })),
+    ],
+    team: null,
+    notes: w.crew.length ? [{ tick: w.tick, time_s: w.tick * DT, worker: 0, step: '모의', text: '모의 백엔드는 작업자를 그리기만 합니다 — 협업 흐름은 개발 서버(serve)나 앱에서 확인하세요' }] : [],
+  };
+}
+
+export function crewAdd({ count = 1, form = 'mixed', cameras = 1, mode } = {}) {
+  const w = need();
+  const n = Math.max(1, Math.min(8 - w.crew.length, Math.floor(count)));
+  for (let i = 0; i < n; i++) {
+    const id = 2 + w.crew.length;
+    const f = form === 'mixed' ? (w.crew.some((c) => c.form === 'forklift') || i > 0 ? 'humanoid' : 'forklift') : form;
+    const a = w.agent.yaw + Math.PI + (id - 2) * 0.7;
+    w.crew.push({ id, form: f, cameras, pos: [w.agent.pos[0] + 1.6 * Math.cos(a), w.agent.pos[1] + 1.6 * Math.sin(a), 0], yaw_deg: (w.agent.yaw * 180) / Math.PI, status_ko: '대기' });
+  }
+  if (mode) w.crewMode = mode;
+  w.teamSize = w.crew.length ? 2 : 1;
+  log('crew', 'info', `서브 작업자 ${n}명 추가 (모의)`, { count: w.crew.length });
+  return { crew: crewStatus(), snapshot: snapshot() };
+}
+
+export function crewClear() {
+  const w = need();
+  const removed = w.crew.length;
+  w.crew = [];
+  w.teamSize = 1;
+  return { removed, crew: crewStatus(), snapshot: snapshot() };
+}
+
+export function crewMode({ mode = 'solo' } = {}) {
+  need().crewMode = mode === 'team' ? 'team' : 'solo';
+  return crewStatus();
+}
+
+export function crewStatusCall() {
+  return crewStatus();
+}
+
+export function cameraRig({ cameras } = {}) {
+  const w = need();
+  if (cameras) w.cameras = cameras === 2 ? 2 : 1;
+  const stereo = w.cameras === 2;
+  return {
+    cameras: w.cameras, tips_needed: !stereo, stand_ins: [],
+    ml: { depth: stereo ? 'sgbm-stereo' : 'stand-in(tipsv2-like)', locate: 'stand-in(siglip2-like)', track: 'region-grow' },
+    devices: { depth: 'cpu', locate: 'cpu', track: 'cpu' },
+    stereo: stereo ? { baseline_m: 0.05, focal_px: 274.2, grid_focal_px: 205.7, subpixel_px: 0.27, sigma_m_at: [[1, 0.026], [2, 0.105], [4, 0.42]] } : null,
   };
 }
 

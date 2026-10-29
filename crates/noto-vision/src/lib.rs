@@ -9,6 +9,7 @@ pub mod locate;
 pub mod pyramid;
 pub mod sam;
 mod sam_decoder;
+pub mod stereo;
 pub mod tips;
 pub mod track;
 pub mod triangulate;
@@ -24,5 +25,6 @@ pub use locate::{label_heats, Heat, LabelPrompt, LabelTexts, LocateCfg, LocateSc
 pub use pyramid::{cell_geometry, gate_points, snap_points, CellGateCfg, CellGeo, Pyramid, PyramidCfg, PyramidReport, SnapCfg};
 pub use tips::{ade_name, InputGrid, TipsConfig, TipsDepth, ADE_SKY};
 pub use sam::{SamCfg, SamModel, SamTracker, SamVariant};
+pub use stereo::{sgbm, stereo_grid, SgbmCfg, SgbmDepth, StereoOut, StereoRig, StereoStats};
 pub use track::{MaskTracker, PointPrompt, RegionCfg, RegionTracker, TrackedMask};
 pub use triangulate::{plan_step, triangulate, Bearing, Fix, TriCfg, TriError, TriStep};

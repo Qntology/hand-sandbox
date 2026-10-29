@@ -112,8 +112,13 @@ pub fn present(m: &ModelSpec) -> bool {
     }
 }
 
-pub fn missing() -> Vec<&'static ModelSpec> {
-    MODELS.iter().filter(|m| !present(m)).collect()
+/// Whether the eye needs this model: a stereo pair measures depth with SGBM and has no use for TIPSv2.
+pub fn needed(m: &ModelSpec, stereo: bool) -> bool {
+    !(stereo && m.id == "tips")
+}
+
+pub fn missing(stereo: bool) -> Vec<&'static ModelSpec> {
+    MODELS.iter().filter(|m| needed(m, stereo) && !present(m)).collect()
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -335,6 +340,7 @@ fn catalog(state: &AppState) -> Value {
             json!({
                 "id": m.id, "label": m.label, "role_ko": m.role_ko, "repo": m.repo, "revision": m.revision, "license": m.license,
                 "dir": dir.display().to_string(), "files": files, "bytes": total, "have": have, "present": present(m),
+                "needed": needed(m, state.stereo()),
             })
         })
         .collect();
@@ -344,7 +350,8 @@ fn catalog(state: &AppState) -> Value {
         "live_devices": state.live_devices(),
         "gpu_hint": gpu_hint(state),
         "models": models,
-        "all_present": missing().is_empty(),
+        "all_present": missing(state.stereo()).is_empty(),
+        "cameras": if state.stereo() { 2 } else { 1 },
         "ready": state.models_ready(),
         "loading": state.loading(),
         "load_error": state.load_error(),
@@ -458,7 +465,9 @@ fn gpu_hint(state: &AppState) -> Option<String> {
 }
 
 fn activate(state: &Arc<AppState>) -> Result<(), String> {
-    let gone = missing();
+    let stereo = state.with_world(|rt| Ok(rt.stereo()))?;
+    state.set_stereo(stereo);
+    let gone = missing(stereo);
     if !gone.is_empty() {
         return Err(format!("모델 파일이 없습니다: {}. 먼저 받으세요", gone.iter().map(|m| m.label).collect::<Vec<_>>().join(", ")));
     }
@@ -477,11 +486,17 @@ fn activate(state: &Arc<AppState>) -> Result<(), String> {
     let live = state.with_world(|rt| {
         step("siglip2", &mut || rt.use_siglip(Arc::clone(&engine.model), Some(&bank_dir())))?;
         step("ttm", &mut || rt.load_ttm(&ttm_dir(), &device))?;
-        step("tips", &mut || rt.use_tips(&tips_dir(), &device))?;
+        // Two cameras: depth is SGBM on the stereo pair (CPU, no weights); TIPSv2 is not loaded at all.
+        if stereo {
+            rt.use_stereo();
+        } else {
+            step("tips", &mut || rt.use_tips(&tips_dir(), &device))?;
+        }
         step("sam", &mut || rt.use_sam(&sam_dir(), &device))?;
         let v = rt.api_models_status()?;
         let dev = |k: &str| v["devices"][k].as_str().unwrap_or("-").to_string();
-        Ok([("siglip2", noto_ml::device_label(engine.model.device())), ("ttm", dev("ttm")), ("tips", dev("depth")), ("sam", dev("track"))]
+        let depth = if stereo { "sgbm" } else { "tips" };
+        Ok([("siglip2", noto_ml::device_label(engine.model.device())), ("ttm", dev("ttm")), (depth, dev("depth")), ("sam", dev("track"))]
             .into_iter()
             .map(|(k, d)| (k.to_string(), d))
             .collect::<std::collections::BTreeMap<_, _>>())
@@ -491,8 +506,8 @@ fn activate(state: &Arc<AppState>) -> Result<(), String> {
     Ok(())
 }
 
-pub fn not_ready_message() -> String {
-    let gone = missing();
+pub fn not_ready_message(stereo: bool) -> String {
+    let gone = missing(stereo);
     if gone.is_empty() {
         "필수 모델을 아직 불러오지 않았습니다. ④ 사전 · 모델에서 불러오기를 누르세요".into()
     } else {
@@ -536,7 +551,7 @@ mod tests {
     #[ignore]
     fn all_models_download_load_and_run() {
         let state = Arc::new(AppState::new());
-        let todo: Vec<&'static ModelSpec> = missing();
+        let todo: Vec<&'static ModelSpec> = missing(false);
         println!("[MODELS] missing before: {:?}", todo.iter().map(|m| m.id).collect::<Vec<_>>());
         if !todo.is_empty() {
             let dl = Arc::clone(&state.downloads);
@@ -557,7 +572,7 @@ mod tests {
             let p = dl.snapshot();
             assert_eq!(p.phase, "done", "{:?}", p.error);
         }
-        assert!(missing().is_empty(), "still missing: {:?}", missing().iter().map(|m| m.id).collect::<Vec<_>>());
+        assert!(missing(false).is_empty(), "still missing: {:?}", missing(false).iter().map(|m| m.id).collect::<Vec<_>>());
         let t0 = Instant::now();
         activate(&state).expect("all four models load");
         let live = state.live_devices();

@@ -14,9 +14,22 @@ function stageRow(s) {
     el('span', { class: 'ph-st', text: STATE_KO[s.state] ?? s.state }));
 }
 
+// 그 눈의 깊이 절차: SGBM(카메라 2대, 스테레오 법칙의 ±mm, 상자 안 유효 화소) 또는 TIPSv2(카메라 1대, 지면 정렬의 ±cm).
+function depthText(c) {
+  if (c.depth_source === 'sgbm') {
+    const sig = c.depth_sigma_m != null ? ` ±${fmt.n(c.depth_sigma_m * 1000, 0)} mm` : '';
+    const valid = c.depth_valid != null ? ` · 유효 ${fmt.n(c.depth_valid * 100, 0)}%` : '';
+    return c.depth_m != null ? ` · SGBM ${fmt.n(c.depth_m, 2)} m${sig}${valid}` : ` · SGBM 깊이 없음${valid}`;
+  }
+  if (c.depth_source === 'tipsv2+ground') {
+    const sig = c.depth_sigma_m != null ? ` ±${fmt.n(c.depth_sigma_m * 100, 0)} cm` : '';
+    return c.depth_m != null ? ` · TIPSv2 ${fmt.n(c.depth_m, 2)} m${sig}` : ' · TIPSv2 지면 정렬 실패';
+  }
+  return c.depth_m != null ? ` · 깊이 ${fmt.n(c.depth_m, 2)} m` : '';
+}
+
 function sightText(c) {
-  const depth = c.depth_m != null ? ` · 깊이 ${fmt.n(c.depth_m, 2)} m` : '';
-  return `${c.label_ko ?? ''} ${c.score != null ? Math.round(c.score * 100) : '—'} · ${fmt.n(c.range_m, 2)} m${depth}`;
+  return `${c.label_ko ?? ''} ${c.score != null ? Math.round(c.score * 100) : '—'} · ${fmt.n(c.range_m, 2)} m${depthText(c)}`;
 }
 
 function checkLine(p) {
@@ -50,7 +63,9 @@ function crossLines(p) {
   sight('①', '탑승자 시선', x.rider, '고개를 숙여 물건을 봅니다');
   sight('②', '포크 카메라', x.fork, '포크를 내리고 포크 카메라로 봅니다 (탑승자는 정면)');
   if (x.verdict) {
-    const [cls, text] = VERDICT[x.verdict] ?? ['wait', x.verdict];
+    let [cls, text] = VERDICT[x.verdict] ?? ['wait', x.verdict];
+    // 포크 카메라가 보긴 했지만 거리를 못 쟀거나(스테레오 매칭 없음) 이웃 것만 본 경우.
+    if (x.verdict === 'rider_only' && x.fork?.ok) text = '교차 검증 △ 포크 카메라로는 확인 못 함 — 탑승자 시선으로';
     const gap = x.apart_m != null ? ` (${fmt.n(x.apart_m * 100, 0)} cm, 허용 ${fmt.n(x.gate_m * 100, 0)} cm)` : '';
     line(cls, `${text}${gap}`);
   }
@@ -69,6 +84,7 @@ function crossLines(p) {
 
 function pose(p) {
   const bits = [];
+  if (p.depth_procedure) bits.push(p.depth_procedure === 'sgbm' ? '깊이: SGBM 스테레오 (카메라 2대)' : '깊이: TIPSv2 단안 (카메라 1대)');
   if (p.mechanism === 'fork') {
     if (p.fork_m != null) bits.push(`포크 ${fmt.n(p.fork_m, 2)} m`);
     const down = (p.neck_deg ?? 0) > 1 || (p.trunk_deg ?? 0) > 1;

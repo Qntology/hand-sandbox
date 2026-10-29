@@ -31,9 +31,16 @@ pub async fn rt_call(state: App<'_>, cmd: String, args: Option<Value>) -> Result
         state.require_models()?;
     }
     let shared: Arc<AppState> = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || shared.with_world(|rt| rt.api_call(&cmd, &args.unwrap_or(Value::Null))))
-        .await
-        .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        shared.with_world(|rt| {
+            let out = rt.api_call(&cmd, &args.unwrap_or(Value::Null));
+            // The eye's camera count decides which models are needed: keep the app's copy in step with the runtime.
+            shared.set_stereo(rt.stereo());
+            out
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]

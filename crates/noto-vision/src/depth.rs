@@ -74,6 +74,19 @@ pub trait DepthModel: Send {
         let mut v = self.infer_scene_batch(&[rgb], want)?;
         v.pop().ok_or_else(|| anyhow::anyhow!("no scene for the frame"))
     }
+    /// The rectified pair a stereo engine measures with (`stereo::SgbmDepth`); a monocular model has none and
+    /// predicts from one image. A stereo engine's depth is metric as it comes out: it takes no ground alignment.
+    fn stereo_rig(&self) -> Option<crate::stereo::StereoRig> {
+        None
+    }
+    /// Depth of the left image of a rectified pair (only a stereo engine has one).
+    fn infer_pair(&mut self, _left: &Rgb, _right: &Rgb) -> Result<DepthMap> {
+        anyhow::bail!("{}는 단안 모델이라 화면 한 장에서 깊이를 추정합니다", self.mode())
+    }
+    /// What the last pair gave (grid, share with depth, why the rest has none).
+    fn stereo_stats(&self) -> Option<crate::stereo::StereoStats> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

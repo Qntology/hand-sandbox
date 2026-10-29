@@ -40,6 +40,8 @@ pub struct GazeCheck {
     pub reason: Option<String>,
     pub neck_deg: f32,
     pub pitch_deg: f32,
+    pub depth_source: Option<String>,
+    pub depth_sigma_m: Option<f32>,
 }
 
 /// One look at an item through one camera: the scan's match of its kind nearest the memory (its label, score and
@@ -63,17 +65,47 @@ pub struct Sighting {
     pub reason: Option<String>,
     pub neck_deg: f32,
     pub pitch_deg: f32,
+    /// Which depth procedure ranged the box: "sgbm" (stereo pair, metric, it places the item), "tipsv2+ground"
+    /// (one camera, aligned to the ground, logged beside the scan's place) or "stand-in".
+    pub depth_source: Option<String>,
+    /// That range's σ (m): the stereo law Z²·σ_d/(f·b) for SGBM, the ground fit's relative error for TIPSv2.
+    pub depth_sigma_m: Option<f32>,
+    /// The share of the box with depth (SGBM leaves what it cannot match empty).
+    pub depth_valid: Option<f32>,
 }
 
 impl Sighting {
     pub fn gaze_check(&self) -> GazeCheck {
-        GazeCheck { tick: self.tick, drop: self.drop, label_ko: self.label_ko.clone(), ok: self.ok, score: self.score, range_m: self.range_m, depth_m: self.depth_m, bbox: self.bbox, reason: self.reason.clone(), neck_deg: self.neck_deg, pitch_deg: self.pitch_deg }
+        GazeCheck {
+            tick: self.tick,
+            drop: self.drop,
+            label_ko: self.label_ko.clone(),
+            ok: self.ok,
+            score: self.score,
+            range_m: self.range_m,
+            depth_m: self.depth_m,
+            bbox: self.bbox,
+            reason: self.reason.clone(),
+            neck_deg: self.neck_deg,
+            pitch_deg: self.pitch_deg,
+            depth_source: self.depth_source.clone(),
+            depth_sigma_m: self.depth_sigma_m,
+        }
     }
 }
 
 /// The least two sightings of one item may be apart and still be the same (m) [추정: the 0.10 m items' half size
 /// and the depth model's range error at a metre].
 pub const CROSS_MIN_M: f32 = 0.08;
+
+/// How far from its memory a look may still find an item beyond the memory's and the look's gate, when the match is
+/// plainly that item (m) [추정: under half the 0.22 m between a felled tree's logs (0.13 m about the stump, three at
+/// 120°) and the 0.35 m between a loading bay's slots].
+pub const ASSOC_REACH_M: f32 = 0.15;
+
+/// How many times nearer the memory the match must be than any other match of its kind in view, to be plainly the
+/// item (a ratio test, as feature matching does).
+pub const ASSOC_RATIO: f32 = 2.0;
 
 /// How far apart two sightings put the item and how far they may be (3σ of both, at least `CROSS_MIN_M`).
 pub fn cross_gap(a: &Sighting, b: &Sighting) -> Option<(f32, f32)> {
@@ -141,6 +173,21 @@ impl Memory {
     pub fn sigma_m(&self, odo_now: f32, rate: DriftRate) -> f32 {
         let d = (odo_now - self.odo_m).max(0.0);
         (self.sigma0_m * self.sigma0_m + (rate.per_m * d).powi(2) + rate.walk_m * rate.walk_m * d).sqrt()
+    }
+
+    /// `fuse`, the memory's σ first raised to what the innovation says when the two σ cannot explain it (covariance
+    /// matching): the memory is the one whose error is under-modelled — wheels slip on soft ground and turns move it by
+    /// more than the drift spec has, until the SDS has learned the rate — and a look that finds the item well away from
+    /// it then moves it most of the way, instead of a tenth.
+    pub fn fuse_adaptive(&self, x: f32, z: f32, sigma_obs: f32, odo_now: f32, tick: u64, rate: DriftRate) -> (Memory, f32) {
+        let innov = (x - self.x).hypot(z - self.z);
+        // A 2-D innovation's square is twice the per-axis variance of the memory and the look together.
+        let implied = 0.5 * innov * innov - sigma_obs * sigma_obs;
+        let s = self.sigma_m(odo_now, rate);
+        if implied <= s * s {
+            return self.fuse(x, z, sigma_obs, odo_now, tick, rate);
+        }
+        Memory { sigma0_m: implied.sqrt(), odo_m: odo_now, ..*self }.fuse(x, z, sigma_obs, odo_now, tick, rate)
     }
 
     pub fn fuse(&self, x: f32, z: f32, sigma_obs: f32, odo_now: f32, tick: u64, rate: DriftRate) -> (Memory, f32) {
@@ -268,6 +315,23 @@ mod tests {
         let (g, _) = m.fuse(3.2, 1.0, 0.03, 10.0, 5, rate);
         assert!((g.x - 3.1).abs() < 1e-4, "{}", g.x);
         assert!(m.sigma_m(20.0, DriftRate::spec(false)) < after);
+    }
+
+    #[test]
+    fn a_look_far_from_an_overconfident_memory_moves_it_most_of_the_way() {
+        let rate = DriftRate::spec(false);
+        let m = Memory::seen(3.0, 1.0, 0.011, 10.0, 0);
+        // Within what the two σ explain, the same as `fuse`.
+        let (a, _) = m.fuse_adaptive(3.01, 1.0, 0.011, 10.0, 5, rate);
+        assert_eq!(a, m.fuse(3.01, 1.0, 0.011, 10.0, 5, rate).0);
+        // 8.6 cm off with σ 1.1 cm (a lift truck's wheels slipped) and a stereo look of ±3.3 cm: plain `fuse` moves
+        // the memory a tenth of the way; covariance matching most of it.
+        let (plain, _) = m.fuse(3.086, 1.0, 0.033, 10.0, 5, rate);
+        let (adapt, innov) = m.fuse_adaptive(3.086, 1.0, 0.033, 10.0, 5, rate);
+        assert!((innov - 0.086).abs() < 1e-5);
+        assert!(plain.x - 3.0 < 0.01, "{}", plain.x);
+        assert!(adapt.x - 3.0 > 0.055, "{}", adapt.x);
+        assert!(adapt.sigma0_m > plain.sigma0_m && adapt.sigma0_m < 0.033);
     }
 
     #[test]
