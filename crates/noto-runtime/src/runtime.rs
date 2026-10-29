@@ -36,11 +36,23 @@ pub struct ScanReport {
     pub judged: Vec<Judged>,
     pub scene: Vec<(String, f32)>,
     pub filter: crate::perception::ScanFilter,
+    /// The camera the scan looked through (the head camera turned as it was, or the carriage camera).
+    pub view: world_sim::render::View,
 }
 
 impl ScanReport {
     pub fn accepted(&self) -> impl Iterator<Item = &Judged> {
         self.judged.iter().filter(|j| j.accepted)
+    }
+
+    /// Whether the scan's boxes still lie on a frame seen through `view`: the same camera, turned and pitched within
+    /// 3° of how it was and moved under 0.3 m. A glance aside, the rider's look down or the carriage camera drew their
+    /// boxes on the wrong part of the first-person frame.
+    pub fn seen_through(&self, view: &world_sim::render::View) -> bool {
+        let (a, b) = (&self.view, view);
+        let turn = (a.yaw - b.yaw + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+        let moved = ((a.origin[0] - b.origin[0]).powi(2) + (a.origin[1] - b.origin[1]).powi(2) + (a.origin[2] - b.origin[2]).powi(2)).sqrt();
+        turn.abs() <= 3f32.to_radians() && (a.pitch - b.pitch).abs() <= 3f32.to_radians() && moved < 0.3
     }
 
     pub fn confidence(&self) -> Option<f32> {
@@ -797,11 +809,17 @@ impl Runtime {
     pub fn scan_now(&mut self, trigger: &str) -> Result<&ScanReport> {
         let t0 = Instant::now();
         let frame = self.world.render(&self.cam);
-        let mut out = self.recognizer.scan(ScanInput { world: &self.world, frame: &frame, camera: &self.cam })?;
+        self.scan_frame(trigger, &frame, t0)
+    }
+
+    /// `scan_now` on `frame`, the current camera's frame the caller rendered at `t0` and may use again.
+    pub(crate) fn scan_frame(&mut self, trigger: &str, frame: &world_sim::Frame, t0: Instant) -> Result<&ScanReport> {
+        let view = self.world.head_view(&self.cam).view;
+        let mut out = self.recognizer.scan(ScanInput { world: &self.world, frame, camera: &self.cam })?;
         let tick = self.world.tick;
         let oracle = self.recognizer.mode() == "oracle";
         let truths: Vec<String> = if oracle {
-            self.world.visible_objects(&frame).into_iter().filter(|v| v.pixels >= self.cfg.min_pixels).map(|v| v.entity).collect()
+            self.world.visible_objects(frame).into_iter().filter(|v| v.pixels >= self.cfg.min_pixels).map(|v| v.entity).collect()
         } else {
             Vec::new()
         };
@@ -829,6 +847,7 @@ impl Runtime {
             judged,
             scene: out.scene,
             filter: out.filter,
+            view,
         };
         self.note_scan(&report);
         self.last_scan = Some(report);
@@ -1116,10 +1135,11 @@ impl Runtime {
             FrameView::Agent => {
                 let cam = Camera { width: width.clamp(32, 2048) as usize, height: height.clamp(32, 2048) as usize, ..self.cam };
                 let f = self.world.render(&cam);
+                let now = self.world.head_view(&cam).view;
                 let det = self
                     .last_scan
                     .as_ref()
-                    .filter(|r| self.world.tick.saturating_sub(r.tick) <= 6)
+                    .filter(|r| self.world.tick.saturating_sub(r.tick) <= 6 && r.seen_through(&now))
                     .map(|r| {
                         r.judged
                             .iter()

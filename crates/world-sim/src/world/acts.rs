@@ -34,7 +34,8 @@ pub struct ActDrive {
     pub object_x0: f32,
 }
 
-/// How fast the base turns to face an item before the tines go to it (rad/s) [추정].
+/// How fast the base turns to face an item before the tines go to it at most (rad/s) [추정]; slower where the ground
+/// and motors give a slower pivot or none (`World::fork_align_rad_s`).
 pub const FORK_ALIGN_RAD_S: f32 = 1.2;
 
 impl ActPlay {
@@ -187,6 +188,18 @@ impl World {
         Ok((dur, (!side).then_some(at)))
     }
 
+    /// How fast the base turns to the item inside a fork act: as an ordinary turn here does (the skid-steer pivot the
+    /// ground and the motors allow, a creep where it cannot pivot), never faster than `FORK_ALIGN_RAD_S`. At a fixed
+    /// rate a track on soft ground spun on the spot inside the act, which a turn outside it could not do.
+    pub fn fork_align_rad_s(&self) -> f32 {
+        let caps = self.turn_caps();
+        if caps.can_pivot() {
+            caps.pivot_rad_s.min(FORK_ALIGN_RAD_S)
+        } else {
+            motion::CREEP_RAD_S
+        }
+    }
+
     /// A look at the ground point (`x`, `z`) — at the middle of an item lying there, if there is one.
     pub(super) fn start_look(&mut self, x: f32, z: f32) -> f32 {
         let (dx, dz) = (x - self.agent.x, z - self.agent.z);
@@ -201,7 +214,7 @@ impl World {
         if fork::applies(&self.body) {
             let size = self.drops.iter().filter(|d| (d.x - x).hypot(d.z - z) < 0.35).map(|d| d.kind.spec().piece_size_m(d.amount)).next().unwrap_or([0.1; 3]);
             let base = (h - 0.5 * size[1]).max(0.0);
-            let turn_s = wrap_angle(heading - self.agent.yaw).abs() / FORK_ALIGN_RAD_S;
+            let turn_s = wrap_angle(heading - self.agent.yaw).abs() / self.fork_align_rad_s();
             let r = fork::look(&self.body, self.fork_m_now(), dx.hypot(dz), size, base, self.carried_kg(), turn_s);
             let dur = r.duration_s;
             let mut play = ActPlay::new(r, self.time_s, None, (self.agent.x, self.agent.z, heading));
@@ -299,7 +312,7 @@ impl World {
         let dist = dx.hypot(dz);
         let heading = dz.atan2(dx);
         let base = (self.drop_base_m(&d) - self.agent_ground_m()).max(0.0);
-        let turn_s = wrap_angle(heading - self.agent.yaw).abs() / FORK_ALIGN_RAD_S;
+        let turn_s = wrap_angle(heading - self.agent.yaw).abs() / self.fork_align_rad_s();
         let r = fork::pick(&self.body, self.fork_m_now(), dist, d.mass_kg(), size, base, self.carried_kg(), turn_s);
         if !r.outcome.ok {
             let why = r.outcome.reason_ko.clone().unwrap_or_default();

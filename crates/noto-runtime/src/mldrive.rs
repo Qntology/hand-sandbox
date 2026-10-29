@@ -634,6 +634,7 @@ impl Runtime {
         let newly_fixed = !t.fixed && t.decider.has_fix();
         if let Some(rec) = self.recording.as_mut() {
             if rec.keyframes.len() < self.test_cfg.record.max_keyframes {
+                kf.truth.shed_pixels();
                 rec.keyframes.push(kf);
                 t.pending_kf = Some(rec.keyframes.len() - 1);
             } else {

@@ -24,7 +24,9 @@ pub const ANKLE_DORSI_MAX_DEG: f32 = 30.0;
 pub const HIP_FLEX_MAX_DEG: f32 = 106.0;
 pub const WAIST_PITCH_MAX_DEG: f32 = 70.0;
 pub const NECK_PITCH_MAX_DEG: f32 = 45.0;
-pub const NECK_PAN_MAX_DEG: f32 = 90.0;
+/// Cervical rotation each way: 80° (AAOS, *Joint Motion*, 1965), as the other limits here are a person's. At 90° a
+/// glance turned the head past what a neck turns.
+pub const NECK_PAN_MAX_DEG: f32 = 80.0;
 pub const SHOULDER_ABD_MAX_DEG: f32 = 129.0;
 pub const SHOULDER_ADD_MAX_DEG: f32 = 19.5;
 pub const HIP_ABD_MAX_DEG: f32 = 30.0;
