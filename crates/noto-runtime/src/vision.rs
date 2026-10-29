@@ -42,6 +42,88 @@ pub struct GazeCheck {
     pub pitch_deg: f32,
 }
 
+/// One look at an item through one camera: the scan's match of its kind nearest the memory (its label, score and
+/// box), where it puts the item on the ground and how sure that is, and the depth model's range inside the box.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Sighting {
+    pub tick: u64,
+    /// "head" (the walker's head camera, or a lift truck rider's) or "fork" (the carriage camera between the tines).
+    pub camera: &'static str,
+    pub drop: u32,
+    pub label_ko: String,
+    pub ok: bool,
+    /// The match lies inside the memory's gate (not a neighbour of the same kind).
+    pub matched: bool,
+    pub score: Option<f32>,
+    pub at: Option<(f32, f32)>,
+    pub sigma_m: Option<f32>,
+    pub range_m: Option<f32>,
+    pub depth_m: Option<f32>,
+    pub bbox: Option<[f32; 4]>,
+    pub reason: Option<String>,
+    pub neck_deg: f32,
+    pub pitch_deg: f32,
+}
+
+impl Sighting {
+    pub fn gaze_check(&self) -> GazeCheck {
+        GazeCheck { tick: self.tick, drop: self.drop, label_ko: self.label_ko.clone(), ok: self.ok, score: self.score, range_m: self.range_m, depth_m: self.depth_m, bbox: self.bbox, reason: self.reason.clone(), neck_deg: self.neck_deg, pitch_deg: self.pitch_deg }
+    }
+}
+
+/// The least two sightings of one item may be apart and still be the same (m) [추정: the 0.10 m items' half size
+/// and the depth model's range error at a metre].
+pub const CROSS_MIN_M: f32 = 0.08;
+
+/// How far apart two sightings put the item and how far they may be (3σ of both, at least `CROSS_MIN_M`).
+pub fn cross_gap(a: &Sighting, b: &Sighting) -> Option<(f32, f32)> {
+    let (pa, pb) = (a.at?, b.at?);
+    let gate = (3.0 * a.sigma_m.unwrap_or(0.05).hypot(b.sigma_m.unwrap_or(0.05))).max(CROSS_MIN_M);
+    Some(((pa.0 - pb.0).hypot(pa.1 - pb.1), gate))
+}
+
+/// A lift truck's two eyes on one item, each checked against the other, as an operator and a fork camera do: the
+/// rider looks down at it before the tines go down, the carriage camera looks at it with them down, and once the item
+/// fills the carriage camera's view the rider looks down at it again.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct CrossCheck {
+    pub drop: u32,
+    pub rider: Option<Sighting>,
+    pub fork: Option<Sighting>,
+    pub recheck: Option<Sighting>,
+    /// The share of the carriage camera's image the item filled when the base stopped for the re-check.
+    pub blocked_share: Option<f32>,
+    /// Rider vs carriage camera, and the re-check vs the carriage camera: (apart, allowed) in m.
+    pub fork_vs_rider: Option<(f32, f32)>,
+    pub recheck_vs_fork: Option<(f32, f32)>,
+}
+
+impl CrossCheck {
+    pub fn new(drop: u32) -> CrossCheck {
+        CrossCheck { drop, ..CrossCheck::default() }
+    }
+
+    /// "agree", "disagree", "fork_only", "rider_only" or "none": what the two looks before the tines go in say. A
+    /// look sees the item when its match lies inside the memory's gate (a neighbour of the same kind does not count).
+    pub fn verdict(&self) -> &'static str {
+        let seen = |s: &Option<Sighting>| s.as_ref().is_some_and(|s| s.ok && s.matched);
+        match (seen(&self.rider), seen(&self.fork), self.fork_vs_rider) {
+            (true, true, Some((d, g))) if d <= g => "agree",
+            (true, true, Some(_)) => "disagree",
+            (true, true, None) => "agree",
+            (false, true, _) => "fork_only",
+            (true, false, _) => "rider_only",
+            (false, false, _) => "none",
+        }
+    }
+
+    /// Whether the re-check found the item where the carriage camera last saw it (`None` before the re-check).
+    pub fn seated(&self) -> Option<bool> {
+        let r = self.recheck.as_ref()?;
+        Some(r.ok && r.matched && self.recheck_vs_fork.map_or(true, |(d, g)| d <= g))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct Memory {
     pub x: f32,

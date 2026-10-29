@@ -23,6 +23,8 @@ pub(crate) const PLACE_REACH_M: f32 = DELIVER_REACH_M - 0.5;
 pub(crate) const INSPECT_STAND_M: f32 = 1.2;
 /// Half the width of the lane the tines and the base sweep going in (m): the base's half width and a margin.
 pub(crate) const FORK_LANE_HALF_M: f32 = 0.30;
+/// How near a lift truck drives to the spot it lines up at (m): half a cell's diagonal, so a cell centre always is.
+pub(crate) const LINEUP_REACH_M: f32 = 0.36;
 pub(crate) const SMALL_ITEM_SEE_M: f32 = 3.0;
 pub(crate) const GROUND_SWEEP_TILT_DEG: f32 = 30.0;
 pub(crate) const MAX_PLACE_FIXES: u32 = 2;
@@ -169,6 +171,9 @@ pub(crate) struct Task {
     pub gazed: Option<u32>,
     /// The drop the forks last lined up in front of (once per drop).
     pub lined_up: Option<u32>,
+    /// The act (by its start time) whose rider look and whose re-check a lift truck already made: once per act.
+    pub rider_looked: Option<f64>,
+    pub rechecked: Option<f64>,
 }
 
 fn add_amount(list: &mut Vec<(String, f32)>, id: &str, a: f32) {
@@ -290,6 +295,8 @@ impl Task {
             place_fixes: 0,
             deliver_retry: false,
             look_turn: None,
+            rider_looked: None,
+            rechecked: None,
             gazed: None,
             lined_up: None,
         })
@@ -515,6 +522,10 @@ impl Runtime {
     fn issue(&mut self, t: &mut Task, action: Action, act: Act) -> Result<(), ActionError> {
         match self.world.command(self.to_world(action.clone())) {
             Ok(ev) => {
+                if matches!(act, Act::Look(_)) {
+                    // A new look at an item: the two eyes start over on it.
+                    self.fork_cross = None;
+                }
                 self.log_world_events(&ev);
                 t.act = Some(act);
                 t.done = None;
@@ -1019,12 +1030,23 @@ impl Runtime {
             let size = d.kind.spec().piece_size_m(d.amount);
             let stop_m = if forks { noto_core::act::fork::standoff_x(&self.world.body, size[0].max(size[2])) } else { 0.4 };
             let far_m = if forks { stop_m + 0.15 } else { PICKUP_REACH_M - 0.1 };
+            // A lift truck takes the wanted item nearest in front first, as an operator does, rather than run its tines
+            // through it to the one behind.
+            if forks {
+                if let Some(k) = self.fork_front_pick(t, id, (m.x, m.z)) {
+                    let other = t.drops[k];
+                    self.log("quest", Level::Info, format!("{name}: 포크 길 앞에 있는 {name}(d{other})부터 듦 — 뒤의 것(d{id})에 포크를 밀어 넣지 않음"), Some(json!({"drop": other, "instead_of": id})));
+                    t.drops.swap(t.drop_idx, k);
+                    continue;
+                }
+            }
             // Tines go straight in: line up on a side where no other item lies in their way.
             if forks && t.lined_up != Some(id) && (dist > far_m || self.fork_path_blocked(id, (m.x, m.z), self.me())) {
                 t.lined_up = Some(id);
                 if let Some((lx, lz)) = self.fork_lineup(id, (m.x, m.z), stop_m) {
                     self.log("quest", Level::Info, format!("{name}: 포크가 곧게 들어갈 자리로 정렬 ({lx:.1}, {lz:.1})"), Some(json!({"drop": id, "x": lx, "z": lz})));
-                    match self.issue(t, Action::MoveTo { x: lx, z: lz, reach_m: 0.12 }, Act::Move(MoveFor::Drop)) {
+                    // Within half a cell's diagonal a cell centre always qualifies; the pick turns the base to the item.
+                    match self.issue(t, Action::MoveTo { x: lx, z: lz, reach_m: LINEUP_REACH_M }, Act::Move(MoveFor::Drop)) {
                         Ok(()) => return Flow::Continue,
                         Err(_) => {}
                     }
@@ -1125,6 +1147,30 @@ impl Runtime {
                 Err(e) => fail(e.code(), action_error_ko(&e)),
             };
         }
+    }
+
+    /// The index in the task's drops of a wanted item lying in the tines' way from where the base stands to the item
+    /// `id` at `at` (the nearest one), which a lift truck takes first.
+    fn fork_front_pick(&self, t: &Task, id: u32, at: (f32, f32)) -> Option<usize> {
+        let from = self.me();
+        let (dx, dz) = (at.0 - from.0, at.1 - from.1);
+        let len = dx.hypot(dz).max(1e-3);
+        let (ux, uz) = (dx / len, dz / len);
+        t.drops
+            .iter()
+            .enumerate()
+            .skip(t.drop_idx + 1)
+            .filter(|(_, &o)| o != id)
+            .filter_map(|(k, &o)| {
+                let d = self.world.drop_item(o)?;
+                let (px, pz) = self.world.belief_of(d.x, d.z);
+                let (rx, rz) = (px - from.0, pz - from.1);
+                let along = rx * ux + rz * uz;
+                let off = (rx * uz - rz * ux).abs();
+                (along > 0.0 && along < len && off < FORK_LANE_HALF_M).then_some((k, along))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(k, _)| k)
     }
 
     /// Whether another item lies in the way of the tines going from where the base stands (`from`) to the item at `at`.
@@ -1249,20 +1295,26 @@ impl Runtime {
         }
     }
 
-    /// The look before the hand: the head is down over the item now (or, on wheels and tracks, the tines are down and
-    /// the carriage camera between them looks at it while the rider keeps looking ahead), so the frame the scan sees is
-    /// the close-up the pick-up needs. The scan names it and fixes where it lies; the depth model, aligned to the ground
-    /// under that camera, gives its range inside the scan's box.
+    /// The look before the hand: the head is down over the item now, so the frame the scan sees is the close-up the
+    /// pick-up needs. The scan names it and fixes where it lies; the depth model, aligned to the ground under that
+    /// camera, gives its range inside the scan's box. A lift truck looks with two eyes instead (`fork_cam_check`).
     fn check_gaze(&mut self, t: &mut Task, id: u32) {
-        let forks = noto_core::act::fork::applies(&self.world.body);
-        self.world.fork_cam = forks;
-        self.check_gaze_with(t, id, forks);
-        self.world.fork_cam = false;
+        if noto_core::act::fork::applies(&self.world.body) {
+            self.fork_cam_check(t, id);
+            return;
+        }
+        let Some(s) = self.sight(t, id, "head") else { return };
+        let how = format!("고개 {:.0}° 숙여", s.neck_deg);
+        self.fuse_sighting(t, id, &s, &how);
+        self.gaze_check = Some(s.gaze_check());
     }
 
-    fn check_gaze_with(&mut self, t: &mut Task, id: u32, forks: bool) {
-        let Some(m) = t.mem.get(&id).copied() else { return };
-        let Some(kind) = self.world.drop_item(id).map(|d| d.kind) else { return };
+    /// One look at the drop `id` through the camera the world shows now (the head camera, or the carriage camera
+    /// when `world.fork_cam`): the scan's match of its kind nearest the memory, where it puts it, and the depth
+    /// model's range inside its box.
+    fn sight(&mut self, t: &mut Task, id: u32, camera: &'static str) -> Option<crate::vision::Sighting> {
+        let m = t.mem.get(&id).copied()?;
+        let kind = self.world.drop_item(id).map(|d| d.kind)?;
         let (rate, odo) = (self.drift_rate(), self.world.odom.travelled_m);
         let before = m.sigma_m(odo, rate);
         let name = kind.spec().label_ko.to_string();
@@ -1292,28 +1344,142 @@ impl Runtime {
         let matched = nearest.filter(|c| off(c.2) <= (3.0 * before.hypot(mem.sigma_obs(c.3))).max(0.06));
         let range_m = nearest.map(|c| self.dist_me(c.2 .0, c.2 .1));
         let depth_m = nearest.and_then(|c| self.depth_in_box(c.1));
-        let ok = nearest.is_some();
+        let screen = match camera {
+            "fork" => "포크 카메라 화면",
+            _ if noto_core::act::fork::applies(&self.world.body) => "탑승자가 숙여 본 화면",
+            _ => "숙인 화면",
+        };
         let reason = match (nearest, matched) {
-            (None, _) => Some(format!("{}에서 {name}을 찾지 못함", if forks { "포크 카메라 화면" } else { "숙인 화면" })),
+            (None, _) => Some(format!("{screen}에서 {name}을 찾지 못함")),
             (Some(c), None) => Some(format!("{name}이 보이지만 기억과 {:.0} cm 떨어져 이웃 것으로 봄 — 기억 위치로 집음", off(c.2) * 100.0)),
             _ => None,
         };
-        let depth = depth_m.map(|d| format!(" · 깊이 모델 {d:.2} m")).unwrap_or_default();
-        let how = if forks { format!("포크 {:.2} m · 포크 카메라로 (탑승자 시선 정면)", self.world.fork_m_now()) } else { format!("고개 {neck_deg:.0}° 숙여") };
-        if let Some(c) = matched {
-            let (f, innov) = m.fuse(c.2 .0, c.2 .1, mem.sigma_obs(c.3), odo, self.world.tick, rate);
-            t.mem.insert(id, f);
-            self.note_look("gaze", format!("d{id}"), Some(before), Some(f.sigma_m(odo, rate)), Some(innov));
-            let msg = format!("비전 확인 ✓ {name}: {how} {:.2} m에서 봄{depth} — 기억 ±{:.0} → ±{:.0} cm", range_m.unwrap_or(f32::NAN), 2.0 * before * 100.0, 2.0 * f.sigma_m(odo, rate) * 100.0);
-            self.log("vision", Level::Info, msg, Some(json!({"drop": id, "neck_deg": neck_deg, "pitch_deg": pitch_deg, "range_m": range_m, "depth_m": depth_m, "innovation_m": innov})));
-        } else if ok {
-            let msg = format!("비전 확인 ✓ {name} 있음: {how} 봄{depth} · {}", reason.clone().unwrap_or_default());
-            self.log("vision", Level::Info, msg, Some(json!({"drop": id, "neck_deg": neck_deg, "pitch_deg": pitch_deg, "range_m": range_m, "depth_m": depth_m})));
-        } else {
-            let msg = format!("비전 확인 실패: {} — 기억(±{:.0} cm)으로 집음", reason.clone().unwrap_or_default(), 2.0 * before * 100.0);
-            self.log("vision", Level::Warn, msg, Some(json!({"drop": id, "neck_deg": neck_deg, "pitch_deg": pitch_deg})));
+        Some(crate::vision::Sighting {
+            tick: self.world.tick,
+            camera,
+            drop: id,
+            label_ko: name,
+            ok: nearest.is_some(),
+            matched: matched.is_some(),
+            score: nearest.map(|c| c.0),
+            at: nearest.map(|c| c.2),
+            sigma_m: nearest.map(|c| mem.sigma_obs(c.3)),
+            range_m,
+            depth_m,
+            bbox: nearest.map(|c| c.1),
+            reason,
+            neck_deg,
+            pitch_deg,
+        })
+    }
+
+    /// `sight`, and once more when the first look does not find the item itself (missed, mistaken for another kind,
+    /// or only a neighbour of its kind in view), as one looks again before trusting a single glance.
+    fn sight_again(&mut self, t: &mut Task, id: u32, camera: &'static str) -> Option<crate::vision::Sighting> {
+        let first = self.sight(t, id, camera)?;
+        if first.matched {
+            return Some(first);
         }
-        self.gaze_check = Some(crate::vision::GazeCheck { tick: self.world.tick, drop: id, label_ko: name, ok, score: nearest.map(|h| h.0), range_m, depth_m, bbox: nearest.map(|h| h.1), reason, neck_deg, pitch_deg });
+        let second = self.sight(t, id, camera)?;
+        self.log("vision", Level::Debug, format!("{}: {} — 한 번 더 봄 → {}", if camera == "fork" { "포크 카메라" } else { "탑승자 시선" }, first.reason.clone().unwrap_or_default(), if second.matched { "찾음" } else { "여전히 못 찾음" }), Some(json!({"drop": id, "camera": camera})));
+        Some(if second.matched || (second.ok && !first.ok) { second } else { first })
+    }
+
+    /// Fixes the memory of `id` with a sighting that matched it, and logs the look (`how` says how it looked).
+    fn fuse_sighting(&mut self, t: &mut Task, id: u32, s: &crate::vision::Sighting, how: &str) {
+        let Some(m) = t.mem.get(&id).copied() else { return };
+        let (rate, odo) = (self.drift_rate(), self.world.odom.travelled_m);
+        let before = m.sigma_m(odo, rate);
+        let depth = s.depth_m.map(|d| format!(" · 깊이 모델 {d:.2} m")).unwrap_or_default();
+        let data = json!({"drop": id, "camera": s.camera, "neck_deg": s.neck_deg, "pitch_deg": s.pitch_deg, "range_m": s.range_m, "depth_m": s.depth_m});
+        match (s.matched, s.at, s.sigma_m) {
+            (true, Some((x, z)), Some(sigma)) => {
+                let (f, innov) = m.fuse(x, z, sigma, odo, self.world.tick, rate);
+                t.mem.insert(id, f);
+                self.note_look("gaze", format!("d{id}"), Some(before), Some(f.sigma_m(odo, rate)), Some(innov));
+                let msg = format!("비전 확인 ✓ {}: {how} {:.2} m에서 봄{depth} — 기억 ±{:.0} → ±{:.0} cm", s.label_ko, s.range_m.unwrap_or(f32::NAN), 2.0 * before * 100.0, 2.0 * f.sigma_m(odo, rate) * 100.0);
+                self.log("vision", Level::Info, msg, Some(data));
+            }
+            _ if s.ok => {
+                let msg = format!("비전 확인 ✓ {} 있음: {how} 봄{depth} · {}", s.label_ko, s.reason.clone().unwrap_or_default());
+                self.log("vision", Level::Info, msg, Some(data));
+            }
+            _ => {
+                let msg = format!("비전 확인 실패: {} — 기억(±{:.0} cm)으로 집음", s.reason.clone().unwrap_or_default(), 2.0 * before * 100.0);
+                self.log("vision", Level::Warn, msg, Some(data));
+            }
+        }
+    }
+
+    /// A lift truck's first eye on the item: the rider looks down at it over the dashboard while the tines are still
+    /// up (the fork look's "rider_check"), with the head camera.
+    fn rider_check(&mut self, t: &mut Task, id: u32) {
+        self.world.fork_cam = false;
+        let Some(s) = self.sight_again(t, id, "head") else { return };
+        let how = format!("탑승자가 고개 {:.0}° 숙여 (포크 {:.2} m)", s.neck_deg, self.world.fork_m_now());
+        self.fuse_sighting(t, id, &s, &how);
+        self.gaze_check = Some(s.gaze_check());
+        self.fork_cross = Some(crate::vision::CrossCheck { rider: Some(s), ..crate::vision::CrossCheck::new(id) });
+    }
+
+    /// A lift truck's second eye on the item: the tines are down and the carriage camera between them looks at it
+    /// (the end of the fork look), checked against what the rider saw. The carriage camera, close and low, fixes the
+    /// memory; when the two disagree it is the one believed, and the log says so.
+    fn fork_cam_check(&mut self, t: &mut Task, id: u32) {
+        self.world.fork_cam = true;
+        let s = self.sight_again(t, id, "fork");
+        self.world.fork_cam = false;
+        let Some(s) = s else { return };
+        let mut x = self.fork_cross.take().filter(|c| c.drop == id).unwrap_or_else(|| crate::vision::CrossCheck::new(id));
+        x.fork_vs_rider = x.rider.as_ref().filter(|r| r.ok && r.matched && s.ok && s.matched).and_then(|r| crate::vision::cross_gap(r, &s));
+        x.fork = Some(s.clone());
+        let how = format!("포크 {:.2} m · 포크 카메라로 (탑승자 시선 정면)", self.world.fork_m_now());
+        self.fuse_sighting(t, id, &s, &how);
+        let (level, msg) = match (x.verdict(), x.fork_vs_rider) {
+            ("agree", Some((d, g))) => (Level::Info, format!("교차 검증 ✓ {}: 탑승자 시선과 포크 카메라가 같은 자리 ({:.0} cm 차이 ≤ {:.0} cm)", s.label_ko, d * 100.0, g * 100.0)),
+            ("agree", None) => (Level::Info, format!("교차 검증 ✓ {}: 탑승자 시선과 포크 카메라 모두 봄", s.label_ko)),
+            ("disagree", Some((d, g))) => (Level::Warn, format!("교차 검증 ✗ {}: 두 시점이 {:.0} cm 어긋남 (> {:.0} cm) — 가까운 포크 카메라를 믿음", s.label_ko, d * 100.0, g * 100.0)),
+            ("fork_only", _) => (Level::Warn, format!("교차 검증 △ {}: 탑승자 시선에는 없고 포크 카메라만 봄 — 포크 카메라를 믿음", s.label_ko)),
+            ("rider_only", _) => (Level::Warn, format!("교차 검증 △ {}: 포크 카메라에는 없고 탑승자만 봄 — 탑승자 시선으로 끼움", s.label_ko)),
+            _ => (Level::Warn, format!("교차 검증 ✗ {}: 두 시점 모두 보지 못함 — 기억으로 끼움", s.label_ko)),
+        };
+        self.log("vision", level, msg, Some(json!({"drop": id, "verdict": x.verdict(), "apart_m": x.fork_vs_rider.map(|v| v.0), "gate_m": x.fork_vs_rider.map(|v| v.1)})));
+        self.gaze_check = Some(s.gaze_check());
+        self.fork_cross = Some(x);
+    }
+
+    /// A lift truck's third look: the tines went in until the item filled the carriage camera's view, the base
+    /// stopped, and the rider looks down at it again (the fork pick's "recheck"). The item must lie where the carriage
+    /// camera last saw it (or the rider, when it saw nothing).
+    fn rider_recheck(&mut self, t: &mut Task, id: u32) {
+        let blocked = self.fork_blocked_share(id);
+        self.world.fork_cam = false;
+        let Some(s) = self.sight_again(t, id, "head") else { return };
+        let mut x = self.fork_cross.take().filter(|c| c.drop == id).unwrap_or_else(|| crate::vision::CrossCheck::new(id));
+        let last = x.fork.as_ref().filter(|f| f.ok && f.matched).or(x.rider.as_ref().filter(|r| r.ok && r.matched));
+        x.recheck_vs_fork = last.filter(|_| s.ok && s.matched).and_then(|f| crate::vision::cross_gap(f, &s));
+        x.blocked_share = Some(blocked);
+        x.recheck = Some(s.clone());
+        let name = s.label_ko.clone();
+        let (level, msg) = match (s.ok && s.matched, x.recheck_vs_fork) {
+            (true, Some((d, g))) if d <= g => (Level::Info, format!("재확인 ✓ {name}: 포크 카메라가 {:.0}% 가려져 탑승자가 고개 {:.0}° 숙여 봄 — 포크 위로 오는 중, 포크 카메라와 {:.0} cm 차이 ≤ {:.0} cm", blocked * 100.0, s.neck_deg, d * 100.0, g * 100.0)),
+            (true, Some((d, g))) => (Level::Warn, format!("재확인 ✗ {name}: 탑승자가 본 자리가 포크 카메라와 {:.0} cm 어긋남 (> {:.0} cm)", d * 100.0, g * 100.0)),
+            (true, None) => (Level::Info, format!("재확인 ✓ {name}: 포크 카메라가 {:.0}% 가려져 탑승자가 고개 {:.0}° 숙여 봄", blocked * 100.0, s.neck_deg)),
+            (false, _) if s.ok => (Level::Warn, format!("재확인 △ {name}: 포크 카메라가 {:.0}% 가려져 탑승자가 봤지만 {}", blocked * 100.0, s.reason.clone().unwrap_or_default())),
+            (false, _) => (Level::Warn, format!("재확인 실패: 포크 카메라가 {:.0}% 가려졌는데 탑승자 시선에도 {name}이 보이지 않음", blocked * 100.0)),
+        };
+        self.log("vision", level, msg, Some(json!({"drop": id, "blocked_share": blocked, "neck_deg": s.neck_deg, "apart_m": x.recheck_vs_fork.map(|v| v.0), "gate_m": x.recheck_vs_fork.map(|v| v.1)})));
+        self.gaze_check = Some(s.gaze_check());
+        self.fork_cross = Some(x);
+    }
+
+    /// The share of the carriage camera's image the drop `id` fills now, from a frame of that camera.
+    fn fork_blocked_share(&mut self, id: u32) -> f32 {
+        self.world.fork_cam = true;
+        let f = self.world.render(&self.cam);
+        self.world.fork_cam = false;
+        let want = world_sim::render::pack_id(world_sim::ObjectClass::Drop, id);
+        f.ids.iter().filter(|&&i| i == want).count() as f32 / f.ids.len().max(1) as f32
     }
 
     /// How far from the robot's feet the thing filling the middle of `bbox` (normalised) lies, by the depth model
@@ -1708,6 +1874,22 @@ impl Runtime {
                 if let Some(n) = self.world.node(*node) {
                     let p = 1.0 - (n.hp / n.max_hp.max(1e-3)).clamp(0.0, 1.0);
                     self.progress(t, p, None);
+                }
+            }
+            // A lift truck looks with its rider's eyes while the act holds still for them: before the tines go down
+            // ("rider_check"), and once the item fills the carriage camera's view ("recheck").
+            Act::Look(id) | Act::Pick(id) if noto_core::act::fork::applies(&self.world.body) => {
+                let id = *id;
+                match self.world.act_phase().map(|p| p.1) {
+                    Some("rider_check") if t.rider_looked != Some(t.act_started_s) => {
+                        t.rider_looked = Some(t.act_started_s);
+                        self.rider_check(t, id);
+                    }
+                    Some("recheck") if t.rechecked != Some(t.act_started_s) => {
+                        t.rechecked = Some(t.act_started_s);
+                        self.rider_recheck(t, id);
+                    }
+                    _ => {}
                 }
             }
             _ => {}

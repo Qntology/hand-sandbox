@@ -133,6 +133,12 @@ function drawAgentView(ctx, w, h, W, dets) {
       dets.push({ o, bbox });
     }
   }
+  // 손에 들려 올라오는 물건(사람 몸): 시선이 따라가므로 화면 가운데 근처에 보인다.
+  const held = W.agent.held;
+  if (held && held.forward > 0.1) {
+    const s = f / held.forward;
+    drawObject(ctx, { kind: 'drop', drop: true, item_id: held.item_id, id: 'held' }, w / 2, horizon + (camH - held.z) * s, s);
+  }
   ctx.fillStyle = 'rgba(30,30,34,0.85)';
   ctx.fillRect(w / 2 - w * 0.05, h - h * 0.07, w * 0.1, h * 0.07);
 }
@@ -159,6 +165,16 @@ function drawForkView(ctx, w, h, W, dets) {
     ctx.lineTo(w / 2 + side * w * 0.2, h);
     ctx.closePath();
     ctx.fill();
+  }
+  // 포크가 물건 밑으로 들어가면 물건의 앞면이 화면을 채운다(가림).
+  const blocked = a.fork_blocked ?? 0;
+  if (blocked > 0) {
+    ctx.fillStyle = DROP_COLOR[a.fork_blocked_item] ?? '#b98a4e';
+    const bh = h * Math.min(1, blocked * 1.1);
+    const bw = w * Math.min(1, 0.35 + blocked);
+    ctx.fillRect((w - bw) / 2, 0, bw, bh);
+    ctx.fillStyle = 'rgba(0,0,0,0.18)';
+    for (let y = 6; y < bh; y += 9) ctx.fillRect((w - bw) / 2, y, bw, 2);
   }
 }
 

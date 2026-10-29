@@ -1,4 +1,5 @@
 pub mod capture;
+pub mod clear;
 pub mod explore;
 pub mod fixture;
 pub mod iso;

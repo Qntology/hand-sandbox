@@ -164,8 +164,7 @@ impl World {
             .shown_boxes(pose)
             .map(|b| Obb { center: self.tilted_body_to_world(b.center, tilt), axes: b.axes.map(|a| self.body_dir_to_world(tilt.apply(a))), half: b.half, color: crate::render::segment_color(b.segment) })
             .collect();
-        let axes = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]].map(|a| self.body_dir_to_world(tilt.apply(a)));
-        v.extend(self.fork_parts().into_iter().map(|(c, half, color)| Obb { center: self.tilted_body_to_world(c, tilt), axes, half, color }));
+        v.extend(self.fork_parts().into_iter().map(|(c, axes, half, color)| Obb { center: self.tilted_body_to_world(c, tilt), axes: axes.map(|a| self.body_dir_to_world(tilt.apply(a))), half, color }));
         v
     }
 }

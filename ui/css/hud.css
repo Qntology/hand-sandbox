@@ -176,3 +176,6 @@
 .ph-forkcam figcaption { position: absolute; left: 5px; top: 4px; font-size: 0.56rem; color: #fff; text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8); }
 .viewport-canvas-wrap[data-h="short"] .pick-hud .ph-forkcam { display: none; }
 @media (prefers-reduced-motion: reduce) { .ph-stage.active .ph-dot { animation: none; } }
+.ph-cross { display: flex; flex-direction: column; gap: 2px; }
+.ph-forkcam.live canvas { border-color: var(--accent-strong); box-shadow: 0 0 0 1px var(--accent-strong); }
+.ph-forkcam.blocked canvas { border-color: var(--warning); box-shadow: 0 0 0 1px var(--warning); }

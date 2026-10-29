@@ -59,6 +59,10 @@ impl Landmark {
     }
 }
 
+/// Two sightings of one item label in one scan are the same item when their centres lie this close (m) [추정: under
+/// the 0.15 m log; a felled tree's logs lie 0.15–0.26 m apart].
+pub const DROP_SAME_M: f32 = 0.12;
+
 #[derive(Clone, Debug)]
 pub struct MemCtx {
     pub odo_m: f32,
@@ -325,11 +329,20 @@ impl PrecisionGates {
                     continue;
                 }
                 let (iou, iomin) = crate::perception::box_iou_and_iomin(&k.bbox, &c.bbox);
-                let dist_ok = match (k.world, c.world) {
-                    (Some((x1, z1)), Some((x2, z2))) => (x1 - x2).hypot(z1 - z2) <= (0.45 * self.cfg.track_radius_m).max(0.35),
-                    _ => false,
+                let apart = match (k.world, c.world) {
+                    (Some((x1, z1)), Some((x2, z2))) => Some((x1 - x2).hypot(z1 - z2)),
+                    _ => None,
                 };
-                if iou >= 0.4 || iomin >= 0.65 || dist_ok {
+                let overlap = iou >= 0.4 || iomin >= 0.65;
+                // Items on the ground are a hand across and lie a hand apart (a felled tree's logs), and up close one
+                // hides part of the next, so their boxes overlap: where both say where they lie, two sightings farther
+                // apart than an item are two items, not one seen twice.
+                let same = if c.kind == EntKind::Drop {
+                    apart.map_or(overlap, |d| d <= DROP_SAME_M)
+                } else {
+                    overlap || apart.is_some_and(|d| d <= (0.45 * self.cfg.track_radius_m).max(0.35))
+                };
+                if same {
                     let area_k = (k.bbox[2] - k.bbox[0]) * (k.bbox[3] - k.bbox[1]);
                     let area_c = (c.bbox[2] - c.bbox[0]) * (c.bbox[3] - c.bbox[1]);
                     if area_c < area_k && c.score >= k.score * 0.85 && c.world.is_some() {

@@ -234,6 +234,9 @@ struct Scene<'a> {
     world: &'a World,
     prims: Vec<Prim>,
     by_cell: Vec<Vec<usize>>,
+    /// Prims that reach over their cell's edge (an item lying across two cells), listed in every cell they touch; a
+    /// ray takes their hit only inside the cell it is crossing.
+    span_cell: Vec<Vec<usize>>,
     top_m: f32,
 }
 
@@ -274,7 +277,7 @@ fn item_style(kind: ItemKind) -> Style {
 impl<'a> Scene<'a> {
     fn build(world: &'a World) -> Scene<'a> {
         let t = &world.terrain;
-        let mut s = Scene { world, prims: Vec::new(), by_cell: vec![Vec::new(); t.w * t.d], top_m: t.max_top_m() + MAX_OBJECT_TOP_M + 0.3 };
+        let mut s = Scene { world, prims: Vec::new(), by_cell: vec![Vec::new(); t.w * t.d], span_cell: vec![Vec::new(); t.w * t.d], top_m: t.max_top_m() + MAX_OBJECT_TOP_M + 0.3 };
 
         for n in &world.nodes {
             let Some((cx, cz)) = t.cell_of(n.x, n.z) else { continue };
@@ -306,20 +309,12 @@ impl<'a> Scene<'a> {
                 continue;
             }
             let Some((cx, cz)) = t.cell_of(d.x, d.z) else { continue };
-            let (ccx, ccz) = cell_center(cx, cz);
             let g = world.drop_base_m(d);
             let spec = d.kind.spec();
             let size = spec.piece_size_m(d.amount);
-            let hw = size[0] * 0.5;
-            let limit = CELL_M * 0.5 - hw - 0.005;
-            let x = d.x.clamp(ccx - limit, ccx + limit);
-            let z = d.z.clamp(ccz - limit, ccz + limit);
-            s.add(cx, cz, Prim {
-                aabb: bx(x, z, g, g + size[1], hw, size[2] * 0.5),
-                id: pack_id(ObjectClass::Drop, d.id),
-                color: spec.color,
-                style: item_style(d.kind),
-            });
+            // Where it lies, even across a cell's edge (the tines and the hands go to that place).
+            let prim = Prim { aabb: bx(d.x, d.z, g, g + size[1], size[0] * 0.5, size[2] * 0.5), id: pack_id(ObjectClass::Drop, d.id), color: spec.color, style: item_style(d.kind) };
+            s.add_spanning(cx, cz, prim);
         }
 
         for w in &world.waypoints {
@@ -362,6 +357,28 @@ impl<'a> Scene<'a> {
         let i = self.world.terrain.idx(cx, cz);
         self.by_cell[i].push(self.prims.len());
         self.prims.push(p);
+    }
+
+    /// `add`, for a prim that may reach over the edge of its cell (`cx`, `cz`): inside it, it is an ordinary prim of
+    /// that cell; across the edge, it goes in every cell it touches (`span_cell`).
+    fn add_spanning(&mut self, cx: usize, cz: usize, p: Prim) {
+        let t = &self.world.terrain;
+        let (x0, z0) = (cx as f32 * CELL_M, cz as f32 * CELL_M);
+        let b = p.aabb;
+        if b.min[0] >= x0 && b.max[0] <= x0 + CELL_M && b.min[2] >= z0 && b.max[2] <= z0 + CELL_M {
+            self.add(cx, cz, p);
+            return;
+        }
+        let i = self.prims.len();
+        self.prims.push(p);
+        let (c0, c1) = (((b.min[0] / CELL_M).floor() as i32).max(0), ((b.max[0] / CELL_M).floor() as i32).min(t.w as i32 - 1));
+        let (r0, r1) = (((b.min[2] / CELL_M).floor() as i32).max(0), ((b.max[2] / CELL_M).floor() as i32).min(t.d as i32 - 1));
+        for cz in r0..=r1 {
+            for cx in c0..=c1 {
+                let ci = t.idx(cx as usize, cz as usize);
+                self.span_cell[ci].push(i);
+            }
+        }
     }
 }
 
@@ -504,13 +521,15 @@ fn trace_cut(scene: &Scene, o: [f32; 3], d: [f32; 3], max_dist: f32, cut: Option
         let (ux, uz) = (cx as usize, cz as usize);
         let ci = t.idx(ux, uz);
         let mut best: Option<Hit> = None;
-        let mut consider = |b: &Aabb, id: u32, color: [u8; 3], style: Style| {
+        let exit = t_max_x.min(t_max_z) + 2e-3;
+        let mut consider_to = |b: &Aabb, id: u32, color: [u8; 3], style: Style, limit: f32| {
             if let Some((tt, axis, sign)) = slab(o, inv, b) {
-                if tt <= max_dist && best.as_ref().map_or(true, |h| tt < h.t) {
+                if tt <= limit && best.as_ref().map_or(true, |h| tt < h.t) {
                     best = Some(Hit { t: tt, axis, sign, id, color, style });
                 }
             }
         };
+        let mut consider = |b: &Aabb, id: u32, color: [u8; 3], style: Style| consider_to(b, id, color, style, max_dist);
         let (x0, z0) = (cx as f32 * CELL_M, cz as f32 * CELL_M);
         let h = t.height_m(ux, uz);
         let curb = t.curb_m(ux, uz);
@@ -535,6 +554,12 @@ fn trace_cut(scene: &Scene, o: [f32; 3], d: [f32; 3], max_dist: f32, cut: Option
                         consider(&b, p.id, p.color, p.style);
                     }
                 }
+            }
+        }
+        for &pi in &scene.span_cell[ci] {
+            let p = &scene.prims[pi];
+            if let Some(b) = cut.map_or(Some(p.aabb), |c| c.clip(&p.aabb)) {
+                consider_to(&b, p.id, p.color, p.style, exit.min(max_dist));
             }
         }
         if best.is_some() {
@@ -713,6 +738,14 @@ pub fn render(world: &World, cam: &Camera) -> Frame {
     if world.fork_cam && noto_core::act::fork::applies(&world.body) {
         let casters = world.shadow_casters();
         return render_rays(world, cam, &Rays::Pinhole { view: hv.view, exposure: hv.exposure }, &world.fork_boxes(), &casters, None);
+    }
+    // What the eyes look down at of the body's own: the tines and their load, or the item in the hands.
+    let own: Vec<Obb> = if world.rider_sees_forks() { world.fork_front_boxes() } else { world.hand_load_boxes() };
+    if !own.is_empty() {
+        let casters = world.shadow_casters();
+        let mut f = render_rays(world, cam, &Rays::Pinhole { view: hv.view, exposure: hv.exposure }, &own, &casters, None);
+        motion_blur(&mut f, cam, &hv.view, &hv.exposure);
+        return f;
     }
     render_view(world, cam, &hv.view, &hv.exposure)
 }
@@ -1103,7 +1136,14 @@ impl World {
             })
             .collect();
         v.extend(self.fork_boxes());
+        v.extend(self.hand_load_boxes());
         v
+    }
+
+    /// The item in the hands (`hand_load`) as a box in the world.
+    pub fn hand_load_boxes(&self) -> Vec<Obb> {
+        let axes = [self.body_dir_to_world([1.0, 0.0, 0.0]), self.body_dir_to_world([0.0, 1.0, 0.0]), self.body_dir_to_world([0.0, 0.0, 1.0])];
+        self.hand_load().map(|(k, size, c)| Obb { center: self.body_to_world(c), axes, half: [0.5 * size[0], 0.5 * size[2], 0.5 * size[1]], color: k.spec().color }).into_iter().collect()
     }
 
     /// The body's own boxes that are drawn: all of them on legs; on wheels and tracks only the chassis, wheels and
@@ -1114,14 +1154,21 @@ impl World {
     }
 
     /// The lift truck of a wheeled or tracked base (body, counterweight, seat and rider, overhead guard), its mast,
-    /// carriage and tines, and the load riding on the tines, as (centre in the body frame, half sizes along the body
-    /// axes, colour).
-    pub fn fork_parts(&self) -> Vec<([f32; 3], [f32; 3], [u8; 3])> {
+    /// carriage and tines, and the load riding on the tines, as (centre in the body frame, box axes in the body frame,
+    /// half sizes along them, colour). The rider leans and bends the head as the head camera does.
+    pub fn fork_parts(&self) -> Vec<([f32; 3], [[f32; 3]; 3], [f32; 3], [u8; 3])> {
+        self.fork_parts_with(true)
+    }
+
+    /// `fork_parts`, without the truck and its rider when `truck` is false: the mast, carriage, tines and load alone.
+    fn fork_parts_with(&self, truck: bool) -> Vec<([f32; 3], [[f32; 3]; 3], [f32; 3], [u8; 3])> {
         if !noto_core::act::fork::applies(&self.body) {
             return Vec::new();
         }
         let eye = self.standing_eye_m();
-        let mut v: Vec<([f32; 3], [f32; 3], [u8; 3])> = noto_core::act::fork::truck_boxes(&self.body, eye)
+        let level = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let body = if truck { noto_core::act::fork::truck_boxes_posed(&self.body, eye, &self.current_kin_pose()) } else { Vec::new() };
+        let mut v: Vec<([f32; 3], [[f32; 3]; 3], [f32; 3], [u8; 3])> = body
             .iter()
             .chain(noto_core::act::fork::boxes(&self.body, self.fork_m_now()).iter())
             .map(|b| {
@@ -1137,19 +1184,31 @@ impl World {
                     "fork_carriage" => [52, 54, 60],
                     _ => [96, 100, 110],
                 };
-                (b.center, b.half, color)
+                (b.center, b.axes, b.half, color)
             })
             .collect();
         for (k, size, c) in self.fork_load() {
-            v.push((c, [0.5 * size[0], 0.5 * size[2], 0.5 * size[1]], k.spec().color));
+            v.push((c, level, [0.5 * size[0], 0.5 * size[2], 0.5 * size[1]], k.spec().color));
         }
         v
     }
 
     /// `fork_parts` in the world.
     pub fn fork_boxes(&self) -> Vec<Obb> {
-        let axes = [self.body_dir_to_world([1.0, 0.0, 0.0]), self.body_dir_to_world([0.0, 1.0, 0.0]), self.body_dir_to_world([0.0, 0.0, 1.0])];
-        self.fork_parts().into_iter().map(|(c, half, color)| Obb { center: self.body_to_world(c), axes, half, color }).collect()
+        self.fork_parts().into_iter().map(|(c, axes, half, color)| Obb { center: self.body_to_world(c), axes: axes.map(|a| self.body_dir_to_world(a)), half, color }).collect()
+    }
+
+    /// Whether the rider of a lift truck is looking down over the dashboard at the tines (a fork act's look or
+    /// re-check, the load riding on, the lift): the head camera then sees the mast, the carriage, the tines and what
+    /// rides on them. Looking ahead the rider sees past them.
+    pub fn rider_sees_forks(&self) -> bool {
+        noto_core::act::fork::applies(&self.body)
+            && matches!(self.act_phase(), Some((noto_core::act::ActKind::Fork, "rider_look" | "rider_check" | "recheck_look" | "recheck" | "seat" | "raise")))
+    }
+
+    /// The mast, carriage, tines and load in the world, as the rider sees them looking down at the tines.
+    pub fn fork_front_boxes(&self) -> Vec<Obb> {
+        self.fork_parts_with(false).into_iter().map(|(c, axes, half, color)| Obb { center: self.body_to_world(c), axes: axes.map(|a| self.body_dir_to_world(a)), half, color }).collect()
     }
 
     pub fn shadow_casters(&self) -> Vec<Obb> {
@@ -1628,13 +1687,16 @@ mod tests {
     #[test]
     fn flat_lighting_renders_the_pixels_of_v09() {
         let want: [(&str, u64); 7] = [
-            ("rest", 0x72c1_1091_ad87_f209),
-            ("turn", 0xb3ce_dd00_33e7_2869),
+            // "rest", "turn", "rugged" and "chase" show an item lying across a cell's edge: since v1.2 it is drawn
+            // where it lies instead of pulled inside its cell (`Scene::add_spanning`). With the old placement all
+            // seven frames keep their pixels.
+            ("rest", 0x925c_7f72_aa63_e2f1),
+            ("turn", 0x57b5_19f0_277a_d133),
             ("walk", 0x7b25_914d_aaa0_a85a),
-            ("rugged", 0xd0ae_544e_dcbd_f643),
+            ("rugged", 0x7683_ea92_1285_5d0f),
             // "chase" and "focus": the wheeled robot is drawn as a lift truck (`act::fork::truck_boxes`) since the
             // forklift change.
-            ("chase", 0xac4f_38a9_b4a1_9759),
+            ("chase", 0x4ff5_5319_520a_25aa),
             ("focus", 0x7ae1_9aba_c82f_7fc9),
             ("top", 0x1777_dd2f_41f0_963c),
         ];

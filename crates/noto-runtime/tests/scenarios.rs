@@ -429,15 +429,32 @@ fn a_walker_bends_its_neck_to_look_at_the_item_before_the_hand_and_the_vision_ch
 }
 
 #[test]
-fn wheels_and_tracks_lift_with_forks_while_the_rider_looks_ahead_and_the_fork_camera_checks() {
+fn wheels_and_tracks_lift_with_forks_and_check_the_item_with_the_rider_and_the_fork_camera() {
     let lift = noto_core::BodyPlan::named("wheel_lift").unwrap();
     let noneck = noto_core::BodyPlan { morph: noto_core::morph::Morphology::named("wheel_noneck").unwrap(), ..noto_core::BodyPlan::default() };
-    for (base, body, tag) in [(BaseKind::Wheel, noto_core::BodyPlan::default(), "wheel"), (BaseKind::Track, noto_core::BodyPlan::default(), "track"), (BaseKind::Mecanum, noto_core::BodyPlan::default(), "mecanum"), (BaseKind::Wheel, lift, "wheel+lift"), (BaseKind::Wheel, noneck, "wheel, no neck")] {
+    for (base, body, tag, neck) in [
+        (BaseKind::Wheel, noto_core::BodyPlan::default(), "wheel", true),
+        (BaseKind::Track, noto_core::BodyPlan::default(), "track", true),
+        (BaseKind::Mecanum, noto_core::BodyPlan::default(), "mecanum", true),
+        (BaseKind::Wheel, lift, "wheel+lift", true),
+        (BaseKind::Wheel, noneck, "wheel, no neck", false),
+    ] {
         let p = pick_with_look(base, body);
-        assert!(p.neck_deg < 1.0, "{tag}: the rider does not bend to the floor ({:.0}°)
-{}", p.neck_deg, p.log);
-        assert!(p.dip_deg < 8.0, "{tag}: the rider keeps looking ahead (head camera {:.0}° below its mount)
-{}", p.dip_deg, p.log);
+        if neck {
+            // An operator glances down at the item before the tines go down, and again once it blocks the fork camera.
+            assert!(p.neck_deg > 20.0 && p.dip_deg > 20.0, "{tag}: the rider bends the head to the item ({:.0}°, camera {:.0}° down)
+{}", p.neck_deg, p.dip_deg, p.log);
+            assert!(p.log.contains("교차 검증 ✓"), "{tag}: the rider's and the fork camera's looks agree:
+{}", p.log);
+            assert!(p.log.contains("재확인 ✓") && p.log.contains("가려져"), "{tag}: the rider looks again once the item blocks the fork camera:
+{}", p.log);
+        } else {
+            // A fixed camera still tips with the chassis on uneven ground; there is no neck to bend.
+            assert!(p.neck_deg < 1.0, "{tag}: no neck to bend ({:.0}°, camera {:.0}° down)
+{}", p.neck_deg, p.dip_deg, p.log);
+            assert!(!p.log.contains("탑승자 시선 ✓") && p.log.contains("포크 카메라만"), "{tag}: the fork camera alone checks:
+{}", p.log);
+        }
         assert!(p.fork_low_m < 0.01, "{tag}: the tines went down to the floor ({:.3} m)
 {}", p.fork_low_m, p.log);
         assert!(p.carried, "{tag}: the log rode on the tines
