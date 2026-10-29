@@ -4,7 +4,7 @@ use anyhow::Result;
 use noto_search::{EntityKind, Lexicon, VisionPrompting};
 use noto_vision::{
     depth_metrics, AlignCfg, AlignFit, CalibTable, DepthKind, DepthMap, DepthMetrics, DepthModel, Heat, Intrinsics, LabelPrompt, LocateCfg, LocateScoring, Mask, MaskTracker,
-    PointPrompt, Pose, RegionTracker, Rgb, SemanticLocator, SemanticPoint, TrackedMask,
+    PointPrompt, Pose, Pyramid, PyramidCfg, PyramidReport, RegionTracker, Rgb, SemanticLocator, SemanticPoint, TrackedMask,
 };
 use serde::{Deserialize, Serialize};
 use world_sim::render::unpack_id;
@@ -38,6 +38,11 @@ pub struct MlFixCfg {
     pub sky_mask: bool,
     #[serde(default)]
     pub normals: bool,
+    /// The 1 : 2 : 4 pyramid: SigLIP2, TIPSv2 and the SAM mask on whole multiples of one grid, the depth's sky and
+    /// far patches gating the semantic heat, peaks snapped onto the nearer surface, SAM encoding only frames with a
+    /// gated prompt or a live track.
+    #[serde(default)]
+    pub pyramid: Option<PyramidCfg>,
 }
 
 /// The depth model's extra heads a configuration asks for: the ADE20K segmentation to take the sky out of the
@@ -67,6 +72,7 @@ impl MlFixCfg {
             scan_calibrated: false,
             sky_mask: false,
             normals: false,
+            pyramid: None,
         }
     }
 
@@ -88,6 +94,7 @@ impl MlFixCfg {
             scan_calibrated: true,
             sky_mask: true,
             normals: false,
+            pyramid: Some(PyramidCfg::default()),
         }
     }
 }
@@ -143,24 +150,43 @@ impl KeyTruth {
         DepthMap { width: self.width, height: self.height, kind: DepthKind::Metric, data: self.depth.clone() }
     }
 
+    /// The mask's bit over the truth pixel (x, y): the same pixel when both have one size, else the mask pixel under
+    /// the truth pixel's centre (a pyramid mask is 288 × 192 on a 384 × 256 frame, the truth 192 × 128).
+    fn mask_at(&self, mask: &Mask, x: u32, y: u32) -> bool {
+        if (mask.width, mask.height) == (self.width, self.height) {
+            return mask.get(x, y);
+        }
+        let mx = (((x as f32 + 0.5) * mask.width as f32 / self.width.max(1) as f32) as u32).min(mask.width.saturating_sub(1));
+        let my = (((y as f32 + 0.5) * mask.height as f32 / self.height.max(1) as f32) as u32).min(mask.height.saturating_sub(1));
+        mask.get(mx, my)
+    }
+
     pub fn entity_under(&self, mask: &Mask) -> Option<(u32, f32)> {
+        if mask.width == 0 || mask.height == 0 {
+            return None;
+        }
         let mut count: HashMap<u32, u32> = HashMap::new();
-        for y in 0..mask.height.min(self.height) {
-            for x in 0..mask.width.min(self.width) {
-                if mask.get(x, y) {
+        let mut area = 0u32;
+        for y in 0..self.height {
+            for x in 0..self.width {
+                if self.mask_at(mask, x, y) {
+                    area += 1;
                     *count.entry(self.ids[(y * self.width + x) as usize]).or_insert(0) += 1;
                 }
             }
         }
         let (raw, n) = count.into_iter().filter(|(raw, _)| matches!(unpack_id(*raw).0, ObjectClass::Node | ObjectClass::Drop)).max_by_key(|(_, n)| *n)?;
-        Some((raw, n as f32 / mask.area().max(1) as f32))
+        Some((raw, n as f32 / area.max(1) as f32))
     }
 
     pub fn iou(&self, mask: &Mask, raw: u32) -> f32 {
+        if mask.width == 0 || mask.height == 0 {
+            return 0.0;
+        }
         let (mut inter, mut uni) = (0u32, 0u32);
-        for y in 0..self.height.min(mask.height) {
-            for x in 0..self.width.min(mask.width) {
-                let a = mask.get(x, y);
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let a = self.mask_at(mask, x, y);
                 let b = self.ids[(y * self.width + x) as usize] == raw;
                 inter += (a && b) as u32;
                 uni += (a || b) as u32;
@@ -206,22 +232,31 @@ pub struct DepthStandIn {
     rng: Rng,
     pub patch_sd: f32,
     pub err: Option<DepthErrModel>,
+    /// The depth patches follow the pyramid's L2 grid while set (else TIPSv2's 36 × 24 keyframe grid).
+    pub pyramid: Option<PyramidCfg>,
 }
 
 impl DepthStandIn {
     pub fn new(seed: u64) -> DepthStandIn {
-        DepthStandIn { rng: Rng::new(seed ^ 0xDE97), patch_sd: 0.06, err: None }
+        DepthStandIn { rng: Rng::new(seed ^ 0xDE97), patch_sd: 0.06, err: None, pyramid: None }
     }
 
     pub fn honest(seed: u64) -> DepthStandIn {
         DepthStandIn { err: Some(DepthErrModel::TIPS_GROUND), ..DepthStandIn::new(seed) }
     }
 
+    fn patch_grid(&self, truth: &KeyTruth) -> (u32, u32) {
+        match &self.pyramid {
+            Some(p) => Pyramid::for_frame(truth.src_width, truth.src_height, p).l2(),
+            None => (36, 24),
+        }
+    }
+
     pub fn run(&mut self, truth: &KeyTruth) -> DepthMap {
         if let Some(m) = self.err {
             return self.run_measured(truth, &m);
         }
-        let (pw, ph) = (36u32, 24u32);
+        let (pw, ph) = self.patch_grid(truth);
         let errs: Vec<f32> = (0..pw * ph).map(|_| (self.patch_sd * gauss(&mut self.rng)).exp()).collect();
         let mut data = Vec::with_capacity(truth.depth.len());
         for y in 0..truth.height {
@@ -236,7 +271,7 @@ impl DepthStandIn {
     }
 
     fn run_measured(&mut self, truth: &KeyTruth, m: &DepthErrModel) -> DepthMap {
-        let (pw, ph) = (36u32, 24u32);
+        let (pw, ph) = self.patch_grid(truth);
         let eta = m.frame_sd * gauss(&mut self.rng);
         let errs: Vec<f32> = (0..pw * ph).map(|_| m.patch_sd * gauss(&mut self.rng)).collect();
         let (w, h) = (truth.width, truth.height);
@@ -311,22 +346,31 @@ pub struct LocateStandIn {
     pub noise_sd: f32,
     pub confusion: f32,
     pub err: Option<LocateErrModel>,
+    /// The heat follows the pyramid's L1 grid while set (else SigLIP2 NaFlex's 19 × 13 keyframe grid).
+    pub pyramid: Option<PyramidCfg>,
 }
 
 impl LocateStandIn {
     pub fn new(seed: u64) -> LocateStandIn {
-        LocateStandIn { rng: Rng::new(seed ^ 0x51C1), noise_sd: 0.04, confusion: 0.35, err: None }
+        LocateStandIn { rng: Rng::new(seed ^ 0x51C1), noise_sd: 0.04, confusion: 0.35, err: None, pyramid: None }
     }
 
     pub fn honest(seed: u64) -> LocateStandIn {
         LocateStandIn { err: Some(LocateErrModel::SIGLIP_MEASURED), ..LocateStandIn::new(seed) }
     }
 
+    fn heat_grid(&self, truth: &KeyTruth) -> (u32, u32) {
+        match &self.pyramid {
+            Some(p) => Pyramid::for_frame(truth.src_width, truth.src_height, p).l1(),
+            None => (19, 13),
+        }
+    }
+
     pub fn run(&mut self, truth: &KeyTruth, labels: &[LabelPrompt]) -> Vec<SemanticPoint> {
         if let Some(m) = self.err {
             return self.run_measured(truth, labels, &m);
         }
-        let (cols, rows) = (19u32, 13u32);
+        let (cols, rows) = self.heat_grid(truth);
         let mut frac: BTreeMap<String, Vec<f32>> = BTreeMap::new();
         let label_of: HashMap<u32, String> = truth
             .objects
@@ -376,7 +420,7 @@ impl LocateStandIn {
     }
 
     fn run_measured(&mut self, truth: &KeyTruth, labels: &[LabelPrompt], m: &LocateErrModel) -> Vec<SemanticPoint> {
-        let (cols, rows) = (19u32, 13u32);
+        let (cols, rows) = self.heat_grid(truth);
         let n = (cols * rows) as usize;
         let cell_of = |o: &VisibleObject| {
             let (cx, cy) = ((o.bbox[0] + o.bbox[2]) as f32 * 0.5, (o.bbox[1] + o.bbox[3]) as f32 * 0.5);
@@ -440,6 +484,7 @@ pub struct MlFrame {
     pub track_iou_truth: Option<f32>,
     pub range_true_m: Option<f32>,
     pub truth_entity: Option<String>,
+    pub pyramid: Option<PyramidReport>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -519,6 +564,33 @@ impl MlPipeline {
         if let LocateEngine::StandIn(_) = self.locate {
             self.locate = LocateEngine::StandIn(LocateStandIn::honest(seed));
         }
+        self.sync_pyramid();
+    }
+
+    /// Hands the configuration's pyramid (or none) to every engine: SigLIP2's dense grid, TIPSv2's input grid, the
+    /// SAM mask grid, the stand-ins' heat and depth patches. Call after swapping an engine; `prefetch` and `analyse`
+    /// call it too.
+    pub fn sync_pyramid(&mut self) {
+        let p = self.fix.pyramid;
+        match &mut self.depth {
+            DepthEngine::Model(m) => m.set_pyramid(p.as_ref()),
+            DepthEngine::StandIn(s) => s.pyramid = p,
+        }
+        match &mut self.locate {
+            LocateEngine::Model(m) => m.set_pyramid(p.as_ref()),
+            LocateEngine::StandIn(s) => s.pyramid = p,
+        }
+        self.tracker.set_pyramid(p.as_ref());
+    }
+
+    /// The prompts a frame's points give the mask tracker: wanted labels above their floors that pass the
+    /// calibrated gate.
+    fn prompts_for(&self, points: &[SemanticPoint], wanted: Option<&[String]>, floor: &dyn Fn(&str) -> f32) -> Vec<PointPrompt> {
+        points
+            .iter()
+            .filter(|p| wanted.map_or(true, |w| w.contains(&p.label)) && p.score >= floor(&p.label) && self.passes_calibration(p))
+            .map(|p| PointPrompt { label: p.label.clone(), px: p.px, py: p.py, score: p.score })
+            .collect()
     }
 
     pub fn labels(&self) -> &[LabelPrompt] {
@@ -563,7 +635,11 @@ impl MlPipeline {
         if sel.is_empty() {
             return Ok(0);
         }
-        self.tracker.prepare(&sel)?;
+        self.sync_pyramid();
+        let lazy = self.fix.pyramid.is_some_and(|p| p.lazy_sam) && matches!(self.locate, LocateEngine::Model(_));
+        if !lazy {
+            self.tracker.prepare(&sel)?;
+        }
         let heads = scene_heads(&self.fix);
         let depths = match &mut self.depth {
             DepthEngine::Model(m) => Some(m.infer_scene_batch(&sel, heads)?),
@@ -573,6 +649,15 @@ impl MlPipeline {
             LocateEngine::Model(m) => Some(m.locate_batch(&sel, &self.labels)?),
             LocateEngine::StandIn(_) => None,
         };
+        if lazy {
+            let any: Vec<&Rgb> = match &points {
+                Some(pts) => sel.iter().zip(pts).filter(|(_, p)| !self.prompts_for(p, None, &|_| f32::NEG_INFINITY).is_empty()).map(|(f, _)| *f).collect(),
+                None => sel.clone(),
+            };
+            if !any.is_empty() {
+                self.tracker.prepare(&any)?;
+            }
+        }
         if depths.is_none() && points.is_none() {
             return Ok(0);
         }
@@ -655,6 +740,7 @@ impl MlPipeline {
         prefer_track: Option<u32>,
         height: Option<noto_vision::align::HeightFn>,
     ) -> Result<MlFrame> {
+        self.sync_pyramid();
         let key = frame_key(rgb);
         let pre = self.pre.remove(&key).unwrap_or_default();
         self.pre_order.retain(|k| *k != key);
@@ -666,22 +752,32 @@ impl MlPipeline {
             (_, DepthEngine::StandIn(_), None) => anyhow::bail!("깊이 대역 모델에는 정답 버퍼가 필요합니다"),
         };
         let mut depth = scene.depth;
+        let seg = scene.segmentation;
         let normals = scene.normals.filter(|_| self.fix.normals);
         let align = match (&self.depth, &self.fix.align) {
             (DepthEngine::Model(m), Some(cfg)) => noto_vision::ground_align_with(&mut depth, normals.as_ref(), intr, pose, height, m.max_depth_m(), cfg),
             _ => None,
         };
-        let points = match (pre.points, &mut self.locate, truth) {
+        let mut points = match (pre.points, &mut self.locate, truth) {
             (Some(p), LocateEngine::Model(_), _) => p,
             (_, LocateEngine::Model(m), _) => m.locate(rgb, &self.labels)?,
             (_, LocateEngine::StandIn(s), Some(t)) => s.run(t, &self.labels),
             (_, LocateEngine::StandIn(_), None) => anyhow::bail!("의미 위치 대역 모델에는 정답 버퍼가 필요합니다"),
         };
-        let prompts: Vec<PointPrompt> = points
-            .iter()
-            .filter(|p| wanted.contains(&p.label) && p.score >= floor(&p.label) && self.passes_calibration(p))
-            .map(|p| PointPrompt { label: p.label.clone(), px: p.px, py: p.py, score: p.score })
-            .collect();
+        let pyramid = self.fix.pyramid.map(|cfg| {
+            let pyr = Pyramid::for_frame(rgb.width, rgb.height, &cfg);
+            let view = noto_vision::pyramid::View { intr, pose, height };
+            let mut rep = PyramidReport::of(&pyr);
+            if cfg.gate.enabled {
+                let geo = noto_vision::cell_geometry(&pyr, &depth, seg.as_ref(), Some(view), cfg.gate.far_m);
+                rep.gated_cells = noto_vision::gate_points(&mut points, &pyr, &geo, &cfg.gate);
+            }
+            if cfg.snap.enabled {
+                rep.snapped = noto_vision::snap_points(&mut points, &pyr, &depth, Some(view), &cfg.snap);
+            }
+            rep
+        });
+        let prompts = self.prompts_for(&points, Some(wanted), floor);
         let tracks = self.tracker.update(rgb, Some(&depth), &prompts)?;
         let pick = tracks
             .iter()
@@ -751,7 +847,7 @@ impl MlPipeline {
                 }
             }
         }
-        Ok(MlFrame { depth, align, depth_metrics: depth_m, points, tracks, target, locate_err_px: loc_err, track_iou_truth: iou, range_true_m: range_true, truth_entity: entity })
+        Ok(MlFrame { depth, align, depth_metrics: depth_m, points, tracks, target, locate_err_px: loc_err, track_iou_truth: iou, range_true_m: range_true, truth_entity: entity, pyramid })
     }
 }
 
@@ -906,6 +1002,57 @@ mod tests {
     }
 
     #[test]
+    fn the_truth_scores_a_mask_of_any_grid_on_its_own_pixels() {
+        let mut t = truth_with(Vec::new());
+        let raw = world_sim::render::pack_id(ObjectClass::Drop, 7);
+        for y in 20..40 {
+            for x in 30..54 {
+                t.ids[(y * t.width + x) as usize] = raw;
+            }
+        }
+        let mut same = Mask::empty(96, 64);
+        let mut fine = Mask::empty(144, 96);
+        for y in 20..40 {
+            for x in 30..54 {
+                same.set(x, y);
+            }
+        }
+        for y in 30..60 {
+            for x in 45..81 {
+                fine.set(x, y);
+            }
+        }
+        assert_eq!(t.iou(&same, raw), 1.0);
+        assert_eq!(t.iou(&fine, raw), 1.0, "a 1.5x mask of the same box scores the same");
+        assert_eq!(t.entity_under(&fine), Some((raw, 1.0)));
+        assert_eq!(t.iou(&Mask::empty(0, 0), raw), 0.0);
+    }
+
+    #[test]
+    fn the_pipeline_hands_its_pyramid_to_the_stand_ins() {
+        let lex = Lexicon::from_json(LEX).unwrap();
+        let mut pipe = MlPipeline::stand_in(&lex, 1);
+        pipe.sync_pyramid();
+        let t = truth_with(Vec::new());
+        let LocateEngine::StandIn(s) = &mut pipe.locate else { panic!() };
+        assert!(s.pyramid.is_some());
+        let labels: Vec<LabelPrompt> = lex_labels(&lex);
+        let pts = s.run(&t, &labels);
+        assert_eq!((pts[0].heat.cols, pts[0].heat.rows), (18, 12), "the 192 x 128 frame's SigLIP2 pyramid grid");
+        let DepthEngine::StandIn(d) = &pipe.depth else { panic!() };
+        assert_eq!(d.patch_grid(&t), (36, 24));
+        pipe.fix = MlFixCfg::legacy();
+        pipe.sync_pyramid();
+        let LocateEngine::StandIn(s) = &mut pipe.locate else { panic!() };
+        let pts = s.run(&t, &labels);
+        assert_eq!((pts[0].heat.cols, pts[0].heat.rows), (19, 13), "the old path keeps NaFlex's own grid");
+    }
+
+    fn lex_labels(lex: &Lexicon) -> Vec<LabelPrompt> {
+        MlPipeline::stand_in(lex, 1).labels().iter().take(2).cloned().collect()
+    }
+
+    #[test]
     fn the_legacy_fix_is_the_old_path_and_v1_switches_every_fix_on() {
         let l = MlFixCfg::legacy();
         assert!(l.align.is_none() && !l.contact_range && !l.calibrated_gate && !l.scan_calibrated && l.locate == LocateCfg::default());
@@ -913,8 +1060,10 @@ mod tests {
         let v = MlFixCfg::v1(&p);
         assert!(v.align.is_some() && v.contact_range && v.calibrated_gate && v.scan_calibrated);
         assert_eq!(v.locate.background, p.background);
+        assert!(l.pyramid.is_none(), "the old path runs every model on its own grid");
+        assert_eq!(v.pyramid, Some(PyramidCfg::default()), "v1 lines the models up 1 : 2 : 4");
         let back: MlFixCfg = serde_json::from_str("{}").unwrap();
-        assert!(back.align.is_none() && (back.pitch_sigma_deg - 0.5).abs() < 1e-6);
+        assert!(back.align.is_none() && back.pyramid.is_none() && (back.pitch_sigma_deg - 0.5).abs() < 1e-6);
         assert!(CalibTable::parse(ML_CALIB_JSON).is_ok());
     }
 }

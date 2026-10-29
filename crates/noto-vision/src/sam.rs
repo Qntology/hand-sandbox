@@ -22,6 +22,8 @@ pub const DEFAULT_DIR: &str = "models/sam";
 pub const TINY_FILE: &str = "mobile_sam-tiny-vitt.safetensors";
 pub const VIT_B_FILE: &str = "sam_vit_b_01ec64.safetensors";
 pub const BATCH_ENV: &str = "NOTO_SAM_BATCH";
+/// The least margin around a track's box (frame px) within which a prompt of its label follows it.
+const FOLLOW_GUARD_PX: f32 = 12.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SamVariant {
@@ -187,15 +189,25 @@ impl SamModel {
 
 pub fn sample_mask(logits: &[f32], frame_w: u32, frame_h: u32, k: u32) -> Mask {
     let k = k.max(1);
-    let (w, h) = ((frame_w / k).max(1), (frame_h / k).max(1));
+    sample_scaled(logits, frame_w, frame_h, (frame_w / k).max(1), (frame_h / k).max(1), k as f32, k as f32)
+}
+
+/// The decoder's low-res logits as a `mask_w` × `mask_h` mask of the frame (the pyramid's L1 grid times
+/// `mask_per_cell`, so every SigLIP2 patch is a whole block of mask pixels).
+pub fn sample_mask_to(logits: &[f32], frame_w: u32, frame_h: u32, mask_w: u32, mask_h: u32) -> Mask {
+    let (w, h) = (mask_w.max(1), mask_h.max(1));
+    sample_scaled(logits, frame_w, frame_h, w, h, frame_w.max(1) as f32 / w as f32, frame_h.max(1) as f32 / h as f32)
+}
+
+fn sample_scaled(logits: &[f32], frame_w: u32, frame_h: u32, w: u32, h: u32, kx: f32, ky: f32) -> Mask {
     let s = SamModel::scale(frame_w, frame_h);
     let r = LOW_RES as f32 / IMAGE_SIZE as f32;
     let at = |x: i64, y: i64| logits[(y.clamp(0, LOW_RES as i64 - 1) as usize) * LOW_RES + x.clamp(0, LOW_RES as i64 - 1) as usize];
     let mut m = Mask::empty(w, h);
     for y in 0..h {
         for x in 0..w {
-            let lx = ((x as f32 + 0.5) * k as f32) * s * r - 0.5;
-            let ly = ((y as f32 + 0.5) * k as f32) * s * r - 0.5;
+            let lx = ((x as f32 + 0.5) * kx) * s * r - 0.5;
+            let ly = ((y as f32 + 0.5) * ky) * s * r - 0.5;
             let (x0, y0) = (lx.floor() as i64, ly.floor() as i64);
             let (fx, fy) = (lx - x0 as f32, ly - y0 as f32);
             let v = at(x0, y0) * (1.0 - fx) * (1.0 - fy) + at(x0 + 1, y0) * fx * (1.0 - fy) + at(x0, y0 + 1) * (1.0 - fx) * fy + at(x0 + 1, y0 + 1) * fx * fy;
@@ -216,20 +228,38 @@ pub struct SamCfg {
     pub max_tracks: usize,
     pub max_misses: u32,
     pub cache_frames: usize,
+    /// The mask grid: the pyramid's (L1 × `mask_per_cell`) while set, else the frame over `downscale`.
+    pub pyramid: Option<crate::pyramid::PyramidCfg>,
 }
 
 impl Default for SamCfg {
     fn default() -> Self {
-        SamCfg { downscale: 2, min_iou_pred: 0.5, min_area_frac: 0.0004, max_area_frac: 0.25, max_tracks: 8, max_misses: 2, cache_frames: 16 }
+        SamCfg { downscale: 2, min_iou_pred: 0.5, min_area_frac: 0.0004, max_area_frac: 0.25, max_tracks: 8, max_misses: 2, cache_frames: 16, pyramid: None }
     }
 }
 
+impl SamCfg {
+    /// The mask size for a `width` × `height` frame.
+    pub fn mask_size(&self, width: u32, height: u32) -> (u32, u32) {
+        match &self.pyramid {
+            Some(p) => crate::pyramid::Pyramid::for_frame(width, height, p).mask(),
+            None => {
+                let k = self.downscale.max(1);
+                ((width / k).max(1), (height / k).max(1))
+            }
+        }
+    }
+}
+
+/// A followed object; its mask and centre are in mask pixels, `sx` × `sy` frame pixels each.
 struct Live {
     id: u32,
     label: String,
     mask: Mask,
     cx: f32,
     cy: f32,
+    sx: f32,
+    sy: f32,
     age: u32,
     misses: u32,
 }
@@ -246,6 +276,7 @@ pub struct SamTracker {
     next_id: u32,
     cache: HashMap<u64, Tensor>,
     order: VecDeque<u64>,
+    encoded: usize,
 }
 
 fn image_key(rgb: &Rgb) -> u64 {
@@ -256,7 +287,7 @@ fn image_key(rgb: &Rgb) -> u64 {
 
 impl SamTracker {
     pub fn new(model: Arc<SamModel>) -> SamTracker {
-        SamTracker { model, cfg: SamCfg::default(), tracks: Vec::new(), next_id: 1, cache: HashMap::new(), order: VecDeque::new() }
+        SamTracker { model, cfg: SamCfg::default(), tracks: Vec::new(), next_id: 1, cache: HashMap::new(), order: VecDeque::new(), encoded: 0 }
     }
 
     fn remember(&mut self, key: u64, emb: Tensor) {
@@ -276,12 +307,24 @@ impl SamTracker {
             return Ok(e.clone());
         }
         let e = self.model.encode_batch(&[rgb])?.pop().expect("one embedding per frame");
+        self.encoded += 1;
         self.remember(key, e.clone());
         Ok(e)
     }
 
     pub fn cached_frames(&self) -> usize {
         self.cache.len()
+    }
+
+    /// How many frames went through the image encoder.
+    pub fn encoded_frames(&self) -> usize {
+        self.encoded
+    }
+
+    /// Whether `update` looks at the image at all: not when there is nothing to prompt and nothing to follow, so a
+    /// search frame without a gated prompt costs no encoder pass.
+    pub fn wants_frame(&self, prompts: usize) -> bool {
+        prompts > 0 || !self.tracks.is_empty()
     }
 
     fn accept(&self, m: &Mask, iou_pred: f32) -> bool {
@@ -291,15 +334,15 @@ impl SamTracker {
     }
 
     fn out(&self, t: &Live, iou_prev: Option<f32>, propagated: bool, score: f32) -> TrackedMask {
-        let k = self.cfg.downscale.max(1) as f32;
+        let (kx, ky) = (t.sx, t.sy);
         let b = t.mask.bbox().unwrap_or([0, 0, 0, 0]);
         TrackedMask {
             id: t.id,
             label: t.label.clone(),
             mask: t.mask.clone(),
-            cx: t.cx * k,
-            cy: t.cy * k,
-            bbox: [b[0] as f32 * k, b[1] as f32 * k, (b[2] + 1) as f32 * k, (b[3] + 1) as f32 * k],
+            cx: t.cx * kx,
+            cy: t.cy * ky,
+            bbox: [b[0] as f32 * kx, b[1] as f32 * ky, (b[2] + 1) as f32 * kx, (b[3] + 1) as f32 * ky],
             area_frac: t.mask.area() as f32 / (t.mask.width * t.mask.height).max(1) as f32,
             score,
             iou_prev,
@@ -331,26 +374,37 @@ impl MaskTracker for SamTracker {
         }
         let refs: Vec<&Rgb> = missing.iter().map(|(_, f)| *f).collect();
         let embs = self.model.encode_batch(&refs)?;
+        self.encoded += refs.len();
         for ((key, _), e) in missing.iter().zip(embs) {
             self.remember(*key, e);
         }
         Ok(())
     }
 
+    fn set_pyramid(&mut self, cfg: Option<&crate::pyramid::PyramidCfg>) {
+        self.cfg.pyramid = cfg.copied();
+    }
+
     fn update(&mut self, rgb: &Rgb, _depth: Option<&DepthMap>, prompts: &[PointPrompt]) -> Result<Vec<TrackedMask>> {
+        if !self.wants_frame(prompts.len()) {
+            return Ok(Vec::new());
+        }
         let emb = self.embedding(rgb)?;
-        let k = self.cfg.downscale.max(1);
-        let kf = k as f32;
+        let (mw, mh) = self.cfg.mask_size(rgb.width, rgb.height);
+        let (kx, ky) = match self.cfg.pyramid {
+            Some(_) => (rgb.width.max(1) as f32 / mw as f32, rgb.height.max(1) as f32 / mh as f32),
+            None => (self.cfg.downscale.max(1) as f32, self.cfg.downscale.max(1) as f32),
+        };
         let mut used = vec![false; prompts.len()];
         let mut queries: Vec<(Query, (f32, f32))> = Vec::new();
         for (ti, t) in self.tracks.iter().enumerate() {
             let near = |p: &PointPrompt| -> bool {
-                let (x, y) = (p.px / kf, p.py / kf);
+                let (x, y) = (p.px / t.sx, p.py / t.sy);
                 if (x as u32) < t.mask.width && (y as u32) < t.mask.height && t.mask.get(x as u32, y as u32) {
                     return true;
                 }
                 let Some(b) = t.mask.bbox() else { return false };
-                let (gx, gy) = ((0.5 * (b[2] - b[0] + 1) as f32).max(6.0), (0.5 * (b[3] - b[1] + 1) as f32).max(6.0));
+                let (gx, gy) = ((0.5 * (b[2] - b[0] + 1) as f32).max(FOLLOW_GUARD_PX / t.sx), (0.5 * (b[3] - b[1] + 1) as f32).max(FOLLOW_GUARD_PX / t.sy));
                 x >= b[0] as f32 - gx && x <= b[2] as f32 + gx && y >= b[1] as f32 - gy && y <= b[3] as f32 + gy
             };
             match prompts.iter().enumerate().find(|(i, p)| !used[*i] && p.label == t.label && near(p)) {
@@ -358,7 +412,7 @@ impl MaskTracker for SamTracker {
                     used[i] = true;
                     queries.push((Query::Follow { track: ti, prompted: true }, (p.px, p.py)));
                 }
-                None if t.misses < self.cfg.max_misses => queries.push((Query::Follow { track: ti, prompted: false }, (t.cx * kf, t.cy * kf))),
+                None if t.misses < self.cfg.max_misses => queries.push((Query::Follow { track: ti, prompted: false }, (t.cx * t.sx, t.cy * t.sy))),
                 None => {}
             }
         }
@@ -368,7 +422,7 @@ impl MaskTracker for SamTracker {
                 continue;
             }
             let on_track = self.tracks.iter().any(|t| {
-                let (x, y) = ((p.px / kf) as u32, (p.py / kf) as u32);
+                let (x, y) = ((p.px / t.sx) as u32, (p.py / t.sy) as u32);
                 x < t.mask.width && y < t.mask.height && t.mask.get(x, y)
             });
             if !on_track {
@@ -385,7 +439,10 @@ impl MaskTracker for SamTracker {
         let mut out = Vec::new();
         let mut next = Vec::new();
         for ((q, _), d) in queries.into_iter().zip(decoded) {
-            let mask = sample_mask(&d.logits, rgb.width, rgb.height, k);
+            let mask = match self.cfg.pyramid {
+                Some(_) => sample_mask_to(&d.logits, rgb.width, rgb.height, mw, mh),
+                None => sample_mask(&d.logits, rgb.width, rgb.height, self.cfg.downscale.max(1)),
+            };
             if !self.accept(&mask, d.iou_pred) {
                 continue;
             }
@@ -398,13 +455,14 @@ impl MaskTracker for SamTracker {
                     t.mask = mask;
                     t.cx = cx;
                     t.cy = cy;
+                    (t.sx, t.sy) = (kx, ky);
                     t.age += 1;
                     let score = if prompted { 0.4 + 0.6 * d.iou_pred.clamp(0.0, 1.0) } else { 0.6 * d.iou_pred.clamp(0.0, 1.0) };
                     out.push(self.out(&t, Some(iou_prev), !prompted, score));
                     next.push(t);
                 }
                 Query::New { prompt } => {
-                    let t = Live { id: self.next_id, label: prompts[prompt].label.clone(), mask, cx, cy, age: 1, misses: 0 };
+                    let t = Live { id: self.next_id, label: prompts[prompt].label.clone(), mask, cx, cy, sx: kx, sy: ky, age: 1, misses: 0 };
                     self.next_id += 1;
                     let score = 0.4 + 0.6 * (d.iou_pred.clamp(0.0, 1.0) * prompts[prompt].score.clamp(0.0, 1.0)).sqrt();
                     out.push(self.out(&t, None, false, score));
@@ -473,6 +531,50 @@ mod tests {
         assert_eq!(d.len(), 3);
         assert!(d.iter().all(|q| q.logits.len() == LOW_RES * LOW_RES && q.iou_pred.is_finite()));
         assert!(m.decode(&both[0], 96, 64, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_pyramid_mask_is_a_whole_number_of_blocks_per_siglip_patch() {
+        let s = SamModel::scale(384, 256) * LOW_RES as f32 / IMAGE_SIZE as f32;
+        let mut logits = vec![-5.0f32; LOW_RES * LOW_RES];
+        for y in 0..LOW_RES {
+            for x in 0..LOW_RES {
+                let (fx, fy) = ((x as f32 + 0.5) / s, (y as f32 + 0.5) / s);
+                if (96.0..192.0).contains(&fx) && (64.0..128.0).contains(&fy) {
+                    logits[y * LOW_RES + x] = 5.0;
+                }
+            }
+        }
+        let cfg = SamCfg { pyramid: Some(crate::pyramid::PyramidCfg::default()), ..SamCfg::default() };
+        assert_eq!(cfg.mask_size(384, 256), (288, 192), "18 x 12 SigLIP2 patches of 16 x 16 mask pixels");
+        assert_eq!(cfg.mask_size(640, 480), (256, 192), "SAM's 256 x 192 low-res logits of a 4:3 frame");
+        assert_eq!(SamCfg::default().mask_size(384, 256), (192, 128));
+        let m = sample_mask_to(&logits, 384, 256, 288, 192);
+        let b = m.bbox().unwrap();
+        let k = 288.0 / 384.0;
+        assert!((b[0] as f32 - 96.0 * k).abs() <= 1.0 && (b[2] as f32 - (192.0 * k - 1.0)).abs() <= 1.0, "{b:?}");
+        assert!((b[1] as f32 - 64.0 * k).abs() <= 1.0 && (b[3] as f32 - (128.0 * k - 1.0)).abs() <= 1.0, "{b:?}");
+        assert_eq!(sample_mask_to(&logits, 384, 256, 192, 128), sample_mask(&logits, 384, 256, 2), "the old grid is one case of the new");
+    }
+
+    #[test]
+    fn nothing_to_prompt_and_nothing_to_follow_skips_the_encoder() {
+        let mut t = SamTracker::new(Arc::new(test_model()));
+        t.cfg = SamCfg { min_iou_pred: f32::MIN, min_area_frac: 0.0, max_area_frac: 1.0, pyramid: Some(crate::pyramid::PyramidCfg::default()), ..SamCfg::default() };
+        let (a, b) = (frame(96, 64, 0), frame(96, 64, 30));
+        assert!(!t.wants_frame(0));
+        assert!(t.update(&a, None, &[]).unwrap().is_empty());
+        assert_eq!(t.encoded_frames(), 0, "an empty search frame costs no encoder pass");
+        let p = PointPrompt { label: "iron_ore_node".into(), px: 40.0, py: 30.0, score: 0.9 };
+        let first = t.update(&a, None, &[p]).unwrap();
+        assert_eq!(t.encoded_frames(), 1);
+        if let Some(f) = first.first() {
+            assert_eq!((f.mask.width, f.mask.height), t.cfg.mask_size(96, 64));
+            assert!(f.cx > 0.0 && f.cx < 96.0 && f.bbox[2] <= 96.0 + 1e-3, "track centres come back in frame pixels");
+            assert!(t.wants_frame(0), "a live track is followed without a prompt");
+            t.update(&b, None, &[]).unwrap();
+            assert_eq!(t.encoded_frames(), 2);
+        }
     }
 
     #[test]

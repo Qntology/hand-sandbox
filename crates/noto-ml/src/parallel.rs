@@ -7,7 +7,8 @@ use anyhow::{anyhow, bail, Result};
 use image::{DynamicImage, GenericImageView};
 use rayon::prelude::*;
 
-use crate::model::Siglip2;
+use crate::model::{DenseEmbedding, Siglip2};
+use crate::preprocess::DenseGrid;
 
 pub const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 
@@ -58,6 +59,10 @@ pub trait TextEmbedder {
 pub trait ImageEmbedder {
     fn embedding_dim(&self) -> usize;
     fn embed_images_batch(&self, images: &[DynamicImage]) -> Result<Vec<Vec<f32>>>;
+    /// One per-patch pass over each whole image on `grid`, for embedders that have one (`None`: crops only).
+    fn embed_dense_images(&self, _images: &[DynamicImage], _grid: DenseGrid) -> Result<Option<Vec<DenseEmbedding>>> {
+        Ok(None)
+    }
 }
 
 impl TextEmbedder for Siglip2 {
@@ -82,6 +87,10 @@ impl ImageEmbedder for Siglip2 {
 
     fn embed_images_batch(&self, images: &[DynamicImage]) -> Result<Vec<Vec<f32>>> {
         self.embed_images(images, 0)
+    }
+
+    fn embed_dense_images(&self, images: &[DynamicImage], grid: DenseGrid) -> Result<Option<Vec<DenseEmbedding>>> {
+        Ok(Some(self.embed_dense_batch_grid(images, grid)?))
     }
 }
 
@@ -492,6 +501,75 @@ pub fn tile_layout(width: u32, height: u32, grids: &[(u32, u32)], overlap: f32) 
     tiles
 }
 
+/// Tile grids snapped to whole blocks of the `l1_cols` × `l1_rows` SigLIP2 grid: each count moves to the nearest
+/// divisor of the patch count (the smaller on a tie), so a tile (before its overlap) is a whole block of patches, e.g.
+/// (2, 2), (4, 3), (6, 4) on 18 × 12 become (2, 2), (3, 3), (6, 4). Repeats are dropped.
+pub fn aligned_tile_grids(grids: &[(u32, u32)], l1_cols: u32, l1_rows: u32) -> Vec<(u32, u32)> {
+    let snap = |want: u32, n: u32| -> u32 {
+        let n = n.max(1);
+        (1..=n).filter(|d| n % d == 0).min_by_key(|d| (d.abs_diff(want.max(1)), *d)).unwrap_or(1)
+    };
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    for &(c, r) in grids {
+        let g = if (c.max(1), r.max(1)) == (1, 1) { (1, 1) } else { (snap(c, l1_cols), snap(r, l1_rows)) };
+        if !out.contains(&g) {
+            out.push(g);
+        }
+    }
+    out
+}
+
+/// Tile embeddings pooled from one dense pass over the whole `width` × `height` frame instead of encoding each
+/// crop: each tile averages the patch vectors it covers, weighted by the share of the patch inside it and by the
+/// attention-pooling head's weight on the patch, then normalised. The whole-frame tile is the pass's own pooled
+/// vector. The patches have seen the whole frame, so these are not the crops' embeddings; scores on them need their
+/// own calibration.
+pub fn pool_dense_tiles(dense: &DenseEmbedding, width: u32, height: u32, tiles: &[Tile]) -> Vec<Vec<f32>> {
+    let (gw, gh) = (dense.grid_w.max(1), dense.grid_h.max(1));
+    let (pw, ph) = (width.max(1) as f32 / gw as f32, height.max(1) as f32 / gh as f32);
+    let dim = dense.pooled.len();
+    tiles
+        .iter()
+        .map(|t| {
+            if t.x == 0 && t.y == 0 && t.w >= width && t.h >= height {
+                return dense.pooled.clone();
+            }
+            let (x0, y0, x1, y1) = (t.x as f32, t.y as f32, (t.x + t.w) as f32, (t.y + t.h) as f32);
+            let mut acc = vec![0.0f32; dim];
+            let mut plain = vec![0.0f32; dim];
+            let (mut wsum, mut csum) = (0.0f32, 0.0f32);
+            for r in 0..gh {
+                let oy = (((r + 1) as f32 * ph).min(y1) - (r as f32 * ph).max(y0)).max(0.0) / ph;
+                if oy <= 0.0 {
+                    continue;
+                }
+                for c in 0..gw {
+                    let ox = (((c + 1) as f32 * pw).min(x1) - (c as f32 * pw).max(x0)).max(0.0) / pw;
+                    if ox <= 0.0 {
+                        continue;
+                    }
+                    let i = r * gw + c;
+                    let Some(v) = dense.vectors.get(i) else { continue };
+                    let cover = ox * oy;
+                    let w = cover * dense.attention.get(i).copied().unwrap_or(0.0).max(0.0);
+                    for k in 0..dim.min(v.len()) {
+                        acc[k] += w * v[k];
+                        plain[k] += cover * v[k];
+                    }
+                    wsum += w;
+                    csum += cover;
+                }
+            }
+            let mut out = if wsum > 0.0 { acc } else { plain };
+            let n = out.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if n > 0.0 && (wsum > 0.0 || csum > 0.0) {
+                out.iter_mut().for_each(|x| *x /= n);
+            }
+            out
+        })
+        .collect()
+}
+
 pub fn crop_tiles(image: &DynamicImage, tiles: &[Tile]) -> Vec<DynamicImage> {
     let (iw, ih) = image.dimensions();
     tiles
@@ -874,5 +952,35 @@ mod tests {
         assert_eq!(o.rows_for(0), 8);
         assert_eq!(o.rows_for(1000), 1);
         assert_eq!(o.rows_for(5), 2);
+    }
+
+    #[test]
+    fn tile_grids_snap_to_whole_blocks_of_patches() {
+        assert_eq!(aligned_tile_grids(&[(2, 2), (4, 3), (6, 4)], 18, 12), vec![(2, 2), (3, 3), (6, 4)]);
+        assert_eq!(aligned_tile_grids(&[(2, 2), (4, 3), (8, 6)], 16, 12), vec![(2, 2), (4, 3), (8, 6)]);
+        assert_eq!(aligned_tile_grids(&[(1, 1), (5, 5), (4, 4)], 16, 16), vec![(1, 1), (4, 4)]);
+        for (c, r) in aligned_tile_grids(&[(2, 2), (4, 3), (6, 4)], 18, 12) {
+            assert!(18 % c == 0 && 12 % r == 0);
+        }
+    }
+
+    #[test]
+    fn a_pooled_tile_is_the_attention_weighted_mean_of_the_patches_it_covers() {
+        let d = DenseEmbedding {
+            grid_h: 1,
+            grid_w: 2,
+            vectors: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            attention: vec![0.75, 0.25],
+            pooled: vec![0.6, 0.8],
+        };
+        let whole = Tile { x: 0, y: 0, w: 4, h: 2, level: 0 };
+        let left = Tile { x: 0, y: 0, w: 2, h: 2, level: 1 };
+        let both = Tile { x: 1, y: 0, w: 2, h: 2, level: 1 };
+        let v = pool_dense_tiles(&d, 4, 2, &[whole, left, both]);
+        assert_eq!(v[0], d.pooled, "the whole frame is the pass's own pooled vector");
+        assert!((v[1][0] - 1.0).abs() < 1e-6 && v[1][1].abs() < 1e-6);
+        let (a, b): (f32, f32) = (0.5 * 0.75, 0.5 * 0.25);
+        let n: f32 = (a * a + b * b).sqrt();
+        assert!((v[2][0] - a / n).abs() < 1e-6 && (v[2][1] - b / n).abs() < 1e-6, "{:?}", v[2]);
     }
 }

@@ -1285,10 +1285,10 @@ fn ml_ab_quests() {
     let sam_dir = PathBuf::from(std::env::var("SAM_DIR").expect("SAM_DIR"));
     let bank = bank_dir();
     let mut rows: BTreeMap<&str, Vec<serde_json::Value>> = BTreeMap::new();
-    for arm in ["standin", "honest", "real_v0.9", "real_v1.0"] {
+    for arm in ["standin", "honest", "real_v0.9", "real_v1.0", "real_v1.3"] {
         let siglip = arm.starts_with("real").then(|| {
             let mut s = noto_ml::Siglip2::load(&sig_dir, &dev).expect("SigLIP2");
-            s.set_position_antialias(arm == "real_v1.0");
+            s.set_position_antialias(arm != "real_v0.9");
             Arc::new(s)
         });
         for cmd in &cmds {
@@ -1297,9 +1297,11 @@ fn ml_ab_quests() {
                 let mut rt = Runtime::new(cfg, LEX, None).expect("runtime");
                 match arm {
                     "honest" => rt.use_honest_stand_ins(),
-                    "real_v0.9" | "real_v1.0" => {
-                        if arm == "real_v0.9" {
-                            rt.ml_pipeline_mut().fix = MlFixCfg::legacy();
+                    "real_v0.9" | "real_v1.0" | "real_v1.3" => {
+                        match arm {
+                            "real_v0.9" => rt.ml_pipeline_mut().fix = MlFixCfg::legacy(),
+                            "real_v1.0" => rt.ml_pipeline_mut().fix.pyramid = None,
+                            _ => {}
                         }
                         rt.use_tips(&tips_dir, &dev).expect("TIPS");
                         rt.use_sam(&sam_dir, &dev).expect("SAM");

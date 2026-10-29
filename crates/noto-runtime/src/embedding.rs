@@ -3,7 +3,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{anyhow, Result};
-use noto_ml::parallel::{embed_frame_tiles, BatchOpts, ImageEmbedder, PhraseBank, TextEmbedder, Tile};
+use noto_ml::parallel::{aligned_tile_grids, embed_frame_tiles, pool_dense_tiles, BatchOpts, ImageEmbedder, PhraseBank, TextEmbedder, Tile};
+use noto_ml::preprocess::{pyramid_grid, DenseGrid, PYRAMID_SHORT_SIDE};
 use noto_ml::Siglip2;
 use noto_search::semantic::PhraseEmbedder;
 use noto_search::vision::EntityScore;
@@ -55,6 +56,22 @@ impl Default for VerifyCfg {
     }
 }
 
+/// The tile scan on the 1 : 2 : 4 pyramid (L0): the tile grids snap to whole blocks of SigLIP2's pyramid grid, one
+/// dense pass over the frame gives every coarser tile by pooling its patches, and only the finest level's tiles that
+/// passed the ROI are cropped and encoded. Off by default: pooled tiles score differently from crops, so the scan's
+/// calibration has to be measured for them first.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DenseTileCfg {
+    pub enabled: bool,
+    pub crop_finest: bool,
+}
+
+impl Default for DenseTileCfg {
+    fn default() -> Self {
+        DenseTileCfg { enabled: false, crop_finest: true }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EmbeddingCfg {
     pub grids: Vec<(u32, u32)>,
@@ -67,11 +84,13 @@ pub struct EmbeddingCfg {
     pub roi: RoiCfg,
     #[serde(default)]
     pub verify: VerifyCfg,
+    #[serde(default)]
+    pub dense: DenseTileCfg,
 }
 
 impl Default for EmbeddingCfg {
     fn default() -> Self {
-        EmbeddingCfg { grids: vec![(2, 2), (4, 3), (6, 4)], overlap: 0.15, prejudice_weight: 0.5, report_floor: 0.10, nms_iou: 0.4, webp_quality: 80.0, roi: RoiCfg::default(), verify: VerifyCfg::default() }
+        EmbeddingCfg { grids: vec![(2, 2), (4, 3), (6, 4)], overlap: 0.15, prejudice_weight: 0.5, report_floor: 0.10, nms_iou: 0.4, webp_quality: 80.0, roi: RoiCfg::default(), verify: VerifyCfg::default(), dense: DenseTileCfg::default() }
     }
 }
 
@@ -168,6 +187,32 @@ impl EmbeddingPerception {
     pub fn cfg(&self) -> &EmbeddingCfg {
         &self.cfg
     }
+
+    /// The tile grids a `width` × `height` frame is cut into: the configured ones, snapped to the pyramid's SigLIP2
+    /// grid when tiles are pooled from the dense pass.
+    pub fn tile_grids(&self, width: u32, height: u32) -> Vec<(u32, u32)> {
+        if !self.cfg.dense.enabled {
+            return self.cfg.grids.clone();
+        }
+        let (rows, cols) = pyramid_grid(width, height, PYRAMID_SHORT_SIDE, noto_ml::Siglip2Config::default().max_patches);
+        aligned_tile_grids(&self.cfg.grids, cols as u32, rows as u32)
+    }
+
+    /// Tile vectors from one dense pass (coarser levels pooled, the finest cropped), or every tile cropped when the
+    /// embedder has no dense pass.
+    fn dense_tiles(&self, img: &DynamicImage, tiles: &[Tile]) -> Result<Vec<Vec<f32>>> {
+        let dense = self.image.embed_dense_images(std::slice::from_ref(img), DenseGrid::pyramid())?.and_then(|mut v| v.pop());
+        let Some(dense) = dense else {
+            return Ok(embed_frame_tiles(&*self.image, &[(img, tiles)])?.pop().unwrap_or_default());
+        };
+        let finest = tiles.iter().map(|t| t.level).max().unwrap_or(0);
+        let crop = |t: &Tile| self.cfg.dense.crop_finest && finest > 0 && t.level == finest;
+        let crops: Vec<Tile> = tiles.iter().filter(|t| crop(t)).copied().collect();
+        let pooled: Vec<Tile> = tiles.iter().filter(|t| !crop(t)).copied().collect();
+        let mut cropped = if crops.is_empty() { Vec::new() } else { embed_frame_tiles(&*self.image, &[(img, &crops)])?.pop().unwrap_or_default() }.into_iter();
+        let mut pooled = pool_dense_tiles(&dense, img.width(), img.height(), &pooled).into_iter();
+        Ok(tiles.iter().filter_map(|t| if crop(t) { cropped.next() } else { pooled.next() }).collect())
+    }
 }
 
 impl Recognizer for EmbeddingPerception {
@@ -193,10 +238,10 @@ impl Recognizer for EmbeddingPerception {
         let hv = input.world.head_view(input.camera);
         let view = hv.est;
         let sc = TileScene { frame: f, camera: input.camera, view: &view, ground_y: view.origin[1] - hv.eye_m };
-        let all = noto_ml::parallel::tile_layout(dw, dh, &self.cfg.grids, self.cfg.overlap);
+        let all = noto_ml::parallel::tile_layout(dw, dh, &self.tile_grids(dw, dh), self.cfg.overlap);
         let (tiles, mut filter) = roi_tiles(&all, &sc, &self.cfg.roi);
         let t0 = Instant::now();
-        let vecs = embed_frame_tiles(&*self.image, &[(&img, &tiles)])?.pop().unwrap_or_default();
+        let vecs = if self.cfg.dense.enabled { self.dense_tiles(&img, &tiles)? } else { embed_frame_tiles(&*self.image, &[(&img, &tiles)])?.pop().unwrap_or_default() };
         let embed_ms = t0.elapsed().as_secs_f32() * 1000.0;
         if vecs.len() != tiles.len() {
             return Err(anyhow!("타일 {}개에 벡터 {}개가 돌아왔습니다", tiles.len(), vecs.len()));
@@ -760,6 +805,53 @@ mod tests {
                 })
                 .collect())
         }
+    }
+
+    /// `Greens` with a dense pass: every patch is the whole frame's `Greens` vector, the attention uniform.
+    struct DenseGreens {
+        crops: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ImageEmbedder for DenseGreens {
+        fn embedding_dim(&self) -> usize {
+            Greens.embedding_dim()
+        }
+        fn embed_images_batch(&self, images: &[DynamicImage]) -> Result<Vec<Vec<f32>>> {
+            self.crops.fetch_add(images.len(), std::sync::atomic::Ordering::Relaxed);
+            Greens.embed_images_batch(images)
+        }
+        fn embed_dense_images(&self, images: &[DynamicImage], grid: DenseGrid) -> Result<Option<Vec<noto_ml::DenseEmbedding>>> {
+            let whole = Greens.embed_images_batch(images)?;
+            Ok(Some(
+                images
+                    .iter()
+                    .zip(whole)
+                    .map(|(im, v)| {
+                        let (gh, gw) = grid.grid_for(im.width(), im.height(), 16, 256);
+                        noto_ml::DenseEmbedding { grid_h: gh, grid_w: gw, vectors: vec![v.clone(); gh * gw], attention: vec![1.0 / (gh * gw) as f32; gh * gw], pooled: v }
+                    })
+                    .collect(),
+            ))
+        }
+    }
+
+    #[test]
+    fn dense_tiles_pool_the_coarse_levels_and_crop_only_the_finest() {
+        let (w, cam) = world_with_tree_ahead();
+        let f = w.render(&cam);
+        let lex = lexicon();
+        let phrases = BankedPhrases::new(Arc::new(WordAxes), None);
+        let cfg = EmbeddingCfg { webp_quality: 100.0, report_floor: 0.2, dense: DenseTileCfg { enabled: true, crop_finest: true }, ..EmbeddingCfg::default() };
+        let emb = Arc::new(DenseGreens { crops: Default::default() });
+        let mut p = EmbeddingPerception::new(&lex, &phrases, emb.clone(), Arc::new(|c| c), "cpu (stand-in)", cfg).unwrap();
+        assert_eq!(p.tile_grids(384, 256), vec![(2, 2), (3, 3), (6, 4)], "whole blocks of the 18 x 12 SigLIP2 grid");
+        let out = p.scan(ScanInput { world: &w, frame: &f, camera: &cam }).unwrap();
+        assert_eq!(out.tiles + (out.filter.skipped_sky + out.filter.skipped_far) as usize, 1 + 4 + 9 + 24);
+        let crops = emb.crops.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(crops > 0 && crops <= 24 && crops < out.tiles, "only finest tiles that passed the ROI are encoded: {crops} of {}", out.tiles);
+        assert!(!out.scene.is_empty());
+        let plain = perception();
+        assert_eq!(plain.tile_grids(384, 256), EmbeddingCfg::default().grids, "off by default");
     }
 
     fn perception() -> EmbeddingPerception {

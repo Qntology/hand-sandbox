@@ -33,6 +33,8 @@ pub trait MaskTracker: Send {
     fn prepare(&mut self, _frames: &[&Rgb]) -> Result<()> {
         Ok(())
     }
+    /// Samples masks on the 1 : 2 : 4 pyramid's grid while `cfg` is set (`None`: the tracker's own downscale).
+    fn set_pyramid(&mut self, _cfg: Option<&crate::pyramid::PyramidCfg>) {}
     fn device(&self) -> String {
         "cpu".into()
     }

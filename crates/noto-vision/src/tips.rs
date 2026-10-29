@@ -213,6 +213,9 @@ impl TipsConfig {
 pub enum InputGrid {
     ShortSide(usize),
     Fixed { cols: usize, rows: usize },
+    /// `ratio` times the SigLIP2 grid of the frame (`noto_ml::preprocess::pyramid_grid`), so every SigLIP2 patch
+    /// covers exactly `ratio` × `ratio` of these patches (2: the 1 : 2 pyramid, 1: the fast 1 : 1).
+    Pyramid { l1_short_side: usize, l1_budget: usize, ratio: usize },
 }
 
 impl Default for InputGrid {
@@ -222,9 +225,17 @@ impl Default for InputGrid {
 }
 
 impl InputGrid {
+    pub fn pyramid(cfg: &crate::pyramid::PyramidCfg) -> InputGrid {
+        InputGrid::Pyramid { l1_short_side: cfg.l1_short_side, l1_budget: cfg.l1_budget, ratio: cfg.l2_ratio }
+    }
+
     pub fn grid_for(self, width: u32, height: u32) -> (usize, usize) {
         match self {
             InputGrid::Fixed { cols, rows } => (cols.max(1), rows.max(1)),
+            InputGrid::Pyramid { l1_short_side, l1_budget, ratio } => {
+                let (rows, cols) = noto_ml::preprocess::pyramid_grid(width, height, l1_short_side, l1_budget);
+                (cols * ratio.max(1), rows * ratio.max(1))
+            }
             InputGrid::ShortSide(n) => {
                 let n = n.max(1) as f64;
                 let (w, h) = (width.max(1) as f64, height.max(1) as f64);
@@ -634,6 +645,8 @@ pub struct TipsDepth {
     seg_head: Option<SegHead>,
     device: Device,
     pub input_grid: InputGrid,
+    /// The pyramid's grid, which overrides `input_grid` while a pipeline runs the 1 : 2 : 4 alignment.
+    pub pyramid_grid: Option<InputGrid>,
     pub max_rel_spread: Option<f32>,
     pub flip_tta: bool,
 }
@@ -685,11 +698,16 @@ impl TipsDepth {
         let has = |head: &str| vb.contains_tensor(&format!("{head}.project.weight"));
         let normals_head = if heads.normals && has("normals_head") { Some(NormalsHead::new(&cfg, vb.pp("normals_head"))?) } else { None };
         let seg_head = if heads.segmentation && has("segmentation_head") { Some(SegHead::new(&cfg, vb.pp("segmentation_head"))?) } else { None };
-        Ok(TipsDepth { cfg, encoder, head, normals_head, seg_head, device: device.clone(), input_grid: InputGrid::default(), max_rel_spread: None, flip_tta: false })
+        Ok(TipsDepth { cfg, encoder, head, normals_head, seg_head, device: device.clone(), input_grid: InputGrid::default(), pyramid_grid: None, max_rel_spread: None, flip_tta: false })
     }
 
     pub fn config(&self) -> &TipsConfig {
         &self.cfg
+    }
+
+    /// The grid a `width` × `height` frame runs on: the pyramid's while one is set, else `input_grid`.
+    pub fn grid_for(&self, width: u32, height: u32) -> (usize, usize) {
+        self.pyramid_grid.unwrap_or(self.input_grid).grid_for(width, height)
     }
 
     pub fn heads(&self) -> SceneHeads {
@@ -747,7 +765,7 @@ impl TipsDepth {
         let mut out: Vec<Option<RunOut>> = (0..frames.len()).map(|_| None).collect();
         let spread = want_spread || self.max_rel_spread.is_some();
         for (&(w, h), idx) in &groups {
-            let (cols, rows) = self.input_grid.grid_for(w, h);
+            let (cols, rows) = self.grid_for(w, h);
             for chunk in idx.chunks((policy.image_rows(cols * rows) / views).max(1)) {
                 let b = chunk.len();
                 let inputs = chunk.iter().map(|&i| model_input(frames[i], (cols * p) as u32, (rows * p) as u32, &self.device)).collect::<anyhow::Result<Vec<_>>>()?;
@@ -858,6 +876,10 @@ impl DepthModel for TipsDepth {
 
     fn infer_scene_batch(&mut self, frames: &[&Rgb], want: SceneHeads) -> anyhow::Result<Vec<DepthScene>> {
         self.scene_batch(frames, want)
+    }
+
+    fn set_pyramid(&mut self, cfg: Option<&crate::pyramid::PyramidCfg>) {
+        self.pyramid_grid = cfg.map(InputGrid::pyramid);
     }
 }
 
@@ -1104,6 +1126,25 @@ mod tests {
         assert_eq!(InputGrid::default().grid_for(384, 256), (36, 24));
         assert_eq!(InputGrid::ShortSide(24).grid_for(256, 384), (24, 36));
         assert_eq!(InputGrid::Fixed { cols: 4, rows: 3 }.grid_for(1000, 10), (4, 3));
+    }
+
+    #[test]
+    fn the_pyramid_grid_is_twice_siglip2s_and_matches_the_default_on_keyframes() {
+        let pyr = InputGrid::pyramid(&crate::pyramid::PyramidCfg::default());
+        for (w, h) in [(384, 256), (640, 480), (256, 384)] {
+            let (gh, gw) = noto_ml::preprocess::pyramid_grid(w, h, 12, 256);
+            assert_eq!(pyr.grid_for(w, h), (2 * gw, 2 * gh), "{w}x{h}");
+            assert_eq!(pyr.grid_for(w, h), InputGrid::default().grid_for(w, h), "{w}x{h}: TIPSv2 runs on its own grid");
+        }
+        assert_eq!(pyr.grid_for(500, 500), (24, 24));
+        assert_eq!(InputGrid::pyramid(&crate::pyramid::PyramidCfg::fast()).grid_for(384, 256), (18, 12));
+        let (mut model, _, _) = header_model(Fill::Random);
+        model.input_grid = InputGrid::Fixed { cols: 4, rows: 3 };
+        assert_eq!(model.grid_for(384, 256), (4, 3));
+        model.set_pyramid(Some(&crate::pyramid::PyramidCfg::fast()));
+        assert_eq!(model.grid_for(384, 256), (18, 12), "the pyramid overrides the grid while it is set");
+        model.set_pyramid(None);
+        assert_eq!(model.grid_for(384, 256), (4, 3), "and gives the old one back");
     }
 
     #[test]

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
+use noto_ml::preprocess::DenseGrid;
 use serde::{Deserialize, Serialize};
 
 use crate::frame::Rgb;
@@ -54,6 +55,8 @@ pub trait SemanticLocator: Send {
         "cpu".into()
     }
     fn locate(&mut self, rgb: &Rgb, labels: &[LabelPrompt]) -> Result<Vec<SemanticPoint>>;
+    /// Runs the dense pass on the 1 : 2 : 4 pyramid's grid while `cfg` is set (`None`: the locator's own grid).
+    fn set_pyramid(&mut self, _cfg: Option<&crate::pyramid::PyramidCfg>) {}
     fn locate_batch(&mut self, frames: &[&Rgb], labels: &[LabelPrompt]) -> Result<Vec<Vec<SemanticPoint>>> {
         frames.iter().map(|f| self.locate(f, labels)).collect()
     }
@@ -138,11 +141,14 @@ pub struct LocateCfg {
     pub templates: Vec<String>,
     #[serde(default)]
     pub logit_scale: Option<f32>,
+    /// The dense pass's patch grid: NaFlex's (fill the 256-patch budget) or the pyramid's (half of TIPSv2's grid).
+    #[serde(default)]
+    pub grid: DenseGrid,
 }
 
 impl Default for LocateCfg {
     fn default() -> Self {
-        LocateCfg { scoring: LocateScoring::PairProb, negative_weight: 0.5, background: Vec::new(), templates: Vec::new(), logit_scale: None }
+        LocateCfg { scoring: LocateScoring::PairProb, negative_weight: 0.5, background: Vec::new(), templates: Vec::new(), logit_scale: None, grid: DenseGrid::Naflex }
     }
 }
 
@@ -158,6 +164,7 @@ impl LocateCfg {
                 }
                 "z" => cfg.scoring = LocateScoring::ZScore,
                 "tpl" => cfg.templates = templates.to_vec(),
+                "pyr" => cfg.grid = DenseGrid::pyramid(),
                 _ => return None,
             }
         }
@@ -174,6 +181,9 @@ impl LocateCfg {
         if !self.templates.is_empty() {
             m.push_str("+tpl");
         }
+        if let DenseGrid::Pyramid { .. } = self.grid {
+            m.push_str("+pyr");
+        }
         m
     }
 }
@@ -189,6 +199,7 @@ pub struct SiglipLocator {
     cache: HashMap<String, Vec<f32>>,
     pub negative_weight: f32,
     cfg: LocateCfg,
+    pyramid: Option<DenseGrid>,
     mode: String,
 }
 
@@ -199,11 +210,16 @@ impl SiglipLocator {
 
     pub fn with_cfg(model: Arc<noto_ml::Siglip2>, cfg: LocateCfg) -> SiglipLocator {
         let mode = cfg.mode();
-        SiglipLocator { model, cache: HashMap::new(), negative_weight: cfg.negative_weight, cfg, mode }
+        SiglipLocator { model, cache: HashMap::new(), negative_weight: cfg.negative_weight, cfg, pyramid: None, mode }
     }
 
     pub fn cfg(&self) -> &LocateCfg {
         &self.cfg
+    }
+
+    /// The settings the next pass runs with: the configured ones on the pyramid's grid while one is set.
+    pub fn effective_cfg(&self) -> LocateCfg {
+        LocateCfg { grid: self.pyramid.unwrap_or(self.cfg.grid), negative_weight: self.negative_weight, ..self.cfg.clone() }
     }
 
     pub fn model(&self) -> &Arc<noto_ml::Siglip2> {
@@ -332,12 +348,16 @@ impl SemanticLocator for SiglipLocator {
         Ok(out.pop().unwrap_or_default())
     }
 
+    fn set_pyramid(&mut self, cfg: Option<&crate::pyramid::PyramidCfg>) {
+        self.pyramid = cfg.map(|p| DenseGrid::Pyramid { short_side: p.l1_short_side });
+        self.mode = self.effective_cfg().mode();
+    }
+
     fn locate_batch(&mut self, frames: &[&Rgb], labels: &[LabelPrompt]) -> Result<Vec<Vec<SemanticPoint>>> {
-        let mut cfg = self.cfg.clone();
-        cfg.negative_weight = self.negative_weight;
+        let cfg = self.effective_cfg();
         let texts = self.label_texts(labels, &cfg)?;
         let images: Vec<image::DynamicImage> = frames.iter().map(|f| f.to_dynamic()).collect();
-        let dense = self.model.embed_dense_batch(&images)?;
+        let dense = self.model.embed_dense_batch_grid(&images, cfg.grid)?;
         let (scale, bias) = self.model.logit_scale_bias();
         Ok(frames.iter().zip(&dense).map(|(rgb, d)| points_with_presence(rgb.width, rgb.height, label_heats(d, &texts, &cfg, scale, bias))).collect())
     }
@@ -419,11 +439,13 @@ mod tests {
             LocateCfg { scoring: LocateScoring::Contrast, background: bg.clone(), ..LocateCfg::default() },
             LocateCfg { scoring: LocateScoring::Contrast, background: bg.clone(), templates: tpl.clone(), ..LocateCfg::default() },
             LocateCfg { scoring: LocateScoring::ZScore, ..LocateCfg::default() },
+            LocateCfg { scoring: LocateScoring::Contrast, background: bg.clone(), grid: DenseGrid::pyramid(), ..LocateCfg::default() },
         ] {
             assert_eq!(LocateCfg::from_mode(&cfg.mode(), &bg, &tpl), Some(cfg.clone()), "{}", cfg.mode());
         }
         assert_eq!(LocateCfg::from_mode("stand-in(siglip2-like)", &bg, &tpl), None);
         assert_eq!(LocateCfg::from_mode("siglip2-dense+what", &bg, &tpl), None);
+        assert_eq!(LocateCfg { grid: DenseGrid::pyramid(), ..LocateCfg::default() }.mode(), "siglip2-dense+pyr", "a pyramid grid is calibrated on its own");
         assert_eq!(apply_template("a photo of {}.", "a log"), "a photo of a log.");
     }
 }

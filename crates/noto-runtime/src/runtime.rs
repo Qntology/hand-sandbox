@@ -510,6 +510,7 @@ impl Runtime {
         let t0 = Instant::now();
         let m = noto_vision::TipsDepth::load(dir, device)?;
         self.ml.depth = crate::ml::DepthEngine::Model(Box::new(m));
+        self.ml.sync_pyramid();
         let ms = t0.elapsed().as_secs_f32() * 1000.0;
         self.log("embed", Level::Info, format!("TIPSv2 DPT 깊이 모델 로드 ({ms:.0} ms) · {} · {}", noto_ml::device_label(device), dir.display()), None);
         Ok(())
@@ -520,6 +521,7 @@ impl Runtime {
         let m = noto_vision::SamModel::load(dir, device)?;
         let mode = m.variant().mode();
         self.ml.tracker = Box::new(noto_vision::SamTracker::new(Arc::new(m)));
+        self.ml.sync_pyramid();
         let ms = t0.elapsed().as_secs_f32() * 1000.0;
         self.log("embed", Level::Info, format!("{mode} 마스크 모델 로드 ({ms:.0} ms) · {} · {}", noto_ml::device_label(device), dir.display()), None);
         Ok(())
@@ -527,11 +529,13 @@ impl Runtime {
 
     pub fn use_depth_stand_in(&mut self) {
         self.ml.depth = crate::ml::DepthEngine::StandIn(crate::ml::DepthStandIn::new(self.cfg.seed));
+        self.ml.sync_pyramid();
         self.log("embed", Level::Info, "깊이: 대역 모델(stand-in)", None);
     }
 
     pub fn use_region_tracker(&mut self) {
         self.ml.tracker = Box::new(noto_vision::RegionTracker::default());
+        self.ml.sync_pyramid();
         self.log("embed", Level::Info, "마스크 추적: 영역 확장(region-grow)", None);
     }
 
@@ -561,6 +565,7 @@ impl Runtime {
         let t0 = Instant::now();
         let phrases = Arc::new(crate::embedding::BankedPhrases::new(Arc::clone(&model), bank_dir));
         self.ml.locate = crate::ml::LocateEngine::Model(Box::new(noto_vision::SiglipLocator::with_cfg(Arc::clone(&model), self.ml.fix.locate.clone())));
+        self.ml.sync_pyramid();
         let prompting = self.ml.fix.scan_prompting.then(|| self.ml.prompting.clone());
         let mut rec = crate::embedding::EmbeddingPerception::siglip_with(model, self.parser.lexicon(), bank_dir, Default::default(), prompting.as_ref())?;
         if self.ml.fix.scan_calibrated {

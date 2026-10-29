@@ -59,12 +59,8 @@ pub fn features(inp: &FusionInput<'_>) -> Features {
                 if v < 0.5 * peak {
                     continue;
                 }
-                let x = (c as f32 + 0.5) / h.cols as f32 * inp.width as f32;
-                let y = (r as f32 + 0.5) / h.rows as f32 * inp.height as f32;
                 total += v;
-                if to_mask(x, y).map_or(false, |(mx, my)| m.get(mx, my)) {
-                    inside += v;
-                }
+                inside += v * cell_coverage(m, c, r, h.cols, h.rows);
             }
         }
         if total > 0.0 {
@@ -85,6 +81,27 @@ pub fn features(inp: &FusionInput<'_>) -> Features {
         }
     }
     f
+}
+
+/// The share of the heat cell (c, r) of a `cols` × `rows` heat that the mask covers, by area: on the 1 : 2 : 4
+/// pyramid a cell is a whole block of mask pixels, otherwise the pixels it cuts count by the part inside it.
+pub fn cell_coverage(m: &Mask, c: u32, r: u32, cols: u32, rows: u32) -> f32 {
+    let (sx, sy) = (m.width as f32 / cols.max(1) as f32, m.height as f32 / rows.max(1) as f32);
+    let (x0, x1, y0, y1) = (c as f32 * sx, (c + 1) as f32 * sx, r as f32 * sy, (r + 1) as f32 * sy);
+    let (mut covered, area) = (0.0f32, (x1 - x0) * (y1 - y0));
+    for y in (y0.floor() as u32)..(y1.ceil() as u32).min(m.height) {
+        let oy = ((y + 1) as f32).min(y1) - (y as f32).max(y0);
+        for x in (x0.floor() as u32)..(x1.ceil() as u32).min(m.width) {
+            if m.get(x, y) {
+                covered += (((x + 1) as f32).min(x1) - (x as f32).max(x0)) * oy;
+            }
+        }
+    }
+    if area > 0.0 {
+        (covered / area).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 pub fn flags(f: &Features, cfg: &FlagCfg) -> Vec<&'static str> {
@@ -153,5 +170,29 @@ mod tests {
         let fl = flags(&f2, &FlagCfg::default());
         assert!(fl.contains(&"peak_off_mask") && fl.contains(&"depth_edge"), "{fl:?}");
         assert_eq!(numeric(&f2).len(), 6);
+    }
+
+    #[test]
+    fn heat_in_mask_integrates_each_cell_over_its_mask_block() {
+        let mut m = Mask::empty(288, 192);
+        for y in 0..192 {
+            for x in 0..288 {
+                if (16 * 9..16 * 9 + 8).contains(&x) && (16 * 6..16 * 7).contains(&y) {
+                    m.set(x, y);
+                }
+            }
+        }
+        assert!((cell_coverage(&m, 9, 6, 18, 12) - 0.5).abs() < 1e-6, "half of the 16 x 16 block");
+        assert_eq!(cell_coverage(&m, 8, 6, 18, 12), 0.0);
+        let mut values = vec![0.0; 18 * 12];
+        values[6 * 18 + 9] = 0.9;
+        values[6 * 18 + 8] = 0.9;
+        let heat = Heat { cols: 18, rows: 12, values };
+        let p = SemanticPoint { label: "stone".into(), px: 9.25 * 384.0 / 18.0, py: 6.5 * 256.0 / 12.0, score: 0.9, margin: 0.5, presence: 1.0, bbox: [0.0; 4], heat };
+        let f = features(&FusionInput { width: 384, height: 256, depth: None, point: Some(&p), mask: Some(&m), depth_range_m: None, depth_scale: None, tri_range_m: None, residual_deg: None, head_tilt_deg: None });
+        assert!((f.heat_in_mask.unwrap() - 0.25).abs() < 1e-6, "half of one of two equal cells: {:?}", f.heat_in_mask);
+        assert_eq!(f.peak_in_mask, Some(true));
+        let coarse = Mask { width: 8, height: 4, bits: (0..32).map(|i| i % 8 >= 4).collect() };
+        assert!((cell_coverage(&coarse, 1, 0, 3, 1) - 0.5).abs() < 1e-5, "a cell cutting mask pixels counts their inside part");
     }
 }

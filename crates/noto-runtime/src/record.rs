@@ -46,6 +46,9 @@ pub struct MlView {
     pub track_iou_truth: Option<f32>,
     pub features: Features,
     pub flags: Vec<String>,
+    /// The 1 : 2 : 4 grids this keyframe ran on and what the cross-layer checks changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pyramid: Option<noto_vision::PyramidReport>,
 }
 
 #[derive(Clone, Debug, Serialize)]

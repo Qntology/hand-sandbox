@@ -68,6 +68,8 @@ pub trait DepthModel: Send {
     fn infer_scene_batch(&mut self, frames: &[&Rgb], _want: SceneHeads) -> Result<Vec<DepthScene>> {
         Ok(self.infer_batch(frames)?.into_iter().map(DepthScene::depth_only).collect())
     }
+    /// Runs on the 1 : 2 : 4 pyramid's grid while `cfg` is set (`None`: the model's own grid).
+    fn set_pyramid(&mut self, _cfg: Option<&crate::pyramid::PyramidCfg>) {}
     fn infer_scene(&mut self, rgb: &Rgb, want: SceneHeads) -> Result<DepthScene> {
         let mut v = self.infer_scene_batch(&[rgb], want)?;
         v.pop().ok_or_else(|| anyhow::anyhow!("no scene for the frame"))

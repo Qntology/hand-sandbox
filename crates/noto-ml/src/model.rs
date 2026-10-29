@@ -8,7 +8,7 @@ use image::DynamicImage;
 use crate::config::Siglip2Config;
 use crate::device::{device_family, trim_idle_pool, BatchPolicy};
 use crate::parallel::{fnv1a, FNV_OFFSET};
-use crate::preprocess::{preprocess, NaflexInput};
+use crate::preprocess::{preprocess, preprocess_grid, DenseGrid, NaflexInput};
 use crate::text::TextTower;
 use crate::tokenizer::TextTokenizer;
 use crate::vision::VisionTower;
@@ -179,7 +179,26 @@ impl Siglip2 {
     }
 
     pub fn embed_dense_batch(&self, images: &[DynamicImage]) -> Result<Vec<DenseEmbedding>> {
-        let inputs = self.preprocess_all(images);
+        self.embed_dense_batch_grid(images, DenseGrid::Naflex)
+    }
+
+    /// The dense pass on the grid `grid` picks for each image (`DenseGrid::Pyramid` lines the patches up with the
+    /// depth and mask layers; the position table is resampled to any grid either way).
+    pub fn embed_dense_batch_grid(&self, images: &[DynamicImage], grid: DenseGrid) -> Result<Vec<DenseEmbedding>> {
+        let inputs = match grid {
+            DenseGrid::Naflex => self.preprocess_all(images),
+            _ => {
+                use rayon::prelude::*;
+                let (p, budget) = (self.config.patch_size, self.config.max_patches);
+                images
+                    .par_iter()
+                    .map(|image| {
+                        let (gh, gw) = grid.grid_for(image.width(), image.height(), p, budget);
+                        preprocess_grid(image, &self.config, gh, gw)
+                    })
+                    .collect()
+            }
+        };
         let mut out: Vec<Option<DenseEmbedding>> = (0..images.len()).map(|_| None).collect();
         for chunk in self.image_chunks(&inputs, 0) {
             let refs: Vec<&NaflexInput> = chunk.iter().map(|&i| &inputs[i]).collect();
@@ -362,6 +381,21 @@ mod tests {
         let whole = m.embed_image(&test_image(32, 16)).unwrap();
         let same: f32 = whole.iter().zip(&d.pooled).map(|(a, b)| a * b).sum();
         assert!((same - 1.0).abs() < 1e-4, "the pooled vector is the image embedding");
+    }
+
+    #[test]
+    fn the_pyramid_grid_is_the_dense_grid_it_asks_for() {
+        let m = tiny_model();
+        let img = test_image(48, 32);
+        let grid = DenseGrid::Pyramid { short_side: 2 };
+        let want = grid.grid_for(48, 32, m.config().patch_size, m.config().max_patches);
+        let d = m.embed_dense_batch_grid(&[img.clone()], grid).unwrap().pop().unwrap();
+        assert_eq!((d.grid_h, d.grid_w), want);
+        assert_eq!((d.grid_h, d.grid_w), (2, 3), "3:2 keeps a 3:2 grid");
+        assert_eq!(d.vectors.len(), 6);
+        let naflex = m.embed_dense_batch_grid(&[img.clone()], DenseGrid::Naflex).unwrap().pop().unwrap();
+        let plain = m.embed_dense(&img).unwrap();
+        assert_eq!((naflex.grid_h, naflex.grid_w), (plain.grid_h, plain.grid_w), "NaFlex is the default dense grid");
     }
 
     #[test]

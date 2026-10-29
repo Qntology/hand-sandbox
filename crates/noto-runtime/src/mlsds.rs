@@ -174,6 +174,7 @@ impl Runtime {
             track_iou_truth: frame.track_iou_truth,
             features: feats,
             flags: fl,
+            pyramid: frame.pyramid,
         };
         let ov = overlay(&frame, kf.intr.width, kf.intr.height, wanted);
         kf.ml_webp = encode_webp(&ov.data, ov.width, ov.height, 70.0).ok().map(|e| e.bytes);
