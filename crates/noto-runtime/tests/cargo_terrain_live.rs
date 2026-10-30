@@ -99,8 +99,15 @@ fn the_inventory_button_and_the_snapshot_speak_the_same_amounts() {
 
 #[test]
 fn a_stone_too_heavy_for_budget_arms_is_broken_and_carried_in_parts() {
-    let cfg = RuntimeConfig { seed: 7, noise: NoiseCfg::none(), body: BodyPlan { arm: Tier::Budget, ..BodyPlan::standard() }, ..RuntimeConfig::default() };
-    let mut rt = runtime_with(cfg);
+    // Budget arms lift about 1.0 kg on the small 1.21 m body but 3.5 kg two-handed on the 1.65 m one: only the small
+    // body has to break the 2.6 kg stone. The 4.2 kg log is too heavy for both.
+    let budget = |body: BodyPlan| runtime_with(RuntimeConfig { seed: 7, noise: NoiseCfg::none(), body: BodyPlan { arm: Tier::Budget, ..body }, ..RuntimeConfig::default() });
+    let mut rt = budget(BodyPlan::standard());
+    let q = run_command(&mut rt, "돌 1개를 베이스캠프로 가져와", 40_000);
+    assert_done(&rt, &q);
+    let log = quest_log(&rt);
+    assert!(log.contains("돌 1개를 그대로 듭니다") && !log.contains("쪼갬"), "the 1.65 m body lifts the stone whole:\n{log}");
+    let mut rt = budget(BodyPlan::default());
     let q = run_command(&mut rt, "돌 1개를 베이스캠프로 가져와", 40_000);
     assert_done(&rt, &q);
     let log = quest_log(&rt);
@@ -108,7 +115,7 @@ fn a_stone_too_heavy_for_budget_arms_is_broken_and_carried_in_parts() {
     assert!(log.contains("쪼개서"), "the cargo decision said why:\n{log}");
     let stock = rt.world().waypoint_by_key("base_camp").unwrap().stock_of(ItemKind::Stone);
     assert!((stock - 1.0).abs() < 1e-3, "one whole stone's worth arrived in pieces: {stock}");
-    let mut rt = runtime_with(RuntimeConfig { seed: 7, noise: NoiseCfg::none(), body: BodyPlan { arm: Tier::Budget, ..BodyPlan::standard() }, ..RuntimeConfig::default() });
+    let mut rt = budget(BodyPlan::standard());
     let q = run_command(&mut rt, "원목 1개를 창고로 가져와", 30_000);
     assert_eq!(q.state, State::Failed);
     assert_eq!(q.failure.as_ref().unwrap().code, "lift_overload");
@@ -137,12 +144,17 @@ fn the_world_and_the_body_reset_apart() {
 fn on_the_rugged_map_targets_hidden_behind_terrain_are_found_from_other_viewpoints() {
     let mut found = 0;
     let mut relocated = 0;
-    for seed in [3u64, 5, 9] {
+    // From the 1.65 m body's eye (1.54 m) most rugged seeds show an ore from the base camp. Seed 11 shows none, seed 1
+    // shows two only on mesa tops it cannot climb, and seed 3's ore lies against its node where no cell is nearer.
+    for seed in [3u64, 11, 1] {
         let mut rt = runtime_with(RuntimeConfig { seed, noise: NoiseCfg::none(), terrain: TerrainKind::Rugged, ..RuntimeConfig::default() });
         let q = run_command(&mut rt, "철광석 1개를 창고로 가져와", 60_000);
         let log = quest_log(&rt);
         if log.contains("시점 (") {
             relocated += 1;
+        }
+        if seed == 11 {
+            assert!(log.contains("시점 (") && q.state == State::Done, "nothing is in view from the base camp: {:?}\n{log}", q.failure);
         }
         if q.state == State::Done {
             found += 1;

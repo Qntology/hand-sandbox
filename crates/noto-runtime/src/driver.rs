@@ -141,6 +141,9 @@ pub(crate) struct Task {
     pub drop_idx: usize,
     pub rounds: u32,
     pub pick_retry: bool,
+    /// The drop a move to was last issued for, where the robot believed it stood then, and whether that move was
+    /// found to have ended where it started.
+    pub drop_move: Option<(u32, f32, f32, bool)>,
     pub trip: Option<Trip>,
     pub trips: u32,
     pub last_cargo: Option<(u32, String)>,
@@ -265,6 +268,7 @@ impl Task {
             drop_idx: 0,
             rounds: 0,
             pick_retry: false,
+            drop_move: None,
             trip: None,
             trips: 0,
             last_cargo: None,
@@ -1085,7 +1089,22 @@ impl Runtime {
                     }
                 }
             }
-            if dist > far_m && !side_here {
+            // A route ends on a cell centre that qualifies. When the robot already stands where it would end (the item
+            // lies against the node it was just mined from), the move ends where it started and would be issued again
+            // every tick: legs then pick from here, and the pick says if the hand cannot reach; tines leave the item.
+            let (mx, mz, _) = self.me();
+            let stalled = dist > far_m && !side_here && t.drop_move.is_some_and(|(did, x, z, _)| did == id && (mx - x).hypot(mz - z) < 0.02);
+            if stalled && t.drop_move.is_some_and(|m| !m.3) {
+                t.drop_move = t.drop_move.map(|(did, x, z, _)| (did, x, z, true));
+                if forks {
+                    self.log("quest", Level::Warn, format!("떨어진 {name}에게 더 다가갈 수 없어 건너뜀 ({dist:.2} m)"), Some(json!({"drop": id, "distance_m": dist})));
+                    t.drop_idx += 1;
+                    continue;
+                }
+                self.log("quest", Level::Info, format!("떨어진 {name}에게 더 다가갈 수 없어 이 자리에서 집음 ({dist:.2} m)"), Some(json!({"drop": id, "distance_m": dist})));
+            }
+            if dist > far_m && !side_here && !stalled {
+                t.drop_move = Some((id, mx, mz, false));
                 t.act_predicted_s = self.world.plan_route(Goal::Within { x: m.x, z: m.z, reach_m: stop_m }).map(|p| p.time_s);
                 let r = match self.issue(t, Action::MoveTo { x: m.x, z: m.z, reach_m: stop_m }, Act::Move(MoveFor::Drop)) {
                     Err(ActionError::NoPath) => self.issue(t, Action::MoveTo { x: m.x, z: m.z, reach_m: PICKUP_REACH_M - 0.1 }, Act::Move(MoveFor::Drop)),
