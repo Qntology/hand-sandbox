@@ -53,6 +53,8 @@ pub struct Sighting {
     pub camera: &'static str,
     pub drop: u32,
     pub label_ko: String,
+    /// Half the item's longest side (m): where on it a look lands depends on the side it looks from.
+    pub half_m: f32,
     pub ok: bool,
     /// The match lies inside the memory's gate (not a neighbour of the same kind).
     pub matched: bool,
@@ -94,23 +96,50 @@ impl Sighting {
     }
 }
 
-/// The least two sightings of one item may be apart and still be the same (m) [추정: the 0.10 m items' half size
-/// and the depth model's range error at a metre].
+/// The least two sightings of one item may be apart and still be the same (m), on a small item [추정: the 0.10 m
+/// items' half size and the depth model's range error at a metre]. A longer one allows half its length: the rider
+/// sees the top of a log and the carriage camera the end nearest it (`cross_gap`).
 pub const CROSS_MIN_M: f32 = 0.08;
 
 /// How far from its memory a look may still find an item beyond the memory's and the look's gate, when the match is
-/// plainly that item (m) [추정: under half the 0.22 m between a felled tree's logs (0.13 m about the stump, three at
-/// 120°) and the 0.35 m between a loading bay's slots].
+/// plainly that item (m) [추정: well under half the 0.54 m between a felled tree's logs and the 0.55 m between a
+/// loading bay's slots]. A long item allows half its length, for the same reason as `CROSS_MIN_M`.
 pub const ASSOC_REACH_M: f32 = 0.15;
+
+/// How far the odometry may have moved everything remembered and a look still be matched by its layout (m) [추정: under
+/// the 0.54 m between a felled tree's logs, so that no shift lays one on its neighbour].
+pub const LAYOUT_REACH_M: f32 = 0.5;
+
+/// The one of `seen` that is the item remembered at `m`, told by the layout: the odometry moved everything remembered
+/// alike, so a look at several of one kind finds them all shifted by the same amount, and the shift that lays the most
+/// `others` on a match names this item's match even when a neighbour lies nearer its memory. None when no shift lays
+/// another on a match, or two lay as many.
+pub fn by_layout(m: (f32, f32), others: &[(f32, f32)], seen: &[(f32, f32)]) -> Option<usize> {
+    let laid = |s: (f32, f32)| others.iter().filter(|o| seen.iter().any(|c| (o.0 + s.0 - c.0).hypot(o.1 + s.1 - c.1) <= CROSS_MIN_M)).count();
+    let mut scored: Vec<(usize, usize)> = seen
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (i, (c.0 - m.0, c.1 - m.1)))
+        .filter(|(_, s)| s.0.hypot(s.1) <= LAYOUT_REACH_M)
+        .map(|(i, s)| (laid(s), i))
+        .collect();
+    scored.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
+    match scored.as_slice() {
+        [(n, i)] if *n > 0 => Some(*i),
+        [(n, i), (next, _), ..] if *n > *next => Some(*i),
+        _ => None,
+    }
+}
 
 /// How many times nearer the memory the match must be than any other match of its kind in view, to be plainly the
 /// item (a ratio test, as feature matching does).
 pub const ASSOC_RATIO: f32 = 2.0;
 
-/// How far apart two sightings put the item and how far they may be (3σ of both, at least `CROSS_MIN_M`).
+/// How far apart two sightings put the item and how far they may be (3σ of both, at least `CROSS_MIN_M` and half the
+/// item's length).
 pub fn cross_gap(a: &Sighting, b: &Sighting) -> Option<(f32, f32)> {
     let (pa, pb) = (a.at?, b.at?);
-    let gate = (3.0 * a.sigma_m.unwrap_or(0.05).hypot(b.sigma_m.unwrap_or(0.05))).max(CROSS_MIN_M);
+    let gate = (3.0 * a.sigma_m.unwrap_or(0.05).hypot(b.sigma_m.unwrap_or(0.05))).max(CROSS_MIN_M).max(a.half_m);
     Some(((pa.0 - pb.0).hypot(pa.1 - pb.1), gate))
 }
 
@@ -302,6 +331,18 @@ fn wrap(a: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_layout_of_several_tells_an_item_from_a_neighbour_nearer_its_memory() {
+        // Three logs remembered, all seen 0.27 m off: a neighbour lies nearer the memory than the item does.
+        let (m, others) = ((12.91, 9.32), [(12.68, 8.95), (12.30, 9.33)]);
+        let seen = [(12.27, 9.61), (12.93, 9.59), (12.73, 9.21)];
+        assert_eq!(by_layout(m, &others, &seen), Some(1));
+        // One log in view says nothing about the shift, and neither does a look whose shifts all lay as many.
+        assert_eq!(by_layout(m, &others, &seen[1..2]), None);
+        assert_eq!(by_layout(m, &[], &seen), None);
+        assert_eq!(by_layout((0.0, 0.0), &[(0.3, 0.0)], &[(0.1, 0.0), (0.4, 0.0), (0.7, 0.0)]), None);
+    }
 
     #[test]
     fn memory_spreads_with_travel_and_a_look_shrinks_it() {

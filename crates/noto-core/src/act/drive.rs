@@ -2,7 +2,7 @@ use serde::Serialize;
 
 use crate::balance::{Body, G};
 use crate::base::BaseKind;
-use crate::kin::{self, KinLoads, KinPose, WHEEL_R_M};
+use crate::kin::{self, KinLoads, KinPose};
 use crate::surface::{self, Surface, SurfaceProps};
 
 use super::{ActEvent, ActKind, ActRollout, ActSample, Outcome, Part, SAMPLE_S};
@@ -192,7 +192,7 @@ pub fn drive(body: &Body, ground: Surface, slope_deg: f32, cargo_kg: f32, speed:
 
 pub fn curb_impact(body: &Body, cargo_kg: f32, speed: f32, front_share: f32, step_m: f32) -> (f32, f32) {
     let m = (body.mass_kg() + cargo_kg) * front_share.clamp(0.1, 1.0);
-    let c = ((WHEEL_R_M - step_m.clamp(0.0, WHEEL_R_M)) / WHEEL_R_M).clamp(0.0, 1.0);
+    let c = ((body.dims.wheel_r_m - step_m.clamp(0.0, body.dims.wheel_r_m)) / body.dims.wheel_r_m).clamp(0.0, 1.0);
     let v = speed * (1.0 - c * c).sqrt();
     super::material::impact(v, m, TYRE_STIFFNESS)
 }

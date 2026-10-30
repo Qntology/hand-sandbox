@@ -19,7 +19,8 @@ let presets = null;
 let evalSeq = 0;
 
 function plan() {
-  const p = { battery_low: $('pp-battery').checked, lift: $('pp-lift').checked };
+  // 몸의 크기(build)는 로봇 프리셋이 정한다. 여기서는 등급만 고른다.
+  const p = { battery_low: $('pp-battery').checked, lift: $('pp-lift').checked, build: state.bodyPlan?.build ?? 'standard' };
   for (const [id] of SEGS) p[id] = $(`pp-${id}`).value;
   return p;
 }
@@ -73,7 +74,7 @@ async function evaluate() {
 const later = debounce(evaluate, 150);
 
 export async function initPresets() {
-  state.bodyPlan = { head: 'mid', chest: 'mid', belly: 'mid', arm: 'mid', leg: 'mid', battery_low: false, lift: false };
+  state.bodyPlan = { head: 'mid', chest: 'mid', belly: 'mid', arm: 'mid', leg: 'mid', battery_low: false, lift: false, build: 'standard' };
   for (const [id] of SEGS) $(`pp-${id}`).addEventListener('change', () => { $('pp-named').value = ''; later(); });
   $('pp-battery').addEventListener('change', later);
   $('pp-lift').addEventListener('change', () => { $('pp-named').value = ''; later(); });
@@ -102,6 +103,7 @@ export async function initPresets() {
     }
   });
   bus.on('config', later);
+  bus.on('rig-applied', (r) => setPlan(r.plan));
   try {
     const r0 = await call('body_presets', {}, { quiet: true });
     presets = r0.presets;
@@ -112,6 +114,7 @@ export async function initPresets() {
     for (const [id] of SEGS) fill($(`pp-${id}`), id === 'leg' ? presets.leg_tiers : presets.tiers);
     clear($('pp-named')).append(el('option', { value: '', text: '직접 조합' }), ...presets.named.map((n) => el('option', { value: n, text: NAMED_KO[n] ?? n })));
     setPlan(r0.current);
+    state.bodyPlan.build = r0.current.build ?? 'standard';
     $('pp-named').value = r0.current_id in NAMED_KO ? r0.current_id : '';
   } catch {
     for (const [id] of SEGS) {

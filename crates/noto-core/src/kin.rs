@@ -1,23 +1,13 @@
 use serde::{Deserialize, Serialize};
 
-use crate::balance::{Body, JointLoad, CARGO_X_M, CARGO_Z_M, G, HIP_HALF_WIDTH_M};
+use crate::balance::{Body, JointLoad, G};
 use crate::base::BaseKind;
 use crate::dynamics::{BodyPose, JointPoint, LinkBox};
-use crate::morph::{column_top_m, HeadMount, Torso, COLUMN_TOP_M, DECK_Z_M};
+use crate::dims::Dims;
+use crate::morph::{column_top_m, HeadMount, Torso};
 use crate::parts::*;
 use crate::Source;
 
-pub const ANKLE_H_M: f32 = 0.08;
-pub const THIGH_M: f32 = (HIP_M - ANKLE_H_M) * 0.5;
-pub const SHANK_M: f32 = (HIP_M - ANKLE_H_M) * 0.5;
-pub const PELVIS_M: f32 = WAIST_M - HIP_M;
-pub const TRUNK_M: f32 = SHOULDER_M - WAIST_M;
-pub const NECK_UP_M: f32 = 0.07;
-pub const PALM_OFFSET_M: f32 = 0.06;
-pub const WHEEL_R_M: f32 = 0.06;
-pub const BELT_W_M: f32 = 0.08;
-pub const BUMPER_GAP_M: f32 = 0.02;
-pub const BUMPER_Z_M: [f32; 2] = [0.03, 0.11];
 
 pub const KNEE_FLEX_MAX_DEG: f32 = 135.0;
 pub const ANKLE_DORSI_MAX_DEG: f32 = 30.0;
@@ -93,9 +83,18 @@ pub struct KinPose {
 }
 
 impl KinPose {
-    pub fn stand(cargo_kg: f32) -> KinPose {
+    pub fn stand(body: &Body, cargo_kg: f32) -> KinPose {
+        KinPose::stand_at(body.dims.hip_m, cargo_kg)
+    }
+
+    /// Standing, for a compact body (`Dims::COMPACT`).
+    pub fn stand_compact(cargo_kg: f32) -> KinPose {
+        KinPose::stand_at(Dims::COMPACT.hip_m, cargo_kg)
+    }
+
+    fn stand_at(hip_m: f32, cargo_kg: f32) -> KinPose {
         KinPose {
-            hip: [0.0, HIP_M],
+            hip: [0.0, hip_m],
             feet: [[0.0, 0.0], [0.0, 0.0]],
             pelvis_y: 0.0,
             pelvis_deg: 0.0,
@@ -252,17 +251,18 @@ pub struct Rom {
 impl Rom {
     pub fn of(body: &Body) -> Rom {
         let (neck_max, pan_max) = body.head_range_deg();
+        let l = &body.limits;
         Rom {
-            knee_max: KNEE_FLEX_MAX_DEG,
-            ankle_dorsi_max: ANKLE_DORSI_MAX_DEG,
-            hip_flex_max: HIP_FLEX_MAX_DEG,
-            waist_max: if body.belly.pitch.is_some() { WAIST_PITCH_MAX_DEG } else { 0.0 },
-            neck_max,
+            knee_max: l.knee_max.unwrap_or(KNEE_FLEX_MAX_DEG),
+            ankle_dorsi_max: l.ankle_dorsi_max.unwrap_or(ANKLE_DORSI_MAX_DEG),
+            hip_flex_max: l.hip_flex_max.unwrap_or(HIP_FLEX_MAX_DEG),
+            waist_max: if body.belly.pitch.is_some() { l.waist_max.unwrap_or(WAIST_PITCH_MAX_DEG) } else { 0.0 },
+            neck_max: l.neck_max.unwrap_or(neck_max),
             pan_max,
-            shoulder: [-60.0, 180.0],
-            elbow_max: 150.0,
+            shoulder: l.shoulder.unwrap_or([-60.0, 180.0]),
+            elbow_max: l.elbow_max.unwrap_or(150.0),
             shoulder_abd: [-SHOULDER_ADD_MAX_DEG, SHOULDER_ABD_MAX_DEG],
-            stance_out_max_m: if body.legged() { ((HIP_M - ANKLE_H_M) * HIP_ABD_MAX_DEG.to_radians().sin() + HIP_HALF_WIDTH_M - 0.5 * STANCE_WIDTH_M).max(0.0) } else { 0.0 },
+            stance_out_max_m: if body.legged() { ((body.dims.hip_m - body.dims.ankle_m) * HIP_ABD_MAX_DEG.to_radians().sin() + body.dims.hip_half_m - 0.5 * body.dims.stance_m).max(0.0) } else { 0.0 },
             lift_max_m: if body.legged() { 0.0 } else { body.lift.as_ref().map_or(0.0, |l| l.stroke_m) },
         }
     }
@@ -308,8 +308,6 @@ pub struct HeadCamera {
     pub pan_deg: f32,
 }
 
-pub const CAMERA_UP_M: f32 = 0.07;
-pub const CAMERA_FWD_M: f32 = 0.07;
 
 pub fn head_camera(body: &Body, pose: &KinPose) -> HeadCamera {
     camera(body, pose)
@@ -317,20 +315,20 @@ pub fn head_camera(body: &Body, pose: &KinPose) -> HeadCamera {
 
 fn neck_of(body: &Body, pose: &KinPose) -> (V3, f32) {
     if body.morph.torso == Torso::Mast {
-        return ([0.0, pose.pelvis_y, COLUMN_TOP_M - pose.lift_m], 0.0);
+        return ([0.0, pose.pelvis_y, body.dims.column_top_m() - pose.lift_m], 0.0);
     }
-    let hip_c: V3 = if body.legged() { [pose.hip[0], pose.pelvis_y, pose.hip[1]] } else { [0.0, pose.pelvis_y, HIP_M - pose.lift_m] };
-    let waist = add(hip_c, scale(up_dir(pose.pelvis_deg), PELVIS_M));
+    let hip_c: V3 = if body.legged() { [pose.hip[0], pose.pelvis_y, pose.hip[1]] } else { [body.dims.seat_x_m, pose.pelvis_y, body.dims.hip_m - pose.lift_m] };
+    let waist = add(hip_c, scale(up_dir(pose.pelvis_deg), body.dims.pelvis_m()));
     let trunk = pose.trunk_deg();
     let v = up_dir(trunk);
-    (add(waist, scale(v, TRUNK_M + NECK_UP_M)), trunk)
+    (add(waist, scale(v, body.dims.trunk_m() + body.dims.neck_up_m)), trunk)
 }
 
-fn lens(pivot: V3, head_deg: f32, pan_deg: f32) -> V3 {
+fn lens(d: &Dims, pivot: V3, head_deg: f32, pan_deg: f32) -> V3 {
     let pan = pan_deg.to_radians();
     let fwd = fore_aft(head_deg);
     let ahead = [fwd[0] * pan.cos(), pan.sin(), fwd[2] * pan.cos()];
-    add(add(pivot, scale(up_dir(head_deg), CAMERA_UP_M)), scale(ahead, CAMERA_FWD_M))
+    add(add(pivot, scale(up_dir(head_deg), d.camera_up_m)), scale(ahead, d.camera_fwd_m))
 }
 
 pub fn camera(body: &Body, pose: &KinPose) -> HeadCamera {
@@ -340,21 +338,21 @@ pub fn camera(body: &Body, pose: &KinPose) -> HeadCamera {
         HeadMount::Neck => {
             let (neck, trunk) = neck_of(body, pose);
             let head = trunk + pose.neck_deg;
-            at(lens(neck, head, pose.neck_pan_deg), head, pose.neck_pan_deg)
+            at(lens(&body.dims, neck, head, pose.neck_pan_deg), head, pose.neck_pan_deg)
         }
         HeadMount::Fixed { tilt_deg } => {
             let (neck, trunk) = neck_of(body, pose);
             let head = trunk + tilt_deg as f32;
-            at(lens(neck, head, 0.0), head, 0.0)
+            at(lens(&body.dims, neck, head, 0.0), head, 0.0)
         }
         HeadMount::MastCamera { height_mm, pan_tilt } => {
-            let pivot = [body.mast_camera_x(), 0.0, height_mm as f32 / 1000.0 - CAMERA_UP_M];
+            let pivot = [body.mast_camera_x(), 0.0, height_mm as f32 / 1000.0 - body.dims.camera_up_m];
             let (tilt, pan) = if pan_tilt { (pose.neck_deg, pose.neck_pan_deg) } else { (0.0, 0.0) };
-            at(lens(pivot, tilt, pan), tilt, pan)
+            at(lens(&body.dims, pivot, tilt, pan), tilt, pan)
         }
         HeadMount::ChassisFront { height_mm } => at([0.5 * body.support_len_m, 0.0, height_mm as f32 / 1000.0], 0.0, 0.0),
         HeadMount::None => {
-            let p = if body.has_torso() || body.has_column() { neck_of(body, pose).0 } else { [0.0, 0.0, DECK_Z_M] };
+            let p = if body.has_torso() || body.has_column() { neck_of(body, pose).0 } else { [0.0, 0.0, body.dims.deck_z_m()] };
             at(p, 0.0, 0.0)
         }
     }
@@ -365,14 +363,14 @@ fn pitch_about_origin(p: V3, deg: f32) -> V3 {
     [p[0] * c + p[2] * s, p[1], -p[0] * s + p[2] * c]
 }
 
-pub fn knee_ik(hip: [f32; 2], ankle: [f32; 2]) -> Option<([f32; 2], f32)> {
+pub fn knee_ik(leg: &Dims, hip: [f32; 2], ankle: [f32; 2]) -> Option<([f32; 2], f32)> {
     let (dx, dz) = (ankle[0] - hip[0], ankle[1] - hip[1]);
     let d = (dx * dx + dz * dz).sqrt();
-    if d > THIGH_M + SHANK_M + 1e-4 || d < 1e-3 {
+    if d > leg.thigh_m() + leg.shank_m() + 1e-4 || d < 1e-3 {
         return None;
     }
-    let d = d.min(THIGH_M + SHANK_M);
-    let h = (THIGH_M * THIGH_M - 0.25 * d * d).max(0.0).sqrt();
+    let d = d.min(leg.thigh_m() + leg.shank_m());
+    let h = (leg.thigh_m() * leg.thigh_m() - 0.25 * d * d).max(0.0).sqrt();
     let (mx, mz) = (hip[0] + 0.5 * dx, hip[1] + 0.5 * dz);
     let (mut px, mut pz) = (-dz / d, dx / d);
     if px < 0.0 {
@@ -380,7 +378,7 @@ pub fn knee_ik(hip: [f32; 2], ankle: [f32; 2]) -> Option<([f32; 2], f32)> {
         pz = -pz;
     }
     let knee = [mx + h * px, mz + h * pz];
-    let interior = (1.0 - 0.5 * d * d / (THIGH_M * THIGH_M)).clamp(-1.0, 1.0).acos();
+    let interior = (1.0 - 0.5 * d * d / (leg.thigh_m() * leg.thigh_m())).clamp(-1.0, 1.0).acos();
     Some((knee, (std::f32::consts::PI - interior).to_degrees()))
 }
 
@@ -390,19 +388,19 @@ pub fn support_margin(support: [f32; 4], zmp: [f32; 2]) -> f32 {
     (1.0 - (zmp[0] - cx).abs() / hx.max(1e-3)).min(1.0 - (zmp[1] - cy).abs() / hy.max(1e-3))
 }
 
-pub fn knee_ik3(hip: [f32; 3], ankle: [f32; 3]) -> Option<([f32; 3], f32)> {
+pub fn knee_ik3(leg: &Dims, hip: [f32; 3], ankle: [f32; 3]) -> Option<([f32; 3], f32)> {
     let d = sub(ankle, hip);
     let len = dot(d, d).sqrt();
-    if len > THIGH_M + SHANK_M + 1e-4 || len < 1e-3 {
+    if len > leg.thigh_m() + leg.shank_m() + 1e-4 || len < 1e-3 {
         return None;
     }
-    let len = len.min(THIGH_M + SHANK_M);
+    let len = len.min(leg.thigh_m() + leg.shank_m());
     let u = scale(d, 1.0 / len);
     let fwd = sub([1.0, 0.0, 0.0], scale(u, u[0]));
     let f = scale(fwd, 1.0 / dot(fwd, fwd).sqrt().max(1e-6));
-    let h = (THIGH_M * THIGH_M - 0.25 * len * len).max(0.0).sqrt();
+    let h = (leg.thigh_m() * leg.thigh_m() - 0.25 * len * len).max(0.0).sqrt();
     let knee = add(add(hip, scale(d, 0.5)), scale(f, h));
-    let interior = (1.0 - 0.5 * len * len / (THIGH_M * THIGH_M)).clamp(-1.0, 1.0).acos();
+    let interior = (1.0 - 0.5 * len * len / (leg.thigh_m() * leg.thigh_m())).clamp(-1.0, 1.0).acos();
     Some((knee, (std::f32::consts::PI - interior).to_degrees()))
 }
 
@@ -427,8 +425,8 @@ struct Mass {
 }
 
 pub fn thigh_share(body: &Body) -> f32 {
-    let full = THIGH_M + 0.45 * SHANK_M;
-    ((full - body.leg.com_down_m) / (full - 0.45 * THIGH_M)).clamp(0.3, 0.95)
+    let full = body.dims.thigh_m() + 0.45 * body.dims.shank_m();
+    ((full - body.leg.com_down_m) / (full - 0.45 * body.dims.thigh_m())).clamp(0.3, 0.95)
 }
 
 pub fn solve(body: &Body, pose: &KinPose, loads: &KinLoads) -> KinReport {
@@ -440,6 +438,7 @@ pub fn solve_fast(body: &Body, pose: &KinPose, loads: &KinLoads) -> KinReport {
 }
 
 fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinReport {
+    let k = body.dims.k;
     let rom = Rom::of(body);
     let legged = body.legged();
     let torso = body.morph.torso;
@@ -450,7 +449,7 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
     let tag = |s: usize| if s == 0 { "r" } else { "l" };
 
     let wide = pose.stance_out_m > 1e-6;
-    let half = STANCE_WIDTH_M * 0.5 + pose.stance_out_m.max(0.0);
+    let half = body.dims.stance_m * 0.5 + pose.stance_out_m.max(0.0);
     let foot_y = [-half, half];
     let mut knees = [[0.0f32; 3]; 2];
     let mut ankles = [[0.0f32; 3]; 2];
@@ -458,20 +457,20 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
     let mut stance = [false; 2];
     let mut leg_angles = [(0.0f32, 0.0f32, 0.0f32); 2];
     let mut hip_abd_deg = [0.0f32; 2];
-    let hip_c: V3 = if legged { [pose.hip[0], pose.pelvis_y, pose.hip[1]] } else { [0.0, pose.pelvis_y, HIP_M - pose.lift_m] };
+    let hip_c: V3 = if legged { [pose.hip[0], pose.pelvis_y, pose.hip[1]] } else { [body.dims.seat_x_m, pose.pelvis_y, body.dims.hip_m - pose.lift_m] };
     if legged {
         let share = thigh_share(body);
         for s in 0..2 {
             let lift = pose.feet[s][1].max(0.0);
             stance[s] = lift <= 1e-4;
             let hip2 = [hip_c[0], hip_c[2]];
-            let rock = if stance[s] && pose.toe_deg[s] > 1e-3 { crate::contact::rocker_ankle_shift(body.leg.foot_len_m, ANKLE_H_M, pose.toe_deg[s]) } else { [0.0, 0.0] };
-            let ankle2 = [pose.feet[s][0] + rock[0], ANKLE_H_M + lift + rock[1]];
+            let rock = if stance[s] && pose.toe_deg[s] > 1e-3 { crate::contact::rocker_ankle_shift(body.leg.foot_len_m, body.dims.ankle_m, pose.toe_deg[s]) } else { [0.0, 0.0] };
+            let ankle2 = [pose.feet[s][0] + rock[0], body.dims.ankle_m + lift + rock[1]];
             let y = foot_y[s] + if stance[s] { 0.0 } else { pose.pelvis_y };
-            hips[s] = [hip_c[0], hip_c[1] + if s == 0 { -HIP_HALF_WIDTH_M } else { HIP_HALF_WIDTH_M }, hip_c[2]];
+            hips[s] = [hip_c[0], hip_c[1] + if s == 0 { -body.dims.hip_half_m } else { body.dims.hip_half_m }, hip_c[2]];
             let too_long = |out: &mut Vec<String>| out.push(format!("leg_{} 다리 길이를 넘는 자세", tag(s)));
             let (knee, ky, knee_flex) = if wide {
-                match knee_ik3(hips[s], [ankle2[0], y, ankle2[1]]) {
+                match knee_ik3(&body.dims, hips[s], [ankle2[0], y, ankle2[1]]) {
                     Some((k, flex)) => ([k[0], k[2]], k[1], flex),
                     None => {
                         too_long(&mut out_of_range);
@@ -479,11 +478,11 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
                     }
                 }
             } else {
-                let (k, flex) = knee_ik(hip2, ankle2).unwrap_or_else(|| {
+                let (k, flex) = knee_ik(&body.dims, hip2, ankle2).unwrap_or_else(|| {
                     too_long(&mut out_of_range);
                     let (dx, dz) = (ankle2[0] - hip2[0], ankle2[1] - hip2[1]);
                     let d = (dx * dx + dz * dz).sqrt().max(1e-3);
-                    ([hip2[0] + dx / d * THIGH_M, hip2[1] + dz / d * THIGH_M], 0.0)
+                    ([hip2[0] + dx / d * body.dims.thigh_m(), hip2[1] + dz / d * body.dims.thigh_m()], 0.0)
                 });
                 (k, y, flex)
             };
@@ -501,12 +500,12 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
             masses.push(Mass { group: Grp::Thigh(s), m: body.leg.mass_kg * share, p: add(hips[s], scale(sub(knees[s], hips[s]), 0.45)) });
             masses.push(Mass { group: Grp::Shank(s), m: body.leg.mass_kg * (1.0 - share), p: add(knees[s], scale(sub(ankles[s], knees[s]), 0.45)) });
             let fl = body.leg.foot_len_m;
-            let sole = ankles[s][2] - ANKLE_H_M;
-            let foot_c = [ankles[s][0] + 0.25 * fl, y, sole + 0.03];
+            let sole = ankles[s][2] - body.dims.ankle_m;
+            let foot_c = [ankles[s][0] + 0.25 * fl, y, sole + 0.03 * k];
             masses.push(Mass { group: Grp::Foot(s), m: body.leg.foot_mass_kg, p: foot_c });
-            boxes.push(limb_box(if s == 0 { "thigh_r" } else { "thigh_l" }, Segment::Leg, hips[s], knees[s], 0.05));
-            boxes.push(limb_box(if s == 0 { "shank_r" } else { "shank_l" }, Segment::Leg, knees[s], ankles[s], 0.045));
-            boxes.push(LinkBox { name: if s == 0 { "foot_r" } else { "foot_l" }, segment: Segment::Foot, center: foot_c, axes: EYE3, half: [fl * 0.5, body.leg.foot_width_m * 0.5, 0.03] });
+            boxes.push(limb_box(if s == 0 { "thigh_r" } else { "thigh_l" }, Segment::Leg, hips[s], knees[s], 0.05 * k));
+            boxes.push(limb_box(if s == 0 { "shank_r" } else { "shank_l" }, Segment::Leg, knees[s], ankles[s], 0.045 * k));
+            boxes.push(LinkBox { name: if s == 0 { "foot_r" } else { "foot_l" }, segment: Segment::Foot, center: foot_c, axes: EYE3, half: [fl * 0.5, body.leg.foot_width_m * 0.5, 0.03 * k] });
             if knee_flex > rom.knee_max + 0.5 {
                 out_of_range.push(format!("knee_{} {:.0}° > {:.0}°", tag(s), knee_flex, rom.knee_max));
             }
@@ -528,19 +527,19 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
     }
 
     let u = up_dir(pose.pelvis_deg);
-    let waist = add(hip_c, scale(u, PELVIS_M));
+    let waist = add(hip_c, scale(u, body.dims.pelvis_m()));
     let trunk_deg = if torso == Torso::Humanoid { pose.trunk_deg() } else { 0.0 };
     let v = up_dir(trunk_deg);
     let (shoulder_c, neck) = match torso {
         Torso::Humanoid => {
-            let shoulder_c = add(waist, scale(v, TRUNK_M));
-            (shoulder_c, add(shoulder_c, scale(v, NECK_UP_M)))
+            let shoulder_c = add(waist, scale(v, body.dims.trunk_m()));
+            (shoulder_c, add(shoulder_c, scale(v, body.dims.neck_up_m)))
         }
-        Torso::Mast => ([0.0, pose.pelvis_y, SHOULDER_M - pose.lift_m], [0.0, pose.pelvis_y, COLUMN_TOP_M - pose.lift_m]),
-        Torso::None => (body.shoulder_at(0, pose.lift_m), [0.0, 0.0, DECK_Z_M]),
+        Torso::Mast => ([0.0, pose.pelvis_y, body.dims.shoulder_m - pose.lift_m], [0.0, pose.pelvis_y, body.dims.column_top_m() - pose.lift_m]),
+        Torso::None => (body.shoulder_at(0, pose.lift_m), [0.0, 0.0, body.dims.deck_z_m()]),
     };
     let neck = match body.camera_mount() {
-        HeadMount::MastCamera { height_mm, .. } => [body.mast_camera_x(), 0.0, height_mm as f32 / 1000.0 - CAMERA_UP_M],
+        HeadMount::MastCamera { height_mm, .. } => [body.mast_camera_x(), 0.0, height_mm as f32 / 1000.0 - body.dims.camera_up_m],
         _ => neck,
     };
     let head_tilt = match body.camera_mount() {
@@ -551,7 +550,7 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
     };
     let head_dir = up_dir(trunk_deg + head_tilt);
     if torso == Torso::Humanoid {
-        let belly_p = add(hip_c, scale(u, PELVIS_M - body.belly.com_down_m));
+        let belly_p = add(hip_c, scale(u, body.dims.pelvis_m() - body.belly.com_down_m));
         masses.push(Mass { group: Grp::Pelvis, m: body.belly.mass_kg, p: belly_p });
         let chest_p = add(waist, scale(v, body.chest.com_up_m));
         masses.push(Mass { group: Grp::Trunk, m: body.chest.mass_kg, p: chest_p });
@@ -565,7 +564,7 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
         let (at, on_pelvis) = body.cargo_point();
         if on_pelvis {
             let fwd = [u[2], 0.0, -u[0]];
-            let bay = add(add(hip_c, scale(u, CARGO_Z_M - HIP_M)), scale(fwd, CARGO_X_M));
+            let bay = add(add(hip_c, scale(u, body.dims.cargo_z_m() - body.dims.hip_m)), scale(fwd, body.dims.cargo_x_m));
             masses.push(Mass { group: Grp::Pelvis, m: pose.cargo_kg, p: bay });
         } else {
             masses.push(Mass { group: Grp::Base, m: pose.cargo_kg, p: at });
@@ -577,11 +576,11 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
         m.p = add(neck, scale(head_dir, body.head.com_up_m));
     }
     if torso == Torso::Humanoid {
-        boxes.push(oriented_box("pelvis", Segment::Belly, add(hip_c, scale(u, 0.06)), pose.pelvis_deg, [0.09, 0.14, 0.07]));
-        boxes.push(oriented_box("trunk", Segment::Chest, add(waist, scale(v, 0.16)), trunk_deg, [0.10, 0.16, 0.16]));
+        boxes.push(oriented_box("pelvis", Segment::Belly, add(hip_c, scale(u, 0.06 * k)), pose.pelvis_deg, [0.09 * k, 0.14 * k, 0.07 * k]));
+        boxes.push(oriented_box("trunk", Segment::Chest, add(waist, scale(v, 0.5 * body.dims.trunk_m() + 0.01 * k)), trunk_deg, [0.10 * k, 0.16 * k, 0.5 * body.dims.trunk_m() + 0.01 * k]));
     }
     if body.head_on_trunk() {
-        boxes.push(oriented_box("head", Segment::Head, add(neck, scale(head_dir, 0.07)), trunk_deg + head_tilt, [0.07, 0.08, 0.07]));
+        boxes.push(oriented_box("head", Segment::Head, add(neck, scale(head_dir, 0.07 * k)), trunk_deg + head_tilt, [0.07 * k, 0.08 * k, 0.07 * k]));
     } else if matches!(body.camera_mount(), HeadMount::MastCamera { .. }) {
         boxes.push(oriented_box("head", Segment::Head, add(neck, scale(head_dir, 0.05)), head_tilt, [0.04, 0.07, 0.04]));
     }
@@ -599,7 +598,7 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
     for s in 0..2 {
         let sh = match torso {
             Torso::Humanoid | Torso::Mast => {
-                let y = if s == 0 { -SHOULDER_HALF_WIDTH_M } else { SHOULDER_HALF_WIDTH_M };
+                let y = if s == 0 { -body.dims.shoulder_half_m } else { body.dims.shoulder_half_m };
                 [shoulder_c[0], shoulder_c[1] + y, shoulder_c[2]]
             }
             Torso::None => body.shoulder_at(s, pose.lift_m),
@@ -625,17 +624,17 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
             df = rotate(df, trunk_fwd, theta);
             flex_axes[s] = rotate([0.0, 1.0, 0.0], trunk_fwd, theta);
         }
-        let el = add(sh, scale(du, UPPER_ARM_M));
-        let wrist = add(el, scale(df, FOREARM_M));
-        let hand = add(wrist, scale(df, PALM_OFFSET_M));
+        let el = add(sh, scale(du, body.dims.upper_arm_m));
+        let wrist = add(el, scale(df, body.dims.forearm_m));
+        let hand = add(wrist, scale(df, body.dims.palm_m));
         shoulders[s] = sh;
         elbows[s] = el;
         hands[s] = hand;
         masses.push(Mass { group: Grp::Upper(s), m: m_up, p: add(sh, scale(du, r_up)) });
-        masses.push(Mass { group: Grp::Fore(s), m: m_fore, p: add(el, scale(df, 0.45 * FOREARM_M)) });
+        masses.push(Mass { group: Grp::Fore(s), m: m_fore, p: add(el, scale(df, 0.45 * body.dims.forearm_m)) });
         masses.push(Mass { group: Grp::Hand(s), m: body.hand_kg, p: hand });
-        boxes.push(limb_box(if s == 0 { "upper_arm_r" } else { "upper_arm_l" }, Segment::Arm, sh, el, 0.035));
-        boxes.push(limb_box(if s == 0 { "forearm_r" } else { "forearm_l" }, Segment::Arm, el, wrist, 0.03));
+        boxes.push(limb_box(if s == 0 { "upper_arm_r" } else { "upper_arm_l" }, Segment::Arm, sh, el, 0.035 * k));
+        boxes.push(limb_box(if s == 0 { "forearm_r" } else { "forearm_l" }, Segment::Arm, el, wrist, 0.03 * k));
         boxes.extend(hand_boxes(s, wrist, df, flex_axes[s], pose.closure, body));
         if !(rom.shoulder[0] - 0.5..=rom.shoulder[1] + 0.5).contains(&pose.shoulder_deg[s]) {
             out_of_range.push(format!("shoulder_{} {:.0}°", tag(s), pose.shoulder_deg[s]));
@@ -686,7 +685,7 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
     let shoulders = shoulders.map(tilt);
     let elbows = elbows.map(tilt);
     let (waist, neck) = (tilt(waist), tilt(neck));
-    let bumper = (!legged).then(|| tilt([0.5 * body.support_len_m + WHEEL_R_M + BUMPER_GAP_M, 0.0, 0.5 * (BUMPER_Z_M[0] + BUMPER_Z_M[1])]));
+    let bumper = (!legged).then(|| tilt([0.5 * body.support_len_m + body.dims.wheel_r_m + body.dims.bumper_gap_m, 0.0, 0.5 * (body.dims.bumper_z_m[0] + body.dims.bumper_z_m[1])]));
     for b in &boxes {
         if matches!(b.segment, Segment::Hand | Segment::Foot) {
             continue;
@@ -765,7 +764,7 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
         }
         let pos = match torso {
             Torso::Humanoid => hip_c,
-            Torso::Mast => [0.0, pose.pelvis_y, SHOULDER_M - pose.lift_m],
+            Torso::Mast => [0.0, pose.pelvis_y, body.dims.shoulder_m - pose.lift_m],
             Torso::None => [body.mast_camera_x(), 0.0, body.shoulder_at(0, pose.lift_m)[2]],
         };
         joints.push(KinJoint { name: "torso_lift".into(), segment: Segment::Leg, pos, angle_deg: None, actuator: lift.name.into(), torque: f, peak: lift.force_n, cont: lift.force_n, ratio: f.abs() / lift.force_n.max(1e-3), effort: f.abs() / lift.force_n.max(1e-3), in_range, structural: false });
@@ -847,17 +846,17 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
         let f = body.chassis.drive_force_n;
         if body.base == BaseKind::Track {
             let e = zmp[0];
-            let area = len * 2.0 * BELT_W_M;
+            let area = len * 2.0 * body.dims.belt_w_m;
             let p0 = n / area.max(1e-4) / 1000.0;
             let (rear, front, loaded) = if e.abs() <= len / 6.0 {
                 (p0 * (1.0 - 6.0 * e / len), p0 * (1.0 + 6.0 * e / len), len)
             } else {
                 let l = (3.0 * (0.5 * len - e.abs())).max(1e-3);
-                let peak = 2.0 * n / (l * 2.0 * BELT_W_M) / 1000.0;
+                let peak = 2.0 * n / (l * 2.0 * body.dims.belt_w_m) / 1000.0;
                 if e > 0.0 { (0.0, peak, l) } else { (peak, 0.0, l) }
             };
             contacts.push(ContactPatch { name: "track".into(), normal_n: n, shear_n: shear, cop: zmp, rect: support, pressure_kpa: Some([rear, front]), loaded_len_m: Some(loaded), shear_y_n: grf[1], torsion_nm: 0.0, sole: None });
-            joints.push(KinJoint { name: "drive".into(), segment: Segment::Foot, pos: tilt([0.0, 0.0, WHEEL_R_M]), angle_deg: None, actuator: body.chassis.name.into(), torque: shear, peak: 2.0 * f, cont: f, ratio: shear.abs() / (2.0 * f).max(1e-3), effort: shear.abs() / f.max(1e-3), in_range: true, structural: false });
+            joints.push(KinJoint { name: "drive".into(), segment: Segment::Foot, pos: tilt([0.0, 0.0, body.dims.wheel_r_m]), angle_deg: None, actuator: body.chassis.name.into(), torque: shear, peak: 2.0 * f, cont: f, ratio: shear.abs() / (2.0 * f).max(1e-3), effort: shear.abs() / f.max(1e-3), in_range: true, structural: false });
         } else {
             let (xr, xf) = (-0.5 * len, 0.5 * len);
             let nf = (n * (zmp[0] - xr) / (xf - xr)).clamp(0.0, n);
@@ -865,7 +864,7 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
                 let sh = if n > 1e-6 { shear * nn / n } else { 0.0 };
                 contacts.push(ContactPatch { name: name.into(), normal_n: nn, shear_n: sh, cop: [x, 0.0], rect: [x - 0.02, x + 0.02, -0.5 * w, 0.5 * w], pressure_kpa: None, loaded_len_m: None, shear_y_n: if n > 1e-6 { grf[1] * nn / n } else { 0.0 }, torsion_nm: 0.0, sole: None });
                 let fa = 0.5 * f;
-                joints.push(KinJoint { name: jname.into(), segment: Segment::Foot, pos: tilt([x, 0.0, WHEEL_R_M]), angle_deg: None, actuator: body.chassis.name.into(), torque: sh, peak: 2.0 * fa, cont: fa, ratio: sh.abs() / (2.0 * fa).max(1e-3), effort: sh.abs() / fa.max(1e-3), in_range: true, structural: false });
+                joints.push(KinJoint { name: jname.into(), segment: Segment::Foot, pos: tilt([x, 0.0, body.dims.wheel_r_m]), angle_deg: None, actuator: body.chassis.name.into(), torque: sh, peak: 2.0 * fa, cont: fa, ratio: sh.abs() / (2.0 * fa).max(1e-3), effort: sh.abs() / fa.max(1e-3), in_range: true, structural: false });
             }
         }
     }
@@ -912,22 +911,23 @@ fn limb_box(name: &'static str, segment: Segment, a: V3, b: V3, w: f32) -> LinkB
 
 fn hand_boxes(side: usize, wrist: V3, dir: V3, axis: V3, closure: f32, body: &Body) -> Vec<LinkBox> {
     let n = if body.gripper_only() { 2 } else { u8::from(body.fingers) as usize };
-    let mut v = vec![limb_box(if side == 0 { "palm_r" } else { "palm_l" }, Segment::Hand, wrist, add(wrist, scale(dir, 0.10)), 0.035)];
+    let k = body.dims.k;
+    let mut v = vec![limb_box(if side == 0 { "palm_r" } else { "palm_l" }, Segment::Hand, wrist, add(wrist, scale(dir, 0.10 * k)), 0.035 * k)];
     let palm_n = cross(dir, axis);
     let palm_n = if palm_n[0] < 0.0 { scale(palm_n, -1.0) } else { palm_n };
     let segs: &[f32] = if n == 2 { &[0.050, 0.035] } else { &[0.040, 0.025, 0.018] };
     let flex_max = [90.0f32, 100.0, 80.0];
-    let base = add(wrist, scale(dir, 0.10));
-    for k in 0..n {
-        let off = -0.035 + 0.07 * k as f32 / (n.max(2) - 1) as f32;
+    let base = add(wrist, scale(dir, 0.10 * k));
+    for f in 0..n {
+        let off = (-0.035 + 0.07 * f as f32 / (n.max(2) - 1) as f32) * k;
         let mut p = add(base, scale(axis, off));
         let mut ang = 0.0f32;
         for (i, len) in segs.iter().enumerate() {
             ang += closure.clamp(0.0, 1.0) * flex_max[i.min(2)];
             let a = ang.to_radians();
             let d = add(scale(dir, a.cos()), scale(palm_n, a.sin()));
-            let q = add(p, scale(d, *len));
-            v.push(limb_box(if side == 0 { "finger_r" } else { "finger_l" }, Segment::Hand, p, q, 0.009));
+            let q = add(p, scale(d, *len * k));
+            v.push(limb_box(if side == 0 { "finger_r" } else { "finger_l" }, Segment::Hand, p, q, 0.009 * k));
             p = q;
         }
     }
@@ -939,32 +939,32 @@ fn base_boxes(body: &Body, pitch_deg: f32) -> Vec<LinkBox> {
     let w = body.support_width_m;
     let p = |q: V3| pitch_about_origin(q, pitch_deg);
     let ax = EYE3.map(|a| pitch_about_origin(a, pitch_deg));
-    let mut v = vec![LinkBox { name: "chassis", segment: Segment::Foot, center: p([0.0, 0.0, WHEEL_R_M + 0.05]), axes: ax, half: [len * 0.5, w * 0.5 - BELT_W_M, 0.05] }];
-    let deck = WHEEL_R_M + 0.1;
+    let mut v = vec![LinkBox { name: "chassis", segment: Segment::Foot, center: p([0.0, 0.0, body.dims.wheel_r_m + 0.05]), axes: ax, half: [len * 0.5, w * 0.5 - body.dims.belt_w_m, 0.05] }];
+    let deck = body.dims.wheel_r_m + 0.1;
     match (body.morph.torso, body.camera_mount()) {
-        (Torso::Humanoid, _) => v.push(LinkBox { name: "mast", segment: Segment::Leg, center: p([0.0, 0.0, 0.5 * (deck + HIP_M)]), axes: ax, half: [0.03, 0.03, 0.5 * (HIP_M - WHEEL_R_M - 0.1)] }),
+        (Torso::Humanoid, _) => v.push(LinkBox { name: "mast", segment: Segment::Leg, center: p([0.0, 0.0, 0.5 * (deck + body.dims.hip_m)]), axes: ax, half: [0.03, 0.03, 0.5 * (body.dims.hip_m - body.dims.wheel_r_m - 0.1)] }),
         (Torso::Mast, head) => {
-            let top = column_top_m(head);
+            let top = column_top_m(&body.dims, head);
             v.push(LinkBox { name: "column", segment: Segment::Leg, center: p([0.0, 0.0, 0.5 * (deck + top)]), axes: ax, half: [0.04, 0.04, 0.5 * (top - deck)] });
         }
         (Torso::None, HeadMount::MastCamera { height_mm, .. }) => {
-            let top = height_mm as f32 / 1000.0 - CAMERA_UP_M;
+            let top = height_mm as f32 / 1000.0 - body.dims.camera_up_m;
             v.push(LinkBox { name: "pole", segment: Segment::Leg, center: p([body.mast_camera_x(), 0.0, 0.5 * (deck + top)]), axes: ax, half: [0.01, 0.01, 0.5 * (top - deck).max(0.0)] });
         }
         _ => {}
     }
-    v.push(LinkBox { name: "bumper", segment: Segment::Foot, center: p([0.5 * len + WHEEL_R_M + BUMPER_GAP_M - 0.01, 0.0, 0.5 * (BUMPER_Z_M[0] + BUMPER_Z_M[1])]), axes: ax, half: [0.01, w * 0.5, 0.5 * (BUMPER_Z_M[1] - BUMPER_Z_M[0])] });
+    v.push(LinkBox { name: "bumper", segment: Segment::Foot, center: p([0.5 * len + body.dims.wheel_r_m + body.dims.bumper_gap_m - 0.01, 0.0, 0.5 * (body.dims.bumper_z_m[0] + body.dims.bumper_z_m[1])]), axes: ax, half: [0.01, w * 0.5, 0.5 * (body.dims.bumper_z_m[1] - body.dims.bumper_z_m[0])] });
     for b in body.deck_boxes() {
         v.push(LinkBox { center: p(b.center), axes: ax, ..b });
     }
     if body.base == BaseKind::Track {
-        for y in [-0.5 * w + 0.5 * BELT_W_M, 0.5 * w - 0.5 * BELT_W_M] {
-            v.push(LinkBox { name: "track", segment: Segment::Foot, center: p([0.0, y, WHEEL_R_M]), axes: ax, half: [len * 0.5 + WHEEL_R_M, BELT_W_M * 0.5, WHEEL_R_M] });
+        for y in [-0.5 * w + 0.5 * body.dims.belt_w_m, 0.5 * w - 0.5 * body.dims.belt_w_m] {
+            v.push(LinkBox { name: "track", segment: Segment::Foot, center: p([0.0, y, body.dims.wheel_r_m]), axes: ax, half: [len * 0.5 + body.dims.wheel_r_m, body.dims.belt_w_m * 0.5, body.dims.wheel_r_m] });
         }
     } else {
         for x in [-0.5 * len, 0.5 * len] {
-            for y in [-0.5 * w + 0.5 * BELT_W_M, 0.5 * w - 0.5 * BELT_W_M] {
-                v.push(LinkBox { name: "wheel", segment: Segment::Foot, center: p([x, y, WHEEL_R_M]), axes: ax, half: [WHEEL_R_M, BELT_W_M * 0.5, WHEEL_R_M] });
+            for y in [-0.5 * w + 0.5 * body.dims.belt_w_m, 0.5 * w - 0.5 * body.dims.belt_w_m] {
+                v.push(LinkBox { name: "wheel", segment: Segment::Foot, center: p([x, y, body.dims.wheel_r_m]), axes: ax, half: [body.dims.wheel_r_m, body.dims.belt_w_m * 0.5, body.dims.wheel_r_m] });
             }
         }
     }
@@ -984,7 +984,7 @@ mod tests {
     fn standing_matches_the_balance_model() {
         for base in [BaseKind::HumanFoot, BaseKind::Wheel] {
             let b = body(Tier::Mid, base);
-            let r = solve(&b, &KinPose::stand(0.0), &KinLoads::default());
+            let r = solve(&b, &KinPose::stand_compact(0.0), &KinLoads::default());
             assert!((r.mass_kg - b.mass_kg()).abs() < 1e-3, "{base:?}: {} vs {}", r.mass_kg, b.mass_kg());
             let q = b.solve(&crate::Posture::quiet(0.0), &crate::FeedForward { enabled: false, gain: 1.0 }, 1e3);
             assert!((r.com[2] - q.com[2]).abs() < 0.03, "{base:?} CoM height {} vs {}", r.com[2], q.com[2]);
@@ -996,31 +996,31 @@ mod tests {
     #[test]
     fn the_head_camera_follows_the_bend_the_neck_and_the_slope() {
         let b = body(Tier::Pro, BaseKind::HumanFoot);
-        let stand = head_camera(&b, &KinPose::stand(0.0));
+        let stand = head_camera(&b, &KinPose::stand_compact(0.0));
         assert!((stand.pos[2] - 1.14).abs() < 0.01 && stand.pitch_down_deg.abs() < 1e-4, "{stand:?}");
-        let bent = head_camera(&b, &KinPose { waist_deg: 60.0, neck_deg: 30.0, ..KinPose::stand(0.0) });
+        let bent = head_camera(&b, &KinPose { waist_deg: 60.0, neck_deg: 30.0, ..KinPose::stand_compact(0.0) });
         assert!(bent.pos[2] < stand.pos[2] - 0.15 && bent.pos[0] > stand.pos[0] + 0.25, "{bent:?}");
         assert!((bent.pitch_down_deg - 90.0).abs() < 1e-3);
-        let left = head_camera(&b, &KinPose { neck_pan_deg: 60.0, ..KinPose::stand(0.0) });
+        let left = head_camera(&b, &KinPose { neck_pan_deg: 60.0, ..KinPose::stand_compact(0.0) });
         assert!(left.pos[1] > 0.05 && left.pan_deg == 60.0, "{left:?}");
         let w = body(Tier::Mid, BaseKind::Wheel);
-        let up = head_camera(&w, &KinPose { base_pitch_deg: 10.0, ..KinPose::stand(0.0) });
+        let up = head_camera(&w, &KinPose { base_pitch_deg: 10.0, ..KinPose::stand_compact(0.0) });
         assert!((up.pitch_down_deg + 10.0).abs() < 1e-3);
     }
 
     #[test]
     fn the_knee_follows_the_hip_and_ankle() {
-        let (k, flex) = knee_ik([0.0, HIP_M], [0.0, ANKLE_H_M]).unwrap();
+        let (k, flex) = knee_ik(&Dims::COMPACT, [0.0, Dims::COMPACT.hip_m], [0.0, crate::dims::Dims::COMPACT.ankle_m]).unwrap();
         assert!(k[0].abs() < 1e-4 && flex.abs() < 0.1, "straight leg: {k:?} {flex}");
-        let (k, flex) = knee_ik([-0.05, HIP_M - 0.25], [0.0, ANKLE_H_M]).unwrap();
+        let (k, flex) = knee_ik(&Dims::COMPACT, [-0.05, Dims::COMPACT.hip_m - 0.25], [0.0, crate::dims::Dims::COMPACT.ankle_m]).unwrap();
         assert!(k[0] > 0.0 && flex > 60.0, "{k:?} {flex}");
-        assert!(knee_ik([0.0, HIP_M + 0.05], [0.0, ANKLE_H_M]).is_none(), "beyond the leg's length");
+        assert!(knee_ik(&Dims::COMPACT, [0.0, Dims::COMPACT.hip_m + 0.05], [0.0, crate::dims::Dims::COMPACT.ankle_m]).is_none(), "beyond the leg's length");
     }
 
     #[test]
     fn a_load_in_the_hand_loads_the_shoulder_elbow_and_moves_the_zmp() {
         let b = body(Tier::Mid, BaseKind::HumanFoot);
-        let mut p = KinPose::stand(0.0);
+        let mut p = KinPose::stand_compact(0.0);
         p.shoulder_deg = [30.0, 0.0];
         p.elbow_deg = [60.0, 10.0];
         let empty = solve(&b, &p, &KinLoads::default());
@@ -1038,7 +1038,7 @@ mod tests {
     #[test]
     fn a_rigid_trunk_cannot_pitch_and_a_squat_bends_the_knees() {
         let mid = body(Tier::Mid, BaseKind::Wheel);
-        let mut p = KinPose::stand(0.0);
+        let mut p = KinPose::stand_compact(0.0);
         p.waist_deg = 30.0;
         let r = solve(&mid, &p, &KinLoads::default());
         assert!(!r.feasible && r.limiting.as_deref().unwrap_or("").contains("허리"), "{:?}", r.limiting);
@@ -1047,9 +1047,9 @@ mod tests {
         assert!(r.feasible, "{:?}", r.limiting);
         assert!(r.joint("waist_pitch").unwrap().torque.abs() > 5.0);
         let legs = body(Tier::Mid, BaseKind::HumanFoot);
-        let stand = solve(&legs, &KinPose::stand(0.0), &KinLoads::default());
-        let mut sq = KinPose::stand(0.0);
-        sq.hip = [-0.08, HIP_M - 0.2];
+        let stand = solve(&legs, &KinPose::stand_compact(0.0), &KinLoads::default());
+        let mut sq = KinPose::stand_compact(0.0);
+        sq.hip = [-0.08, crate::dims::Dims::COMPACT.hip_m - 0.2];
         sq.pelvis_deg = 30.0;
         let r = solve(&legs, &sq, &KinLoads::default());
         fn k(r: &KinReport) -> &KinJoint {
@@ -1061,7 +1061,7 @@ mod tests {
     #[test]
     fn wheel_and_track_loads_follow_the_zmp() {
         let b = body(Tier::Mid, BaseKind::Wheel);
-        let mut p = KinPose::stand(0.0);
+        let mut p = KinPose::stand_compact(0.0);
         p.shoulder_deg = [80.0, 80.0];
         p.elbow_deg = [0.0, 0.0];
         let r = solve(&b, &p, &KinLoads::holding(2.0, true, 0.0));
@@ -1073,7 +1073,7 @@ mod tests {
         let tr = r.contact("track").unwrap();
         let pk = tr.pressure_kpa.unwrap();
         assert!(pk[1] > pk[0], "the front of the track carries more: {pk:?}");
-        let push = solve(&b, &KinPose::stand(0.0), &KinLoads { bumper_force: [-30.0, 0.0, 0.0], ..KinLoads::default() });
+        let push = solve(&b, &KinPose::stand_compact(0.0), &KinLoads { bumper_force: [-30.0, 0.0, 0.0], ..KinLoads::default() });
         assert!((push.grf[0] - 30.0).abs() < 1e-3, "{:?}", push.grf);
     }
 }

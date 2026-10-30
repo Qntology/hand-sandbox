@@ -1263,7 +1263,7 @@ fn depth_model_rs(m: &DepthErrModel) -> String {
 }
 
 fn run_quest(rt: &mut Runtime, cmd: &str, seed: u64, base: BaseKind) -> serde_json::Value {
-    rt.test_start(cmd, seed, noto_core::BodyPlan::default(), Some(base)).expect("test starts");
+    rt.test_start(cmd, seed, noto_core::BodyPlan::standard(), Some(base)).expect("test starts");
     let mut guard = 0;
     while rt.test_session().map(|t| t.phase) != Some(noto_runtime::TestPhase::Done) {
         rt.test_advance(400).expect("test advances");

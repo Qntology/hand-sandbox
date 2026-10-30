@@ -251,7 +251,7 @@ mod tests {
 
     #[test]
     fn a_full_bay_of_quest_cargo_makes_a_trip_and_foreign_cargo_refuses() {
-        let mut w = world(BodyPlan::default(), BaseKind::Track, FingerCount::Five);
+        let mut w = world(BodyPlan::standard(), BaseKind::Track, FingerCount::Five);
         let cap = w.capacity_kg();
         let log = ItemKind::Log.spec().mass_kg;
         let n = (cap / log).floor();

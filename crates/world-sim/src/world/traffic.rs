@@ -29,13 +29,34 @@ pub const YIELD_VEHICLE_S: f32 = 3.0;
 pub const DISMOUNT_S: f32 = 3.0;
 pub const REMOUNT_S: f32 = 3.0;
 pub const RIDER_WALK_MPS: f32 = 0.8;
-/// A standing rider's eye height (m) and the radius it keeps others at (m).
-pub const RIDER_EYE_M: f32 = 1.5;
+/// The radius a standing rider keeps others at (m).
 pub const RIDER_R_M: f32 = 0.28;
 /// How far from a node a lift truck stops for its rider to walk over and fell it, and the farthest it may (m): the
 /// tines' tips stay clear of the trunk.
 pub const RIDER_STOP_M: f32 = 1.8;
 pub const RIDER_REACH_M: f32 = 3.5;
+
+/// The distance `RIDER_STOP_M` for this truck: its tine tips and a margin, if they reach further.
+pub fn rider_stop_m(body: &noto_core::balance::Body) -> f32 {
+    RIDER_STOP_M.max(crate::clear::Footprint::of(body).front_m + 0.3)
+}
+
+/// The distance `RIDER_REACH_M` for this truck.
+pub fn rider_reach_m(body: &noto_core::balance::Body) -> f32 {
+    RIDER_REACH_M + rider_stop_m(body) - RIDER_STOP_M
+}
+
+/// The person who rides a truck, on foot.
+pub fn rider_body(body: &noto_core::balance::Body) -> noto_core::balance::Body {
+    use noto_core::{BaseKind, BodyPlan, Morphology};
+    noto_core::balance::Body::new(&BodyPlan { morph: Morphology::humanoid(BaseKind::HumanFoot), ..body.plan }, BaseKind::HumanFoot, body.fingers)
+}
+
+/// A standing rider's eye height (m).
+pub fn rider_eye_m(body: &noto_core::balance::Body) -> f32 {
+    let on_foot = rider_body(body);
+    noto_core::kin::head_camera(&on_foot, &noto_core::kin::KinPose::stand(&on_foot, 0.0)).pos[2]
+}
 /// The id the first worker's dismounted rider goes by among the robots.
 pub const RIDER_ID: u32 = 1000;
 
@@ -112,29 +133,56 @@ impl Rider {
         step >= d - 1e-4
     }
 
-    /// The rider's body as boxes in the world, standing (on foot) at its place.
-    pub fn boxes(&self, ground_m: f32) -> Vec<crate::render::Obb> {
+    /// The rider's body as solids in the world, standing (on foot) at its place: the same person as on the seat.
+    pub fn boxes(&self, ground_m: f32, body: &noto_core::balance::Body) -> Vec<crate::render::Obb> {
+        use noto_core::kin::{self, KinLoads, KinPose};
+        let on_foot = rider_body(body);
+        let links = kin::solve(&on_foot, &KinPose::stand(&on_foot, 0.0), &KinLoads::default()).boxes;
+        let parts = noto_core::rig::dress(&on_foot, &links, &noto_core::rig::Palette { accent: [236, 190, 40], ..Default::default() });
         let (s, c) = self.yaw.sin_cos();
-        let axes = [[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]];
-        let at = |up: f32| [self.x, ground_m + up, self.z];
-        vec![
-            crate::render::Obb { center: at(0.42), axes, half: [0.08, 0.42, 0.11], color: [52, 70, 112] },
-            crate::render::Obb { center: at(1.10), axes, half: [0.10, 0.26, 0.18], color: [214, 92, 40] },
-            crate::render::Obb { center: at(1.47), axes, half: [0.09, 0.11, 0.09], color: [222, 186, 150] },
-            crate::render::Obb { center: at(1.60), axes, half: [0.10, 0.03, 0.10], color: [236, 190, 40] },
-        ]
+        let at = |p: [f32; 3]| [self.x + c * p[0] + s * p[1], ground_m + p[2], self.z + s * p[0] - c * p[1]];
+        let dir = |v: [f32; 3]| [c * v[0] + s * v[1], v[2], s * v[0] - c * v[1]];
+        parts.iter().map(|p| crate::render::Obb::placed(p, at, dir)).collect()
     }
 }
 
-/// A robot as the others see it: a disc on the ground.
+/// A robot as the others see it: its outline on the ground. A lift truck is long and narrow, and a disc round it
+/// would cover the bay it waits at.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct RobotDisc {
+pub struct RobotOutline {
     pub id: u32,
     pub x: f32,
     pub z: f32,
-    pub r: f32,
+    pub yaw: f32,
+    pub front: f32,
+    pub rear: f32,
+    pub half_w: f32,
     pub moving: bool,
     pub humanoid: bool,
+}
+
+impl RobotOutline {
+    /// A round outline, for someone on foot.
+    fn round(id: u32, x: f32, z: f32, r: f32, moving: bool) -> RobotOutline {
+        RobotOutline { id, x, z, yaw: 0.0, front: r, rear: r, half_w: r, moving, humanoid: true }
+    }
+
+    fn of(id: u32, x: f32, z: f32, yaw: f32, fp: crate::clear::Footprint, moving: bool, humanoid: bool) -> RobotOutline {
+        RobotOutline { id, x, z, yaw, front: fp.front_m, rear: fp.rear_m, half_w: fp.half_w_m, moving, humanoid }
+    }
+
+    /// Whether a point lies within `pad` of the outline.
+    pub fn near(&self, p: (f32, f32), pad: f32) -> bool {
+        let (s, c) = self.yaw.sin_cos();
+        let (dx, dz) = (p.0 - self.x, p.1 - self.z);
+        let (along, across) = (dx * c + dz * s, dz * c - dx * s);
+        along <= self.front + pad && along >= -self.rear - pad && across.abs() <= self.half_w + pad
+    }
+
+    /// The farthest the outline reaches from the robot's centre.
+    pub fn reach_m(&self) -> f32 {
+        self.front.max(self.rear).hypot(self.half_w)
+    }
 }
 
 /// The robot looking: where it is, which way it goes and how fast, how wide its way is (half its width) and how far
@@ -173,19 +221,19 @@ impl World {
         fp.half_w_m.max(0.5 * (fp.front_m + fp.rear_m)).max(0.3)
     }
 
-    /// Every robot on the map as a disc: the first worker (and its rider while on foot) and the sub-workers.
-    pub fn robot_discs(&self) -> Vec<RobotDisc> {
+    /// Every robot on the map: the first worker (and its rider while on foot) and the sub-workers.
+    pub fn robot_outlines(&self) -> Vec<RobotOutline> {
         // On the move: going somewhere, even while stopped for another robot (so that two which stopped for each
         // other still tell who gives way).
         let agent_moving = matches!(self.active, Some((_, Active::Move(_))));
-        let mut v = vec![RobotDisc { id: 1, x: self.agent.x, z: self.agent.z, r: self.agent_radius_m(), moving: agent_moving, humanoid: self.body.legged() }];
+        let mut v = vec![RobotOutline::of(1, self.agent.x, self.agent.z, self.agent.yaw, self.footprint(), agent_moving, self.body.legged())];
         if let Some(r) = self.rider.filter(|r| r.off()) {
-            v.push(RobotDisc { id: RIDER_ID, x: r.x, z: r.z, r: RIDER_R_M, moving: !matches!(r.phase, RiderPhase::Mine), humanoid: true });
+            v.push(RobotOutline::round(RIDER_ID, r.x, r.z, RIDER_R_M, !matches!(r.phase, RiderPhase::Mine)));
         }
         for w in &self.crew {
-            v.push(RobotDisc { id: w.id, x: w.x, z: w.z, r: w.radius_m(), moving: matches!(w.job, crate::crew::Job::Go { .. }), humanoid: w.form == crate::crew::Form::Humanoid });
+            v.push(RobotOutline::of(w.id, w.x, w.z, w.yaw, w.footprint, matches!(w.job, crate::crew::Job::Go { .. }), w.form == crate::crew::Form::Humanoid));
             if let Some(r) = w.rider.filter(|r| r.off()) {
-                v.push(RobotDisc { id: RIDER_ID + w.id, x: r.x, z: r.z, r: RIDER_R_M, moving: !matches!(r.phase, RiderPhase::Mine), humanoid: true });
+                v.push(RobotOutline::round(RIDER_ID + w.id, r.x, r.z, RIDER_R_M, !matches!(r.phase, RiderPhase::Mine)));
             }
         }
         v
@@ -241,17 +289,17 @@ impl World {
             // Standing, or no path: only a robot pressing on it.
             samples = vec![(me.at.0, me.at.1, 0.0)];
         }
-        self.robot_discs()
+        self.robot_outlines()
             .into_iter()
             .filter(|o| !own(o.id))
             .filter_map(|o| {
                 let (dx, dz) = (o.x - me.at.0, o.z - me.at.1);
                 let d = dx.hypot(dz);
                 let bearing = wrap_angle(dz.atan2(dx) - me.dir).abs();
-                let touching = d - o.r - me.half_w <= 0.05;
+                let touching = o.near(me.at, me.half_w + 0.05);
                 let seen = (bearing <= half && d <= SIGHT_RANGE_M) || touching;
                 // Bodies that would overlap: the path's points within both half widths of the robot's centre.
-                let hit = samples.iter().find(|s| (s.0 - o.x).hypot(s.1 - o.z) < o.r + me.half_w - 0.05).map(|s| s.2);
+                let hit = samples.iter().find(|s| o.near((s.0, s.1), me.half_w - 0.05)).map(|s| s.2);
                 let hit = hit.or(touching.then_some(0.0).filter(|_| bearing <= half));
                 hit.filter(|_| seen && self.line_of_sight(me.at, (o.x, o.z), me.eye_m.min(1.2))).map(|s| (o.id, s))
             })
@@ -267,21 +315,21 @@ impl World {
     /// `still_robot_cells` with moving robots too when `still_only` is false, widened by `pad`.
     pub fn robot_cells(&self, except: &[u32], keep: Option<(usize, usize)>, pad: f32, still_only: bool) -> HashSet<(usize, usize)> {
         let mut out = HashSet::new();
-        for o in self.robot_discs().into_iter().filter(|o| !except.contains(&o.id) && (!still_only || !o.moving)) {
-            let reach = o.r + pad;
+        for o in self.robot_outlines().into_iter().filter(|o| !except.contains(&o.id) && (!still_only || !o.moving)) {
             let (cx, cz) = match self.terrain.cell_of(o.x, o.z) {
                 Some(c) => c,
                 None => continue,
             };
-            for dz in -2i32..=2 {
-                for dx in -2i32..=2 {
+            let span = ((o.reach_m() + pad) / CELL_M).ceil() as i32 + 1;
+            for dz in -span..=span {
+                for dx in -span..=span {
                     let (x, z) = (cx as i32 + dx, cz as i32 + dz);
                     if x < 0 || z < 0 || x as usize >= self.terrain.w || z as usize >= self.terrain.d {
                         continue;
                     }
                     let c = (x as usize, z as usize);
                     let (px, pz) = crate::terrain::cell_center(c.0, c.1);
-                    if (px - o.x).hypot(pz - o.z) <= reach && Some(c) != keep {
+                    if o.near((px, pz), pad) && Some(c) != keep {
                         out.insert(c);
                     }
                 }
@@ -305,18 +353,18 @@ impl World {
     pub(crate) fn rider_walk(&self, id: u32, r: &mut Rider, dt: f32) -> bool {
         let goal = if r.phase == RiderPhase::WalkOut { r.stand } else { r.seat };
         let to = r.via.unwrap_or(goal);
-        let me = Looker { id, at: (r.x, r.z), dir: (to.1 - r.z).atan2(to.0 - r.x), half_w: RIDER_R_M, front: RIDER_R_M, speed: RIDER_WALK_MPS, eye_m: RIDER_EYE_M };
+        let me = Looker { id, at: (r.x, r.z), dir: (to.1 - r.z).atan2(to.0 - r.x), half_w: RIDER_R_M, front: RIDER_R_M, speed: RIDER_WALK_MPS, eye_m: rider_eye_m(&self.body) };
         let path: Vec<(f32, f32)> = r.via.into_iter().chain(std::iter::once(goal)).collect();
         if let Some((other, _)) = self.robot_in_way(&me, &path) {
             r.held_s += dt;
             if r.held_s >= YIELD_HUMANOID_S {
                 // Step round it on the side nearer the goal.
-                if let Some(o) = self.robot_discs().into_iter().find(|o| o.id == other) {
+                if let Some(o) = self.robot_outlines().into_iter().find(|o| o.id == other) {
                     let (dx, dz) = (goal.0 - r.x, goal.1 - r.z);
                     let n = dx.hypot(dz).max(1e-3);
                     let (px, pz) = (-dz / n, dx / n);
                     let side = if (o.x - r.x) * px + (o.z - r.z) * pz > 0.0 { -1.0 } else { 1.0 };
-                    let off = o.r + RIDER_R_M + 0.3;
+                    let off = o.reach_m() + RIDER_R_M + 0.3;
                     r.via = Some((o.x + px * off * side, o.z + pz * off * side));
                 }
                 r.held_s = 0.0;

@@ -95,11 +95,11 @@ impl<'a> Carrier<'a> {
 }
 
 pub fn carry_hand_z(body: &Body) -> f32 {
-    kin::solve_fast(body, &grasp::hold_pose(true, 0.0), &KinLoads::default()).hands[0][2]
+    kin::solve_fast(body, &grasp::hold_pose(body, true, 0.0), &KinLoads::default()).hands[0][2]
 }
 
 pub fn carry_pose(body: &Body, hand_z: f32) -> KinPose {
-    grasp::arms_to(body, &grasp::hold_pose(true, 0.0), [CARRY_REACH_M, hand_z], true)
+    grasp::arms_to(body, &grasp::hold_pose(body, true, 0.0), [CARRY_REACH_M, hand_z], true)
 }
 
 fn holds_in_hands(name: &str) -> bool {

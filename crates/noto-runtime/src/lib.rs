@@ -15,6 +15,7 @@ pub mod nnlive;
 pub mod perception;
 pub mod precision;
 pub mod record;
+pub mod rigs;
 pub mod runtime;
 pub mod stereo;
 pub mod testrun;

@@ -38,6 +38,9 @@ if /i not "%BACKEND%"=="cpu" (
 set "RUST_BACKTRACE=1"
 cd /d "%~dp0"
 
+rem The app embeds the SolidCraft editor; its web package is not in git. Without it the app runs, but the editor tab says so.
+if /i not "%ACTION%"=="check" if /i not "%ACTION%"=="test" if not exist "uiendor\solidcraft\index.html" call "%~dp0fetch_solidcraft.bat"
+
 if /i "%ACTION%"=="dev" goto :dev
 if /i "%ACTION%"=="build" goto :build
 if /i "%ACTION%"=="check" goto :check

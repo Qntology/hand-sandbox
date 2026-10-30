@@ -168,6 +168,27 @@ pub struct Hand {
     pub base: BaseSpec,
 }
 
+impl Hand {
+    /// This hand on a body `k` times as long: lengths k, joint torque k⁴ (`parts::Actuator::scaled`).
+    pub fn scaled(mut self, k: f32) -> Hand {
+        if k == 1.0 {
+            return self;
+        }
+        self.palm.width *= k;
+        self.palm.length *= k;
+        for f in &mut self.fingers {
+            f.mount = crate::math::Vec3::new(f.mount.x * k, f.mount.y * k, f.mount.z * k);
+            for s in &mut f.segments {
+                *s *= k;
+            }
+            for j in &mut f.joints {
+                j.max_torque *= k.powi(4);
+            }
+        }
+        self
+    }
+}
+
 struct Slot {
     name: &'static str,
     thumb: bool,

@@ -178,7 +178,7 @@ fn normal(seed: u64, a: i32, b: i32) -> f32 {
 
 impl World {
     pub fn standing_eye_m(&self) -> f32 {
-        hkin::head_camera(&self.body, &KinPose::stand(0.0)).pos[2]
+        hkin::head_camera(&self.body, &KinPose::stand(&self.body, 0.0)).pos[2]
     }
 
     /// The body pose the head camera hangs on right now (an act, a step, a held gaze, or standing).
@@ -196,7 +196,7 @@ impl World {
             return (pose, src == noto_core::Source::FootLift);
         }
         let slope = if self.body.legged() { 0.0 } else { self.posture_now().0.slope_deg };
-        (KinPose { base_pitch_deg: slope, ..KinPose::stand(self.carried_kg()) }, false)
+        (KinPose { base_pitch_deg: slope, ..KinPose::stand(&self.body, self.carried_kg()) }, false)
     }
 
     pub fn head_view(&self, cam: &Camera) -> HeadView {
@@ -247,10 +247,11 @@ impl World {
     pub fn rider_view(&self, cam: &Camera, r: &super::traffic::Rider) -> HeadView {
         let ground = self.surface_m(r.x, r.z);
         let tilt = if r.phase == super::traffic::RiderPhase::Mine { 20.0f32 } else { 0.0 };
-        let view = View { origin: [r.x, ground + super::traffic::RIDER_EYE_M, r.z], yaw: r.yaw - cam.pan_deg.to_radians(), pitch: (cam.pitch_deg - tilt).to_radians(), roll: 0.0 };
+        let eye_m = super::traffic::rider_eye_m(&self.body);
+        let view = View { origin: [r.x, ground + eye_m, r.z], yaw: r.yaw - cam.pan_deg.to_radians(), pitch: (cam.pitch_deg - tilt).to_radians(), roll: 0.0 };
         let timing = sensor_timing_at(self.body.head.sensor, self.scene_lux());
         let exposure = Exposure { rate: [0.0; 3], exposure_s: timing.exposure_s, readout_s: timing.readout_s };
-        HeadView { view, exposure, est: view, shake: Shake::still(), eye_m: super::traffic::RIDER_EYE_M, head_pitch_deg: tilt, pan_deg: cam.pan_deg, blur_px: 0.0, tilt_deg: [0.0, 0.0] }
+        HeadView { view, exposure, est: view, shake: Shake::still(), eye_m, head_pitch_deg: tilt, pan_deg: cam.pan_deg, blur_px: 0.0, tilt_deg: [0.0, 0.0] }
     }
 
     /// The fork carriage camera: between the tines, a little above them, looking ahead and down at what the tines
@@ -294,11 +295,11 @@ impl World {
             let u = (self.walk.since_step_m / g.step_m.max(1e-3)).clamp(0.0, 1.0);
             let s = sway(u, self.walk.stance, g.step_s, stab)
                 .add(self.heel_strike(g, ground, t))
-                .add(footfall(seed, gd, g.step_m, self.walk.steps, stab));
+                .add(footfall(seed, gd, g.step_m, self.body.dims.stance_m, self.walk.steps, stab));
             (s, t)
         } else {
             let tracked = matches!(self.body.base, noto_core::BaseKind::Track);
-            let bridge = if tracked { self.body.support_len_m } else { 2.0 * hkin::WHEEL_R_M };
+            let bridge = if tracked { self.body.support_len_m } else { 2.0 * self.body.dims.wheel_r_m };
             (rolling(seed, gd, self.eye.travelled_m, speed, self.body.support_len_m.max(0.2), self.body.support_width_m.max(0.2), bridge), IMU_WINDOW_S)
         }
     }
@@ -314,7 +315,7 @@ impl World {
         let r2 = (GYRATION_SHARE * eye).powi(2);
         let pitch_arm = 0.5 * g.step_m / r2;
         let side = if self.walk.stance == 0 { -1.0 } else { 1.0 };
-        let roll_arm = side * 0.5 * noto_core::parts::STANCE_WIDTH_M / r2;
+        let roll_arm = side * 0.5 * self.body.dims.stance_m / r2;
         Shake { source: "heel_strike", dz_m: x, pitch: pitch_arm * x, roll: roll_arm * x, rate: [v, pitch_arm * v, roll_arm * v] }
     }
 }
@@ -335,7 +336,7 @@ fn sway(u: f32, stance: usize, step_s: f32, stab: f32) -> Shake {
     }
 }
 
-fn footfall(seed: u64, gd: f32, step_m: f32, steps: u32, stab: f32) -> Shake {
+fn footfall(seed: u64, gd: f32, step_m: f32, stance_m: f32, steps: u32, stab: f32) -> Shake {
     let s_now = steps as f32 * step_m;
     let s_last = s_now - step_m;
     let (side_now, side_last) = if steps % 2 == 0 { (0, 1) } else { (1, 0) };
@@ -349,7 +350,7 @@ fn footfall(seed: u64, gd: f32, step_m: f32, steps: u32, stab: f32) -> Shake {
         source: "footfall",
         dz_m: 0.5 * dh,
         pitch: keep * (dh / step_m.max(0.05)).atan() * 0.5,
-        roll: keep * roll_sign * (dh / noto_core::parts::STANCE_WIDTH_M).atan() * 0.5,
+        roll: keep * roll_sign * (dh / stance_m).atan() * 0.5,
         rate: [0.0; 3],
     }
 }
@@ -453,7 +454,7 @@ mod tests {
         assert!(peak(Surface::Firm) > peak(Surface::Grass) && peak(Surface::Grass) > peak(Surface::Sand), "firm {} grass {} sand {}", peak(Surface::Firm), peak(Surface::Grass), peak(Surface::Sand));
         assert_eq!(strike_peak_mps2(Surface::Sand, 0.15), 0.0);
         assert!(strike_peak_mps2(Surface::Firm, 0.15) > 4.0);
-        let tilt = |s: Surface| ((0..400).map(|k| footfall(5, roughness_gd(s), 0.3, k, 0.55).roll.powi(2)).sum::<f32>() / 400.0).sqrt();
+        let tilt = |s: Surface| ((0..400).map(|k| footfall(5, roughness_gd(s), 0.3, noto_core::dims::Dims::COMPACT.stance_m, k, 0.55).roll.powi(2)).sum::<f32>() / 400.0).sqrt();
         assert!(tilt(Surface::Rock) > 4.0 * tilt(Surface::Firm), "rock {} firm {}", tilt(Surface::Rock), tilt(Surface::Firm));
         let roll = |s: Surface| ((0..400).map(|i| rolling(5, roughness_gd(s), i as f32 * 0.07, 1.0, 0.4, 0.35, 0.12).pitch.powi(2)).sum::<f32>() / 400.0).sqrt();
         assert!(roll(Surface::Gravel) > 1.5 * roll(Surface::Firm), "gravel {} firm {}", roll(Surface::Gravel), roll(Surface::Firm));

@@ -1,11 +1,10 @@
 use serde::Serialize;
 
-use crate::balance::{Body, CARGO_X_M, CARGO_Z_M, G, GRIP_SAFETY};
+use crate::balance::{Body, G, GRIP_SAFETY};
 use crate::contact::{self, FingerContact, FingerContacts, PadSurface};
 use crate::hand::Hand;
 use crate::kin::{self, KinLoads, KinPose};
 use crate::math::Vec3;
-use crate::parts::*;
 use crate::sim::{grasp as close_hand, top_grasp, ContactSource, GraspSetup, Payload, TopGrasp};
 use crate::surface::Surface;
 
@@ -16,7 +15,6 @@ use super::{min_jerk, ActEvent, ActKind, ActRollout, ActSample, Draw, Grip, Outc
 pub const LOOP_RISE_S: f32 = 0.35 / 4.0;
 pub const CLOSE_SWING_RAD: f32 = 0.8;
 pub const TIP_LEVER_M: f32 = 0.06;
-pub const BAY_RIM_Z_M: f32 = CARGO_Z_M + 0.08;
 pub const BAY_DROP_M: f32 = 0.03;
 pub const LIFT_SLOWEST_S: f32 = 3.0;
 pub const MIN_JERK_ACC: f32 = 5.77;
@@ -277,15 +275,15 @@ impl GripCtl {
     }
 }
 
-pub fn hold_pose(two_arms: bool, cargo_kg: f32) -> KinPose {
-    KinPose { shoulder_deg: [30.0, if two_arms { 30.0 } else { 0.0 }], elbow_deg: [60.0, if two_arms { 60.0 } else { 10.0 }], closure: 1.0, ..KinPose::stand(cargo_kg) }
+pub fn hold_pose(body: &Body, two_arms: bool, cargo_kg: f32) -> KinPose {
+    KinPose { shoulder_deg: [30.0, if two_arms { 30.0 } else { 0.0 }], elbow_deg: [60.0, if two_arms { 60.0 } else { 10.0 }], closure: 1.0, ..KinPose::stand(body, cargo_kg) }
 }
 
 pub fn hold_pose_for(body: &Body, two_arms: bool, cargo_kg: f32) -> KinPose {
     if body.deck_arms() {
         return KinPose { closure: 1.0, ..body.stand(cargo_kg) };
     }
-    let hold = hold_pose(two_arms, cargo_kg);
+    let hold = hold_pose(body, two_arms, cargo_kg);
     if body.mast_arms() {
         if let Some(s) = stow_pose(body, two_arms, cargo_kg) {
             return KinPose { lift_m: s.lift_m, ..hold };
@@ -306,8 +304,8 @@ pub fn arms_to(body: &Body, p: &KinPose, at: [f32; 2], two_arms: bool) -> KinPos
     let mut out = *p;
     let sh = reach::shoulder_point(body, p);
     let (dx, dz) = (at[0] - sh[0], at[1] - sh[1]);
-    let k = ((UPPER_ARM_M + FOREARM_M + kin::PALM_OFFSET_M - 0.002) / (dx * dx + dz * dz).sqrt().max(1e-6)).min(1.0);
-    if let Some((sd, ed)) = reach::arm_ik(sh, [sh[0] + dx * k, sh[1] + dz * k], p.trunk_deg()) {
+    let k = ((body.dims.upper_arm_m + body.dims.forearm_m + body.dims.palm_m - 0.002) / (dx * dx + dz * dz).sqrt().max(1e-6)).min(1.0);
+    if let Some((sd, ed)) = reach::arm_ik(&body.dims, sh, [sh[0] + dx * k, sh[1] + dz * k], p.trunk_deg()) {
         for &k in holding_arms(two_arms) {
             out.shoulder_deg[k] = sd;
             out.elbow_deg[k] = ed;
@@ -319,14 +317,14 @@ pub fn arms_to(body: &Body, p: &KinPose, at: [f32; 2], two_arms: bool) -> KinPos
 pub fn arms_to3(body: &Body, p: &KinPose, at: [f32; 3], two_arms: bool) -> KinPose {
     let mut out = *p;
     let sh = reach::shoulder_point(body, p);
-    let len = UPPER_ARM_M + FOREARM_M + kin::PALM_OFFSET_M - 0.002;
+    let len = body.dims.upper_arm_m + body.dims.forearm_m + body.dims.palm_m - 0.002;
     for &k in holding_arms(two_arms) {
         let (sy, ty) = (body.shoulder_mount(k)[1], if k == 0 { at[1] } else { -at[1] });
         let s3 = [sh[0], sy, sh[1]];
         let d = [at[0] - s3[0], ty - s3[1], at[2] - s3[2]];
         let n = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-6);
         let f = (len / n).min(1.0);
-        if let Some((sd, ed, ad)) = reach::arm_ik3(s3, [s3[0] + d[0] * f, s3[1] + d[1] * f, s3[2] + d[2] * f], p.trunk_deg(), k) {
+        if let Some((sd, ed, ad)) = reach::arm_ik3(&body.dims, s3, [s3[0] + d[0] * f, s3[1] + d[1] * f, s3[2] + d[2] * f], p.trunk_deg(), k) {
             out.shoulder_deg[k] = sd;
             out.elbow_deg[k] = ed;
             out.shoulder_abd_deg[k] = ad;
@@ -378,23 +376,23 @@ impl LiftPath {
     }
 }
 
-pub fn bay_pose(two_arms: bool, cargo_kg: f32) -> KinPose {
-    let target = [CARGO_X_M + 0.12, BAY_RIM_Z_M + BAY_DROP_M + 0.05];
-    let (sd, ed) = reach::arm_ik([0.0, SHOULDER_M], target, 0.0).unwrap_or((30.0, 60.0));
-    KinPose { shoulder_deg: [sd, if two_arms { sd } else { 0.0 }], elbow_deg: [ed, if two_arms { ed } else { 10.0 }], closure: 1.0, ..KinPose::stand(cargo_kg) }
+pub fn bay_pose(body: &Body, two_arms: bool, cargo_kg: f32) -> KinPose {
+    let target = [body.dims.cargo_x_m + 0.12, body.dims.cargo_z_m() + 0.08 + BAY_DROP_M + 0.05];
+    let (sd, ed) = reach::arm_ik(&body.dims, [0.0, body.dims.shoulder_m], target, 0.0).unwrap_or((30.0, 60.0));
+    KinPose { shoulder_deg: [sd, if two_arms { sd } else { 0.0 }], elbow_deg: [ed, if two_arms { ed } else { 10.0 }], closure: 1.0, ..KinPose::stand(body, cargo_kg) }
 }
 
 pub fn stow_pose(body: &Body, two_arms: bool, cargo_kg: f32) -> Option<KinPose> {
     let c = body.cargo_geom()?;
     if c.on_pelvis {
-        return Some(bay_pose(two_arms, cargo_kg));
+        return Some(bay_pose(body, two_arms, cargo_kg));
     }
     let stand = body.stand(cargo_kg);
     let lift_max = kin::Rom::of(body).lift_max_m;
     let n = if lift_max > 0.0 { 40 } else { 0 };
     (0..=n).find_map(|i| {
         let mut p = KinPose { lift_m: if n == 0 { 0.0 } else { lift_max * i as f32 / n as f32 }, closure: 1.0, ..stand };
-        let (sd, ed) = reach::arm_ik(reach::shoulder_point(body, &p), c.release, p.trunk_deg())?;
+        let (sd, ed) = reach::arm_ik(&body.dims, reach::shoulder_point(body, &p), c.release, p.trunk_deg())?;
         for &k in holding_arms(two_arms) {
             p.shoulder_deg[k] = sd;
             p.elbow_deg[k] = ed;
@@ -1009,12 +1007,13 @@ fn grasp_hold_low(body: &Body, cargo_kg: f32) -> KinPose {
     if body.deck_arms() {
         return body.stand(cargo_kg);
     }
-    KinPose { shoulder_deg: [15.0, 0.0], elbow_deg: [5.0, 10.0], ..KinPose::stand(cargo_kg) }
+    KinPose { shoulder_deg: [15.0, 0.0], elbow_deg: [5.0, 10.0], ..KinPose::stand(body, cargo_kg) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parts::BodyPlan;
     use crate::base::BaseKind;
     use crate::hand::{FingerCount, NotoConfig};
 

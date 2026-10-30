@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use noto_core::rig::{self, Palette, Solid, VisualPart};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -243,7 +244,6 @@ struct Scene<'a> {
 const SKY_TOP: [f32; 3] = [112.0, 168.0, 232.0];
 const SKY_HORIZON: [f32; 3] = [200.0, 222.0, 240.0];
 const CURB_YELLOW: [u8; 3] = [232, 196, 48];
-const FORK_YELLOW: [u8; 3] = [236, 172, 36];
 
 pub fn segment_color(s: noto_core::Segment) -> [u8; 3] {
     use noto_core::Segment;
@@ -259,7 +259,7 @@ pub fn segment_color(s: noto_core::Segment) -> [u8; 3] {
 }
 const CURB_DARK: [u8; 3] = [48, 48, 52];
 const STONE: [u8; 3] = [120, 120, 124];
-const MAX_OBJECT_TOP_M: f32 = 1.7;
+const MAX_OBJECT_TOP_M: f32 = 5.2;
 const WATER_DROP_M: f32 = 0.06;
 
 fn bx(cx: f32, cz: f32, y0: f32, y1: f32, hw: f32, hd: f32) -> Aabb {
@@ -287,8 +287,11 @@ impl<'a> Scene<'a> {
             let spec = n.kind.spec();
             match n.kind {
                 NodeKind::Tree => {
-                    s.add(cx, cz, Prim { aabb: bx(x, z, g, g + 1.0, 0.10, 0.10), id, color: spec.color, style: Style::Plain });
-                    s.add(cx, cz, Prim { aabb: bx(x, z, g + 0.8, g + 1.6, 0.24, 0.24), id, color: [58, 122, 52], style: Style::Leaves });
+                    // A young pine [추정]: the crown starts above a lift truck's guard, so the trunk is what stands in the way.
+                    s.add(cx, cz, Prim { aabb: bx(x, z, g, g + 2.9, 0.14, 0.14), id, color: spec.color, style: Style::Plain });
+                    for (y0, y1, half) in [(2.35, 3.25, 1.05), (3.25, 4.05, 0.80), (4.05, 4.70, 0.46)] {
+                        s.add_spanning(cx, cz, Prim { aabb: bx(x, z, g + y0, g + y1, half, half), id, color: [58, 122, 52], style: Style::Leaves });
+                    }
                 }
                 NodeKind::Boulder => {
                     s.add(cx, cz, Prim { aabb: bx(x, z, g, g + 0.40, 0.24, 0.24), id, color: spec.color, style: Style::Plain });
@@ -594,6 +597,30 @@ fn sky(dir_y: f32) -> [f32; 3] {
     mix(SKY_HORIZON, SKY_TOP, dir_y.clamp(0.0, 1.0).sqrt())
 }
 
+/// Bilinear noise over a unit lattice, in -0.5…0.5.
+fn lattice_noise(seed: u64, x: f32, y: f32) -> f32 {
+    let (x0, y0) = (x.floor(), y.floor());
+    let (fx, fy) = (x - x0, y - y0);
+    let at = |dx: i32, dy: i32| (hash2(seed, x0 as i32 + dx, y0 as i32 + dy) & 0xFFFF) as f32 / 65535.0 - 0.5;
+    let (a, b) = (at(0, 0) + (at(1, 0) - at(0, 0)) * fx, at(0, 1) + (at(1, 1) - at(0, 1)) * fx);
+    a + (b - a) * fy
+}
+
+/// Grain finer than the texels: the soil, bark and paint a camera resolves up close. It sits on the surface, so both
+/// eyes of a stereo pair see the same grain, and it fades out where it would fall under a pixel at this distance
+/// (a pixel of the 274 px head camera covers `t` / 274 m) and turn into noise different in each eye.
+fn grain(u: f32, v: f32, t: f32, seed: u64) -> f32 {
+    let mut sum = 0.0;
+    for (per_m, amp, salt) in [(180.0f32, 0.09f32, 0x1Du64), (64.0, 0.11, 0x51), (26.0, 0.08, 0xA7)] {
+        let px = 274.0 / (per_m * t.max(0.05));
+        let keep = ((px - 0.8) / 0.8).clamp(0.0, 1.0);
+        if keep > 0.0 {
+            sum += keep * amp * lattice_noise(seed ^ salt, u * per_m, v * per_m);
+        }
+    }
+    sum
+}
+
 fn surface(hit: &Hit, p: [f32; 3], seed: u64) -> ([f32; 3], f32) {
     let (u, v) = match hit.axis {
         1 => (p[0], p[2]),
@@ -602,7 +629,7 @@ fn surface(hit: &Hit, p: [f32; 3], seed: u64) -> ([f32; 3], f32) {
     };
     let (tu, tv) = ((u * 16.0).floor() as i32, (v * 16.0).floor() as i32);
     let h = hash2(seed ^ (hit.id as u64).wrapping_mul(0x9E37) ^ hit.axis as u64, tu, tv);
-    let noise = ((h & 0xFF) as f32 / 255.0 - 0.5) * 0.14;
+    let noise = ((h & 0xFF) as f32 / 255.0 - 0.5) * 0.14 + grain(u, v, hit.t, seed ^ (hit.axis as u64) << 3);
 
     let mut c = [hit.color[0] as f32, hit.color[1] as f32, hit.color[2] as f32];
     match hit.style {
@@ -754,12 +781,12 @@ fn render_shifted(world: &World, cam: &Camera, right_m: f32) -> Frame {
     }
     if world.fork_cam && noto_core::act::fork::applies(&world.body) {
         let casters = world.shadow_casters();
-        return render_rays(world, cam, &Rays::Pinhole { view: hv.view, exposure: hv.exposure }, &world.fork_boxes(), &casters, None);
+        return render_rays(world, cam, &Rays::Pinhole { view: hv.view, exposure: hv.exposure }, &world.fork_front_boxes(), &casters, None);
     }
     if world.rider.is_some_and(|r| r.off()) {
         // The rider on foot: the head camera sees the truck it stepped down from.
         let casters = world.shadow_casters();
-        return render_rays(world, cam, &Rays::Pinhole { view: hv.view, exposure: hv.exposure }, &world.fork_boxes(), &casters, None);
+        return render_rays(world, cam, &Rays::Pinhole { view: hv.view, exposure: hv.exposure }, &world.fork_front_boxes(), &casters, None);
     }
     // What the eyes look down at of the body's own: the tines and their load, or the item in the hands.
     let own: Vec<Obb> = if world.rider_sees_forks() { world.fork_front_boxes() } else { world.hand_load_boxes() };
@@ -835,39 +862,110 @@ fn motion_blur(f: &mut Frame, cam: &Camera, view: &View, exp: &Exposure) {
     });
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// A solid of a robot or what it carries, oriented in the world: a box, a cylinder or capsule round `axes[2]`, or a
+/// design's triangles (`noto_core::rig::Solid`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Obb {
     pub center: [f32; 3],
     pub axes: [[f32; 3]; 3],
     pub half: [f32; 3],
     pub color: [u8; 3],
+    pub solid: Solid,
+}
+
+fn hit_box(o: [f32; 3], d: [f32; 3], half: [f32; 3]) -> Option<(f32, [f32; 3])> {
+    let (mut t0, mut t1, mut axis) = (f32::NEG_INFINITY, f32::INFINITY, 0usize);
+    for k in 0..3 {
+        if d[k].abs() < 1e-9 {
+            if o[k].abs() > half[k] {
+                return None;
+            }
+            continue;
+        }
+        let (a, b) = ((-half[k] - o[k]) / d[k], (half[k] - o[k]) / d[k]);
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        if lo > t0 {
+            t0 = lo;
+            axis = k;
+        }
+        t1 = t1.min(hi);
+        if t0 > t1 {
+            return None;
+        }
+    }
+    if !(t1 > 0.0 && t0 > 0.0) {
+        return None;
+    }
+    let mut n = [0.0; 3];
+    n[axis] = if d[axis] > 0.0 { -1.0 } else { 1.0 };
+    Some((t0, n))
+}
+
+/// The nearer crossing of the round side (about local z, radius `r`) within `|z| <= h`, outside it.
+fn hit_side(o: [f32; 3], d: [f32; 3], r: f32, h: f32) -> Option<(f32, [f32; 3])> {
+    let a = d[0] * d[0] + d[1] * d[1];
+    if a < 1e-12 {
+        return None;
+    }
+    let b = o[0] * d[0] + o[1] * d[1];
+    let disc = b * b - a * (o[0] * o[0] + o[1] * o[1] - r * r);
+    if disc < 0.0 {
+        return None;
+    }
+    let t = (-b - disc.sqrt()) / a;
+    let z = o[2] + t * d[2];
+    (t > 0.0 && z.abs() <= h).then(|| (t, [(o[0] + t * d[0]) / r, (o[1] + t * d[1]) / r, 0.0]))
+}
+
+fn hit_cylinder(o: [f32; 3], d: [f32; 3], r: f32, h: f32) -> Option<(f32, [f32; 3])> {
+    if let Some(s) = hit_side(o, d, r, h) {
+        return Some(s);
+    }
+    if d[2].abs() < 1e-9 {
+        return None;
+    }
+    let side = if d[2] > 0.0 { -1.0 } else { 1.0 };
+    let t = (side * h - o[2]) / d[2];
+    let (x, y) = (o[0] + t * d[0], o[1] + t * d[1]);
+    (t > 0.0 && x * x + y * y <= r * r).then_some((t, [0.0, 0.0, side]))
+}
+
+fn hit_ball(o: [f32; 3], d: [f32; 3], z: f32, r: f32) -> Option<(f32, [f32; 3])> {
+    let c = [o[0], o[1], o[2] - z];
+    let b = c[0] * d[0] + c[1] * d[1] + c[2] * d[2];
+    let disc = b * b - (c[0] * c[0] + c[1] * c[1] + c[2] * c[2] - r * r);
+    if disc < 0.0 {
+        return None;
+    }
+    let t = -b - disc.sqrt();
+    (t > 0.0).then(|| (t, [(c[0] + t * d[0]) / r, (c[1] + t * d[1]) / r, (c[2] + t * d[2]) / r]))
+}
+
+fn hit_capsule(o: [f32; 3], d: [f32; 3], r: f32, h: f32) -> Option<(f32, [f32; 3])> {
+    [hit_side(o, d, r, h), hit_ball(o, d, h, r), hit_ball(o, d, -h, r)].into_iter().flatten().min_by(|a, b| a.0.total_cmp(&b.0))
 }
 
 impl Obb {
-    fn hit(&self, o: [f32; 3], d: [f32; 3]) -> Option<(f32, usize)> {
+    /// A part in the body frame, placed by `at` (a point) and `dir` (a direction).
+    pub fn placed(p: &VisualPart, at: impl Fn([f32; 3]) -> [f32; 3], dir: impl Fn([f32; 3]) -> [f32; 3]) -> Obb {
+        Obb { center: at(p.center), axes: p.axes.map(dir), half: p.half, color: p.color, solid: p.solid }
+    }
+
+    /// Where the ray first meets the solid, from outside: the distance and the normal in the solid's own axes.
+    fn hit(&self, o: [f32; 3], d: [f32; 3]) -> Option<(f32, [f32; 3])> {
         let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
         let rel = [o[0] - self.center[0], o[1] - self.center[1], o[2] - self.center[2]];
-        let (mut t0, mut t1, mut axis) = (f32::NEG_INFINITY, f32::INFINITY, 0usize);
-        for k in 0..3 {
-            let (ok, dk) = (dot(self.axes[k], rel), dot(self.axes[k], d));
-            if dk.abs() < 1e-9 {
-                if ok.abs() > self.half[k] {
-                    return None;
-                }
-                continue;
-            }
-            let (a, b) = ((-self.half[k] - ok) / dk, (self.half[k] - ok) / dk);
-            let (lo, hi) = if a < b { (a, b) } else { (b, a) };
-            if lo > t0 {
-                t0 = lo;
-                axis = k;
-            }
-            t1 = t1.min(hi);
-            if t0 > t1 {
-                return None;
-            }
+        let (lo, ld) = (self.axes.map(|a| dot(a, rel)), self.axes.map(|a| dot(a, d)));
+        match self.solid {
+            Solid::Box => hit_box(lo, ld, self.half),
+            Solid::Cylinder => hit_cylinder(lo, ld, self.half[0], self.half[2]),
+            Solid::Capsule => hit_capsule(lo, ld, self.half[0], self.half[2]),
+            Solid::Mesh(id) => hit_box(lo, ld, self.half).and(noto_core::rig::mesh(id)).and_then(|m| m.hit(lo, ld)),
         }
-        (t1 > 0.0 && t0 > 0.0).then_some((t0, axis))
+    }
+
+    fn bound_r(&self) -> f32 {
+        (self.half[0] * self.half[0] + self.half[1] * self.half[1] + self.half[2] * self.half[2]).sqrt() + if self.solid == Solid::Capsule { self.half[0] } else { 0.0 }
     }
 }
 
@@ -967,9 +1065,42 @@ pub enum Rays {
     Ortho { centre: [f32; 3], yaw: f32, pitch: f32, half_h_m: f32 },
 }
 
+/// A run of a robot's solids and a ball round them: a ray that misses the ball skips the run.
+struct Bound {
+    centre: [f32; 3],
+    r2: f32,
+    parts: std::ops::Range<usize>,
+}
+
+fn bounds_of(robot: &[Obb]) -> Vec<Bound> {
+    const RUN: usize = 24;
+    let mut v = Vec::with_capacity(robot.len() / RUN + 1);
+    for (i, run) in robot.chunks(RUN).enumerate() {
+        let mut c = [0.0f32; 3];
+        for b in run {
+            for k in 0..3 {
+                c[k] += b.center[k] / run.len() as f32;
+            }
+        }
+        let r = run.iter().map(|b| ((b.center[0] - c[0]).powi(2) + (b.center[1] - c[1]).powi(2) + (b.center[2] - c[2]).powi(2)).sqrt() + b.bound_r()).fold(0.0f32, f32::max);
+        v.push(Bound { centre: c, r2: r * r, parts: i * RUN..i * RUN + run.len() });
+    }
+    v
+}
+
+impl Bound {
+    fn missed_by(&self, o: [f32; 3], d: [f32; 3]) -> bool {
+        let v = [self.centre[0] - o[0], self.centre[1] - o[1], self.centre[2] - o[2]];
+        let along = v[0] * d[0] + v[1] * d[1] + v[2] * d[2];
+        let d2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+        (along < 0.0 && d2 > self.r2) || d2 - along * along > self.r2
+    }
+}
+
 struct Pass<'a> {
     scene: &'a Scene<'a>,
     robot: &'a [Obb],
+    bounds: Vec<Bound>,
     casters: Casters<'a>,
     cut: Option<&'a Cutaway>,
     day: Option<Daylight>,
@@ -981,15 +1112,13 @@ struct Pass<'a> {
 impl Pass<'_> {
     fn cast(&self, o: [f32; 3], d: [f32; 3], along: f32) -> ([u8; 3], u32, f32) {
         let world_hit = trace_cut(self.scene, o, d, self.max_dist, self.cut);
-        let body = self.robot.iter().filter_map(|b| b.hit(o, d).map(|(t, ax)| (t, ax, b))).min_by(|a, b| a.0.total_cmp(&b.0));
-        if let Some((t, ax, b)) = body.filter(|(t, _, _)| world_hit.as_ref().map_or(true, |h| *t < h.t)) {
+        let body = self.bounds.iter().filter(|b| !b.missed_by(o, d)).flat_map(|b| &self.robot[b.parts.clone()]).filter_map(|b| b.hit(o, d).map(|(t, n)| (t, n, b))).min_by(|a, b| a.0.total_cmp(&b.0));
+        if let Some((t, l, b)) = body.filter(|(t, _, _)| world_hit.as_ref().map_or(true, |h| *t < h.t)) {
             let dim = 1.0 - 0.25 * (t / self.fog_dist).clamp(0.0, 1.0);
             let k = match &self.day {
-                None => [[1.0, 0.86, 0.72][ax] * dim; 3],
+                None => [(l[0] * l[0] + 0.86 * l[1] * l[1] + 0.72 * l[2] * l[2]) * dim; 3],
                 Some(day) => {
-                    let a = b.axes[ax];
-                    let s = if a[0] * d[0] + a[1] * d[1] + a[2] * d[2] > 0.0 { -1.0 } else { 1.0 };
-                    let n = [a[0] * s, a[1] * s, a[2] * s];
+                    let n = [0, 1, 2].map(|i| b.axes[0][i] * l[0] + b.axes[1][i] * l[1] + b.axes[2][i] * l[2]);
                     let p = [o[0] + d[0] * t, o[1] + d[1] * t, o[2] + d[2] * t];
                     let g = day.face_gain(n, sunlit(self.scene, day, p, n, &self.casters));
                     [g[0] * dim, g[1] * dim, g[2] * dim]
@@ -1045,7 +1174,7 @@ pub fn render_rays(world: &World, cam: &Camera, rays: &Rays, robot: &[Obb], cast
     };
     let day = world.cfg.lighting.daylight();
     let casters = Casters::new(if day.is_some() { [robot, casters] } else { [&[], &[]] });
-    let pass = Pass { scene: &scene, robot, casters, cut, day, max_dist, fog_dist, seed: world.cfg.seed };
+    let pass = Pass { scene: &scene, robot, bounds: bounds_of(robot), casters, cut, day, max_dist, fog_dist, seed: world.cfg.seed };
 
     let mut rgb = vec![0u8; w * h * 3];
     let mut ids = vec![0u32; w * h];
@@ -1166,16 +1295,7 @@ impl World {
     }
 
     pub fn robot_boxes(&self, pose: &noto_core::dynamics::BodyPose) -> Vec<Obb> {
-        let mut v: Vec<Obb> = self
-            .shown_boxes(pose)
-            .map(|b| Obb {
-                center: self.body_to_world(b.center),
-                axes: [self.body_dir_to_world(b.axes[0]), self.body_dir_to_world(b.axes[1]), self.body_dir_to_world(b.axes[2])],
-                half: b.half,
-                color: segment_color(b.segment),
-            })
-            .collect();
-        v.extend(self.fork_boxes());
+        let mut v: Vec<Obb> = self.robot_parts(pose).iter().map(|p| Obb::placed(p, |c| self.body_to_world(c), |a| self.body_dir_to_world(a))).collect();
         v.extend(self.hand_load_boxes());
         v
     }
@@ -1183,55 +1303,33 @@ impl World {
     /// The item in the hands (`hand_load`) as a box in the world.
     pub fn hand_load_boxes(&self) -> Vec<Obb> {
         let axes = [self.body_dir_to_world([1.0, 0.0, 0.0]), self.body_dir_to_world([0.0, 1.0, 0.0]), self.body_dir_to_world([0.0, 0.0, 1.0])];
-        self.hand_load().map(|(k, size, c)| Obb { center: self.body_to_world(c), axes, half: [0.5 * size[0], 0.5 * size[2], 0.5 * size[1]], color: k.spec().color }).into_iter().collect()
+        self.hand_load().map(|(k, size, c)| Obb { center: self.body_to_world(c), axes, half: [0.5 * size[0], 0.5 * size[2], 0.5 * size[1]], color: k.spec().color, solid: Solid::Box }).into_iter().collect()
     }
 
-    /// The body's own boxes that are drawn: all of them on legs; on wheels and tracks only the chassis, wheels and
-    /// tracks, since the rest of the base is drawn as a lift truck (`fork_parts`).
-    pub fn shown_boxes<'a>(&self, pose: &'a noto_core::dynamics::BodyPose) -> impl Iterator<Item = &'a noto_core::dynamics::LinkBox> {
-        let truck = noto_core::act::fork::applies(&self.body);
-        pose.boxes.iter().filter(move |b| !truck || matches!(b.name, "chassis" | "wheel" | "track"))
+    /// The first worker's outside in the body frame: dressed links on legs; on wheels and tracks the lift truck, its
+    /// rider when aboard, the mast and tines and what rides on them.
+    pub fn robot_parts(&self, pose: &noto_core::dynamics::BodyPose) -> Vec<VisualPart> {
+        let palette = Palette::default();
+        if !noto_core::act::fork::applies(&self.body) {
+            return rig::dress(&self.body, &pose.boxes, &palette);
+        }
+        let mut v = rig::truck_parts(&self.body, &palette);
+        if !self.rider.is_some_and(|r| r.off()) {
+            v.extend(rig::rider_parts(&self.body, &self.current_kin_pose(), &palette));
+        }
+        v.extend(self.fork_front_parts());
+        v
     }
 
-    /// The lift truck of a wheeled or tracked base (body, counterweight, seat and rider, overhead guard), its mast,
-    /// carriage and tines, and the load riding on the tines, as (centre in the body frame, box axes in the body frame,
-    /// half sizes along them, colour). The rider leans and bends the head as the head camera does.
-    pub fn fork_parts(&self) -> Vec<([f32; 3], [[f32; 3]; 3], [f32; 3], [u8; 3])> {
-        self.fork_parts_with(true)
-    }
-
-    /// `fork_parts`, without the truck and its rider when `truck` is false: the mast, carriage, tines and load alone.
-    fn fork_parts_with(&self, truck: bool) -> Vec<([f32; 3], [[f32; 3]; 3], [f32; 3], [u8; 3])> {
+    /// The mast, carriage, tines and load, in the body frame.
+    fn fork_front_parts(&self) -> Vec<VisualPart> {
         if !noto_core::act::fork::applies(&self.body) {
             return Vec::new();
         }
-        let eye = self.standing_eye_m();
+        let mut v = rig::fork_parts(&self.body, self.fork_m_now());
         let level = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-        let mut body = if truck { noto_core::act::fork::truck_boxes_posed(&self.body, eye, &self.current_kin_pose()) } else { Vec::new() };
-        if self.rider.is_some_and(|r| r.off()) {
-            body.retain(|b| !b.name.starts_with("rider_"));
-        }
-        let mut v: Vec<([f32; 3], [[f32; 3]; 3], [f32; 3], [u8; 3])> = body
-            .iter()
-            .chain(noto_core::act::fork::boxes(&self.body, self.fork_m_now()).iter())
-            .map(|b| {
-                let color = match b.name {
-                    "truck_body" | "truck_cab" | "truck_dash" | "rider_helmet" => FORK_YELLOW,
-                    "truck_counterweight" => [58, 60, 66],
-                    "truck_seat" | "truck_steer" => [30, 30, 34],
-                    "truck_roof" | "truck_guard" => [44, 46, 52],
-                    "rider_torso" | "rider_arm" => [214, 92, 40],
-                    "rider_leg" => [52, 70, 112],
-                    "rider_head" => [222, 186, 150],
-                    "fork_tine" => [64, 66, 72],
-                    "fork_carriage" => [52, 54, 60],
-                    _ => [96, 100, 110],
-                };
-                (b.center, b.axes, b.half, color)
-            })
-            .collect();
         for (k, size, c) in self.fork_load() {
-            v.push((c, level, [0.5 * size[0], 0.5 * size[2], 0.5 * size[1]], k.spec().color));
+            v.push(VisualPart { solid: Solid::Box, center: c, axes: level, half: [0.5 * size[0], 0.5 * size[2], 0.5 * size[1]], color: k.spec().color });
         }
         v
     }
@@ -1240,12 +1338,8 @@ impl World {
     pub fn rider_boxes(&self, origin: Option<[f32; 3]>) -> Vec<Obb> {
         let mine = |x: f32, z: f32| origin.is_some_and(|o| (o[0] - x).hypot(o[2] - z) < 0.3);
         let riders = self.rider.iter().chain(self.crew.iter().filter_map(|w| w.rider.as_ref()));
-        riders.filter(|r| r.off() && !mine(r.x, r.z)).flat_map(|r| r.boxes(self.surface_m(r.x, r.z))).collect()
-    }
-
-    /// `fork_parts` in the world.
-    pub fn fork_boxes(&self) -> Vec<Obb> {
-        self.fork_parts().into_iter().map(|(c, axes, half, color)| Obb { center: self.body_to_world(c), axes: axes.map(|a| self.body_dir_to_world(a)), half, color }).collect()
+        let body = &self.body;
+        riders.filter(|r| r.off() && !mine(r.x, r.z)).flat_map(|r| r.boxes(self.surface_m(r.x, r.z), body)).collect()
     }
 
     /// Whether the rider of a lift truck is looking down over the dashboard at the tines (a fork act's look or
@@ -1256,9 +1350,9 @@ impl World {
             && matches!(self.act_phase(), Some((noto_core::act::ActKind::Fork, "rider_look" | "rider_check" | "recheck_look" | "recheck" | "seat" | "raise")))
     }
 
-    /// The mast, carriage, tines and load in the world, as the rider sees them looking down at the tines.
+    /// The mast, carriage, tines and load in the world, as the rider and the carriage camera see them.
     pub fn fork_front_boxes(&self) -> Vec<Obb> {
-        self.fork_parts_with(false).into_iter().map(|(c, axes, half, color)| Obb { center: self.body_to_world(c), axes: axes.map(|a| self.body_dir_to_world(a)), half, color }).collect()
+        self.fork_front_parts().iter().map(|p| Obb::placed(p, |c| self.body_to_world(c), |a| self.body_dir_to_world(a))).collect()
     }
 
     pub fn shadow_casters(&self) -> Vec<Obb> {
@@ -1273,7 +1367,7 @@ impl World {
         if !at_rest {
             return self.body_pose();
         }
-        let stand = noto_core::kin::KinPose::stand(self.carried_kg());
+        let stand = noto_core::kin::KinPose::stand(&self.body, self.carried_kg());
         Some(noto_core::kin::solve(&self.body, &stand, &noto_core::kin::KinLoads::default()).body_pose(0.0, noto_core::Source::Quiet))
     }
 }
@@ -1451,7 +1545,7 @@ mod tests {
                 let (class, id) = unpack_id(f.ids[j * f.width + i]);
                 if class == ObjectClass::Node && id == 5 {
                     let (x, z) = cam.world_point_in(&view, i as f32 + 0.5, j as f32 + 0.5, f.depth[j * f.width + i]).unwrap();
-                    assert!((x - nx).abs() <= CELL_M * 0.5 + 0.02 && (z - nz).abs() <= CELL_M * 0.5 + 0.02, "({x},{z}) not on cell ({nx},{nz})");
+                    assert!((x - nx).abs() <= 1.1 && (z - nz).abs() <= 1.1, "({x},{z}) not under the crown of ({nx},{nz})");
                     checked += 1;
                 }
             }
@@ -1527,12 +1621,12 @@ mod tests {
         let mut w = world();
         w.agent.yaw = 0.0;
         let (ax, az) = (w.agent.x, w.agent.z);
-        for (id, dx) in [(80u32, 1.6f32), (81, 3.6)] {
+        for (id, dx) in [(80u32, 2.6f32), (81, 4.6)] {
             let (cx, cz) = w.terrain.cell_of(ax + dx, az).unwrap();
             let (x, z) = cell_center(cx, cz);
             w.nodes.push(crate::world::Node { id, kind: NodeKind::Boulder, x, z, hp: 7.5, max_hp: 7.5 });
         }
-        let f = render(&w, &Camera { width: 160, height: 96, pitch_deg: -3.0, ..Camera::default() });
+        let f = render(&w, &Camera { width: 160, height: 96, pitch_deg: -20.0, ..Camera::default() });
         let seen = visible_objects(&w, &f);
         let near = seen.iter().find(|o| o.entity == "n80").expect("near boulder");
         let far = seen.iter().find(|o| o.entity == "n81");
@@ -1606,7 +1700,7 @@ mod tests {
             let (cx, cz) = w.terrain.cell_of(w.agent.x + 1.5, w.agent.z).unwrap();
             let (x, z) = cell_center(cx, cz);
             w.nodes.push(crate::world::Node { id, kind, x, z, hp: 1.0, max_hp: 1.0 });
-            let f = render(&w, &Camera { width: 128, height: 96, pitch_deg: -3.0, ..Camera::default() });
+            let f = render(&w, &Camera { width: 128, height: 96, pitch_deg: -32.0, ..Camera::default() });
             let (mut s, mut n) = ([0f64; 3], 0f64);
             for (i, &v) in f.ids.iter().enumerate() {
                 if v == pack_id(ObjectClass::Node, id) {
@@ -1735,29 +1829,23 @@ mod tests {
     }
 
     #[test]
-    fn flat_lighting_renders_the_pixels_of_v09() {
+    fn flat_lighting_keeps_its_pixels() {
+        // v1.5: full-size trees and logs, the grain on every surface, the robot drawn from `noto_core::rig`.
         let want: [(&str, u64); 7] = [
-            // "rest", "turn", "rugged" and "chase" show an item lying across a cell's edge: since v1.2 it is drawn
-            // where it lies instead of pulled inside its cell (`Scene::add_spanning`). With the old placement all
-            // seven frames keep their pixels.
-            ("rest", 0x925c_7f72_aa63_e2f1),
-            ("turn", 0x57b5_19f0_277a_d133),
-            ("walk", 0x7b25_914d_aaa0_a85a),
-            ("rugged", 0x7683_ea92_1285_5d0f),
-            // "chase" and "focus": the wheeled robot is drawn as a lift truck (`act::fork::truck_boxes`) since the
-            // forklift change.
-            ("chase", 0x4ff5_5319_520a_25aa),
-            ("focus", 0x7ae1_9aba_c82f_7fc9),
+            ("rest", 0x7990_df86_dfb0_1581),
+            ("turn", 0xfd98_ffbd_86cc_7c23),
+            ("walk", 0xb6f7_776f_22ad_0e99),
+            ("rugged", 0x5a2e_6f68_6ebe_e09b),
+            ("chase", 0xbec5_dc45_4b5a_1b42),
+            ("focus", 0xc52e_326a_aed5_f073),
             ("top", 0x1777_dd2f_41f0_963c),
         ];
-        // "turn" and "walk" are poses after one tick of turning and seven of walking: they moved when the turn rate
-        // became the base's own (steer::TurnCaps) and the walk started from where the robot stands. The other frames
-        // are the v0.9 pixels.
+        // "turn" and "walk" are poses after one tick of turning and seven of walking.
         let frames = flat_reference_frames();
         assert_eq!(frames.len(), want.len());
         for ((name, f), (wname, h)) in frames.iter().zip(want) {
             assert_eq!(*name, wname);
-            assert_eq!(frame_hash(f), h, "{name}: the flat lighting must keep the v0.9 pixels");
+            assert_eq!(frame_hash(f), h, "{name}: the flat lighting must keep its pixels");
         }
     }
 
@@ -1857,7 +1945,7 @@ mod tests {
         let bare = w.clone();
         w.nodes.push(crate::world::Node { id: 5, kind: NodeKind::Tree, x: tx, z: tz, hp: 3.0, max_hp: 3.0 });
         let cam = Camera { width: 200, height: 200, max_dist_m: 30.0, ..Camera::default() };
-        let rays = Rays::Ortho { centre: [tx + 1.5, 0.0, tz], yaw: 0.0, pitch: -std::f32::consts::FRAC_PI_2, half_h_m: 2.5 };
+        let rays = Rays::Ortho { centre: [tx + 4.5, 0.0, tz], yaw: 0.0, pitch: -std::f32::consts::FRAC_PI_2, half_h_m: 5.5 };
         for h in [30.0f32, 45.0, 60.0] {
             let sun = crate::light::Lighting::Sun { elevation_deg: h, azimuth_deg: 270.0, overcast: 0.0 };
             let (mut tw, mut bw) = (w.clone(), bare.clone());
@@ -1870,10 +1958,10 @@ mod tests {
                     let k = j * cam.width + i;
                     unpack_id(with.ids[k]).0 == ObjectClass::Ground && luma(&with.rgb[k * 3..k * 3 + 3]) < 0.75 * luma(&without.rgb[k * 3..k * 3 + 3])
                 })
-                .map(|j| 1.5 + (1.0 - 2.0 * (j as f32 + 0.5) / cam.height as f32) * 2.5)
+                .map(|j| 4.5 + (1.0 - 2.0 * (j as f32 + 0.5) / cam.height as f32) * 5.5)
                 .fold(f32::NEG_INFINITY, f32::max);
-            let want = 0.24 + 1.6 / h.to_radians().tan();
-            assert!((tip - want).abs() < 0.06, "h {h}: shadow ends {tip:.3} m past the trunk, geometry says {want:.3} m");
+            let want = [(1.05f32, 3.25f32), (0.80, 4.05), (0.46, 4.70)].map(|(r, top)| r + top / h.to_radians().tan()).into_iter().fold(0.0, f32::max);
+            assert!((tip - want).abs() < 0.16, "h {h}: shadow ends {tip:.3} m past the trunk, geometry says {want:.3} m");
         }
     }
 
@@ -1881,8 +1969,8 @@ mod tests {
     fn the_resting_shadow_pose_matches_the_dynamics() {
         let span = |pose: &noto_core::dynamics::BodyPose, w: &World| {
             let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
-            for (o, b) in w.robot_boxes(pose).iter().zip(w.shown_boxes(pose)) {
-                if b.segment == noto_core::Segment::Foot {
+            for o in w.robot_boxes(pose).iter() {
+                if o.center[1] - w.agent_ground_m() < 0.2 {
                     continue;
                 }
                 for i in 0..3 {

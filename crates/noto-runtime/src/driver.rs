@@ -770,7 +770,7 @@ impl Runtime {
         }
         // A lift truck stops short of the node with its tines clear of the trunk; its rider walks the rest.
         let forks = noto_core::act::fork::applies(&self.world.body);
-        let (mine_at, reach) = if forks { (world_sim::world::RIDER_STOP_M + 0.3, world_sim::world::RIDER_STOP_M) } else { (MINE_REACH_M - 0.1, self.cfg.approach_reach_m) };
+        let (mine_at, reach) = if forks { (world_sim::world::traffic::rider_stop_m(&self.world.body) + 0.3, world_sim::world::traffic::rider_stop_m(&self.world.body)) } else { (MINE_REACH_M - 0.1, self.cfg.approach_reach_m) };
         if dist <= mine_at {
             self.goto_phase(t, Phase::Mine, if forks { "지게차를 세우고 탑승자가 내려서 채취" } else { "" });
             return Flow::Continue;
@@ -795,7 +795,7 @@ impl Runtime {
         let (ax, az) = (self.world.agent.x, self.world.agent.z);
         let at = self.world.true_of(believed.0, believed.1);
         // A lift truck's rider walks over: the nodes within its walk, the one nearest where the eye put it.
-        let reach = if noto_core::act::fork::applies(&self.world.body) { world_sim::world::RIDER_REACH_M } else { MINE_REACH_M };
+        let reach = if noto_core::act::fork::applies(&self.world.body) { world_sim::world::traffic::rider_reach_m(&self.world.body) } else { MINE_REACH_M };
         self.world
             .nodes
             .iter()
@@ -1202,7 +1202,7 @@ impl Runtime {
     /// The index in the task's drops of a wanted item lying in the tines' way from where the base stands to the item
     /// `id` at `at` (the nearest one), which a lift truck takes first. In the way means in the lane and nearer than
     /// `id` by more than half of each item, so the tines meet it first. Two items about as far away side by side (a
-    /// felled tree drops its logs 0.13 m around the trunk) are not in front of each other: counted so, each was swapped
+    /// felled tree's logs around the stump) are not in front of each other: counted so, each was swapped
     /// for the other without end inside one tick. The forks line up past such a neighbour instead (`fork_lineup`).
     /// Every item is placed where the task remembers it, as `at` is, else where the robot believes it lies.
     fn fork_front_pick(&self, t: &Task, id: u32, at: (f32, f32)) -> Option<usize> {
@@ -1399,7 +1399,9 @@ impl Runtime {
             })
             .unwrap_or_default();
         let off = |w: (f32, f32)| (w.0 - m.x).hypot(w.1 - m.z);
-        let nearest = seen.iter().copied().min_by(|a, b| off(a.2).total_cmp(&off(b.2)));
+        let others: Vec<(f32, f32)> = t.mem.iter().filter(|(j, _)| **j != id && self.world.drop_item(**j).is_some_and(|d| d.kind == kind)).map(|(_, o)| (o.x, o.z)).collect();
+        let laid = crate::vision::by_layout((m.x, m.z), &others, &seen.iter().map(|c| c.2).collect::<Vec<_>>()).map(|i| seen[i]);
+        let nearest = laid.or_else(|| seen.iter().copied().min_by(|a, b| off(a.2).total_cmp(&off(b.2))));
         let boxd = nearest.map(|c| self.depth_in_box(&frame, c.1, crate::perception::centre_offset_m(EntKind::Drop)));
         // Where the look puts the item, by the eye's depth procedure. Two cameras (SGBM): the pair's metric depth in
         // the box places it, with the stereo law's σ, and a box SGBM could not match places nothing — the look saw
@@ -1413,16 +1415,17 @@ impl Runtime {
         // Data association: the look fixes the memory with what lies inside the memory's and the look's own
         // uncertainty, or — beyond that, within `ASSOC_REACH_M` — with a match that is plainly this item: `ASSOC_RATIO`
         // times nearer the memory than any other match of its kind in view, and nearer to it than to any other item of
-        // its kind remembered. Several of one kind lie close together (a felled tree drops its logs 0.22 m apart, a bay
-        // stages them 0.35 m apart); a match outside both is a neighbour, and the memory stays as it was. The second
-        // arm is for a memory off by more than its σ says (wheels slip on soft ground by more than the drift spec, until
-        // the SDS has learned the rate), where a precise look — SGBM's ±1–3 cm — was thrown away as a neighbour.
+        // its kind remembered. Several of one kind lie close together (a felled tree's logs, a bay's row); a match
+        // outside both is a neighbour, and the memory stays as it was. The second arm is for a memory off by more than
+        // its σ says (wheels slip on soft ground by more than the drift spec, until the SDS has learned the rate),
+        // where a precise look — SGBM's ±1–3 cm — was thrown away as a neighbour; a match by the layout of several
+        // (`by_layout`) is one too.
         let mut offs: Vec<f32> = seen.iter().map(|c| off(c.2)).collect();
         offs.sort_by(f32::total_cmp);
         let alone = offs.get(1).map_or(true, |&d2| d2 >= ASSOC_RATIO * offs[0]);
-        let others: Vec<(f32, f32)> = t.mem.iter().filter(|(j, _)| **j != id && self.world.drop_item(**j).is_some_and(|d| d.kind == kind)).map(|(_, o)| (o.x, o.z)).collect();
-        let plainly = |p: (f32, f32)| alone && off(p) <= ASSOC_REACH_M && others.iter().all(|o| (p.0 - o.0).hypot(p.1 - o.1) > off(p));
-        let matched = placed.filter(|(p, sig)| off(*p) <= (3.0 * before.hypot(*sig)).max(0.06) || plainly(*p));
+        let half_m = 0.5 * kind.spec().size_m.into_iter().fold(0.0, f32::max);
+        let plainly = |p: (f32, f32)| alone && off(p) <= ASSOC_REACH_M.max(half_m) && others.iter().all(|o| (p.0 - o.0).hypot(p.1 - o.1) > off(p));
+        let matched = placed.filter(|(p, sig)| off(*p) <= (3.0 * before.hypot(*sig)).max(0.06) || laid.is_some() || plainly(*p));
         let range_m = placed.map(|(p, _)| self.dist_me(p.0, p.1));
         let screen = match camera {
             "fork" => "포크 카메라 화면",
@@ -1447,6 +1450,7 @@ impl Runtime {
             camera,
             drop: id,
             label_ko: name,
+            half_m,
             ok: nearest.is_some(),
             matched: matched.is_some(),
             score: nearest.map(|c| c.0),
@@ -2396,7 +2400,7 @@ mod tests {
 
     #[test]
     fn logs_side_by_side_are_not_in_front_of_each_other_and_a_nearer_one_is() {
-        // Two logs of a felled tree, 0.22 m apart and as far away as each other; the old test counted each as in
+        // Two logs side by side, 0.22 m apart and as far away as each other; the old test counted each as in
         // the lane short of the other.
         let (rt, mut t) = collecting(&[(901, 1.2, 0.11), (902, 1.21, -0.11)]);
         assert_eq!(rt.fork_front_pick(&t, 901, at(&rt, 901)), None);

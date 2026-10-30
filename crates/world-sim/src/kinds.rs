@@ -41,8 +41,9 @@ impl ItemKind {
                 id: "log",
                 label_ko: "원목",
                 label_en: "wooden log",
-                size_m: [0.15, 0.15, 0.15],
-                mass_kg: 2.4,
+                // A split length of firewood [추정: 0.50 m long, 0.14 m through, pine at 550 kg/m³].
+                size_m: [0.50, 0.14, 0.14],
+                mass_kg: 4.2,
                 color: [128, 92, 54],
                 divisible: false,
             },

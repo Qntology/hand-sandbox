@@ -42,6 +42,7 @@ impl BaseKind {
                 mass_kg: None,
                 walk_com_z_m: None,
                 walk_foot_m: None,
+                walk_dims: None,
             },
             BaseKind::Mecanum => BaseSpec {
                 kind: self,
@@ -55,6 +56,7 @@ impl BaseKind {
                 mass_kg: None,
                 walk_com_z_m: None,
                 walk_foot_m: None,
+                walk_dims: None,
             },
             BaseKind::Track => BaseSpec {
                 kind: self,
@@ -68,6 +70,7 @@ impl BaseKind {
                 mass_kg: None,
                 walk_com_z_m: None,
                 walk_foot_m: None,
+                walk_dims: None,
             },
             BaseKind::HumanFoot => BaseSpec {
                 kind: self,
@@ -81,6 +84,7 @@ impl BaseKind {
                 mass_kg: None,
                 walk_com_z_m: None,
                 walk_foot_m: None,
+                walk_dims: None,
             },
         }
     }
@@ -103,6 +107,9 @@ pub struct BaseSpec {
     pub walk_com_z_m: Option<f32>,
     #[serde(default)]
     pub walk_foot_m: Option<f32>,
+    /// The walker's lengths, for the gait model.
+    #[serde(default)]
+    pub walk_dims: Option<crate::dims::Dims>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

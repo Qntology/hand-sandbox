@@ -18,7 +18,7 @@ fn cell(scenario: &str, form: &str, axis: &str, value: Option<f32>, rule: Rule, 
 pub fn c1() -> BenchScenario {
     let wheel = Body::new(&BodyPlan::uniform(noto_core::Tier::Mid), BaseKind::Wheel, FingerCount::Five);
     let (id, form) = ("C1-mid-Wheel", form_id(&wheel));
-    let d = 2.0 * noto_core::kin::WHEEL_R_M;
+    let d = 2.0 * noto_core::dims::Dims::COMPACT.wheel_r_m;
     let mut cells: Vec<BenchCell> = CHASSIS
         .iter()
         .map(|&(g, name, r)| cell(id, &form, &format!("{name}_rms_mps2"), Some(chassis_accel_rms(11, g, CHASSIS_SPEED_MPS, wheel.support_len_m, wheel.support_width_m, d)), Rule::Like { reference: r, tolerance: CHASSIS_SPREAD }, CITE_CHASSIS))

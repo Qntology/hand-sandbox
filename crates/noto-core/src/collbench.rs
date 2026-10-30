@@ -9,7 +9,6 @@ use crate::balance::Body;
 use crate::base::BaseKind;
 use crate::effects::Rule;
 use crate::kin::KinPose;
-use crate::parts::HIP_M;
 use crate::surface::Surface;
 
 pub const FALL_PELVIS_MPS: (f32, f32) = (2.14, 0.63);
@@ -192,7 +191,7 @@ pub fn library() -> Vec<CxScenario> {
 }
 
 pub fn leg_m(_body: &Body) -> f32 {
-    HIP_M
+    crate::dims::Dims::COMPACT.hip_m
 }
 
 fn froude_v(v: f32, leg: f32) -> f32 {
@@ -240,7 +239,7 @@ fn bump_cells(body: &Body, c: &Collision, cells: &mut Vec<BenchCell>) {
 
 pub fn evaluate(body: &Body, s: &CxScenario) -> BenchResult {
     let legged = body.base == BaseKind::HumanFoot;
-    let stand = KinPose::stand(0.0);
+    let stand = KinPose::stand(body, 0.0);
     let mut cells = Vec::new();
     let notes;
     match s.kind {

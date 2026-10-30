@@ -35,7 +35,7 @@ use world_sim::{Action, ItemKind, TimedEvent, WorldEvent};
 
 use crate::runtime::Runtime;
 
-/// How far behind its bay's row a lift truck waits (m): the tines' length and a little.
+/// How far behind its bay a compact lift truck waits (m): the tines' length and a little.
 pub const PARK_BEHIND_M: f32 = 1.4;
 /// A lift truck goes for the staged items within this of them (m): its tines reach that far ahead.
 pub const FORK_REACH_M: f32 = 1.1;
@@ -214,11 +214,17 @@ fn plan_for(target: &Target, quantity: u32, dest: Option<&PlaceRef>) -> Plan {
 
 /// How near a worker goes to a node it fells: a humanoid within arm's reach, a lift truck where it stops for its
 /// rider to step down and walk the rest.
-fn mine_reach(form: Form) -> f32 {
-    match form {
+fn mine_reach(w: &world_sim::Worker) -> f32 {
+    match w.form {
         Form::Humanoid => MINE_REACH_M - 0.1,
-        Form::Forklift => world_sim::world::RIDER_STOP_M,
+        Form::Forklift => world_sim::world::traffic::rider_stop_m(&w.body),
     }
+}
+
+/// How near a lift truck stops to an item to take it: the tines' length in front of the item, plus the gap
+/// (`FORK_REACH_M` on a compact truck).
+fn fork_reach(w: &world_sim::Worker) -> f32 {
+    FORK_REACH_M.max(noto_core::act::fork::standoff_x(&w.body, 0.5) + 0.1)
 }
 
 fn parse_drops(text: &str) -> Vec<u32> {
@@ -503,7 +509,8 @@ impl Runtime {
                         let off = (k as f32 - (world_sim::crew::BAY_SLOTS as f32 - 1.0) * 0.5) * world_sim::crew::BAY_SLOT_M;
                         clear(bx + fx * world_sim::crew::BAY_ROW_AHEAD_M + rx * off, bz + fz * world_sim::crew::BAY_ROW_AHEAD_M + rz * off)
                     });
-                    let park = (bx - fx * PARK_BEHIND_M, bz - fz * PARK_BEHIND_M);
+                    let behind = self.park_behind();
+                    let park = (bx - fx * behind, bz - fz * behind);
                     if !(clear(bx, bz) && row && clear(park.0, park.1)) {
                         continue;
                     }
@@ -515,6 +522,12 @@ impl Runtime {
             }
         }
         None
+    }
+
+    /// How far behind its bay a lift truck waits, so that its tines stop short of the row of staged items.
+    fn park_behind(&self) -> f32 {
+        let body = self.world.crew.iter().find(|w| w.form == Form::Forklift).map_or(&self.world.body, |w| &w.body);
+        PARK_BEHIND_M.max(noto_core::act::fork::standoff_x(body, world_sim::ItemKind::Log.spec().size_m[0]) - world_sim::crew::BAY_ROW_AHEAD_M + 0.1)
     }
 
     fn bay_frame(&self, bay: u32) -> Option<((f32, f32), (f32, f32))> {
@@ -529,7 +542,8 @@ impl Runtime {
     fn park_spot(&self, bay: u32) -> Option<((f32, f32), (f32, f32))> {
         let ((bx, bz), (fx, fz)) = self.bay_frame(bay)?;
         let row = self.world.bay_slot(bay, world_sim::crew::BAY_SLOTS / 2)?;
-        Some(((bx - fx * PARK_BEHIND_M, bz - fz * PARK_BEHIND_M), row))
+        let behind = self.park_behind();
+        Some(((bx - fx * behind, bz - fz * behind), row))
     }
 
     fn send_to_park(&mut self, id: u32) {
@@ -728,7 +742,7 @@ impl Runtime {
         let item = lane.item.unwrap_or(ItemKind::Log);
         let team = self.crew.team.is_some();
         let step = if team { "협업" } else { "개별" };
-        let reach_pick = if lane.form == Form::Forklift { FORK_REACH_M } else { PICKUP_REACH_M - 0.1 };
+        let reach_pick = if lane.form == Form::Forklift { self.world.crew_worker(id).map_or(FORK_REACH_M, fork_reach) } else { PICKUP_REACH_M - 0.1 };
         match (lane.stage.clone(), outcome) {
             (Stage::ToNode { node }, Some((true, _))) => match self.world.crew_command(id, Job::Mine { node }) {
                 Ok(()) => {
@@ -866,7 +880,7 @@ impl Runtime {
             }
             let near = self.world.waypoint(team.bay).map_or(me, |p| (p.x, p.z));
             if let Some((node, x, z)) = self.nearest_node(near, item, &lane.avoid) {
-                match self.world.crew_command(id, Job::Go { x, z, reach_m: mine_reach(lane.form) }) {
+                match self.world.crew_command(id, Job::Go { x, z, reach_m: self.world.crew_worker(id).map_or(MINE_REACH_M, mine_reach) }) {
                     Ok(()) => {
                         lane.stage = Stage::ToNode { node };
                         self.note(id, "③ 채취", format!("n{node}로 감"));
@@ -910,7 +924,7 @@ impl Runtime {
         }
         if item.from_node() {
             match self.nearest_node(me, item, &lane.avoid) {
-                Some((node, x, z)) => match self.world.crew_command(id, Job::Go { x, z, reach_m: mine_reach(lane.form) }) {
+                Some((node, x, z)) => match self.world.crew_command(id, Job::Go { x, z, reach_m: self.world.crew_worker(id).map_or(MINE_REACH_M, mine_reach) }) {
                     Ok(()) => {
                         lane.stage = Stage::ToNode { node };
                         self.lane_quest_to(lane, StepKind::Approach, Some(format!("n{node}")));
@@ -1015,7 +1029,7 @@ impl Runtime {
             lane.picks.retain(|d| self.world.drop_item(*d).is_some());
             if let Some(&d) = lane.picks.first().filter(|_| room) {
                 if let Some((x, z)) = self.world.drop_item(d).map(|d| (d.x, d.z)) {
-                    if self.world.crew_command(id, Job::Go { x, z, reach_m: FORK_REACH_M }).is_ok() {
+                    if self.world.crew_command(id, Job::Go { x, z, reach_m: self.world.crew_worker(id).map_or(FORK_REACH_M, fork_reach) }).is_ok() {
                         lane.stage = Stage::ToDrop { drop: d };
                     }
                 }

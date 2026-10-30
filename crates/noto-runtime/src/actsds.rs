@@ -209,7 +209,7 @@ impl Runtime {
         let body = &self.world.body;
         let cargo = self.world.carried_kg();
         let s2 = Scope::new(Track::Act, "walk:ts", ground.id());
-        let leg = noto_core::parts::HIP_M;
+        let leg = body.dims.hip_m;
         for (k, v) in [("speed_mps", g.speed), ("step_m", g.step_m), ("step_s", g.step_s), ("ds_frac", g.ds_frac), ("rcof", g.rcof), ("froude", g.speed * g.speed / (G * leg))] {
             self.sds.record_baseline(&s2, k, v as f64);
         }

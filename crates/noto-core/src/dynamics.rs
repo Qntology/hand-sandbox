@@ -1,8 +1,7 @@
 use serde::Serialize;
 
-use crate::balance::{step_knee_lever, Body, FeedForward, Posture, Source, CARGO_X_M, CARGO_Z_M, G, HIP_HALF_WIDTH_M, KNEE_LEVER_STAND_M, KNEE_LEVER_WALK_M, REACTION_DELAY_S};
-use crate::kin::CAMERA_UP_M;
-use crate::morph::{column_top_m, HeadMount, Torso, COLUMN_TOP_M};
+use crate::balance::{step_knee_lever, Body, FeedForward, Posture, Source, G, REACTION_DELAY_S};
+use crate::morph::{column_top_m, HeadMount, Torso};
 use crate::parts::*;
 
 type V = [f64; 3];
@@ -165,7 +164,7 @@ impl Robot {
             }
             if post.cargo_kg > 0.0 && body.cargo_point().1 {
                 pm += post.cargo_kg as f64;
-                pc = add(pc, scale([CARGO_X_M as f64, 0.0, (CARGO_Z_M - WAIST_M) as f64], post.cargo_kg as f64));
+                pc = add(pc, scale([body.dims.cargo_x_m as f64, 0.0, (body.dims.cargo_z_m() - body.dims.waist_m) as f64], post.cargo_kg as f64));
             }
             links.push(Link { name: "pelvis", segment: Segment::Belly, parent: None, origin: [0.0; 3], axis: YAW_AXIS, dof: None, locked: None, mass: pm, com: scale(pc, 1.0 / pm.max(1e-6)), inertia: box_inertia(pm, pelvis_half), shape: ([0.0, 0.0, -0.06], pelvis_half) });
             dof_joints.push((1, body.belly.waist, -90f64.to_radians(), 90f64.to_radians()));
@@ -186,15 +185,15 @@ impl Robot {
                 None => (None, Some(0)),
             };
             links.push(Link { name: "trunk", segment: Segment::Chest, parent: Some(1), origin: [0.0; 3], axis: PITCH_AXIS, dof, locked, mass: tm, com: [0.0, 0.0, body.chest.com_up_m as f64], inertia: box_inertia(tm, trunk_half), shape: ([0.0, 0.0, 0.16], trunk_half) });
-            let neck_h = (SHOULDER_M + 0.07 - WAIST_M) as f64;
+            let neck_h = (body.dims.shoulder_m + 0.07 - body.dims.waist_m) as f64;
             head_in_tree = head_link(body, &mut links, &mut dof_joints, &mut joints, [0.0, 0.0, neck_h], neck_lim, head_half);
             arm_parent = 2;
-            root_z = WAIST_M;
+            root_z = body.dims.waist_m;
         } else {
             links.push(Link { name: "deck", segment: Segment::Foot, parent: None, origin: [0.0; 3], axis: YAW_AXIS, dof: None, locked: None, mass: 0.0, com: [0.0; 3], inertia: [[0.0; 3]; 3], shape: ([0.0; 3], [0.0; 3]) });
             let pivot = match body.camera_mount() {
-                HeadMount::MastCamera { height_mm, .. } => Some([body.mast_camera_x() as f64, 0.0, (height_mm as f32 / 1000.0 - CAMERA_UP_M) as f64]),
-                HeadMount::Neck | HeadMount::Fixed { .. } => Some([0.0, 0.0, COLUMN_TOP_M as f64]),
+                HeadMount::MastCamera { height_mm, .. } => Some([body.mast_camera_x() as f64, 0.0, (height_mm as f32 / 1000.0 - body.dims.camera_up_m) as f64]),
+                HeadMount::Neck | HeadMount::Fixed { .. } => Some([0.0, 0.0, body.dims.column_top_m() as f64]),
                 _ => None,
             };
             head_in_tree = pivot.is_some_and(|p| head_link(body, &mut links, &mut dof_joints, &mut joints, p, neck_lim, [0.04, 0.07, 0.04]));
@@ -203,7 +202,7 @@ impl Robot {
         }
         let (m_up, r_up, m_fore) = body.arm_split();
         let (m_up, r_up, m_fore) = (m_up as f64, r_up as f64, m_fore as f64);
-        let (up_l, fo_l) = (UPPER_ARM_M as f64, FOREARM_M as f64);
+        let (up_l, fo_l) = (body.dims.upper_arm_m as f64, body.dims.forearm_m as f64);
         for (side, tag) in [(0usize, "r"), (1, "l")].into_iter().take(body.arm_count()) {
             let mount = body.shoulder_mount(side);
             let origin = [mount[0] as f64, mount[1] as f64, (mount[2] - root_z) as f64];
@@ -737,11 +736,11 @@ fn whole_body(body: &Body, post: &Posture, single: bool, robot: &Robot, r: &Rnea
 fn lower_masses(body: &Body, post: &Posture, single: bool, root: &RootState, head_in_tree: bool) -> Vec<(f64, V)> {
     let mut v = Vec::new();
     if body.legged() {
-        for (i, y) in [-STANCE_WIDTH_M / 2.0, STANCE_WIDTH_M / 2.0].into_iter().enumerate() {
+        for (i, y) in [-body.dims.stance_m / 2.0, body.dims.stance_m / 2.0].into_iter().enumerate() {
             let swing = single && i == 1;
             let lift = if swing { post.step_m.max(0.05) } else { 0.0 } as f64;
             let ys = if swing { root.shift_y as f64 } else { 0.0 };
-            v.push((body.leg.mass_kg as f64, [if swing { 0.10 } else { 0.0 }, y as f64 + ys, (HIP_M - body.leg.com_down_m) as f64 + lift * 0.5]));
+            v.push((body.leg.mass_kg as f64, [if swing { 0.10 } else { 0.0 }, y as f64 + ys, (body.dims.hip_m - body.leg.com_down_m) as f64 + lift * 0.5]));
             v.push((body.leg.foot_mass_kg as f64, [0.25 * body.leg.foot_len_m as f64 + if swing { 0.15 } else { 0.0 }, y as f64 + ys, 0.04 + lift]));
         }
     } else {
@@ -775,10 +774,10 @@ fn lower_torques(body: &Body, post: &Posture, single: bool, grf: [f32; 3], zmp: 
         let force = m * (G as f64 * (slope.sin() + crr * slope.cos()) + root.accel.abs() as f64);
         return vec![force as f32];
     }
-    let half = STANCE_WIDTH_M as f64 / 2.0;
+    let half = body.dims.stance_m as f64 / 2.0;
     let feet = [-half, half];
     let share_r = if single { 1.0 } else { ((half - zmp[1] as f64) / (2.0 * half)).clamp(0.0, 1.0) };
-    let d = if post.step_m > 0.0 { step_knee_lever(post.step_m) } else if single { KNEE_LEVER_WALK_M } else { KNEE_LEVER_STAND_M } as f64;
+    let d = if post.step_m > 0.0 { step_knee_lever(&body.dims, post.step_m) } else if single { body.dims.knee_lever_walk_m } else { body.dims.knee_lever_stand_m } as f64;
     let mut out = Vec::with_capacity(8);
     for (k, fy) in feet.iter().enumerate() {
         let share = if k == 0 { share_r } else { 1.0 - share_r };
@@ -787,9 +786,9 @@ fn lower_torques(body: &Body, post: &Posture, single: bool, grf: [f32; 3], zmp: 
         let x_hi = 0.75 * body.leg.foot_len_m as f64;
         let cop = [(zmp[0] as f64).clamp(x_lo, x_hi), *fy, 0.0];
         let ankle = [0.0, *fy, 0.08];
-        let knee = [cop[0] + d, *fy, 0.5 * (HIP_M as f64 + 0.08)];
+        let knee = [cop[0] + d, *fy, 0.5 * (body.dims.hip_m as f64 + 0.08)];
         let side = if k == 0 { -1.0 } else { 1.0 };
-        let hip = [0.0, root.shift_y as f64 + side * HIP_HALF_WIDTH_M as f64, HIP_M as f64 + root.rise_m as f64];
+        let hip = [0.0, root.shift_y as f64 + side * body.dims.hip_half_m as f64, body.dims.hip_m as f64 + root.rise_m as f64];
         let m_at = |p: V| cross(sub(cop, p), fk);
         out.push(m_at(hip)[1].abs() as f32);
         out.push(m_at(hip)[0].abs() as f32);
@@ -920,17 +919,17 @@ impl Rollout {
         }
         let pelvis = k.pos[0];
         if body.legged() {
-            let half = STANCE_WIDTH_M / 2.0;
+            let half = body.dims.stance_m / 2.0;
             for (side, tag) in [(0usize, "r"), (1, "l")] {
                 let y = if side == 0 { -half } else { half };
                 let swing = post.single_support && side == 1 && s.t >= self.lift_at;
                 let lift = if swing { post.step_m.max(0.05) } else { 0.0 };
                 let sign = if side == 0 { -1.0 } else { 1.0 };
-                let hip = [pelvis[0] as f32, pelvis[1] as f32 + sign * HIP_HALF_WIDTH_M, HIP_M + s.root.rise_m];
-                let ankle = [if swing { 0.15 } else { 0.0 }, y + if swing { s.root.shift_y } else { 0.0 }, 0.08 + lift];
-                let bend = if post.step_m > 0.0 { step_knee_lever(post.step_m) } else if post.single_support && s.t >= self.lift_at { KNEE_LEVER_WALK_M } else { KNEE_LEVER_STAND_M };
+                let hip = [pelvis[0] as f32, pelvis[1] as f32 + sign * body.dims.hip_half_m, body.dims.hip_m + s.root.rise_m];
+                let ankle = [if swing { 0.15 } else { 0.0 }, y + if swing { s.root.shift_y } else { 0.0 }, body.dims.ankle_m + lift];
+                let bend = if post.step_m > 0.0 { step_knee_lever(&body.dims, post.step_m) } else if post.single_support && s.t >= self.lift_at { body.dims.knee_lever_walk_m } else { body.dims.knee_lever_stand_m };
                 let knee = [0.5 * (hip[0] + ankle[0]) + bend, 0.5 * (hip[1] + ankle[1]), 0.5 * (hip[2] + ankle[2])];
-                for (name, a, b, w) in [("thigh", hip, knee, 0.05f32), ("shank", knee, ankle, 0.045)] {
+                for (name, a, b, w) in [("thigh", hip, knee, 0.05 * body.dims.k), ("shank", knee, ankle, 0.045 * body.dims.k)] {
                     boxes.push(limb_box(if side == 0 { if name == "thigh" { "thigh_r" } else { "shank_r" } } else if name == "thigh" { "thigh_l" } else { "shank_l" }, Segment::Leg, a, b, w));
                 }
                 let fl = body.leg.foot_len_m;
@@ -944,16 +943,16 @@ impl Rollout {
         } else {
             let r = rot(PITCH_AXIS, -(s.root.pitch as f64));
             let len = body.support_len_m;
-            boxes.push(LinkBox { name: "chassis", segment: Segment::Foot, center: f3(mv(&r, [0.0, 0.0, 0.08])), axes: axes_of(&r), half: [len / 2.0, CHASSIS_WIDTH_M / 2.0, 0.06] });
+            boxes.push(LinkBox { name: "chassis", segment: Segment::Foot, center: f3(mv(&r, [0.0, 0.0, 0.08])), axes: axes_of(&r), half: [len / 2.0, body.dims.chassis_w_m / 2.0, 0.06] });
             match body.morph.torso {
-                Torso::Humanoid => boxes.push(LinkBox { name: "mast", segment: Segment::Leg, center: f3(mv(&r, [0.0, 0.0, (0.14 + WAIST_M as f64 - 0.13) / 2.0])), axes: axes_of(&r), half: [0.03, 0.03, (WAIST_M - 0.27) / 2.0] }),
+                Torso::Humanoid => boxes.push(LinkBox { name: "mast", segment: Segment::Leg, center: f3(mv(&r, [0.0, 0.0, (0.14 + body.dims.waist_m as f64 - 0.13) / 2.0])), axes: axes_of(&r), half: [0.03, 0.03, (body.dims.waist_m - 0.27) / 2.0] }),
                 Torso::Mast => {
-                    let top = column_top_m(body.camera_mount());
+                    let top = column_top_m(&body.dims, body.camera_mount());
                     boxes.push(LinkBox { name: "column", segment: Segment::Leg, center: f3(mv(&r, [0.0, 0.0, (0.14 + top as f64) / 2.0])), axes: axes_of(&r), half: [0.04, 0.04, (top - 0.14) / 2.0] });
                 }
                 Torso::None => {
                     if let HeadMount::MastCamera { height_mm, .. } = body.camera_mount() {
-                        let top = height_mm as f32 / 1000.0 - CAMERA_UP_M;
+                        let top = height_mm as f32 / 1000.0 - body.dims.camera_up_m;
                         boxes.push(LinkBox { name: "pole", segment: Segment::Leg, center: f3(mv(&r, [body.mast_camera_x() as f64, 0.0, (0.14 + top as f64) / 2.0])), axes: axes_of(&r), half: [0.01, 0.01, ((top - 0.14) / 2.0).max(0.0)] });
                     }
                 }
@@ -1025,7 +1024,7 @@ mod tests {
         }
         let e = r.joint_index("elbow_r").unwrap();
         let (_, _, m_fore) = b.arm_split();
-        let fo = FOREARM_M as f64;
+        let fo = crate::dims::Dims::COMPACT.forearm_m as f64;
         let hand = b.hand_kg as f64;
         let want = m_fore as f64 * (0.45 * fo).powi(2) + m_fore as f64 * (0.06f64.powi(2) + fo.powi(2)) / 12.0 + hand * (fo + 0.06).powi(2) + hand * (0.08f64.powi(2) + 0.08f64.powi(2)) / 12.0;
         assert!((m[e][e] - want).abs() < 1e-6, "{} vs {want}", m[e][e]);
@@ -1101,7 +1100,7 @@ mod tests {
             let r = simulate(&b, &Posture::quiet(0.0), &to, &FeedForward::default(), 1e3, &DynCfg::default());
             assert!(r.min_margin > 0.0, "{tier:?}: {} at {} s, {:?}", r.min_margin, r.min_margin_t, r.notes);
             let end = r.samples.last().unwrap();
-            assert!((end.com[1] + STANCE_WIDTH_M / 2.0).abs() < 0.02, "CoM over the right foot: {:?}", end.com);
+            assert!((end.com[1] + crate::dims::Dims::COMPACT.stance_m / 2.0).abs() < 0.02, "CoM over the right foot: {:?}", end.com);
             let early = r.pose_at(&b, &to, 0.05).unwrap();
             let late = r.pose_at(&b, &to, 10.0).unwrap();
             assert!(early.support[3] - early.support[2] > late.support[3] - late.support[2], "two feet, then one");

@@ -1,7 +1,7 @@
 use serde::Serialize;
 
 use crate::balance::{Body, G};
-use crate::kin::{KinLoads, KinPose, BUMPER_GAP_M, WHEEL_R_M};
+use crate::kin::{KinLoads, KinPose};
 use crate::surface::Surface;
 
 use super::drive;
@@ -52,7 +52,7 @@ pub fn stable_radius_m(side_m: f32, mu_c: f32, lead_m: f32) -> f32 {
 }
 
 pub fn lead_m(body: &Body, side_m: f32) -> f32 {
-    0.5 * body.support_len_m + WHEEL_R_M + BUMPER_GAP_M + 0.5 * side_m
+    0.5 * body.support_len_m + body.dims.wheel_r_m + body.dims.bumper_gap_m + 0.5 * side_m
 }
 
 pub fn planned_radius_m(body: &Body, material: ItemMaterial, side_m: f32) -> f32 {

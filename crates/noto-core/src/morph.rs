@@ -2,11 +2,12 @@ use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
 
-use crate::balance::{Body, Posture, CARGO_X_M, CARGO_Z_M, MAST_KG};
+use crate::balance::{Body, Posture, MAST_KG};
 use crate::base::BaseKind;
+use crate::dims::Dims;
 use crate::dynamics::LinkBox;
 use crate::hand::{FingerCount, Hand, NotoConfig};
-use crate::kin::{KinPose, CAMERA_UP_M, NECK_UP_M, WHEEL_R_M};
+use crate::kin::KinPose;
 use crate::parts::*;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -231,8 +232,8 @@ pub struct Morphology {
     pub cargo: Cargo,
 }
 
-pub const DECK_Z_M: f32 = WHEEL_R_M + 0.10;
-pub const ELECTRONICS_Z_M: f32 = WHEEL_R_M + 0.05;
+/// The compact chassis deck the small forms mount on (`Dims::deck_z_m` for a body's own).
+pub const DECK_Z_M: f32 = 0.16;
 pub const DECK_BOX_KG: f32 = 0.30;
 pub const DECK_ARM_BASE_HALF_M: f32 = 0.03;
 pub const DECK_ARM_X_M: f32 = -0.06;
@@ -249,7 +250,6 @@ pub const TOTE_SIZE_M: [f32; 3] = [0.16, 0.24, 0.12];
 pub const TOTE_KG: f32 = 0.4;
 pub const TOTE_X_M: f32 = 0.06;
 pub const RIM_RELEASE_M: f32 = 0.20;
-pub const COLUMN_TOP_M: f32 = SHOULDER_M + NECK_UP_M;
 pub const MAST_TILT_MAX_DEG: f32 = 83.0;
 /// A pan-tilt head's pan each way (a robot unit, not a neck).
 pub const MAST_PAN_MAX_DEG: f32 = 90.0;
@@ -272,10 +272,10 @@ pub fn pole_x_m(support_len_m: f32) -> f32 {
     -0.5 * support_len_m + 0.02
 }
 
-pub fn column_top_m(head: HeadMount) -> f32 {
+pub fn column_top_m(d: &Dims, head: HeadMount) -> f32 {
     match head {
-        HeadMount::MastCamera { height_mm, .. } => COLUMN_TOP_M.max(height_mm as f32 / 1000.0 - CAMERA_UP_M),
-        _ => COLUMN_TOP_M,
+        HeadMount::MastCamera { height_mm, .. } => d.column_top_m().max(height_mm as f32 / 1000.0 - d.camera_up_m),
+        _ => d.column_top_m(),
     }
 }
 
@@ -541,9 +541,9 @@ impl Body {
     }
 
     pub fn shoulder_mount(&self, side: usize) -> [f32; 3] {
-        let y = if side == 0 { -SHOULDER_HALF_WIDTH_M } else { SHOULDER_HALF_WIDTH_M };
+        let y = if side == 0 { -self.dims.shoulder_half_m } else { self.dims.shoulder_half_m };
         match self.morph.torso {
-            Torso::Humanoid | Torso::Mast => [0.0, y, SHOULDER_M],
+            Torso::Humanoid | Torso::Mast => [0.0, y, self.dims.shoulder_m],
             Torso::None => {
                 let yd = if self.arm_count() >= 2 { if side == 0 { -DECK_ARMS_HALF_SPACING_M } else { DECK_ARMS_HALF_SPACING_M } } else { 0.0 };
                 match self.morph.mast_lift_m() {
@@ -572,7 +572,7 @@ impl Body {
 
     pub fn stand(&self, cargo_kg: f32) -> KinPose {
         let (s, e) = self.rest_arms_deg();
-        KinPose { shoulder_deg: s, elbow_deg: e, ..KinPose::stand(cargo_kg) }
+        KinPose { shoulder_deg: s, elbow_deg: e, ..KinPose::stand(self, cargo_kg) }
     }
 
     pub fn quiet(&self, cargo_kg: f32) -> Posture {
@@ -592,8 +592,8 @@ impl Body {
 
     pub fn neck_pivot(&self) -> Option<[f32; 3]> {
         match self.morph.head {
-            HeadMount::Neck => Some([0.0, 0.0, SHOULDER_M + NECK_UP_M]),
-            HeadMount::MastCamera { height_mm, pan_tilt: true } => Some([self.mast_camera_x(), 0.0, height_mm as f32 / 1000.0 - CAMERA_UP_M]),
+            HeadMount::Neck => Some([0.0, 0.0, self.dims.shoulder_m + self.dims.neck_up_m]),
+            HeadMount::MastCamera { height_mm, pan_tilt: true } => Some([self.mast_camera_x(), 0.0, height_mm as f32 / 1000.0 - self.dims.camera_up_m]),
             _ => None,
         }
     }
@@ -608,19 +608,19 @@ impl Body {
 
     pub fn head_com(&self) -> Option<[f32; 3]> {
         match self.morph.head {
-            HeadMount::Neck => Some([0.0, 0.0, SHOULDER_M + NECK_UP_M + self.head.com_up_m]),
+            HeadMount::Neck => Some([0.0, 0.0, self.dims.shoulder_m + self.dims.neck_up_m + self.head.com_up_m]),
             HeadMount::Fixed { tilt_deg } => {
                 let t = (tilt_deg as f32).to_radians();
-                Some([self.head.com_up_m * t.sin(), 0.0, SHOULDER_M + NECK_UP_M + self.head.com_up_m * t.cos()])
+                Some([self.head.com_up_m * t.sin(), 0.0, self.dims.shoulder_m + self.dims.neck_up_m + self.head.com_up_m * t.cos()])
             }
-            HeadMount::MastCamera { height_mm, .. } => Some([self.mast_camera_x(), 0.0, height_mm as f32 / 1000.0 - CAMERA_UP_M + self.head.com_up_m]),
+            HeadMount::MastCamera { height_mm, .. } => Some([self.mast_camera_x(), 0.0, height_mm as f32 / 1000.0 - self.dims.camera_up_m + self.head.com_up_m]),
             HeadMount::ChassisFront { height_mm } => Some([0.5 * self.support_len_m, 0.0, height_mm as f32 / 1000.0]),
             HeadMount::None => None,
         }
     }
 
     pub fn deck_point(&self) -> [f32; 3] {
-        [0.0, 0.0, ELECTRONICS_Z_M]
+        [0.0, 0.0, self.dims.wheel_r_m + 0.05]
     }
 
     pub fn deck_boxes(&self) -> Vec<LinkBox> {
@@ -657,7 +657,7 @@ impl Body {
         }
         match (self.morph.torso, self.morph.head) {
             (Torso::Humanoid, _) => Some((self.mast_kg(), [0.0, 0.0, 0.35])),
-            (Torso::Mast, h) => Some((self.mast_kg(), [0.0, 0.0, 0.5 * (DECK_Z_M + column_top_m(h))])),
+            (Torso::Mast, h) => Some((self.mast_kg(), [0.0, 0.0, 0.5 * (DECK_Z_M + column_top_m(&self.dims, h))])),
             (Torso::None, HeadMount::MastCamera { height_mm, .. }) => Some((self.mast_kg(), [self.mast_camera_x(), 0.0, 0.5 * (DECK_Z_M + height_mm as f32 / 1000.0)])),
             _ => None,
         }
@@ -666,8 +666,8 @@ impl Body {
     pub fn cargo_geom(&self) -> Option<CargoGeom> {
         match self.morph.cargo {
             Cargo::Bay => {
-                let rim = CARGO_Z_M + 0.08;
-                Some(CargoGeom { cargo: Cargo::Bay, at: [CARGO_X_M, 0.0, CARGO_Z_M], on_pelvis: true, release: [CARGO_X_M + 0.12, rim + 0.03 + 0.05], rim_z_m: rim, floor_z_m: CARGO_Z_M - CARGO_ABOVE_FLOOR_M, payload_kg: None, struct_kg: 0.0, struct_at: [CARGO_X_M, 0.0, CARGO_Z_M], center: [CARGO_X_M, 0.0, CARGO_Z_M], half: [0.08, 0.12, 0.08] })
+                let rim = self.dims.cargo_z_m() + 0.08;
+                Some(CargoGeom { cargo: Cargo::Bay, at: [self.dims.cargo_x_m, 0.0, self.dims.cargo_z_m()], on_pelvis: true, release: [self.dims.cargo_x_m + 0.12, rim + 0.03 + 0.05], rim_z_m: rim, floor_z_m: self.dims.cargo_z_m() - CARGO_ABOVE_FLOOR_M, payload_kg: None, struct_kg: 0.0, struct_at: [self.dims.cargo_x_m, 0.0, self.dims.cargo_z_m()], center: [self.dims.cargo_x_m, 0.0, self.dims.cargo_z_m()], half: [0.08, 0.12, 0.08] })
             }
             Cargo::Bed { len_mm, width_mm, height_mm, payload_kg } => {
                 let (l, w, h) = (len_mm as f32 / 1000.0, width_mm as f32 / 1000.0, height_mm as f32 / 1000.0);
@@ -775,10 +775,10 @@ pub fn mounted_belly(mut belly: BellyPreset, torso: Torso) -> BellyPreset {
     belly
 }
 
-pub fn column_kg(torso: Torso, head: HeadMount) -> f32 {
+pub fn column_kg(d: &Dims, torso: Torso, head: HeadMount) -> f32 {
     match (torso, head) {
         (Torso::Humanoid, _) => MAST_KG,
-        (Torso::Mast, h) => MAST_KG + EXTRUSION_KG_PER_M * (column_top_m(h) - HIP_M),
+        (Torso::Mast, h) => MAST_KG + EXTRUSION_KG_PER_M * (column_top_m(d, h) - d.hip_m),
         (Torso::None, HeadMount::MastCamera { height_mm, .. }) => POLE_MOUNT_KG + EXTRUSION_KG_PER_M * (height_mm as f32 / 1000.0 - DECK_Z_M).max(0.0),
         _ => 0.0,
     }
@@ -850,10 +850,11 @@ mod tests {
     #[test]
     fn a_column_runs_up_to_a_mast_camera_above_it() {
         let cam = HeadMount::MastCamera { height_mm: STRETCH_CAMERA_H_MM, pan_tilt: true };
-        assert!((column_top_m(cam) - (STRETCH_CAMERA_H_MM as f32 / 1000.0 - CAMERA_UP_M)).abs() < 1e-6);
-        assert!(column_kg(Torso::Mast, cam) > column_kg(Torso::Mast, HeadMount::Neck));
-        assert_eq!(column_top_m(HeadMount::MastCamera { height_mm: 900, pan_tilt: false }), COLUMN_TOP_M);
-        assert_eq!(column_top_m(HeadMount::Neck), COLUMN_TOP_M);
+        let d = Dims::COMPACT;
+        assert!((column_top_m(&d, cam) - (STRETCH_CAMERA_H_MM as f32 / 1000.0 - d.camera_up_m)).abs() < 1e-6);
+        assert!(column_kg(&d, Torso::Mast, cam) > column_kg(&d, Torso::Mast, HeadMount::Neck));
+        assert_eq!(column_top_m(&d, HeadMount::MastCamera { height_mm: 900, pan_tilt: false }), d.column_top_m());
+        assert_eq!(column_top_m(&d, HeadMount::Neck), d.column_top_m());
     }
 
     #[test]

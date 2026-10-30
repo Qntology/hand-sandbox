@@ -13,3 +13,6 @@ node_modules/
 # Test runner logs (test_cuda / test_rocm / test_vulkan / test_cpu) and the downloaded protoc
 /test_logs
 /tools
+
+# The SolidCraft web package, fetched by fetch_solidcraft.bat
+/ui/vendor/solidcraft
