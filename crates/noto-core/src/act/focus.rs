@@ -304,7 +304,7 @@ mod tests {
             let mut cfg = NotoConfig::preset(FingerCount::Five);
             cfg.base = base;
             let hand = cfg.build().unwrap();
-            let r = kin::solve(&body, &KinPose { closure: 0.6, ..KinPose::stand(0.0) }, &KinLoads::default());
+            let r = kin::solve(&body, &KinPose { closure: 0.6, ..KinPose::stand_compact(0.0) }, &KinLoads::default());
             let f = frame(&FocusCtx { body: &body, hand: &hand, report: &r, sample: None, action: Some(ActKind::Grasp), event: None, ground_mu: 0.6, drive: None, object: None, step_mu: None });
             assert_eq!(f.hand.fingers.len(), 5);
             assert!(f.hand_joints.len() >= 10);

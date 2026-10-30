@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::base::{BaseKind, BaseSpec};
+use crate::dims::Dims;
 use crate::hand::FingerCount;
 use crate::morph::{column_kg, mounted_belly, mounted_chest, mounted_head, Manip, Morphology};
 use crate::parts::*;
@@ -9,13 +10,8 @@ use crate::surface::{self, Contact, Surface};
 pub const G: f32 = 9.81;
 pub const REACTION_DELAY_S: f32 = 0.10;
 pub const MARGIN_KEEP: f32 = 0.2;
-pub const KNEE_LEVER_WALK_M: f32 = 0.085;
-pub const KNEE_LEVER_STAND_M: f32 = 0.03;
 pub const KNEE_SAFETY: f32 = 1.5;
-pub const HIP_HALF_WIDTH_M: f32 = 0.09;
 pub const MAST_KG: f32 = 1.0;
-pub const CARGO_X_M: f32 = 0.12;
-pub const CARGO_Z_M: f32 = WAIST_M - 0.10;
 pub const GRIP_SAFETY: f32 = 2.0;
 pub const STOP_DISTANCE_M: f32 = 0.5;
 
@@ -176,6 +172,7 @@ pub struct Coupling {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BalanceReport {
     pub source: Source,
+    pub cargo_x_m: f32,
     pub mass_kg: f32,
     pub hand_load_kg: f32,
     pub cargo_kg: f32,
@@ -225,7 +222,7 @@ impl BalanceReport {
     pub fn ref_ctx(&self, body_mass_kg: f32) -> RefCtx {
         let m = body_mass_kg.max(1.0);
         match self.source {
-            Source::CarryFront => RefCtx { load_ratio: self.cargo_kg / m, load_dist_m: CARGO_X_M, slope_deg: self.slope_deg },
+            Source::CarryFront => RefCtx { load_ratio: self.cargo_kg / m, load_dist_m: self.cargo_x_m, slope_deg: self.slope_deg },
             _ => RefCtx { load_ratio: self.hand_load_kg / m, load_dist_m: 0.0, slope_deg: self.slope_deg },
         }
     }
@@ -284,6 +281,9 @@ pub struct Body {
     pub hand_kg: f32,
     pub support_len_m: f32,
     pub support_width_m: f32,
+    pub dims: Dims,
+    /// Joint limits a design set.
+    pub limits: crate::rig::RigLimits,
 }
 
 struct Eval {
@@ -306,39 +306,74 @@ impl Body {
         let leg = plan.leg_preset();
         let legged = morph.legged();
         let spec = base.spec();
+        let dims = plan.dims(base);
+        let rig = match plan.build {
+            crate::dims::Build::Rig(id) => crate::rig::get(id),
+            _ => None,
+        };
+        // A design's own masses stand in for the parts': its links are what was drawn.
+        let m = rig.as_ref().map_or_else(crate::rig::RigMasses::default, |r| r.masses);
+        let mut leg = leg;
+        leg.mass_kg = m.leg.unwrap_or(leg.mass_kg);
+        leg.foot_mass_kg = m.foot.unwrap_or(leg.foot_mass_kg);
+        leg.foot_len_m = m.foot_len_m.unwrap_or(leg.foot_len_m);
+        leg.foot_width_m = m.foot_width_m.unwrap_or(leg.foot_width_m);
+        leg.com_down_m = m.leg_com_down_m.unwrap_or(leg.com_down_m);
         let (support_len_m, support_width_m) = if legged {
-            (leg.foot_len_m, STANCE_WIDTH_M + leg.foot_width_m)
+            (leg.foot_len_m, dims.stance_m + leg.foot_width_m)
         } else {
-            (spec.footprint_m, CHASSIS_WIDTH_M)
+            (dims.wheelbase_m.unwrap_or(spec.footprint_m), dims.chassis_w_m)
         };
         let gripper = (morph.manip == Manip::Gripper1).then(|| plan.gripper_preset());
         let hand_kg = match morph.manip {
             Manip::None => 0.0,
             Manip::Gripper1 => gripper.as_ref().map_or(0.0, |g| g.mass_kg),
-            Manip::Arms2 | Manip::Arm1 => hand_mass_kg(fingers),
+            Manip::Arms2 | Manip::Arm1 => m.hand.unwrap_or(hand_mass_kg(fingers) * plan.k().powi(3)),
         };
+        let mut head = mounted_head(plan.head_preset(), morph.head);
+        head.mass_kg = m.head.unwrap_or(head.mass_kg);
+        head.com_up_m = m.head_com_up_m.unwrap_or(head.com_up_m);
+        let mut chest = mounted_chest(plan.chest_preset(), morph.torso);
+        if let Some(total) = m.chest {
+            // The trunk link holds the chest and its battery, in their proportion.
+            let share = chest.mass_kg / (chest.mass_kg + chest.battery_kg).max(1e-3);
+            chest.mass_kg = total * share;
+            chest.battery_kg = total * (1.0 - share);
+        }
+        chest.com_up_m = m.chest_com_up_m.unwrap_or(chest.com_up_m);
+        let mut belly = mounted_belly(plan.belly_preset(), morph.torso);
+        belly.mass_kg = m.belly.unwrap_or(belly.mass_kg);
+        belly.com_down_m = m.belly_com_down_m.unwrap_or(belly.com_down_m);
+        let mut arm = plan.arm_preset();
+        arm.mass_kg = m.arm.unwrap_or(arm.mass_kg);
+        arm.com_m = m.arm_com_m.unwrap_or(arm.com_m);
+        let mut chassis = plan.chassis_preset();
+        chassis.mass_kg = m.chassis.unwrap_or(chassis.mass_kg);
+        chassis.com_m = m.chassis_com_m.unwrap_or(chassis.com_m);
         Body {
             plan: BodyPlan { morph: Morphology { lower: plan.morph.lower, ..morph }, ..*plan },
             base,
             fingers,
             morph,
             legged,
-            head: mounted_head(plan.head_preset(), morph.head),
-            chest: mounted_chest(plan.chest_preset(), morph.torso),
-            belly: mounted_belly(plan.belly_preset(), morph.torso),
-            arm: plan.arm_preset(),
+            head,
+            chest,
+            belly,
+            arm,
             leg,
-            chassis: plan.chassis_preset(),
+            chassis,
             lift: BodyPlan { morph, ..*plan }.lift_preset(base),
             gripper,
             hand_kg,
             support_len_m,
             support_width_m,
+            dims,
+            limits: rig.as_ref().map_or_else(crate::rig::RigLimits::default, |r| r.limits),
         }
     }
 
     pub fn mast_kg(&self) -> f32 {
-        column_kg(self.morph.torso, self.morph.head) + self.lift.as_ref().map_or(0.0, |l| l.mass_kg)
+        column_kg(&self.dims, self.morph.torso, self.morph.head) + self.lift.as_ref().map_or(0.0, |l| l.mass_kg)
     }
 
     pub fn mass_kg(&self) -> f32 {
@@ -348,7 +383,8 @@ impl Body {
     }
 
     pub fn battery_j(&self) -> f64 {
-        self.chest.battery_wh as f64 * 3600.0
+        // A truck runs on its traction battery [추정: 48 V 375 Ah], the rider on nothing of its own.
+        self.dims.payload_kg.map_or(self.chest.battery_wh, |_| 18_000.0) as f64 * 3600.0
     }
 
     pub fn com_height_m(&self) -> f32 {
@@ -358,7 +394,7 @@ impl Body {
     pub fn arm_split(&self) -> (f32, f32, f32) {
         let m_fore = 0.25 * self.arm.mass_kg;
         let m_up = self.arm.mass_kg - m_fore;
-        let r_up = ((self.arm.com_m * self.arm.mass_kg - m_fore * (UPPER_ARM_M + 0.45 * FOREARM_M)) / m_up).max(0.02);
+        let r_up = ((self.arm.com_m * self.arm.mass_kg - m_fore * (self.dims.upper_arm_m + 0.45 * self.dims.forearm_m)) / m_up).max(0.02);
         (m_up, r_up, m_fore)
     }
 
@@ -367,7 +403,7 @@ impl Body {
             let c = post.slope_deg.to_radians().cos();
             let (x0, x1) = (-0.25 * self.leg.foot_len_m * c, 0.75 * self.leg.foot_len_m * c);
             if post.single_support {
-                let ys = -STANCE_WIDTH_M / 2.0;
+                let ys = -self.dims.stance_m / 2.0;
                 [x0, x1, ys - self.leg.foot_width_m / 2.0, ys + self.leg.foot_width_m / 2.0]
             } else {
                 [x0, x1, -self.support_width_m / 2.0, self.support_width_m / 2.0]
@@ -394,11 +430,11 @@ impl Body {
         let du = [a.sin(), 0.0, -a.cos()];
         let df = [b.sin(), 0.0, -b.cos()];
         let at = |o: [f32; 3], d: [f32; 3], r: f32| [o[0] + d[0] * r, o[1] + d[1] * r, o[2] + d[2] * r];
-        let elbow = at(sh, du, UPPER_ARM_M);
-        let hand = at(elbow, df, FOREARM_M + 0.06);
+        let elbow = at(sh, du, self.dims.upper_arm_m);
+        let hand = at(elbow, df, self.dims.forearm_m + 0.06);
         let mut v = vec![
             Pt { seg: Segment::Arm, group: Group::Upper, m: m_up, p: at(sh, du, r_up) },
-            Pt { seg: Segment::Arm, group: Group::Upper, m: m_fore, p: at(elbow, df, 0.45 * FOREARM_M) },
+            Pt { seg: Segment::Arm, group: Group::Upper, m: m_fore, p: at(elbow, df, 0.45 * self.dims.forearm_m) },
             Pt { seg: Segment::Hand, group: Group::Upper, m: self.hand_kg, p: hand },
         ];
         if load > 0.0 {
@@ -416,12 +452,12 @@ impl Body {
             }
         }
         if self.has_torso() {
-            v.push(up(Segment::Chest, self.chest.mass_kg, [0.0, 0.0, WAIST_M + self.chest.com_up_m]));
-            let belly_z = WAIST_M - self.belly.com_down_m;
+            v.push(up(Segment::Chest, self.chest.mass_kg, [0.0, 0.0, self.dims.waist_m + self.chest.com_up_m]));
+            let belly_z = self.dims.waist_m - self.belly.com_down_m;
             if self.plan.battery_low {
                 v.push(Pt { seg: Segment::Belly, group: Group::Pelvis, m: self.chest.battery_kg, p: [0.0, 0.0, belly_z] });
             } else {
-                v.push(up(Segment::Chest, self.chest.battery_kg, [0.0, 0.0, WAIST_M + self.chest.com_up_m]));
+                v.push(up(Segment::Chest, self.chest.battery_kg, [0.0, 0.0, self.dims.waist_m + self.chest.com_up_m]));
             }
             v.push(Pt { seg: Segment::Belly, group: Group::Pelvis, m: self.belly.mass_kg, p: [0.0, 0.0, belly_z] });
         }
@@ -437,11 +473,11 @@ impl Body {
             v.push(Pt { seg: mm.segment, group: Group::Lower, m: mm.kg, p: mm.at });
         }
         if self.legged() {
-            for (i, y) in [-STANCE_WIDTH_M / 2.0, STANCE_WIDTH_M / 2.0].into_iter().enumerate() {
+            for (i, y) in [-self.dims.stance_m / 2.0, self.dims.stance_m / 2.0].into_iter().enumerate() {
                 let swing = post.single_support && i == 1;
                 let lift = if swing { post.step_m.max(0.05) } else { 0.0 };
                 let g = if swing { Group::Swing } else { Group::Lower };
-                v.push(Pt { seg: Segment::Leg, group: g, m: self.leg.mass_kg, p: [if swing { 0.10 } else { 0.0 }, y, HIP_M - self.leg.com_down_m + lift * 0.5] });
+                v.push(Pt { seg: Segment::Leg, group: g, m: self.leg.mass_kg, p: [if swing { 0.10 } else { 0.0 }, y, self.dims.hip_m - self.leg.com_down_m + lift * 0.5] });
                 v.push(Pt { seg: Segment::Foot, group: g, m: self.leg.foot_mass_kg, p: [0.25 * self.leg.foot_len_m + if swing { 0.15 } else { 0.0 }, y, 0.04 + lift] });
             }
         } else {
@@ -455,7 +491,7 @@ impl Body {
 
     fn evaluate(&self, post: &Posture, lean: f32, shift_y: f32) -> Eval {
         let mut pts = self.points(post);
-        let pivot = [0.0, 0.0, WAIST_M];
+        let pivot = [0.0, 0.0, self.dims.waist_m];
         for p in pts.iter_mut() {
             if p.group == Group::Upper {
                 p.p = rot_xz(p.p, pivot, lean);
@@ -499,7 +535,7 @@ impl Body {
 
     pub fn nominal_shift(&self, post: &Posture) -> f32 {
         let m = self.mass_kg() + post.cargo_kg + post.hand_load_kg.iter().sum::<f32>();
-        let arm_len = UPPER_ARM_M + FOREARM_M + 0.06;
+        let arm_len = self.dims.upper_arm_m + self.dims.forearm_m + 0.06;
         let mut s = 0.0;
         for i in 0..self.arm_count() {
             let a = post.arm_elev_deg[i].to_radians();
@@ -530,7 +566,7 @@ impl Body {
         let band = self.ankle_band();
         let excess = delta - delta.clamp(-band, band);
         let upper_m: f32 = uncomp.pts.iter().filter(|p| p.group == Group::Upper).map(|p| p.m).sum();
-        let upper_h: f32 = uncomp.pts.iter().filter(|p| p.group == Group::Upper).map(|p| p.m * (p.p[2] - WAIST_M)).sum::<f32>() / upper_m.max(1e-3);
+        let upper_h: f32 = uncomp.pts.iter().filter(|p| p.group == Group::Upper).map(|p| p.m * (p.p[2] - self.dims.waist_m)).sum::<f32>() / upper_m.max(1e-3);
         let max_lean = self.belly.max_lean_deg.to_radians();
         let lean = if excess.abs() > 1e-5 && max_lean > 0.0 {
             (-(excess * uncomp.mass) / (upper_m * upper_h.max(0.05))).clamp(-1.0, 1.0).asin().clamp(-max_lean, max_lean)
@@ -539,7 +575,7 @@ impl Body {
         };
         let shift_y = if self.legged() && post.single_support {
             let moved: f32 = uncomp.pts.iter().filter(|p| p.group != Group::Lower).map(|p| p.m).sum();
-            (-STANCE_WIDTH_M / 2.0 - uncomp.com[1]) * uncomp.mass / moved.max(1e-3)
+            (-self.dims.stance_m / 2.0 - uncomp.com[1]) * uncomp.mass / moved.max(1e-3)
         } else {
             0.0
         };
@@ -568,7 +604,7 @@ impl Body {
 
         let keep = 1.0 - self.head.gaze_stabilization;
         let head_pitch = (fin.pitch + lean).to_degrees() * keep;
-        let head_roll = if self.legged() && post.single_support { (shift_y / HIP_M).atan().to_degrees() * keep } else { 0.0 };
+        let head_roll = if self.legged() && post.single_support { (shift_y / self.dims.hip_m).atan().to_degrees() * keep } else { 0.0 };
 
         let joints = self.joint_loads(post, &fin, lean, shift_y, grip_capacity_n);
         let comp_joint = |j: &JointLoad, eps: f32| {
@@ -602,6 +638,7 @@ impl Body {
         }
 
         let mut rep = BalanceReport {
+            cargo_x_m: self.dims.cargo_x_m,
             source: post.source,
             mass_kg: fin.mass,
             hand_load_kg: post.hand_load_kg.iter().sum(),
@@ -646,7 +683,7 @@ impl Body {
         let contact_use = if self.legged && post.single_support { [use_, 0.0] } else { [use_, use_] };
         let e = post.arm_elev_deg[0].to_radians();
         let f = (post.arm_elev_deg[0] + post.elbow_deg[0]).to_radians();
-        let hand_z = (SHOULDER_M - UPPER_ARM_M * e.cos() - (FOREARM_M + 0.06) * f.cos()).max(0.05);
+        let hand_z = (self.dims.shoulder_m - self.dims.upper_arm_m * e.cos() - (self.dims.forearm_m + 0.06) * f.cos()).max(0.05);
         let room = crate::contact::friction_room_n(mu, n, shear);
         let (push_slide, pull_slide) = (room[0], room[1]);
         let push_tip = ((zmp[0] - support[0]).max(0.0) * w / hand_z).max(0.0);
@@ -675,7 +712,7 @@ impl Body {
             JointLoad { joint: joint.into(), segment: seg, actuator: act.name.into(), torque_nm: t, cont_nm: act.cont_nm, peak_nm: act.peak_nm, effort: t / act.cont_nm.max(1e-3), peak_ratio: t / act.peak_nm.max(1e-3) }
         };
         let tilt = |p: [f32; 3]| {
-            let mut q = rot_xz(p, [0.0, 0.0, WAIST_M], lean);
+            let mut q = rot_xz(p, [0.0, 0.0, self.dims.waist_m], lean);
             q[1] += shift_y;
             if e.pitch != 0.0 {
                 q = rot_xz(q, [0.0, 0.0, 0.0], -e.pitch);
@@ -697,7 +734,7 @@ impl Body {
                 out.push(JointLoad { joint: format!("grip_{tag}"), segment: Segment::Hand, actuator: "손가락 마찰".into(), torque_nm: need, cont_nm: cap, peak_nm: cap, effort: need / cap, peak_ratio: need / cap });
             }
         }
-        let waist = tilt([0.0, 0.0, WAIST_M]);
+        let waist = tilt([0.0, 0.0, self.dims.waist_m]);
         if let Some(pitch) = &self.belly.pitch {
             out.push(jl("waist", Segment::Belly, pitch, moment(&mut e.pts.iter().filter(|p| p.group == Group::Upper), waist)));
         }
@@ -711,12 +748,12 @@ impl Body {
             let x_ank = 0.0;
             let tau_ankle = G * e.pts.iter().filter(|p| p.seg != Segment::Foot && p.group != Group::Swing).map(|p| p.m * lever(p, [x_ank, 0.0, 0.08])).sum::<f32>() / n_support;
             out.push(jl("ankle", Segment::Foot, &self.leg.ankle, tau_ankle));
-            let d = if post.step_m > 0.0 { step_knee_lever(post.step_m) } else if post.single_support { KNEE_LEVER_WALK_M } else { KNEE_LEVER_STAND_M };
+            let d = if post.step_m > 0.0 { step_knee_lever(&self.dims, post.step_m) } else if post.single_support { self.dims.knee_lever_walk_m } else { self.dims.knee_lever_stand_m };
             let leg_m = 2.0 * self.leg.mass_kg;
             out.push(jl("knee", Segment::Leg, &self.leg.knee, (above_feet - leg_m * 0.5) * G * d / n_support));
             if post.single_support {
                 let upper: f32 = e.mass - e.pts.iter().filter(|p| matches!(p.seg, Segment::Leg | Segment::Foot)).map(|p| p.m).sum::<f32>();
-                out.push(jl("hip_roll", Segment::Leg, &self.leg.knee, upper * G * HIP_HALF_WIDTH_M));
+                out.push(jl("hip_roll", Segment::Leg, &self.leg.knee, upper * G * self.dims.hip_half_m));
             }
         } else {
             let slope = post.slope_deg.to_radians();
@@ -763,7 +800,7 @@ impl Body {
                 v.push(cell(Segment::Leg, "peak_ratio", "", lj.peak_ratio, lj.peak_ratio, Some(lj), lj.joint == "hip_roll"));
             }
             if post.single_support {
-                let frac = r.lateral_com_shift_m.abs() / (STANCE_WIDTH_M / 2.0);
+                let frac = r.lateral_com_shift_m.abs() / (self.dims.stance_m / 2.0);
                 v.push(cell(Segment::Belly, "shift_frac", "", frac, frac, None, false));
             }
         }
@@ -781,7 +818,7 @@ impl Body {
 
     pub fn drive_limits(&self, spec: &BaseSpec, cargo_kg: f32) -> DriveLimits {
         let m = self.mass_kg() + cargo_kg;
-        let ref_m = Body::new(&BodyPlan::default(), self.base, FingerCount::Five).mass_kg();
+        let ref_m = Body::new(&BodyPlan { build: self.plan.build, ..BodyPlan::default() }, self.base, FingerCount::Five).mass_kg();
         let mut reasons = Vec::new();
         let mut speed = spec.max_speed_mps;
         let mut slope = spec.max_slope_deg;
@@ -791,12 +828,12 @@ impl Body {
         let accel = (G * (quiet.margin_x - MARGIN_KEEP).max(0.02) * half / quiet.com[2].max(0.1)).min(3.0);
         let capacity;
         if self.legged() {
-            let v_fr = (self.leg.froude * G * HIP_M).sqrt();
+            let v_fr = (self.leg.froude * G * self.dims.hip_m).sqrt();
             if v_fr < speed {
                 speed = v_fr;
                 reasons.push(format!("보행 속도 한계 Froude {:.2} → {:.2} m/s", self.leg.froude, v_fr));
             }
-            let need = m * G * KNEE_LEVER_WALK_M;
+            let need = m * G * self.dims.knee_lever_walk_m;
             let s = self.leg.knee.cont_nm / need;
             if s < 1.0 {
                 let f = s * s;
@@ -808,7 +845,7 @@ impl Body {
                 reasons.push(format!("무릎 피크 {:.1} < {:.1}×필요 {:.1} N·m: 거의 걸을 수 없음", self.leg.knee.peak_nm, KNEE_SAFETY, need));
             }
             let d_max = self.leg.knee.peak_nm / (KNEE_SAFETY * m * G);
-            let h_max = ((d_max / HIP_M - 0.10) / 0.40 * HIP_M).max(0.0);
+            let h_max = ((d_max / self.dims.hip_m - 0.10) / 0.40 * self.dims.hip_m).max(0.0);
             if h_max < step {
                 step = h_max;
                 reasons.push(format!("무릎 피크로 오를 수 있는 턱 {:.0} cm", h_max * 100.0));
@@ -819,7 +856,7 @@ impl Body {
                 slope = slip;
                 reasons.push(format!("단단한 바닥에서 발 마찰 {:.2} − 보행 전단 {:.3}의 미끄럼 한계 {slip:.0}°", firm.mu_foot, surface::GAIT_RCOF));
             }
-            capacity = (self.leg.knee.cont_nm / (G * KNEE_LEVER_WALK_M) - self.mass_kg()).max(0.0);
+            capacity = (self.leg.knee.cont_nm / (G * self.dims.knee_lever_walk_m) - self.mass_kg()).max(0.0);
         } else {
             if self.chassis.max_speed_mps < speed {
                 speed = self.chassis.max_speed_mps;
@@ -854,7 +891,10 @@ impl Body {
                 Tier::Mid => 30.0,
                 Tier::Pro => 100.0,
             };
-            capacity = (structural - (self.mass_kg() - self.chassis.mass_kg)).max(0.0);
+            capacity = match self.dims.payload_kg {
+                Some(rated) => rated,
+                None => (structural - (self.mass_kg() - self.chassis.mass_kg)).max(0.0),
+            };
         }
         let capacity_kg = match self.cargo_geom() {
             Some(c) => match c.payload_kg {
@@ -864,7 +904,7 @@ impl Body {
                     }
                     capacity.min(p)
                 }
-                None => capacity.min(self.base.carry_capacity_kg()),
+                None => capacity.min(self.dims.payload_kg.unwrap_or(self.base.carry_capacity_kg())),
             },
             None => {
                 reasons.push("적재 공간 없음 (집게로 든 것만 운반)".to_string());
@@ -929,8 +969,8 @@ impl Body {
     }
 }
 
-pub fn step_knee_lever(h: f32) -> f32 {
-    HIP_M * (0.10 + 0.40 * h / HIP_M)
+pub fn step_knee_lever(d: &Dims, h: f32) -> f32 {
+    d.hip_m * (0.10 + 0.40 * h / d.hip_m)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -1093,7 +1133,7 @@ mod tests {
         let b = body(Tier::Mid, BaseKind::HumanFoot);
         let p = Posture { source: Source::FootLift, single_support: true, ..Posture::quiet(0.0) };
         let r = b.solve(&p, &FeedForward::default(), 50.0);
-        assert!((r.com[1] + STANCE_WIDTH_M / 2.0).abs() < 0.02, "CoM over the right foot: {:?}", r.com);
+        assert!((r.com[1] + crate::dims::Dims::COMPACT.stance_m / 2.0).abs() < 0.02, "CoM over the right foot: {:?}", r.com);
         assert!(r.margin > 0.0, "{r:?}");
         let hip = r.joint("hip_roll").unwrap();
         assert!(hip.peak_ratio > 0.05 && hip.peak_ratio < 1.0, "{}", hip.peak_ratio);

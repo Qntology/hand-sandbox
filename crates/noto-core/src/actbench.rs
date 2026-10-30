@@ -526,7 +526,7 @@ fn eval_walk(body: &Body, s: &AxScenario) -> AxResult {
     let cargo = s.cargo_frac * body.mass_kg();
     let speed = body.drive_limits(&body.base.spec(), cargo).max_speed_mps;
     let weight = (body.mass_kg() + cargo) * G;
-    let leg = crate::parts::HIP_M;
+    let leg = body.dims.hip_m;
     let (mut slipped_steps, mut steps, mut falls) = (0u32, 0u32, 0u32);
     let mut runs = Vec::new();
     let mut slides = Vec::new();

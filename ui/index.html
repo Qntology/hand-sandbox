@@ -29,6 +29,9 @@
           <button type="button" class="menu-btn" data-view="side" data-tip-title="손·발" data-tip="손가락·관절·발(이동 베이스)을 2D 측면도로 보고 물체 파지를 시험합니다.">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 13V6.5a1.5 1.5 0 0 1 3 0V12M11 11V4.5a1.5 1.5 0 0 1 3 0V12M14 11V6a1.5 1.5 0 0 1 3 0v8.5a6 6 0 0 1-6 6h-.5a5 5 0 0 1-4-2L4.5 15a1.5 1.5 0 0 1 2.4-1.8L8 14.5"/></svg><span>손·발</span>
           </button>
+          <button type="button" class="menu-btn" data-view="rig" data-tip-title="로봇 설계" data-tip="로봇 프리셋을 고르고, 내장한 SolidCraft 편집기에서 치수·모양·관절을 고쳐 새 프리셋으로 저장해 시뮬레이션에 넣습니다.">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg><span>로봇 설계</span>
+          </button>
           <button type="button" class="menu-btn" data-view="analysis" data-tip-title="분석" data-tip="비전 점수, 명령 해석 과정, SDS(통계 원장) 상태를 표로 봅니다.">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4v16h16"/><path d="M8 15l3.5-4 3 2.5L19 8"/></svg><span>분석</span>
           </button>
@@ -149,8 +152,20 @@
         </div>
 
         <!-- ⑤ 부품 프리셋 -->
+        <div class="panel-section-header" data-section="secRig" role="button" tabindex="0" aria-expanded="true" aria-controls="secRig">
+          <span class="sec-title"><span class="step-no">5</span><span class="sec-name">로봇 프리셋</span><span class="help" tabindex="0" data-tip="몸 전체의 크기와 형태를 고릅니다. 기본 프리셋은 월드의 문·선반에 맞는 실제 크기이고, '로봇 설계'에서 고쳐 저장한 로봇도 여기에 나타납니다.">?</span></span>
+          <span class="step-sum" id="sum-rig"></span><span class="chevron" aria-hidden="true">▼</span>
+        </div>
+        <div class="panel-section-body" id="secRig">
+          <div class="form-group"><label for="rig-preset-side">로봇</label><select id="rig-preset-side"></select></div>
+          <div class="btn-row">
+            <button type="button" class="btn btn-sm" id="rig-apply-side">월드에 적용</button>
+            <button type="button" class="btn btn-sm" id="rig-edit">로봇 설계 열기</button>
+          </div>
+        </div>
+
         <div class="panel-section-header" data-section="secPresets" role="button" tabindex="0" aria-expanded="true" aria-controls="secPresets">
-          <span class="sec-title"><span class="step-no">5</span><span class="sec-name">부품 프리셋</span><span class="help" tabindex="0" data-tip="머리·가슴·배·팔·다리(바퀴형이면 섀시) 부품 등급을 고릅니다. 등급은 실제 액추에이터·배터리 데이터시트 값이고(docs/research/parts.md), 질량·무게중심·관절 토크가 바뀌어 들 수 있는 물건, 속도, 경사·턱 한계, 적재량이 달라집니다. 모습은 그대로입니다.">?</span></span>
+          <span class="sec-title"><span class="step-no">6</span><span class="sec-name">부품 프리셋</span><span class="help" tabindex="0" data-tip="머리·가슴·배·팔·다리(바퀴형이면 섀시) 부품 등급을 고릅니다. 등급은 실제 액추에이터·배터리 데이터시트 값이고(docs/research/parts.md), 질량·무게중심·관절 토크가 바뀌어 들 수 있는 물건, 속도, 경사·턱 한계, 적재량이 달라집니다. 모습은 그대로입니다.">?</span></span>
           <span class="step-sum" id="sum-presets"></span><span class="chevron" aria-hidden="true">▼</span>
         </div>
         <div class="panel-section-body" id="secPresets">
@@ -229,7 +244,40 @@
       <div class="bottom-tabs center-tabs" role="tablist" aria-label="가운데 화면" id="center-tabs">
         <button type="button" class="bottom-tab active" role="tab" id="ctab-world" data-tab="world" aria-selected="true" aria-controls="cpane-world">월드</button>
         <button type="button" class="bottom-tab" role="tab" id="ctab-side" data-tab="side" aria-selected="false" aria-controls="cpane-side" tabindex="-1">손·발 측면도</button>
+        <button type="button" class="bottom-tab" role="tab" id="ctab-rig" data-tab="rig" aria-selected="false" aria-controls="cpane-rig" tabindex="-1">로봇 설계</button>
         <button type="button" class="bottom-tab" role="tab" id="ctab-analysis" data-tab="analysis" aria-selected="false" aria-controls="cpane-analysis" tabindex="-1">분석</button>
+      </div>
+
+      <!-- 로봇 설계: 이 앱이 SolidCraft 편집 화면을 품는다 -->
+      <div class="center-pane" id="cpane-rig" role="tabpanel" aria-labelledby="ctab-rig" hidden>
+        <div class="rig-bar">
+          <label class="vt-label" for="rig-preset">프리셋</label>
+          <select id="rig-preset" aria-label="로봇 프리셋"></select>
+          <button type="button" class="btn btn-sm" id="rig-open" data-tip-title="편집기에 불러오기" data-tip="고른 로봇을 편집기에 부품과 관절로 만들어 엽니다. 지금 편집 중인 설계는 닫힙니다.">편집기에 불러오기</button>
+          <div class="vt-sep"></div>
+          <label class="vt-label" for="rig-name">이름</label>
+          <input type="text" id="rig-name" maxlength="40" spellcheck="false" aria-label="새 프리셋 이름" />
+          <button type="button" class="btn btn-sm" id="rig-back" data-tip-title="프리셋으로 저장" data-tip="편집기의 설계를 내보내 치수·질량·관절을 측정하고 로봇 프리셋으로 저장합니다.">프리셋으로 저장</button>
+          <button type="button" class="btn btn-sm" id="rig-delete">삭제</button>
+          <div class="vt-sep"></div>
+          <button type="button" class="btn btn-sm" id="rig-check" data-tip-title="투입 전 검사" data-tip="서기, 문 통과, 원목 들기를 물리 모델로 미리 계산합니다.">검사</button>
+          <button type="button" class="btn btn-sm btn-primary" id="rig-apply" data-tip-title="시뮬레이션에 넣기" data-tip="이 로봇으로 월드를 다시 만들고 월드 화면으로 돌아갑니다.">시뮬레이션에 넣기</button>
+          <button type="button" class="btn btn-sm" id="rig-wide" aria-pressed="false">크게 보기</button>
+          <span class="rig-status" id="rig-status" role="status"></span>
+        </div>
+        <div class="rig-body">
+          <div class="rig-stage" id="rig-stage">
+            <div class="rig-missing" id="rig-missing" hidden>
+              <b>SolidCraft 웹 패키지가 아직 없습니다</b>
+              <p>저장소 폴더에서 <code>fetch_solidcraft.bat</code>을 한 번 실행하면 공식 릴리스를 받아 <code>ui/vendor/solidcraft</code>에 풉니다.</p>
+            </div>
+          </div>
+          <aside class="rig-side" aria-label="로봇 요약">
+            <div class="rig-note" id="rig-note"></div>
+            <div id="rig-summary"></div>
+            <a class="rig-legal" href="vendor/solidcraft/NOTICE" target="_blank" rel="noopener">SolidCraft · MIT OR Apache-2.0 고지</a>
+          </aside>
+        </div>
       </div>
 
       <!-- 월드 -->

@@ -8,7 +8,8 @@ let backend = null;
 // 개발 서버(shim)는 이름 그대로 받는다.
 const RT_CALL = new Set(['test_start', 'test_step', 'test_status', 'test_keyframe', 'test_video', 'test_stats', 'test_cancel', 'body_presets', 'body_plan_eval', 'body_plan_set', 'world_body',
   'inventory_drop', 'world_reset', 'body_reset', 'world_terrain', 'nn_status', 'physics_status', 'depth_view',
-  'crew_add', 'crew_clear', 'crew_mode', 'crew_status', 'camera_rig']);
+  'crew_add', 'crew_clear', 'crew_mode', 'crew_status', 'camera_rig',
+  'rig_presets', 'rig_design', 'rig_import', 'rig_keep_design', 'rig_validate', 'rig_apply', 'rig_delete']);
 
 export async function initApi() {
   const tauriInvoke = window.__TAURI__?.core?.invoke;

@@ -419,7 +419,7 @@ fn pick_with_look(base: BaseKind, body: noto_core::BodyPlan) -> PickLook {
 
 #[test]
 fn a_walker_bends_its_neck_to_look_at_the_item_before_the_hand_and_the_vision_check_runs() {
-    let p = pick_with_look(BaseKind::HumanFoot, noto_core::BodyPlan::default());
+    let p = pick_with_look(BaseKind::HumanFoot, noto_core::BodyPlan::standard());
     assert!(p.neck_deg > 20.0, "the neck bent only {:.0}°
 {}", p.neck_deg, p.log);
     assert!(p.dip_deg > 20.0, "the camera dipped only {:.0}°
@@ -430,12 +430,12 @@ fn a_walker_bends_its_neck_to_look_at_the_item_before_the_hand_and_the_vision_ch
 
 #[test]
 fn wheels_and_tracks_lift_with_forks_and_check_the_item_with_the_rider_and_the_fork_camera() {
-    let lift = noto_core::BodyPlan::named("wheel_lift").unwrap();
-    let noneck = noto_core::BodyPlan { morph: noto_core::morph::Morphology::named("wheel_noneck").unwrap(), ..noto_core::BodyPlan::default() };
+    let lift = noto_core::BodyPlan { build: noto_core::dims::Build::Standard, ..noto_core::BodyPlan::named("wheel_lift").unwrap() };
+    let noneck = noto_core::BodyPlan { morph: noto_core::morph::Morphology::named("wheel_noneck").unwrap(), ..noto_core::BodyPlan::standard() };
     for (base, body, tag, neck) in [
-        (BaseKind::Wheel, noto_core::BodyPlan::default(), "wheel", true),
-        (BaseKind::Track, noto_core::BodyPlan::default(), "track", true),
-        (BaseKind::Mecanum, noto_core::BodyPlan::default(), "mecanum", true),
+        (BaseKind::Wheel, noto_core::BodyPlan::standard(), "wheel", true),
+        (BaseKind::Track, noto_core::BodyPlan::standard(), "track", true),
+        (BaseKind::Mecanum, noto_core::BodyPlan::standard(), "mecanum", true),
         (BaseKind::Wheel, lift, "wheel+lift", true),
         (BaseKind::Wheel, noneck, "wheel, no neck", false),
     ] {

@@ -34,7 +34,7 @@ fn assert_done(rt: &Runtime, q: &noto_quest::Quest) {
 
 #[test]
 fn carried_items_are_set_down_by_command_here_or_at_a_place() {
-    let mut rt = runtime_with(RuntimeConfig { seed: 7, noise: NoiseCfg::none(), body: BodyPlan::named("pro").unwrap(), ..RuntimeConfig::default() });
+    let mut rt = runtime_with(RuntimeConfig { seed: 7, noise: NoiseCfg::none(), body: BodyPlan { build: noto_core::dims::Build::Standard, ..BodyPlan::named("pro").unwrap() }, ..RuntimeConfig::default() });
     let q = run_command(&mut rt, "원목 2개 캐줘", 30_000);
     assert_done(&rt, &q);
     assert_eq!(rt.world().carried_count(ItemKind::Log), 2);
@@ -99,7 +99,7 @@ fn the_inventory_button_and_the_snapshot_speak_the_same_amounts() {
 
 #[test]
 fn a_stone_too_heavy_for_budget_arms_is_broken_and_carried_in_parts() {
-    let cfg = RuntimeConfig { seed: 7, noise: NoiseCfg::none(), body: BodyPlan { arm: Tier::Budget, ..BodyPlan::default() }, ..RuntimeConfig::default() };
+    let cfg = RuntimeConfig { seed: 7, noise: NoiseCfg::none(), body: BodyPlan { arm: Tier::Budget, ..BodyPlan::standard() }, ..RuntimeConfig::default() };
     let mut rt = runtime_with(cfg);
     let q = run_command(&mut rt, "돌 1개를 베이스캠프로 가져와", 40_000);
     assert_done(&rt, &q);
@@ -108,7 +108,7 @@ fn a_stone_too_heavy_for_budget_arms_is_broken_and_carried_in_parts() {
     assert!(log.contains("쪼개서"), "the cargo decision said why:\n{log}");
     let stock = rt.world().waypoint_by_key("base_camp").unwrap().stock_of(ItemKind::Stone);
     assert!((stock - 1.0).abs() < 1e-3, "one whole stone's worth arrived in pieces: {stock}");
-    let mut rt = runtime_with(RuntimeConfig { seed: 7, noise: NoiseCfg::none(), body: BodyPlan { arm: Tier::Budget, ..BodyPlan::default() }, ..RuntimeConfig::default() });
+    let mut rt = runtime_with(RuntimeConfig { seed: 7, noise: NoiseCfg::none(), body: BodyPlan { arm: Tier::Budget, ..BodyPlan::standard() }, ..RuntimeConfig::default() });
     let q = run_command(&mut rt, "원목 1개를 창고로 가져와", 30_000);
     assert_eq!(q.state, State::Failed);
     assert_eq!(q.failure.as_ref().unwrap().code, "lift_overload");
@@ -193,7 +193,7 @@ fn a_typed_command_records_the_three_rows_in_the_live_world() {
 #[test]
 fn the_old_seeded_integrated_test_still_runs_beside_the_live_one() {
     let mut rt = runtime(7);
-    rt.test_start("원목 1개를 창고로 가져와", 7, BodyPlan::default(), Some(BaseKind::Wheel)).unwrap();
+    rt.test_start("원목 1개를 창고로 가져와", 7, BodyPlan::standard(), Some(BaseKind::Wheel)).unwrap();
     let mut guard = 0;
     while rt.test_session().map(|t| t.phase) != Some(TestPhase::Done) {
         rt.test_advance(400).unwrap();

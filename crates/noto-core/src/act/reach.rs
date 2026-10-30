@@ -1,7 +1,8 @@
 use serde::Serialize;
 
 use crate::balance::{Body, G};
-use crate::kin::{self, KinLoads, KinPose, KinReport, Rom, ANKLE_H_M, PALM_OFFSET_M, SHANK_M, THIGH_M, WHEEL_R_M, BUMPER_GAP_M};
+use crate::dims::Dims;
+use crate::kin::{self, KinLoads, KinPose, KinReport, Rom};
 use crate::morph::{HeadMount, Torso};
 use crate::parts::*;
 
@@ -71,8 +72,8 @@ fn form_refusal(body: &Body, goal: &ReachGoal, approach: &'static str) -> Option
     None
 }
 
-pub fn arm_ik(shoulder: [f32; 2], target: [f32; 2], trunk_deg: f32) -> Option<(f32, f32)> {
-    let (l1, l2) = (UPPER_ARM_M, FOREARM_M + PALM_OFFSET_M);
+pub fn arm_ik(d: &Dims, shoulder: [f32; 2], target: [f32; 2], trunk_deg: f32) -> Option<(f32, f32)> {
+    let (l1, l2) = (d.upper_arm_m, d.forearm_m + d.palm_m);
     let (dx, dz) = (target[0] - shoulder[0], target[1] - shoulder[1]);
     let d = (dx * dx + dz * dz).sqrt();
     if d > l1 + l2 - 1e-4 || d < (l1 - l2).abs() + 1e-4 {
@@ -85,23 +86,23 @@ pub fn arm_ik(shoulder: [f32; 2], target: [f32; 2], trunk_deg: f32) -> Option<(f
     Some((upper.to_degrees() + trunk_deg, elbow.to_degrees()))
 }
 
-pub fn leg_angles(pose: &KinPose) -> (f32, f32) {
-    let knee = kin::knee_ik(pose.hip, [0.0, ANKLE_H_M]).map(|k| k.0).unwrap_or([0.0, ANKLE_H_M + SHANK_M]);
-    (knee[0].atan2(knee[1] - ANKLE_H_M).to_degrees(), (knee[0] - pose.hip[0]).atan2(pose.hip[1] - knee[1]).to_degrees())
+pub fn leg_angles(d: &Dims, pose: &KinPose) -> (f32, f32) {
+    let knee = kin::knee_ik(d, pose.hip, [0.0, d.ankle_m]).map(|k| k.0).unwrap_or([0.0, d.ankle_m + d.shank_m()]);
+    (knee[0].atan2(knee[1] - d.ankle_m).to_degrees(), (knee[0] - pose.hip[0]).atan2(pose.hip[1] - knee[1]).to_degrees())
 }
 
-pub fn hip_at(shank_deg: f32, thigh_deg: f32) -> [f32; 2] {
+pub fn hip_at(d: &Dims, shank_deg: f32, thigh_deg: f32) -> [f32; 2] {
     let (s, t) = (shank_deg.to_radians(), thigh_deg.to_radians());
-    let knee = [SHANK_M * s.sin(), ANKLE_H_M + SHANK_M * s.cos()];
-    [knee[0] - THIGH_M * t.sin(), knee[1] + THIGH_M * t.cos()]
+    let knee = [d.shank_m() * s.sin(), d.ankle_m + d.shank_m() * s.cos()];
+    [knee[0] - d.thigh_m() * t.sin(), knee[1] + d.thigh_m() * t.cos()]
 }
 
 pub fn blend(body: &Body, a: &KinPose, b: &KinPose, u: f32) -> KinPose {
     let mut p = KinPose::lerp(a, b, u);
     let planted = |q: &KinPose| q.feet.iter().all(|f| f[0].abs() < 1e-4 && f[1].abs() < 1e-4);
     if body.legged() && planted(a) && planted(b) {
-        let ((sa, ta), (sb, tb)) = (leg_angles(a), leg_angles(b));
-        p.hip = hip_at(sa + (sb - sa) * u, ta + (tb - ta) * u);
+        let ((sa, ta), (sb, tb)) = (leg_angles(&body.dims, a), leg_angles(&body.dims, b));
+        p.hip = hip_at(&body.dims, sa + (sb - sa) * u, ta + (tb - ta) * u);
     }
     p
 }
@@ -109,21 +110,21 @@ pub fn blend(body: &Body, a: &KinPose, b: &KinPose, u: f32) -> KinPose {
 pub fn shoulder_point(body: &Body, pose: &KinPose) -> [f32; 2] {
     match body.morph.torso {
         Torso::Humanoid => {}
-        Torso::Mast => return [0.0, SHOULDER_M - pose.lift_m],
+        Torso::Mast => return [0.0, body.dims.shoulder_m - pose.lift_m],
         Torso::None => {
             let s = body.shoulder_at(0, pose.lift_m);
             return [s[0], s[2]];
         }
     }
-    let hip = if body.legged() { pose.hip } else { [0.0, HIP_M - pose.lift_m] };
+    let hip = if body.legged() { pose.hip } else { [0.0, body.dims.hip_m - pose.lift_m] };
     let p = pose.pelvis_deg.to_radians();
     let t = pose.trunk_deg().to_radians();
-    let waist = [hip[0] + kin::PELVIS_M * p.sin(), hip[1] + kin::PELVIS_M * p.cos()];
-    [waist[0] + kin::TRUNK_M * t.sin(), waist[1] + kin::TRUNK_M * t.cos()]
+    let waist = [hip[0] + body.dims.pelvis_m() * p.sin(), hip[1] + body.dims.pelvis_m() * p.cos()];
+    [waist[0] + body.dims.trunk_m() * t.sin(), waist[1] + body.dims.trunk_m() * t.cos()]
 }
 
 pub fn min_object_x(body: &Body, half_len_m: f32) -> f32 {
-    let front = if body.legged() { 0.75 * body.leg.foot_len_m } else { 0.5 * body.support_len_m + WHEEL_R_M + BUMPER_GAP_M };
+    let front = if body.legged() { 0.75 * body.leg.foot_len_m } else { 0.5 * body.support_len_m + body.dims.wheel_r_m + body.dims.bumper_gap_m };
     front + half_len_m + STANDOFF_GAP_M
 }
 
@@ -137,7 +138,7 @@ struct Cand {
 }
 
 fn strategy_of(body: &Body, pose: &KinPose) -> &'static str {
-    let squat = body.legged() && pose.hip[1] < HIP_M - 0.05;
+    let squat = body.legged() && pose.hip[1] < body.dims.hip_m - 0.05;
     let hinge = body.legged() && pose.pelvis_deg > 10.0;
     let stoop = pose.waist_deg > 10.0;
     if !body.legged() && pose.lift_m > 0.05 {
@@ -182,9 +183,9 @@ fn violation(r: &KinReport) -> f32 {
 
 fn look_from(body: &Body, sh: [f32; 2]) -> Option<([f32; 2], f32)> {
     match body.camera_mount() {
-        HeadMount::Neck => Some(([sh[0], sh[1] + kin::NECK_UP_M + 0.07], kin::NECK_PITCH_MAX_DEG)),
-        HeadMount::MastCamera { height_mm, pan_tilt: true } => Some(([body.mast_camera_x() + kin::CAMERA_FWD_M, height_mm as f32 / 1000.0], body.head_range_deg().0)),
-        HeadMount::Fixed { tilt_deg } => Some(([sh[0], sh[1] + kin::NECK_UP_M + 0.07], tilt_deg.abs() as f32)),
+        HeadMount::Neck => Some(([sh[0], sh[1] + body.dims.neck_up_m + 0.07], kin::NECK_PITCH_MAX_DEG)),
+        HeadMount::MastCamera { height_mm, pan_tilt: true } => Some(([body.mast_camera_x() + body.dims.camera_fwd_m, height_mm as f32 / 1000.0], body.head_range_deg().0)),
+        HeadMount::Fixed { tilt_deg } => Some(([sh[0], sh[1] + body.dims.neck_up_m + 0.07], tilt_deg.abs() as f32)),
         _ => None,
     }
 }
@@ -193,7 +194,7 @@ pub fn look_down_pose(body: &Body, dist_m: f32, target_z_m: f32, cargo_kg: f32) 
     let mut pose = body.stand(cargo_kg);
     let rom = Rom::of(body);
     let sh0 = shoulder_point(body, &pose);
-    let eye_z = sh0[1] + kin::NECK_UP_M + 0.07;
+    let eye_z = sh0[1] + body.dims.neck_up_m + 0.07;
     let needed_deg = (eye_z - target_z_m).max(0.05).atan2(dist_m.max(0.15)).to_degrees();
     let neck_max = body.head_range_deg().0;
     if matches!(body.camera_mount(), HeadMount::Neck | HeadMount::MastCamera { pan_tilt: true, .. }) {
@@ -214,15 +215,15 @@ fn candidate_or_miss(body: &Body, goal: &ReachGoal, x_obj: f32, shank_deg: f32, 
     let mut pose = body.stand(goal.cargo_kg);
     if body.legged() {
         let (s, t) = (shank_deg.to_radians(), thigh_deg.to_radians());
-        let knee = [SHANK_M * s.sin(), ANKLE_H_M + SHANK_M * s.cos()];
-        pose.hip = [knee[0] - THIGH_M * t.sin(), knee[1] + THIGH_M * t.cos()];
+        let knee = [body.dims.shank_m() * s.sin(), body.dims.ankle_m + body.dims.shank_m() * s.cos()];
+        pose.hip = [knee[0] - body.dims.thigh_m() * t.sin(), knee[1] + body.dims.thigh_m() * t.cos()];
         pose.pelvis_deg = pelvis_deg;
     } else {
         pose.lift_m = lift_m;
     }
     pose.waist_deg = waist_deg;
     let sh = shoulder_point(body, &pose);
-    let (sd, ed) = arm_ik(sh, [x_obj, goal.palm_z], pose.trunk_deg()).ok_or(None)?;
+    let (sd, ed) = arm_ik(&body.dims, sh, [x_obj, goal.palm_z], pose.trunk_deg()).ok_or(None)?;
     let rest = body.stand(goal.cargo_kg);
     pose.shoulder_deg = [sd, if goal.two_arms { sd } else { rest.shoulder_deg[1] }];
     pose.elbow_deg = [ed, if goal.two_arms { ed } else { rest.elbow_deg[1] }];
@@ -253,18 +254,18 @@ fn lowest_palm(body: &Body, rom: &Rom, x_obj: f32) -> f32 {
         for t in steps(thigh_max, 11) {
             for p in steps(pelvis_max, 12) {
                 for w in steps(rom.waist_max, 9) {
-                    let mut pose = KinPose::stand(0.0);
+                    let mut pose = KinPose::stand(body, 0.0);
                     if body.legged() {
                         let (sr, tr) = (s.to_radians(), t.to_radians());
-                        let knee = [SHANK_M * sr.sin(), ANKLE_H_M + SHANK_M * sr.cos()];
-                        pose.hip = [knee[0] - THIGH_M * tr.sin(), knee[1] + THIGH_M * tr.cos()];
+                        let knee = [body.dims.shank_m() * sr.sin(), body.dims.ankle_m + body.dims.shank_m() * sr.cos()];
+                        pose.hip = [knee[0] - body.dims.thigh_m() * tr.sin(), knee[1] + body.dims.thigh_m() * tr.cos()];
                         pose.pelvis_deg = p;
                     } else {
                         pose.lift_m = rom.lift_max_m;
                     }
                     pose.waist_deg = w;
                     let sh = shoulder_point(body, &pose);
-                    let reach = UPPER_ARM_M + FOREARM_M + PALM_OFFSET_M;
+                    let reach = body.dims.upper_arm_m + body.dims.forearm_m + body.dims.palm_m;
                     let dx = x_obj - sh[0];
                     if dx.abs() <= reach {
                         best = best.min(sh[1] - (reach * reach - dx * dx).sqrt());
@@ -278,7 +279,7 @@ fn lowest_palm(body: &Body, rom: &Rom, x_obj: f32) -> f32 {
 
 fn highest_palm(body: &Body, x_obj: f32) -> Option<f32> {
     let sh = shoulder_point(body, &body.stand(0.0));
-    let reach = UPPER_ARM_M + FOREARM_M + PALM_OFFSET_M;
+    let reach = body.dims.upper_arm_m + body.dims.forearm_m + body.dims.palm_m;
     let dx = x_obj - sh[0];
     (dx.abs() <= reach).then(|| sh[1] + (reach * reach - dx * dx).sqrt())
 }
@@ -330,8 +331,8 @@ pub fn plan(body: &Body, goal: &ReachGoal) -> ReachPlan {
     }
     if let Some((b, x)) = best.as_ref().map(|(c, x)| (c.pose, *x)) {
         let (s0, t0) = if body.legged() {
-            let knee = kin::knee_ik(b.hip, [0.0, ANKLE_H_M]).map(|k| k.0).unwrap_or([0.0, ANKLE_H_M + SHANK_M]);
-            ((knee[0]).atan2(knee[1] - ANKLE_H_M).to_degrees(), (knee[0] - b.hip[0]).atan2(b.hip[1] - knee[1]).to_degrees())
+            let knee = kin::knee_ik(&body.dims, b.hip, [0.0, body.dims.ankle_m]).map(|k| k.0).unwrap_or([0.0, body.dims.ankle_m + body.dims.shank_m()]);
+            ((knee[0]).atan2(knee[1] - body.dims.ankle_m).to_degrees(), (knee[0] - b.hip[0]).atan2(b.hip[1] - knee[1]).to_degrees())
         } else {
             (0.0, 0.0)
         };
@@ -399,7 +400,7 @@ pub fn plan(body: &Body, goal: &ReachGoal) -> ReachPlan {
 pub const BETWEEN_GAP_M: f32 = STANDOFF_GAP_M + 0.02;
 pub const PALM_HALF_M: f32 = 0.035;
 
-pub fn arm_ik3(shoulder: [f32; 3], target: [f32; 3], trunk_deg: f32, side: usize) -> Option<(f32, f32, f32)> {
+pub fn arm_ik3(d: &Dims, shoulder: [f32; 3], target: [f32; 3], trunk_deg: f32, side: usize) -> Option<(f32, f32, f32)> {
     let t = trunk_deg.to_radians();
     let (k, v) = ([t.cos(), -t.sin()], [t.sin(), t.cos()]);
     let r = [target[0] - shoulder[0], target[1] - shoulder[1], target[2] - shoulder[2]];
@@ -407,7 +408,7 @@ pub fn arm_ik3(shoulder: [f32; 3], target: [f32; 3], trunk_deg: f32, side: usize
     let theta = ry.atan2(-rv);
     let u = -(ry * ry + rv * rv).sqrt();
     let sag = [shoulder[0] + rk * k[0] + u * v[0], shoulder[2] + rk * k[1] + u * v[1]];
-    let (fd, ed) = arm_ik([shoulder[0], shoulder[2]], sag, trunk_deg)?;
+    let (fd, ed) = arm_ik(d, [shoulder[0], shoulder[2]], sag, trunk_deg)?;
     let abd = if side == 0 { -theta } else { theta }.to_degrees();
     Some((fd, ed, abd))
 }
@@ -425,13 +426,13 @@ struct Cand3 {
     legs: [f32; 4],
 }
 
-fn hip_splayed(shank_deg: f32, thigh_deg: f32, out_m: f32) -> Option<[f32; 2]> {
-    let h = hip_at(shank_deg, thigh_deg);
+fn hip_splayed(d: &Dims, shank_deg: f32, thigh_deg: f32, out_m: f32) -> Option<[f32; 2]> {
+    let h = hip_at(d, shank_deg, thigh_deg);
     if out_m <= 0.0 {
         return Some(h);
     }
-    let tall = h[1] - ANKLE_H_M;
-    (tall > out_m + 1e-3).then(|| [h[0], ANKLE_H_M + (tall * tall - out_m * out_m).sqrt()])
+    let tall = h[1] - d.ankle_m;
+    (tall > out_m + 1e-3).then(|| [h[0], d.ankle_m + (tall * tall - out_m * out_m).sqrt()])
 }
 
 pub fn rise_margin(bottom: &KinReport, top: &KinReport, t: f32) -> f32 {
@@ -472,7 +473,7 @@ fn candidate3(body: &Body, goal: &ReachGoal, hands: Hands, out_m: f32, legs: [f3
     let [shank_deg, thigh_deg, pelvis_deg, waist_deg] = legs;
     let mut pose = body.stand(goal.cargo_kg);
     if body.legged() {
-        pose.hip = hip_splayed(shank_deg, thigh_deg, out_m).ok_or(None)?;
+        pose.hip = hip_splayed(&body.dims, shank_deg, thigh_deg, out_m).ok_or(None)?;
         pose.pelvis_deg = pelvis_deg;
         pose.stance_out_m = out_m;
     }
@@ -482,7 +483,7 @@ fn candidate3(body: &Body, goal: &ReachGoal, hands: Hands, out_m: f32, legs: [f3
     let pan_max = Rom::of(body).pan_max;
     let two = match hands {
         Hands::Side { x, y } => {
-            let (fd, ed, ad) = arm_ik3([sh[0], body.shoulder_mount(0)[1], sh[1]], [x, y, goal.palm_z], trunk, 0).ok_or(None)?;
+            let (fd, ed, ad) = arm_ik3(&body.dims, [sh[0], body.shoulder_mount(0)[1], sh[1]], [x, y, goal.palm_z], trunk, 0).ok_or(None)?;
             pose.shoulder_deg[0] = fd;
             pose.elbow_deg[0] = ed;
             pose.shoulder_abd_deg = [ad, 0.0];
@@ -497,7 +498,7 @@ fn candidate3(body: &Body, goal: &ReachGoal, hands: Hands, out_m: f32, legs: [f3
         Hands::Between { x, y } => {
             for s in 0..2 {
                 let (sy, ty) = (body.shoulder_mount(s)[1], if s == 0 { -y } else { y });
-                let (fd, ed, ad) = arm_ik3([sh[0], sy, sh[1]], [x, ty, goal.palm_z], trunk, s).ok_or(None)?;
+                let (fd, ed, ad) = arm_ik3(&body.dims, [sh[0], sy, sh[1]], [x, ty, goal.palm_z], trunk, s).ok_or(None)?;
                 pose.shoulder_deg[s] = fd;
                 pose.elbow_deg[s] = ed;
                 pose.shoulder_abd_deg[s] = ad;
@@ -609,7 +610,7 @@ fn failed3(body: &Body, goal: &ReachGoal, approach: &'static str, why: String, x
 }
 
 pub fn side_object_y(body: &Body, half_w_m: f32) -> f32 {
-    let edge = if body.legged() { 0.5 * STANCE_WIDTH_M + 0.5 * body.leg.foot_width_m } else { 0.5 * body.support_width_m };
+    let edge = if body.legged() { 0.5 * body.dims.stance_m + 0.5 * body.leg.foot_width_m } else { 0.5 * body.support_width_m };
     -(edge + half_w_m + STANDOFF_GAP_M)
 }
 
@@ -647,7 +648,7 @@ pub fn plan_straddle(body: &Body, goal: &ReachGoal, half_w_m: f32) -> ReachPlan 
     if !body.legged() {
         return failed3(body, goal, "straddle", "바퀴·트랙은 물건을 발 사이에 두고 설 수 없음".into(), 0.0, 0.0, 0);
     }
-    let need = (half_w_m + BETWEEN_GAP_M + 0.5 * body.leg.foot_width_m - 0.5 * STANCE_WIDTH_M).max(0.0);
+    let need = (half_w_m + BETWEEN_GAP_M + 0.5 * body.leg.foot_width_m - 0.5 * body.dims.stance_m).max(0.0);
     if need > rom.stance_out_max_m {
         return failed3(body, goal, "straddle", format!("물건이 넓어 발 사이에 두려면 발을 {need:.2} m 벌려야 함 (한계 {:.2} m)", rom.stance_out_max_m), 0.0, 0.0, 0);
     }
@@ -724,13 +725,13 @@ mod tests {
     #[test]
     fn the_arm_ik_puts_the_palm_on_the_target() {
         let b = body(BodyPlan::default(), BaseKind::Wheel);
-        let mut pose = KinPose::stand(0.0);
-        let (sd, ed) = arm_ik([0.0, SHOULDER_M], [0.30, 0.70], 0.0).unwrap();
+        let mut pose = KinPose::stand_compact(0.0);
+        let (sd, ed) = arm_ik(&Dims::COMPACT, [0.0, Dims::COMPACT.shoulder_m], [0.30, 0.70], 0.0).unwrap();
         pose.shoulder_deg = [sd, 0.0];
         pose.elbow_deg = [ed, 10.0];
         let r = kin::solve(&b, &pose, &KinLoads::default());
         assert!((r.hands[0][0] - 0.30).abs() < 2e-3 && (r.hands[0][2] - 0.70).abs() < 2e-3, "{:?}", r.hands[0]);
-        assert!(arm_ik([0.0, SHOULDER_M], [0.0, 0.40], 0.0).is_none(), "below the hanging hand");
+        assert!(arm_ik(&Dims::COMPACT, [0.0, Dims::COMPACT.shoulder_m], [0.0, 0.40], 0.0).is_none(), "below the hanging hand");
     }
 
     #[test]
@@ -778,9 +779,9 @@ mod tests {
         assert!(j.torque > 50.0 && j.ratio < 1.0, "{j:?}");
         assert!(p.descend_s >= MIN_JERK_PEAK * p.pose.lift_m / TORSO_LIFT.speed_mps - 1e-3, "{}", p.descend_s);
         let legs = body(BodyPlan::named("wheel_lift").unwrap(), BaseKind::HumanFoot);
-        assert!(kin::solve_fast(&legs, &KinPose::stand(0.0), &KinLoads::default()).joint("torso_lift").is_none());
+        assert!(kin::solve_fast(&legs, &KinPose::stand_compact(0.0), &KinLoads::default()).joint("torso_lift").is_none());
         let plain = body(BodyPlan::uniform(Tier::Pro), BaseKind::Wheel);
-        assert!(kin::solve_fast(&plain, &KinPose::stand(0.0), &KinLoads::default()).joint("torso_lift").is_none());
+        assert!(kin::solve_fast(&plain, &KinPose::stand_compact(0.0), &KinLoads::default()).joint("torso_lift").is_none());
     }
 
     #[test]
@@ -790,7 +791,7 @@ mod tests {
         let g = ReachGoal { two_arms: true, ..ReachGoal::ground_object(0.10, 4.0, true, 0.0) };
         let top = top_report(&b, &g, true);
         let rom = Rom::of(&b);
-        let need = (0.05 + BETWEEN_GAP_M + 0.5 * b.leg.foot_width_m - 0.5 * STANCE_WIDTH_M).max(0.0);
+        let need = (0.05 + BETWEEN_GAP_M + 0.5 * b.leg.foot_width_m - 0.5 * crate::dims::Dims::COMPACT.stance_m).max(0.0);
         let mut best: std::collections::BTreeMap<&'static str, (f32, String)> = Default::default();
         let mut misses: std::collections::BTreeMap<String, u32> = Default::default();
         for out in [need, need + 0.03] {

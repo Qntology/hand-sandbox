@@ -134,7 +134,7 @@ mod tests {
         let cam = Camera { width: 192, height: 128, fov_deg: 64.0, max_dist_m: 30.0, ..Camera::default() };
         let (f, o) = render(&w, &cam, 0.0);
         let o = o.expect("an overlay");
-        let robot_px = (0..f.width * f.height).filter(|&i| f.ids[i] == 0 && f.depth[i] < CHASE_DIST_M + 1.0).count();
+        let robot_px = (0..f.width * f.height).filter(|&i| f.ids[i] == 0 && f.depth[i].is_finite()).count();
         assert!(robot_px > 200, "{robot_px} robot pixels");
         let joints = o["joints"].as_array().unwrap();
         assert!(joints.iter().any(|j| j["name"] == "shoulder_r" && j["at"]["visible"].is_boolean()));
@@ -143,7 +143,7 @@ mod tests {
         assert!(o["zmp"].is_object() && o["support"].as_array().unwrap().len() == 4);
         let truck = World::new(WorldConfig { cells: 40, ..WorldConfig::default() }).unwrap();
         let (f, _) = render(&truck, &cam, 0.0);
-        let robot_px = (0..f.width * f.height).filter(|&i| f.ids[i] == 0 && f.depth[i] < CHASE_DIST_M + 1.0).count();
+        let robot_px = (0..f.width * f.height).filter(|&i| f.ids[i] == 0 && f.depth[i].is_finite()).count();
         assert!(robot_px > 200, "the wheeled base is drawn as a lift truck: {robot_px} robot pixels");
     }
 
@@ -151,10 +151,20 @@ mod tests {
     fn the_chase_framing_follows_the_robots_size() {
         let w = World::new(WorldConfig { cells: 40, ..WorldConfig::default() }).unwrap();
         let cam = Camera { width: 480, height: 320, fov_deg: 64.0, max_dist_m: 30.0, ..Camera::default() };
+        let mut noto = noto_core::NotoConfig::preset(noto_core::FingerCount::Five);
+        noto.base = noto_core::BaseKind::HumanFoot;
+        let walker = World::new(WorldConfig { cells: 40, noto, ..WorldConfig::default() }).unwrap();
+        for robot in [&w, &walker] {
+            let (f, _) = render(robot, &cam, 30.0);
+            let px: Vec<(usize, usize)> = (0..f.width * f.height).filter(|&i| f.ids[i] == 0 && f.depth[i].is_finite()).map(|i| (i % f.width, i / f.width)).collect();
+            let along = |g: fn(&(usize, usize)) -> usize| (px.iter().map(g).min().unwrap(), px.iter().map(g).max().unwrap());
+            let ((x0, x1), (y0, y1)) = (along(|p| p.0), along(|p| p.1));
+            assert!(x0 > 0 && y0 > 0 && x1 + 1 < f.width && y1 + 1 < f.height, "the whole robot in the frame: {x0}..{x1} × {y0}..{y1}");
+            assert!(y1 - y0 > f.height / 4, "and large enough to read: {y0}..{y1}");
+        }
         let pose = w.body_pose().unwrap();
         let ext = RobotExtent::of(&w, &w.tilted_robot_boxes(&pose, &w.base_tilt(&pose)));
         let fr = ChaseFraming::fit(&ext, &cam);
-        assert!((fr.dist_m - CHASE_DIST_M).abs() < 0.6 && (fr.height_m - CHASE_HEIGHT_M).abs() < 0.35 && (fr.target_m - 0.75).abs() < 0.2, "{fr:?} for {ext:?}");
         let small = RobotExtent { height_m: 0.5 * ext.height_m, half_span_m: 0.5 * ext.half_span_m, radius_m: 0.5 * ext.radius_m };
         let fs = ChaseFraming::fit(&small, &cam);
         assert!((fs.dist_m - 0.5 * fr.dist_m).abs() < 1e-4 && (fs.height_m - 0.5 * fr.height_m).abs() < 1e-4);

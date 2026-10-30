@@ -241,9 +241,9 @@ impl World {
             return g.pose.fork_m;
         }
         if self.carried_kg() > AMOUNT_EPS {
-            fork::FORK_CARRY_M
+            self.body.dims.fork_carry_m
         } else {
-            fork::FORK_REST_M
+            self.body.dims.fork_rest_m
         }
     }
 
@@ -273,7 +273,7 @@ impl World {
         let play = self.act.as_ref().filter(|p| p.rollout.kind == ActKind::Fork);
         let sample = play.and_then(|p| p.rollout.sample_at(p.t()));
         let mut out = Vec::new();
-        let mut z = self.fork_m_now() + fork::TINE_T_M;
+        let mut z = self.fork_m_now() + self.body.dims.tine_t_m;
         match (play.and_then(|p| p.object), sample.and_then(|s| s.object), sample.map(|s| s.phase)) {
             (Some((k, a)), Some(o), Some("raise")) => {
                 let size = k.spec().piece_size_m(a);
@@ -511,7 +511,7 @@ impl World {
                 continue;
             }
             self.walk.slips += 1;
-            let (fell, slide) = gait::slip_outcome(&g, mu);
+            let (fell, slide) = gait::slip_outcome(&self.body.dims, &g, mu);
             self.odom.foot_slid(slide);
             let side = if self.walk.stance == 0 { "오른" } else { "왼" };
             if fell {
@@ -557,19 +557,19 @@ impl World {
                 let t = p.t();
                 let s = p.rollout.sample_at(t);
                 let ev = p.rollout.events.iter().filter(|e| e.t <= t + 1e-6).last();
-                (s.map_or(KinPose::stand(self.carried_kg()), |s| s.pose), s.map_or(KinLoads::default(), |s| s.loads), Some(p.rollout.kind), s.cloned(), ev.cloned(), p.object)
+                (s.map_or(KinPose::stand(&self.body, self.carried_kg()), |s| s.pose), s.map_or(KinLoads::default(), |s| s.loads), Some(p.rollout.kind), s.cloned(), ev.cloned(), p.object)
             }
             (None, Some(p)) if self.active.is_none() && self.time_s - (p.start_s + p.rollout.duration_s as f64) < 3.0 => {
                 let t = p.t();
                 let s = p.rollout.sample_at(t);
                 let ev = p.rollout.events.last();
-                (s.map_or(KinPose::stand(self.carried_kg()), |s| s.pose), s.map_or(KinLoads::default(), |s| s.loads), Some(p.rollout.kind), s.cloned(), ev.cloned(), p.object)
+                (s.map_or(KinPose::stand(&self.body, self.carried_kg()), |s| s.pose), s.map_or(KinLoads::default(), |s| s.loads), Some(p.rollout.kind), s.cloned(), ev.cloned(), p.object)
             }
             _ => match self.act_pose() {
                 Some((pose, loads, _)) => (pose, loads, Some(ActKind::Walk), None, None, None),
                 None => {
                     let moving = matches!(&self.active, Some((_, Active::Move(_)))) && self.agent.speed_mps > 0.0;
-                    let pose = KinPose { base_pitch_deg: if self.body.legged() { 0.0 } else { self.posture_now().0.slope_deg }, ..KinPose::stand(self.carried_kg()) };
+                    let pose = KinPose { base_pitch_deg: if self.body.legged() { 0.0 } else { self.posture_now().0.slope_deg }, ..KinPose::stand(&self.body, self.carried_kg()) };
                     (pose, KinLoads::default(), moving.then_some(ActKind::Drive), None, None, None)
                 }
             },

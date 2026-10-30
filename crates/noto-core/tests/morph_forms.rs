@@ -212,7 +212,7 @@ fn the_default_forms_are_todays_robots() {
         let f = body_of(form, Tier::Mid);
         assert_eq!(f.mass_kg(), today.mass_kg(), "{form}");
         assert_eq!(f.com_height_m(), today.com_height_m(), "{form}");
-        assert_eq!(kin::camera(&f, &KinPose::stand(0.0)), kin::head_camera(&today, &KinPose::stand(0.0)), "{form}");
+        assert_eq!(kin::camera(&f, &KinPose::stand_compact(0.0)), kin::head_camera(&today, &KinPose::stand_compact(0.0)), "{form}");
         assert_eq!(f.plan.id(), "mid");
         let p = Posture::arm_lift(2.4, false, 0.0);
         assert_eq!(f.solve(&p, &FeedForward::default(), 200.0), today.solve(&p, &FeedForward::default(), 200.0), "{form}");
@@ -253,7 +253,7 @@ fn forms_have_only_the_joints_they_have() {
 
 #[test]
 fn the_camera_follows_the_mount() {
-    let stand = KinPose::stand(0.0);
+    let stand = KinPose::stand_compact(0.0);
     let legs = body_of("legs_humanoid", Tier::Mid);
     assert!((kin::camera(&legs, &stand).pos[2] - 1.14).abs() < 0.01);
     let noneck = body_of("wheel_noneck", Tier::Mid);
@@ -468,7 +468,7 @@ fn drive_and_push_draw_each_form_in_its_own_rest_pose() {
     use noto_core::act::drive;
     use noto_core::act::push::{self, PushInput, PushLeg};
     let deck = body_of("deck_gripper", Tier::Mid);
-    let hanging = kin::solve(&deck, &KinPose::stand(0.0), &KinLoads::default());
+    let hanging = kin::solve(&deck, &KinPose::stand_compact(0.0), &KinLoads::default());
     assert!(hanging.hands[0][2] < 0.0, "{:?}", hanging.hands[0]);
     for form in ["deck_gripper", "mast_gripper", "truck", "wheel_noneck", "wheel_humanoid", "track_humanoid"] {
         let b = body_of(form, Tier::Mid);
@@ -487,7 +487,7 @@ fn drive_and_push_draw_each_form_in_its_own_rest_pose() {
         }
         assert!(b.arm_count() == 0 || low > 0.1, "{form}: a hand at {low} m");
         if b.morph.humanoid_upper() {
-            assert_eq!(d.samples[0].pose, KinPose { base_pitch_deg: 5.0, ..KinPose::stand(1.0) }, "{form}: today's pose, bit for bit");
+            assert_eq!(d.samples[0].pose, KinPose { base_pitch_deg: 5.0, ..KinPose::stand_compact(1.0) }, "{form}: today's pose, bit for bit");
         }
         let st = drive::state(&b, Surface::Firm.props(), 0.0, 0.0, 0.0, 0.0);
         let r = kin::solve_fast(&b, &b.stand(0.0), &KinLoads::default());
@@ -543,7 +543,7 @@ fn a_load_on_an_arm_the_form_does_not_have_is_never_dropped() {
     assert!(!left.feasible && left.limiting.as_deref().is_some_and(|l| l.contains("왼팔 없음")), "{:?}", left.limiting);
     assert!(deck.solve(&Posture { hand_load_kg: [1.0, 0.0], ..deck.quiet(0.0) }, &FeedForward::default(), 1e3).feasible);
     let today = Body::new(&BodyPlan::default(), BaseKind::Wheel, FingerCount::Five);
-    assert!(kin::solve(&today, &KinPose::stand(0.0), &KinLoads::holding(1.0, true, 0.0)).out_of_range.is_empty());
+    assert!(kin::solve(&today, &KinPose::stand_compact(0.0), &KinLoads::holding(1.0, true, 0.0)).out_of_range.is_empty());
 }
 
 #[test]
@@ -553,7 +553,7 @@ fn a_mast_cameras_mass_sits_where_all_three_models_swing_it() {
         let mut b = Body::new(&BodyPlan { morph: m, ..BodyPlan::default() }, BaseKind::Wheel, FingerCount::Five);
         b.head.com_up_m = 0.15;
         let com = b.head_com().unwrap();
-        assert!((com[2] - (STRETCH_CAMERA_H_MM as f32 / 1000.0 - kin::CAMERA_UP_M + 0.15)).abs() < 1e-6, "{com:?}");
+        assert!((com[2] - (STRETCH_CAMERA_H_MM as f32 / 1000.0 - noto_core::dims::Dims::COMPACT.camera_up_m + 0.15)).abs() < 1e-6, "{com:?}");
         let k = kin::solve(&b, &b.stand(0.0), &KinLoads::default());
         let q = b.solve(&b.quiet(0.0), &FeedForward { enabled: false, gain: 1.0 }, 1e3);
         assert!((k.com[2] - q.com[2]).abs() < 1e-4 && (k.com[0] - q.com[0]).abs() < 1e-4, "pan_tilt {pan_tilt}: kin {:?} vs balance {:?}", k.com, q.com);

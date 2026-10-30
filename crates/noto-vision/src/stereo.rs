@@ -10,8 +10,12 @@
 //!
 //! Steps (Hirschmüller 2008, with a census cost): both images to grey on that grid; 5 × 5 census of each; matching
 //! cost = Hamming distance summed over a small block; the cost aggregated along 8 paths with the P1/P2 smoothness
-//! penalties; winner-take-all disparity with a uniqueness ratio; parabola sub-pixel; left–right consistency from the
-//! same aggregated costs; small speckles removed.
+//! penalties, P2 falling at the image's own edges (§2.2 there); winner-take-all disparity with a uniqueness ratio;
+//! sub-pixel fit; left–right consistency from the same aggregated costs; small speckles removed.
+//!
+//! Costs are aggregated once, over the left image, and the right image's disparities read from that same volume;
+//! stereo depth here does not sum paths separately per image, does not refine a chosen window at a higher resolution
+//! over a coarser whole, and does not project a pattern (see `docs/PLAN-v1.5.md` for the patents these keep clear of).
 
 use std::time::Instant;
 
@@ -58,6 +62,10 @@ pub struct SgbmCfg {
     pub p1: u16,
     /// Penalty for a larger step (an edge between surfaces), in census bits.
     pub p2: u16,
+    /// The grey-level step between neighbours at which the P2 of a disparity step halves: depth edges go where the
+    /// image has an edge. 0 keeps P2 the same everywhere.
+    #[serde(default)]
+    pub p2_edge: f32,
     /// The best aggregated cost must beat every disparity more than one away by this share (OpenCV's
     /// uniquenessRatio / 100).
     pub uniqueness: f32,
@@ -95,6 +103,7 @@ impl Default for SgbmCfg {
             paths: 8,
             p1: 10,
             p2: 120,
+            p2_edge: 12.0,
             uniqueness: 0.10,
             lr_max_diff: 1.0,
             min_texture: 2.0,
@@ -311,6 +320,18 @@ fn costs(cl: &[u32], cr: &[u32], w: usize, h: usize, nd: usize, block: usize) ->
     out
 }
 
+/// P2 by the grey-level step between two neighbours: `p2` on a flat stretch, falling towards just above P1 at an edge.
+fn p2_by_step(cfg: &SgbmCfg) -> [u16; 256] {
+    let p2 = cfg.p2.max(cfg.p1 + 1);
+    let mut lut = [p2; 256];
+    if cfg.p2_edge > 0.0 {
+        for (g, v) in lut.iter_mut().enumerate() {
+            *v = ((p2 as f32 * cfg.p2_edge / (cfg.p2_edge + g as f32)).round() as u16).max(cfg.p1 + 1);
+        }
+    }
+    lut
+}
+
 /// One step along an aggregation path: L(p, d) = C(p, d) + min(L(p−r, d), L(p−r, d±1) + P1, min L(p−r) + P2) −
 /// min L(p−r). Writes L(p, ·) into `out` and returns its minimum.
 #[inline]
@@ -343,8 +364,10 @@ fn path_step(c: &[u16], prev: Option<(&[u16], u16)>, p1: u16, p2: u16, out: &mut
 
 /// S(p, d) = Σ_r L_r(p, d) over 4 or 8 paths, in two sweeps: rows top to bottom with the paths from the left, the
 /// top-left, the top and the top-right; then rows bottom to top with the four opposite ones.
-fn aggregate(cost: &[u16], w: usize, h: usize, nd: usize, cfg: &SgbmCfg) -> Vec<u16> {
-    let (p1, p2) = (cfg.p1, cfg.p2.max(cfg.p1 + 1));
+fn aggregate(cost: &[u16], grey: &[f32], w: usize, h: usize, nd: usize, cfg: &SgbmCfg) -> Vec<u16> {
+    let p1 = cfg.p1;
+    let lut = p2_by_step(cfg);
+    let step = |a: usize, b: usize| lut[(grey[a] - grey[b]).abs().min(255.0) as usize];
     let diagonals = cfg.paths >= 8;
     let mut sum = vec![0u16; w * h * nd];
     let mut tmp = vec![0u16; nd];
@@ -364,10 +387,10 @@ fn aggregate(cost: &[u16], w: usize, h: usize, nd: usize, cfg: &SgbmCfg) -> Vec<
                 let c = &cost[p..p + nd];
                 // Along the row.
                 along_min = if xi == 0 {
-                    path_step(c, None, p1, p2, &mut tmp)
+                    path_step(c, None, p1, 0, &mut tmp)
                 } else {
-                    let m = path_step(c, Some((&along, along_min)), p1, p2, &mut tmp);
-                    m
+                    let q = if forward { x.wrapping_sub(1) } else { x + 1 };
+                    path_step(c, Some((&along, along_min)), p1, step(y * w + x, y * w + q), &mut tmp)
                 };
                 along.copy_from_slice(&tmp);
                 for d in 0..nd {
@@ -388,9 +411,10 @@ fn aggregate(cost: &[u16], w: usize, h: usize, nd: usize, cfg: &SgbmCfg) -> Vec<
                     let m = match from {
                         Some(fx) => {
                             let lp = &prev[k][fx * nd..fx * nd + nd];
-                            path_step(c, Some((lp, prev_min[k][fx])), p1, p2, &mut tmp)
+                            let fy = if forward { y - 1 } else { y + 1 };
+                            path_step(c, Some((lp, prev_min[k][fx])), p1, step(y * w + x, fy * w + fx), &mut tmp)
                         }
-                        None => path_step(c, None, p1, p2, &mut tmp),
+                        None => path_step(c, None, p1, 0, &mut tmp),
                     };
                     cur[k][x * nd..x * nd + nd].copy_from_slice(&tmp);
                     cur_min[k][x] = m;
@@ -512,7 +536,7 @@ pub fn sgbm(left: &Rgb, right: &Rgb, rig: &StereoRig, cfg: &SgbmCfg, pyramid: Op
     let (cr, _) = census(&gr, w, h);
     let block = cfg.block as usize;
     let cost = costs(&cl, &cr, w, h, nd, block);
-    let sum = aggregate(&cost, w, h, nd, cfg);
+    let sum = aggregate(&cost, &gl, w, h, nd, cfg);
 
     // The right image's own best disparity at each of its pixels, from the same aggregated costs: S_R(xr, d) =
     // S(xr + d, d).
@@ -883,6 +907,55 @@ mod tests {
         let valid = (0..H).flat_map(|y| (0..W).map(move |x| (x, y))).filter(|&(x, y)| inner(x, y) && out.depth.at(x, y).is_finite()).count();
         assert!(valid < 500, "{valid} pixels claim a depth on stripes that repeat every 6 px");
         assert!(out.stats.not_unique > 20_000, "{:?}", out.stats);
+    }
+
+    #[test]
+    fn the_jump_penalty_falls_at_an_image_edge() {
+        let cfg = SgbmCfg::default();
+        let lut = p2_by_step(&cfg);
+        assert_eq!(lut[0], cfg.p2);
+        assert!(lut[12] < cfg.p2 && lut[12] > cfg.p1, "{}", lut[12]);
+        assert!(lut[255] < lut[12] && lut[255] > cfg.p1, "{}", lut[255]);
+        let flat = p2_by_step(&SgbmCfg { p2_edge: 0.0, ..cfg });
+        assert!(flat.iter().all(|v| *v == cfg.p2), "without an edge term P2 stays");
+    }
+
+    #[test]
+    fn a_depth_edge_lands_on_the_image_edge() {
+        // A bright box in front of a dark, faint background: the disparity should step where the brightness does.
+        let faint = texture(21, W, H);
+        let sharp = texture(22, W, H);
+        let (x0, x1, y0, y1) = (120u32, 200u32, 50u32, 140u32);
+        let inside = |x: u32, y: u32| (x0..x1).contains(&x) && (y0..y1).contains(&y);
+        let (df, db) = (18.0f32, 6.0f32);
+        let shade = |v: f32| 40.0 + 0.04 * v;
+        let left = rgb_of(|x, y| if inside(x, y) { 120.0 + 0.5 * sharp[(y * W + x) as usize] } else { shade(faint[(y * W + x) as usize]) }, W, H);
+        let right = rgb_of(
+            |xr, y| {
+                let xf = xr as f32 + df;
+                if inside(xf as u32, y) {
+                    120.0 + 0.5 * sample(&sharp, W, xf, y)
+                } else {
+                    shade(sample(&faint, W, xr as f32 + db, y))
+                }
+            },
+            W,
+            H,
+        );
+        let cfg = SgbmCfg { min_texture: 0.5, ..SgbmCfg::default() };
+        let wrong = |c: SgbmCfg| {
+            let out = sgbm(&left, &right, &rig(), &c, None).unwrap();
+            // Just outside the top and bottom of the box: the background, not the box.
+            (x0 + 8..x1 - 8)
+                .flat_map(|x| [(x, y0 - 2), (x, y1 + 1)])
+                .filter(|&(x, y)| {
+                    let d = out.disparity[(y * W + x) as usize];
+                    d.is_finite() && (d - df).abs() < 3.0
+                })
+                .count()
+        };
+        let (with, without) = (wrong(cfg), wrong(SgbmCfg { p2_edge: 0.0, ..cfg }));
+        assert!(with <= without, "the disparity of the box spills past its edge on {with} pixels with the edge term, {without} without");
     }
 
     #[test]

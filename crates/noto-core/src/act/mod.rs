@@ -273,7 +273,7 @@ pub fn locomotion_factor_with(spec: &crate::base::BaseSpec, ground: &crate::surf
     match spec.kind {
         BaseKind::HumanFoot => {
             let Some(z) = spec.walk_com_z_m else { return Some(1.0) };
-            let g = gait::plan_z(z, spec.walk_foot_m.unwrap_or(gait::NOMINAL_FOOT_M), spec.max_speed_mps, crate::surface::available_mu(spec.kind, ground), slope_deg.max(0.0));
+            let g = gait::plan_z(&spec.walk_dims.unwrap_or(crate::dims::Dims::COMPACT), z, spec.walk_foot_m.unwrap_or(gait::NOMINAL_FOOT_M), spec.max_speed_mps, crate::surface::available_mu(spec.kind, ground), slope_deg.max(0.0));
             Some((g.speed / g.speed_cmd.max(1e-3)).clamp(0.05, 1.0))
         }
         _ => {

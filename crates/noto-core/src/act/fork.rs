@@ -16,36 +16,18 @@
 
 use crate::balance::{Body, G};
 use crate::dynamics::LinkBox;
-use crate::kin::{self, KinLoads, KinPose, BUMPER_GAP_M, WHEEL_R_M};
+use crate::kin::{self, KinLoads, KinPose};
 use crate::parts::Segment;
 
 use super::{gaze, min_jerk, ActEvent, ActKind, ActRollout, ActSample, Outcome, Part, SAMPLE_S};
 
-/// Tine length (m) [추정] (a small robot's tines: twice the 0.10 m items they carry).
-pub const TINE_LEN_M: f32 = 0.20;
-/// Tine centre-to-centre spread (m) [추정]: the smallest item (0.10 m) rests on both tines.
-pub const TINE_SPREAD_M: f32 = 0.07;
-pub const TINE_W_M: f32 = 0.025;
-pub const TINE_T_M: f32 = 0.012;
-pub const MAST_TOP_M: f32 = 0.95;
-/// The highest the tines go (m): the mast top less the carriage.
-pub const FORK_MAX_M: f32 = MAST_TOP_M - 0.10;
-/// Tine heights (m above the ground under the base): down on the floor, empty travel, loaded travel [추정].
+/// Tine height with the tines down on the floor (m above the ground under the base).
 pub const FORK_FLOOR_M: f32 = 0.0;
-pub const FORK_REST_M: f32 = 0.05;
-pub const FORK_CARRY_M: f32 = 0.10;
-/// Mast speed (m/s), the same 0.10 m/s as the torso and mast lifts (`parts::TORSO_LIFT`) [추정].
-pub const MAST_MPS: f32 = 0.10;
-/// Mast push (N), as `parts::TORSO_LIFT` (450 N) [추정].
-pub const MAST_FORCE_N: f32 = 450.0;
-/// Creep speed while the tines slide under or out of the item (m/s) [추정].
-pub const INSERT_MPS: f32 = 0.12;
 /// How long the carriage camera holds still to see (s): one fixation, as `gaze::FIXATE_S`.
 pub const CHECK_S: f32 = super::gaze::FIXATE_S;
 /// Restoring moment over overturning moment about the front axle that a load may not go under [추정].
 pub const TIP_MIN: f32 = 1.5;
-/// The carriage camera: above the tines, looking ahead and down (deg below level) [추정].
-pub const CAMERA_UP_M: f32 = 0.06;
+/// The carriage camera looks ahead and down (deg below level) [추정].
 pub const CAMERA_PITCH_DEG: f32 = 25.0;
 /// The carriage camera's lens: the head camera's 70° across a 4:3 frame (the HUD's small fork view) [추정].
 pub const CAMERA_HFOV_DEG: f32 = 70.0;
@@ -65,7 +47,7 @@ pub fn applies(body: &Body) -> bool {
 
 /// The bumper face (m forward of the base centre), where the mast stands.
 pub fn front_x(body: &Body) -> f32 {
-    0.5 * body.support_len_m + WHEEL_R_M + BUMPER_GAP_M
+    0.5 * body.support_len_m + body.dims.wheel_r_m + body.dims.bumper_gap_m
 }
 
 /// Where the tines start (m forward of the base centre).
@@ -80,12 +62,12 @@ pub fn load_x(body: &Body, len_m: f32) -> f32 {
 
 /// How far ahead an item `len_m` long must lie (its centre) for the tines to go down in front of it, not on it.
 pub fn standoff_x(body: &Body, len_m: f32) -> f32 {
-    heel_x(body) + TINE_LEN_M + 0.5 * len_m + STANDOFF_GAP_M
+    heel_x(body) + body.dims.tine_len_m + 0.5 * len_m + STANDOFF_GAP_M
 }
 
 /// The carriage camera's place on the body for tines at `fork_m` (x forward, y left, z up).
 pub fn camera_pos(body: &Body, fork_m: f32) -> [f32; 3] {
-    [heel_x(body) - 0.01, 0.0, fork_m + TINE_T_M + CAMERA_UP_M]
+    [heel_x(body) + body.dims.fork_camera_fwd_m, 0.0, fork_m + body.dims.tine_t_m + body.dims.fork_camera_up_m]
 }
 
 /// How much of the carriage camera's image an item fills: the share of a ray grid over the camera's view that meets
@@ -143,34 +125,34 @@ impl ForkFit {
 pub fn check(body: &Body, mass_kg: f32, size_m: [f32; 3], base_m: f32, load_kg: f32) -> Result<ForkFit, String> {
     let len = size_m[0].max(size_m[2]);
     let narrow = size_m[0].min(size_m[2]);
-    if narrow < TINE_SPREAD_M + TINE_W_M - 1e-4 {
-        return Err(format!("물건 폭 {:.0} cm가 포크 간격 {:.0} cm보다 좁아 포크 사이로 빠짐", narrow * 100.0, (TINE_SPREAD_M + TINE_W_M) * 100.0));
+    if narrow < body.dims.fork_min_item_m - 1e-4 {
+        return Err(format!("물건 폭 {:.0} cm가 포크 간격 {:.0} cm보다 좁아 포크 사이로 빠짐", narrow * 100.0, body.dims.fork_min_item_m * 100.0));
     }
-    if len > 2.0 * TINE_LEN_M {
-        return Err(format!("물건 길이 {:.0} cm가 포크 길이 {:.0} cm의 2배를 넘음", len * 100.0, TINE_LEN_M * 100.0));
+    if len > 2.0 * body.dims.tine_len_m {
+        return Err(format!("물건 길이 {:.0} cm가 포크 길이 {:.0} cm의 2배를 넘음", len * 100.0, body.dims.tine_len_m * 100.0));
     }
-    if base_m > FORK_MAX_M {
-        return Err(format!("물건이 {:.2} m 높이에 있어 마스트 최고 {:.2} m보다 높음", base_m, FORK_MAX_M));
+    if base_m > body.dims.fork_max_m() {
+        return Err(format!("물건이 {:.2} m 높이에 있어 마스트 최고 {:.2} m보다 높음", base_m, body.dims.fork_max_m()));
     }
     let axle = 0.5 * body.support_len_m;
-    let lx = load_x(body, len.min(2.0 * TINE_LEN_M));
-    let com_x = kin::solve_fast(body, &KinPose::stand(0.0), &KinLoads::default()).com[0];
+    let lx = load_x(body, len.min(2.0 * body.dims.tine_len_m));
+    let com_x = kin::solve_fast(body, &KinPose::stand(body, 0.0), &KinLoads::default()).com[0];
     let restoring = body.mass_kg() * (axle - com_x).max(0.01);
     let total = mass_kg + load_kg;
     let tip_ratio = restoring / (total * (lx - axle).max(0.01)).max(1e-6);
     let tip_kg = restoring / (TIP_MIN * (lx - axle).max(0.01));
-    let capacity_kg = tip_kg.min(MAST_FORCE_N / G);
+    let capacity_kg = tip_kg.min(body.dims.mast_force_n / G);
     if total > capacity_kg {
         return Err(format!(
             "포크 하중 {total:.1} kg > 한계 {capacity_kg:.1} kg (앞바퀴 축 기준 전도 여유 {tip_ratio:.2} < {TIP_MIN:.1}, 마스트 {:.0} kg)",
-            MAST_FORCE_N / G
+            body.dims.mast_force_n / G
         ));
     }
     Ok(ForkFit { tip_ratio, capacity_kg, load_x_m: lx })
 }
 
 fn sample(body: &Body, t: f32, phase: &'static str, fork_m: f32, cargo_kg: f32, object: [f32; 3]) -> ActSample {
-    posed(body, t, phase, &KinPose::stand(cargo_kg), fork_m, object)
+    posed(body, t, phase, &KinPose::stand(body, cargo_kg), fork_m, object)
 }
 
 /// A sample with the rider's head (and lean) as in `head`, the tines at `fork_m`.
@@ -183,14 +165,14 @@ fn posed(body: &Body, t: f32, phase: &'static str, head: &KinPose, fork_m: f32, 
 /// Moves the tines from `from_m` to `to_m` on the mast, `phase` by phase, appending samples from `t0`. Returns the end.
 #[allow(clippy::too_many_arguments)]
 fn travel(body: &Body, samples: &mut Vec<ActSample>, t0: f32, phase: &'static str, from_m: f32, to_m: f32, cargo_kg: f32, object: impl Fn(f32) -> [f32; 3]) -> f32 {
-    let ahead = KinPose::stand(cargo_kg);
+    let ahead = KinPose::stand(body, cargo_kg);
     travel_with(body, samples, t0, phase, from_m, to_m, |_| ahead, object)
 }
 
 /// `travel` with the rider's head as `head` gives it at each time (s from `t0`).
 #[allow(clippy::too_many_arguments)]
 fn travel_with(body: &Body, samples: &mut Vec<ActSample>, t0: f32, phase: &'static str, from_m: f32, to_m: f32, head: impl Fn(f32) -> KinPose, object: impl Fn(f32) -> [f32; 3]) -> f32 {
-    let dt = ((to_m - from_m).abs() / MAST_MPS).max(SAMPLE_S);
+    let dt = ((to_m - from_m).abs() / body.dims.mast_mps).max(SAMPLE_S);
     let n = (dt / SAMPLE_S).ceil().max(1.0) as usize;
     for i in 1..=n {
         let u = min_jerk(i as f32 / n as f32);
@@ -249,7 +231,7 @@ fn blocked_at(body: &Body, fork_m: f32, from_x: f32, to_x: f32, z: f32, size_m: 
 #[allow(clippy::too_many_arguments)]
 fn align(body: &Body, samples: &mut Vec<ActSample>, turn_s: f32, fork_m: f32, cargo_kg: f32, from_x: f32, to_x: f32, z: f32) -> f32 {
     let back = (to_x - from_x).max(0.0);
-    let dur = turn_s.max(back / INSERT_MPS);
+    let dur = turn_s.max(back / body.dims.insert_mps);
     if dur < ALIGN_MIN_S {
         return 0.0;
     }
@@ -270,7 +252,7 @@ pub fn look(body: &Body, from_m: f32, dist_m: f32, size_m: [f32; 3], base_m: f32
     let floor = base_m.max(FORK_FLOOR_M);
     let x = dist_m.max(standoff_x(body, size_m[0].max(size_m[2])));
     let obj = [x, 0.0, base_m + 0.5 * size_m[1]];
-    let ahead = KinPose::stand(cargo_kg);
+    let ahead = KinPose::stand(body, cargo_kg);
     let mut samples = vec![sample(body, 0.0, "align", from_m, cargo_kg, [dist_m, 0.0, obj[2]])];
     let mut events = Vec::new();
     let t0 = align(body, &mut samples, turn_s, from_m, cargo_kg, dist_m, x, obj[2]);
@@ -310,7 +292,7 @@ pub fn pick(body: &Body, from_m: f32, dist_m: f32, mass_kg: f32, size_m: [f32; 3
     let floor = base_m.max(FORK_FLOOR_M);
     let half_h = 0.5 * size_m[1];
     let at_rest = |x: f32| [x, 0.0, base_m + half_h];
-    let ahead = KinPose::stand(load_kg);
+    let ahead = KinPose::stand(body, load_kg);
     // Tines still up: back off first so they come down in front of the item, not on it.
     let x0 = if (from_m - floor).abs() > 1e-3 { dist_m.max(standoff_x(body, size_m[0].max(size_m[2]))) } else { dist_m };
     let mut samples = vec![sample(body, 0.0, "align", from_m, load_kg, at_rest(dist_m))];
@@ -329,7 +311,7 @@ pub fn pick(body: &Body, from_m: f32, dist_m: f32, mass_kg: f32, size_m: [f32; 3
     // In with the carriage camera on the item, as far as it still sees past it.
     let (stop_x, share) = if slide > 0.0 && rider { blocked_at(body, floor, dist_m, fit.load_x_m, base_m + half_h, size_m) } else { (fit.load_x_m, 0.0) };
     let creep = |samples: &mut Vec<ActSample>, t0: f32, phase: &'static str, from_x: f32, to_x: f32, head: &dyn Fn(f32, f32) -> KinPose| {
-        let dt = ((from_x - to_x).abs() / INSERT_MPS).max(SAMPLE_S);
+        let dt = ((from_x - to_x).abs() / body.dims.insert_mps).max(SAMPLE_S);
         let n = (dt / SAMPLE_S).ceil().max(1.0) as usize;
         for i in 1..=n {
             let x = from_x + (to_x - from_x) * min_jerk(i as f32 / n as f32);
@@ -352,9 +334,9 @@ pub fn pick(body: &Body, from_m: f32, dist_m: f32, mass_kg: f32, size_m: [f32; 3
         t = creep(&mut samples, t, "seat", stop_x, fit.load_x_m, &ahead_now);
     }
     events.push(ActEvent::new(t, "fork_in", if slide >= 0.0 { format!("{:.0} cm 전진해 포크를 물건 밑으로 넣음", slide * 100.0) } else { format!("{:.0} cm 물러나 포크 끝을 물건에 맞춤", -slide * 100.0) }, &[Part::Wheel, Part::Track], Some(slide), true));
-    let carry = (floor + FORK_CARRY_M).min(FORK_MAX_M).max(FORK_CARRY_M);
-    let on = |h: f32| [fit.load_x_m, 0.0, h + TINE_T_M + half_h];
-    let head = head_shift(body, eyes, KinPose::stand(load_kg + mass_kg), t);
+    let carry = (floor + body.dims.fork_carry_m).min(body.dims.fork_max_m()).max(body.dims.fork_carry_m);
+    let on = |h: f32| [fit.load_x_m, 0.0, h + body.dims.tine_t_m + half_h];
+    let head = head_shift(body, eyes, KinPose::stand(body, load_kg + mass_kg), t);
     let t_raise = t;
     t = travel_with(body, &mut samples, t, "raise", floor, carry, |s| head(t_raise + s), on);
     events.push(ActEvent::new(t, "fork_up", format!("마스트로 {:.1} kg를 {carry:.2} m까지 들어올림 (전도 여유 {:.2})", mass_kg, fit.tip_ratio), &[Part::Wheel, Part::Track], Some(fit.tip_ratio), true));
@@ -367,15 +349,15 @@ pub fn pick(body: &Body, from_m: f32, dist_m: f32, mass_kg: f32, size_m: [f32; 3
 
 /// Sets the load down at `surface_m` (the pile top): lower, back out from under it, raise the empty tines to rest.
 pub fn set_down(body: &Body, from_m: f32, mass_kg: f32, size_m: [f32; 3], surface_m: f32, load_kg: f32) -> ActRollout {
-    let len = size_m[0].max(size_m[2]).min(2.0 * TINE_LEN_M);
+    let len = size_m[0].max(size_m[2]).min(2.0 * body.dims.tine_len_m);
     let lx = load_x(body, len);
     let half_h = 0.5 * size_m[1];
-    let floor = surface_m.max(FORK_FLOOR_M).min(FORK_MAX_M);
-    let mut samples = vec![sample(body, 0.0, "lower_load", from_m, load_kg, [lx, 0.0, from_m + TINE_T_M + half_h])];
-    let mut t = travel(body, &mut samples, 0.0, "lower_load", from_m, floor, load_kg, |h| [lx, 0.0, h + TINE_T_M + half_h]);
+    let floor = surface_m.max(FORK_FLOOR_M).min(body.dims.fork_max_m());
+    let mut samples = vec![sample(body, 0.0, "lower_load", from_m, load_kg, [lx, 0.0, from_m + body.dims.tine_t_m + half_h])];
+    let mut t = travel(body, &mut samples, 0.0, "lower_load", from_m, floor, load_kg, |h| [lx, 0.0, h + body.dims.tine_t_m + half_h]);
     let mut events = vec![ActEvent::new(t, "fork_down", format!("짐을 {floor:.2} m에 내려놓음"), &[Part::Wheel, Part::Track], Some(floor), true)];
-    let back = heel_x(body) + TINE_LEN_M + 0.02 - (lx - 0.5 * len);
-    let dt = (back / INSERT_MPS).max(SAMPLE_S);
+    let back = heel_x(body) + body.dims.tine_len_m + 0.02 - (lx - 0.5 * len);
+    let dt = (back / body.dims.insert_mps).max(SAMPLE_S);
     let n = (dt / SAMPLE_S).ceil().max(1.0) as usize;
     let left = (load_kg - mass_kg).max(0.0);
     for i in 1..=n {
@@ -385,8 +367,8 @@ pub fn set_down(body: &Body, from_m: f32, mass_kg: f32, size_m: [f32; 3], surfac
     t += dt;
     events.push(ActEvent::new(t, "fork_out", format!("{:.0} cm 후진해 포크를 뺌", back * 100.0), &[Part::Wheel, Part::Track], Some(back), true));
     let end_obj = [lx + back, 0.0, floor + half_h];
-    t = travel(body, &mut samples, t, "rest", floor, FORK_REST_M, left, |_| end_obj);
-    let metrics = vec![("fork_m", FORK_REST_M), ("back_m", back), ("duration_s", t)];
+    t = travel(body, &mut samples, t, "rest", floor, body.dims.fork_rest_m, left, |_| end_obj);
+    let metrics = vec![("fork_m", body.dims.fork_rest_m), ("back_m", back), ("duration_s", t)];
     ActRollout { kind: ActKind::Fork, samples, events, outcome: Outcome::ok(), duration_s: t, metrics, notes: vec![] }
 }
 
@@ -394,7 +376,7 @@ pub fn set_down(body: &Body, from_m: f32, mass_kg: f32, size_m: [f32; 3], surfac
 /// with a counterweight at the back, a raised seat with a seated rider whose eyes are at `eye_m` (the head camera),
 /// a dashboard and steering wheel, and an overhead guard on four posts. Body frame; the names say what each box is.
 pub fn truck_boxes(body: &Body, eye_m: f32) -> Vec<LinkBox> {
-    truck_boxes_posed(body, eye_m, &KinPose::stand(0.0))
+    truck_boxes_posed(body, eye_m, &KinPose::stand(body, 0.0))
 }
 
 /// `truck_boxes` with the rider leaning by `pose`'s trunk angle and bending the head by its neck, as the head camera
@@ -403,7 +385,7 @@ pub fn truck_boxes_posed(body: &Body, eye_m: f32, pose: &KinPose) -> Vec<LinkBox
     let eye3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
     let (l, w) = (body.support_len_m, body.support_width_m);
     let b = |name: &'static str, segment: Segment, c: [f32; 3], half: [f32; 3]| LinkBox { name, segment, center: c, axes: eye3, half };
-    let deck = WHEEL_R_M + 0.04;
+    let deck = body.dims.wheel_r_m + 0.04;
     let top = deck + 0.20;
     let seat = (eye_m - 0.315).max(top + 0.04);
     let roof = seat + 0.315 + 0.13;
@@ -452,14 +434,14 @@ pub fn boxes(body: &Body, fork_m: f32) -> Vec<LinkBox> {
     let eye = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
     let fx = front_x(body);
     let hx = heel_x(body);
-    let h = fork_m.clamp(FORK_FLOOR_M, FORK_MAX_M);
+    let h = fork_m.clamp(FORK_FLOOR_M, body.dims.fork_max_m());
     let mut v = Vec::new();
-    for y in [-0.5 * TINE_SPREAD_M - 0.03, 0.5 * TINE_SPREAD_M + 0.03] {
-        v.push(LinkBox { name: "fork_mast", segment: Segment::Leg, center: [fx + 0.012, y, 0.5 * (0.02 + MAST_TOP_M)], axes: eye, half: [0.012, 0.012, 0.5 * (MAST_TOP_M - 0.02)] });
+    for y in [-0.5 * body.dims.tine_spread_m - 0.03, 0.5 * body.dims.tine_spread_m + 0.03] {
+        v.push(LinkBox { name: "fork_mast", segment: Segment::Leg, center: [fx + 0.012, y, 0.5 * (0.02 + body.dims.mast_top_m)], axes: eye, half: [0.012, 0.012, 0.5 * (body.dims.mast_top_m - 0.02)] });
     }
-    v.push(LinkBox { name: "fork_carriage", segment: Segment::Foot, center: [hx - 0.008, 0.0, h + 0.05], axes: eye, half: [0.008, 0.5 * TINE_SPREAD_M + 0.04, 0.05] });
-    for y in [-0.5 * TINE_SPREAD_M, 0.5 * TINE_SPREAD_M] {
-        v.push(LinkBox { name: "fork_tine", segment: Segment::Foot, center: [hx + 0.5 * TINE_LEN_M, y, h + 0.5 * TINE_T_M], axes: eye, half: [0.5 * TINE_LEN_M, 0.5 * TINE_W_M, 0.5 * TINE_T_M] });
+    v.push(LinkBox { name: "fork_carriage", segment: Segment::Foot, center: [hx - 0.008, 0.0, h + 0.05], axes: eye, half: [0.008, 0.5 * body.dims.tine_spread_m + 0.04, 0.05] });
+    for y in [-0.5 * body.dims.tine_spread_m, 0.5 * body.dims.tine_spread_m] {
+        v.push(LinkBox { name: "fork_tine", segment: Segment::Foot, center: [hx + 0.5 * body.dims.tine_len_m, y, h + 0.5 * body.dims.tine_t_m], axes: eye, half: [0.5 * body.dims.tine_len_m, 0.5 * body.dims.tine_w_m, 0.5 * body.dims.tine_t_m] });
     }
     v
 }
@@ -484,7 +466,7 @@ mod tests {
     #[test]
     fn a_pick_lowers_slides_in_then_lifts_and_the_rider_keeps_looking_ahead() {
         let b = body(BaseKind::Wheel);
-        let r = pick(&b, FORK_REST_M, 0.55, 2.4, [0.15; 3], 0.0, 0.0, 0.4);
+        let r = pick(&b, crate::dims::Dims::COMPACT.fork_rest_m, 0.55, 2.4, [0.15; 3], 0.0, 0.0, 0.4);
         assert!(r.outcome.ok, "{:?}", r.outcome);
         let phases: Vec<&str> = r.samples.iter().map(|s| s.phase).collect::<Vec<_>>();
         let first = |p: &str| phases.iter().position(|q| *q == p).unwrap();
@@ -493,10 +475,10 @@ mod tests {
         let low = r.samples.iter().filter(|s| s.phase == "insert").map(|s| s.pose.fork_m).fold(f32::INFINITY, f32::min);
         assert!(low <= 1e-3, "the tines are on the floor while they slide in: {low}");
         let end = r.samples.last().unwrap();
-        assert!((end.pose.fork_m - FORK_CARRY_M).abs() < 1e-3, "{}", end.pose.fork_m);
+        assert!((end.pose.fork_m - crate::dims::Dims::COMPACT.fork_carry_m).abs() < 1e-3, "{}", end.pose.fork_m);
         assert!(end.pose.neck_deg.abs() < 0.5, "the rider looks ahead again with the load up: {}", end.pose.neck_deg);
         let obj = end.object.unwrap();
-        assert!((obj[0] - load_x(&b, 0.15)).abs() < 1e-4 && obj[2] > FORK_CARRY_M, "the log rides on the tines: {obj:?}");
+        assert!((obj[0] - load_x(&b, 0.15)).abs() < 1e-4 && obj[2] > crate::dims::Dims::COMPACT.fork_carry_m, "the log rides on the tines: {obj:?}");
         let slide = r.metric("slide_m").unwrap();
         assert!((slide - (0.55f32.max(standoff_x(&b, 0.15)) - load_x(&b, 0.15))).abs() < 1e-4, "the tines come down in front of the log, then slide in: {slide}");
     }
@@ -536,7 +518,7 @@ mod tests {
     #[test]
     fn a_look_has_the_rider_check_first_then_the_carriage_camera() {
         let b = body(BaseKind::Track);
-        let r = look(&b, FORK_REST_M, 0.62, [0.15; 3], 0.0, 0.0, 0.0);
+        let r = look(&b, crate::dims::Dims::COMPACT.fork_rest_m, 0.62, [0.15; 3], 0.0, 0.0, 0.0);
         let phases: Vec<&str> = r.samples.iter().map(|s| s.phase).fold(Vec::new(), |mut v, p| {
             if v.last() != Some(&p) {
                 v.push(p);
@@ -545,7 +527,7 @@ mod tests {
         });
         assert_eq!(phases, ["rider_look", "rider_check", "lower", "check"], "{phases:?}");
         let rider = r.samples.iter().filter(|s| s.phase == "rider_check").last().unwrap();
-        assert!(rider.pose.neck_deg > 20.0 && (rider.pose.fork_m - FORK_REST_M).abs() < 1e-4, "the rider looks down while the tines are still up: {:?}", rider.pose);
+        assert!(rider.pose.neck_deg > 20.0 && (rider.pose.fork_m - crate::dims::Dims::COMPACT.fork_rest_m).abs() < 1e-4, "the rider looks down while the tines are still up: {:?}", rider.pose);
         let fork = r.samples.last().unwrap();
         assert!(fork.pose.neck_deg.abs() < 0.5 && fork.pose.fork_m <= 1e-3, "looking ahead again, tines down for the carriage camera: {:?}", fork.pose);
         let kinds: Vec<&str> = r.events.iter().map(|e| e.kind).collect();
@@ -557,7 +539,7 @@ mod tests {
     fn the_rider_leans_and_bends_the_head_in_the_truck_drawing() {
         let b = body(BaseKind::Wheel);
         let ahead = truck_boxes(&b, 1.0);
-        let down = truck_boxes_posed(&b, 1.0, &KinPose { neck_deg: 40.0, ..KinPose::stand(0.0) });
+        let down = truck_boxes_posed(&b, 1.0, &KinPose { neck_deg: 40.0, ..KinPose::stand_compact(0.0) });
         let head = |v: &[LinkBox]| v.iter().find(|x| x.name == "rider_head").unwrap().clone();
         let (h0, h1) = (head(&ahead), head(&down));
         assert!(h1.center[0] > h0.center[0] && h1.center[2] < h0.center[2], "the head tips forward and down: {:?} -> {:?}", h0.center, h1.center);
@@ -581,17 +563,17 @@ mod tests {
     #[test]
     fn a_set_down_lowers_backs_out_and_raises_the_empty_tines() {
         let b = body(BaseKind::Track);
-        let r = set_down(&b, FORK_CARRY_M, 2.4, [0.15; 3], 0.0, 2.4);
+        let r = set_down(&b, crate::dims::Dims::COMPACT.fork_carry_m, 2.4, [0.15; 3], 0.0, 2.4);
         assert!(r.outcome.ok);
         let objs: Vec<f32> = r.samples.iter().filter(|s| s.phase == "back_out").map(|s| s.object.unwrap()[0]).collect();
-        assert!(objs.windows(2).all(|w| w[1] >= w[0] - 1e-6) && objs.last().unwrap() > &(heel_x(&b) + TINE_LEN_M), "the base backs off the load: {objs:?}");
-        assert!((r.samples.last().unwrap().pose.fork_m - FORK_REST_M).abs() < 1e-3);
+        assert!(objs.windows(2).all(|w| w[1] >= w[0] - 1e-6) && objs.last().unwrap() > &(heel_x(&b) + crate::dims::Dims::COMPACT.tine_len_m), "the base backs off the load: {objs:?}");
+        assert!((r.samples.last().unwrap().pose.fork_m - crate::dims::Dims::COMPACT.fork_rest_m).abs() < 1e-3);
     }
 
     #[test]
     fn a_look_lowers_the_tines_and_holds_for_the_camera() {
         let b = body(BaseKind::Wheel);
-        let r = look(&b, FORK_REST_M, 0.3, [0.15; 3], 0.0, 0.0, 0.0);
+        let r = look(&b, crate::dims::Dims::COMPACT.fork_rest_m, 0.3, [0.15; 3], 0.0, 0.0, 0.0);
         assert!(r.samples.last().unwrap().object.unwrap()[0] >= standoff_x(&b, 0.15) - 1e-4, "it backs off so the tines come down in front of the item");
         assert!(r.samples.iter().any(|s| s.phase == "check") && r.samples.last().unwrap().pose.fork_m <= 1e-3);
         let cam = camera_pos(&b, 0.0);

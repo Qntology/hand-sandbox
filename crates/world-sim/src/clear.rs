@@ -163,10 +163,11 @@ impl Footprint {
     pub fn of(body: &noto_core::balance::Body) -> Footprint {
         if body.legged() {
             // Shoulders plus an arm's thickness each side; the hands and what they hold a little ahead of the chest.
-            Footprint { front_m: 0.22, rear_m: 0.15, half_w_m: noto_core::parts::SHOULDER_HALF_WIDTH_M + 0.06 }
+            let k = body.dims.k;
+            Footprint { front_m: 0.22 * k, rear_m: 0.15 * k, half_w_m: body.dims.shoulder_half_m + 0.06 * k }
         } else {
             use noto_core::act::fork;
-            Footprint { front_m: fork::heel_x(body) + fork::TINE_LEN_M, rear_m: 0.5 * body.support_len_m + 0.09, half_w_m: 0.5 * body.support_width_m }
+            Footprint { front_m: fork::heel_x(body) + body.dims.tine_len_m, rear_m: 0.5 * body.support_len_m + 1.15 * body.dims.wheel_r_m + 0.02, half_w_m: 0.5 * body.support_width_m }
         }
     }
 

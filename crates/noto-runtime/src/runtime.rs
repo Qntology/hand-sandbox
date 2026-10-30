@@ -301,6 +301,8 @@ pub struct Runtime {
     pub(crate) recording: Option<crate::record::Recording>,
     pub(crate) ml: crate::ml::MlPipeline,
     pub(crate) ml_task: Option<crate::mldrive::MlTask>,
+    /// The robots saved from the CAD editor.
+    pub(crate) rigs: crate::rigs::RigShelf,
     pub(crate) test: Option<crate::testrun::TestSession>,
     pub test_cfg: crate::testrun::TestCfg,
     pub(crate) live_queue: std::collections::VecDeque<String>,
@@ -356,6 +358,7 @@ impl Runtime {
             recording: None,
             ml,
             ml_task: None,
+            rigs: crate::rigs::RigShelf::open(data_dir.map(|d| d.join("rigs"))),
             test: None,
             test_cfg: crate::testrun::TestCfg::default(),
             live_queue: std::collections::VecDeque::new(),

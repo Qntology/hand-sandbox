@@ -27,7 +27,7 @@ fn moments(rows: &[Value]) -> Vec<&str> {
 #[test]
 fn three_passes_record_keyframes_ml_tracks_decisions_and_success_rates() {
     let mut rt = runtime();
-    let st = run_test(&mut rt, "원목 1개를 창고로 가져와", BodyPlan::default(), BaseKind::Wheel);
+    let st = run_test(&mut rt, "원목 1개를 창고로 가져와", BodyPlan::standard(), BaseKind::Wheel);
     assert_eq!(st["game_quest"]["state"], "done", "{}", st["game_quest"]);
     let game = st["game"]["keyframes"].as_array().unwrap();
     let fixed: Vec<&Value> = game.iter().filter(|k| k["event"].is_null()).collect();
@@ -91,7 +91,7 @@ fn three_passes_record_keyframes_ml_tracks_decisions_and_success_rates() {
 #[test]
 fn a_legged_pick_is_recorded_moment_by_moment_with_its_focus_views_and_the_act_sds() {
     let mut rt = runtime();
-    let st = run_test(&mut rt, "원목 1개를 창고로 가져와", BodyPlan::default(), BaseKind::HumanFoot);
+    let st = run_test(&mut rt, "원목 1개를 창고로 가져와", BodyPlan::standard(), BaseKind::HumanFoot);
     assert_eq!(st["game_quest"]["state"], "done", "{}", st["game_quest"]);
     let game = st["game"]["keyframes"].as_array().unwrap();
     let m = moments(game);
@@ -126,7 +126,7 @@ fn a_legged_pick_is_recorded_moment_by_moment_with_its_focus_views_and_the_act_s
 #[test]
 fn a_budget_arm_fails_where_a_mid_arm_succeeds_and_both_are_recorded() {
     let mut rt = runtime();
-    let budget = BodyPlan { arm: Tier::Budget, ..BodyPlan::default() };
+    let budget = BodyPlan { arm: Tier::Budget, ..BodyPlan::standard() };
     let st = run_test(&mut rt, "원목 1개를 창고로 가져와", budget, BaseKind::HumanFoot);
     assert_eq!(st["game_quest"]["state"], "failed");
     assert_eq!(st["game_quest"]["failure"]["code"], "lift_overload", "{}", st["game_quest"]);

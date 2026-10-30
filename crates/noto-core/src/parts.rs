@@ -1,18 +1,11 @@
 use serde::{Deserialize, Serialize};
 
 use crate::base::BaseKind;
+use crate::dims::{Build, Dims, HEAD_TOP_COMPACT_M, STANDARD_STATURE_M};
 use crate::hand::FingerCount;
 use crate::morph::{HeadMount, Morphology, Torso};
 use crate::wear::Reducer;
 
-pub const HIP_M: f32 = 0.58;
-pub const WAIST_M: f32 = 0.70;
-pub const SHOULDER_M: f32 = 1.00;
-pub const SHOULDER_HALF_WIDTH_M: f32 = 0.18;
-pub const UPPER_ARM_M: f32 = 0.22;
-pub const FOREARM_M: f32 = 0.20;
-pub const STANCE_WIDTH_M: f32 = 0.18;
-pub const CHASSIS_WIDTH_M: f32 = 0.40;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -66,6 +59,8 @@ pub struct Actuator {
     pub thermal_tau_s: f32,
     pub reducer: Reducer,
     pub src: &'static str,
+    /// Length scale of the body this size of actuator is for, over the catalogue part's (`scaled`).
+    pub scale_k: f32,
 }
 
 impl Actuator {
@@ -80,19 +75,37 @@ impl Actuator {
         }
     }
 
+    /// The same design for a body `k` times as long, by geometric similarity at equal gait number: mass k³, torque k⁴
+    /// (mass times lever), speed k^-½. A catalogue part `k` = 1 is returned as it is.
+    pub fn scaled(self, k: f32) -> Actuator {
+        if k == 1.0 {
+            return self;
+        }
+        Actuator { peak_nm: self.peak_nm * k.powi(4), cont_nm: self.cont_nm * k.powi(4), speed_rad_s: self.speed_rad_s / k.sqrt(), mass_kg: self.mass_kg * k.powi(3), price_usd: self.price_usd * k * k, scale_k: self.scale_k * k, ..self }
+    }
+
+    /// The name shown for it; a scaled part says it is an equivalent, not the catalogue part.
+    pub fn label(&self) -> String {
+        if self.scale_k == 1.0 {
+            self.name.to_string()
+        } else {
+            format!("{} 급 ×{:.1} 환산", self.name, self.scale_k.powi(4))
+        }
+    }
+
     pub fn torque_at(&self, omega: f32) -> f32 {
         self.peak_nm * (1.0 - (omega.abs() / self.speed_rad_s.max(1e-3))).clamp(0.0, 1.0)
     }
 }
 
-pub const STS3215: Actuator = Actuator { name: "Feetech STS3215 (12 V)", peak_nm: 2.94, cont_nm: 0.98, speed_rad_s: 4.7, mass_kg: 0.055, price_usd: 32.0, backdrivable: false, thermal_tau_s: 200.0, reducer: Reducer::Spur, src: "1" };
-pub const HTD45H: Actuator = Actuator { name: "Hiwonder HTD-45H", peak_nm: 4.41, cont_nm: 1.5, speed_rad_s: 5.8, mass_kg: 0.064, price_usd: 30.0, backdrivable: false, thermal_tau_s: 200.0, reducer: Reducer::Spur, src: "4" };
-pub const XM430: Actuator = Actuator { name: "Dynamixel XM430-W350", peak_nm: 4.1, cont_nm: 0.82, speed_rad_s: 4.8, mass_kg: 0.082, price_usd: 310.0, backdrivable: false, thermal_tau_s: 250.0, reducer: Reducer::Spur, src: "7,10" };
-pub const RS01: Actuator = Actuator { name: "Robstride 01", peak_nm: 17.0, cont_nm: 6.0, speed_rad_s: 33.0, mass_kg: 0.38, price_usd: 130.0, backdrivable: true, thermal_tau_s: 600.0, reducer: Reducer::Planetary, src: "15" };
-pub const RS02: Actuator = Actuator { name: "Robstride 02", peak_nm: 17.0, cont_nm: 6.0, speed_rad_s: 42.9, mass_kg: 0.405, price_usd: 145.0, backdrivable: true, thermal_tau_s: 600.0, reducer: Reducer::Planetary, src: "15" };
-pub const RS03: Actuator = Actuator { name: "Robstride 03", peak_nm: 60.0, cont_nm: 20.0, speed_rad_s: 20.4, mass_kg: 0.88, price_usd: 225.0, backdrivable: true, thermal_tau_s: 800.0, reducer: Reducer::Planetary, src: "16" };
-pub const RS04: Actuator = Actuator { name: "Robstride 04", peak_nm: 120.0, cont_nm: 40.0, speed_rad_s: 20.9, mass_kg: 1.42, price_usd: 255.0, backdrivable: true, thermal_tau_s: 900.0, reducer: Reducer::Planetary, src: "17" };
-pub const BHL6512: Actuator = Actuator { name: "BHL 6512 (자작 사이클로이드)", peak_nm: 20.0, cont_nm: 7.0, speed_rad_s: 15.0, mass_kg: 0.55, price_usd: 170.0, backdrivable: true, thermal_tau_s: 500.0, reducer: Reducer::Cycloid, src: "22" };
+pub const STS3215: Actuator = Actuator { name: "Feetech STS3215 (12 V)", peak_nm: 2.94, cont_nm: 0.98, speed_rad_s: 4.7, mass_kg: 0.055, price_usd: 32.0, backdrivable: false, thermal_tau_s: 200.0, reducer: Reducer::Spur, src: "1", scale_k: 1.0 };
+pub const HTD45H: Actuator = Actuator { name: "Hiwonder HTD-45H", peak_nm: 4.41, cont_nm: 1.5, speed_rad_s: 5.8, mass_kg: 0.064, price_usd: 30.0, backdrivable: false, thermal_tau_s: 200.0, reducer: Reducer::Spur, src: "4", scale_k: 1.0 };
+pub const XM430: Actuator = Actuator { name: "Dynamixel XM430-W350", peak_nm: 4.1, cont_nm: 0.82, speed_rad_s: 4.8, mass_kg: 0.082, price_usd: 310.0, backdrivable: false, thermal_tau_s: 250.0, reducer: Reducer::Spur, src: "7,10", scale_k: 1.0 };
+pub const RS01: Actuator = Actuator { name: "Robstride 01", peak_nm: 17.0, cont_nm: 6.0, speed_rad_s: 33.0, mass_kg: 0.38, price_usd: 130.0, backdrivable: true, thermal_tau_s: 600.0, reducer: Reducer::Planetary, src: "15", scale_k: 1.0 };
+pub const RS02: Actuator = Actuator { name: "Robstride 02", peak_nm: 17.0, cont_nm: 6.0, speed_rad_s: 42.9, mass_kg: 0.405, price_usd: 145.0, backdrivable: true, thermal_tau_s: 600.0, reducer: Reducer::Planetary, src: "15", scale_k: 1.0 };
+pub const RS03: Actuator = Actuator { name: "Robstride 03", peak_nm: 60.0, cont_nm: 20.0, speed_rad_s: 20.4, mass_kg: 0.88, price_usd: 225.0, backdrivable: true, thermal_tau_s: 800.0, reducer: Reducer::Planetary, src: "16", scale_k: 1.0 };
+pub const RS04: Actuator = Actuator { name: "Robstride 04", peak_nm: 120.0, cont_nm: 40.0, speed_rad_s: 20.9, mass_kg: 1.42, price_usd: 255.0, backdrivable: true, thermal_tau_s: 900.0, reducer: Reducer::Planetary, src: "17", scale_k: 1.0 };
+pub const BHL6512: Actuator = Actuator { name: "BHL 6512 (자작 사이클로이드)", peak_nm: 20.0, cont_nm: 7.0, speed_rad_s: 15.0, mass_kg: 0.55, price_usd: 170.0, backdrivable: true, thermal_tau_s: 500.0, reducer: Reducer::Cycloid, src: "22", scale_k: 1.0 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -234,6 +247,10 @@ pub const fn lift_mass_kg(stroke_m: f32) -> f32 {
 pub const MAST_LIFT: LiftPreset = LiftPreset { name: "마스트 리프트 (Stretch 급)", stroke_m: 0.84, speed_mps: 0.10, force_n: 450.0, mass_kg: lift_mass_kg(0.84), power_w: 30.0, cost_usd: 600.0, src: "행정: Stretch RE1 리프트 · 속도·힘·질량·가격 추정" };
 
 impl HeadPreset {
+    fn scaled(self, k: f32) -> HeadPreset {
+        HeadPreset { mass_kg: self.mass_kg * k.powi(3), com_up_m: self.com_up_m * k, neck: self.neck.scaled(k), power_w: self.power_w * k * k, ..self }
+    }
+
     pub fn of(tier: Tier) -> HeadPreset {
         match tier.no_plus() {
             Tier::Budget => HeadPreset { tier: Tier::Budget, mass_kg: 0.45, com_up_m: 0.07, neck: STS3215, sensor: "OAK-D Lite", gaze_stabilization: 0.45, power_w: 5.0, cost_usd: 215.0 },
@@ -244,6 +261,11 @@ impl HeadPreset {
 }
 
 impl ChestPreset {
+    fn scaled(self, k: f32) -> ChestPreset {
+        let v = k.powi(3);
+        ChestPreset { mass_kg: self.mass_kg * v, battery_kg: self.battery_kg * v, battery_wh: self.battery_wh * v, com_up_m: self.com_up_m * k, power_w: self.power_w * k * k, ..self }
+    }
+
     pub fn of(tier: Tier) -> ChestPreset {
         match tier.no_plus() {
             Tier::Budget => ChestPreset { tier: Tier::Budget, mass_kg: 1.2, battery_kg: 0.72, battery_wh: 160.0, com_up_m: 0.15, computer: "Raspberry Pi 5", power_w: 6.0, cost_usd: 150.0 },
@@ -254,6 +276,10 @@ impl ChestPreset {
 }
 
 impl BellyPreset {
+    fn scaled(self, k: f32) -> BellyPreset {
+        BellyPreset { mass_kg: self.mass_kg * k.powi(3), com_down_m: self.com_down_m * k, waist: self.waist.scaled(k), pitch: self.pitch.map(|p| p.scaled(k)), power_w: self.power_w * k * k, ..self }
+    }
+
     pub fn of(tier: Tier) -> BellyPreset {
         match tier.no_plus() {
             Tier::Budget => BellyPreset { tier: Tier::Budget, mass_kg: 0.7, com_down_m: 0.06, waist: HTD45H.ganged("2× HTD-45H"), pitch: None, max_lean_deg: 0.0, power_w: 3.0, cost_usd: 70.0 },
@@ -264,6 +290,10 @@ impl BellyPreset {
 }
 
 impl ArmPreset {
+    fn scaled(self, k: f32) -> ArmPreset {
+        ArmPreset { mass_kg: self.mass_kg * k.powi(3), com_m: self.com_m * k, shoulder: self.shoulder.scaled(k), elbow: self.elbow.scaled(k), power_w: self.power_w * k * k, ..self }
+    }
+
     pub fn of(tier: Tier) -> ArmPreset {
         match tier.no_plus() {
             Tier::Budget => ArmPreset { tier: Tier::Budget, mass_kg: 0.64, com_m: 0.17, shoulder: HTD45H.ganged("2× HTD-45H"), elbow: STS3215, power_w: 10.0, cost_usd: 135.0 },
@@ -274,6 +304,10 @@ impl ArmPreset {
 }
 
 impl LegPreset {
+    fn scaled(self, k: f32) -> LegPreset {
+        LegPreset { mass_kg: self.mass_kg * k.powi(3), com_down_m: self.com_down_m * k, knee: self.knee.scaled(k), ankle: self.ankle.scaled(k), foot_mass_kg: self.foot_mass_kg * k.powi(3), foot_len_m: self.foot_len_m * k, foot_width_m: self.foot_width_m * k, power_w: self.power_w * k * k, ..self }
+    }
+
     pub fn of(tier: Tier) -> LegPreset {
         match tier {
             Tier::Budget => LegPreset { tier, mass_kg: 1.45, com_down_m: 0.23, knee: HTD45H.ganged("2× HTD-45H"), ankle: HTD45H.ganged("2× HTD-45H"), froude: 0.02, foot_mass_kg: 0.10, foot_len_m: 0.16, foot_width_m: 0.08, power_w: 50.0, cost_usd: 315.0 },
@@ -285,6 +319,16 @@ impl LegPreset {
 }
 
 impl ChassisPreset {
+    /// A 1-tonne counterbalanced electric truck: tare mass with its traction battery, which is also the counterweight
+    /// [추정: the class weighs 2.3–2.8 t].
+    pub fn truck(tier: Tier) -> ChassisPreset {
+        match tier.no_plus() {
+            Tier::Budget => ChassisPreset { tier: Tier::Budget, name: "1톤 전동 지게차 (납축 배터리)", mass_kg: 2650.0, com_m: 0.50, max_speed_mps: 2.2, drive_force_n: 7500.0, power_w: 5000.0, cost_usd: 19_000.0, src: "est" },
+            Tier::Mid => ChassisPreset { tier: Tier::Mid, name: "1톤 전동 지게차 (리튬 배터리)", mass_kg: 2450.0, com_m: 0.50, max_speed_mps: 3.0, drive_force_n: 9000.0, power_w: 6000.0, cost_usd: 26_000.0, src: "est" },
+            _ => ChassisPreset { tier: Tier::Pro, name: "1톤 전동 지게차 (고출력)", mass_kg: 2400.0, com_m: 0.48, max_speed_mps: 3.5, drive_force_n: 11000.0, power_w: 8000.0, cost_usd: 34_000.0, src: "est" },
+        }
+    }
+
     pub fn of(tier: Tier) -> ChassisPreset {
         match tier.no_plus() {
             Tier::Budget => ChassisPreset { tier: Tier::Budget, name: "LeKiwi 급 (STS3215 ×3)", mass_kg: 1.7, com_m: 0.06, max_speed_mps: 0.24, drive_force_n: 46.0, power_w: 30.0, cost_usd: 226.0, src: "30" },
@@ -336,6 +380,9 @@ pub struct BodyPlan {
     pub lift: bool,
     #[serde(default)]
     pub morph: Morphology,
+    /// The body's size (`crate::dims`): the parts above scale with it.
+    #[serde(default)]
+    pub build: Build,
 }
 
 impl Default for BodyPlan {
@@ -346,13 +393,43 @@ impl Default for BodyPlan {
 
 impl BodyPlan {
     pub fn uniform(tier: Tier) -> BodyPlan {
-        BodyPlan { head: tier, chest: tier, belly: tier, arm: tier, leg: tier, battery_low: false, lift: false, morph: Morphology::default() }
+        BodyPlan { head: tier, chest: tier, belly: tier, arm: tier, leg: tier, battery_low: false, lift: false, morph: Morphology::default(), build: Build::Compact }
+    }
+
+    /// A person's size on legs and a 1-tonne truck on wheels: the world's own scale, and what a new world starts with.
+    pub fn standard() -> BodyPlan {
+        BodyPlan { build: Build::Standard, ..BodyPlan::uniform(Tier::Mid) }
     }
 
     pub fn id(&self) -> String {
-        match self.morph.upper_key() {
+        let id = match self.morph.upper_key() {
             Some(k) => format!("{}+{k}", self.tier_id()),
             None => self.tier_id(),
+        };
+        match self.build {
+            Build::Compact => id,
+            b => format!("{id}@{}", b.id()),
+        }
+    }
+
+    /// Lengths over the compact robot's, for sizing the parts. The small forms (a mast camera on a deck, an AMR) are
+    /// the robots they copy and keep their catalogue parts.
+    pub fn k(&self) -> f32 {
+        if self.morph.torso != Torso::Humanoid {
+            return 1.0;
+        }
+        match self.build {
+            Build::Compact => 1.0,
+            Build::Standard => STANDARD_STATURE_M / HEAD_TOP_COMPACT_M,
+            Build::Rig(id) => crate::rig::get(id).map_or(1.0, |r| r.dims.k),
+        }
+    }
+
+    pub fn dims(&self, base: BaseKind) -> Dims {
+        if self.morph.torso == Torso::Humanoid {
+            Dims::of(self.build, base)
+        } else {
+            Dims::COMPACT
         }
     }
 
@@ -404,21 +481,24 @@ impl BodyPlan {
     pub const NAMED: [&'static str; 7] = ["budget", "mid", "pro", "budget_arms_mid_base", "pro_arms", "battery_low", "wheel_lift"];
 
     pub fn head_preset(&self) -> HeadPreset {
-        HeadPreset::of(self.head)
+        HeadPreset::of(self.head).scaled(self.k())
     }
     pub fn chest_preset(&self) -> ChestPreset {
-        ChestPreset::of(self.chest)
+        ChestPreset::of(self.chest).scaled(self.k())
     }
     pub fn belly_preset(&self) -> BellyPreset {
-        BellyPreset::of(self.belly)
+        BellyPreset::of(self.belly).scaled(self.k())
     }
     pub fn arm_preset(&self) -> ArmPreset {
-        ArmPreset::of(self.arm)
+        ArmPreset::of(self.arm).scaled(self.k())
     }
     pub fn leg_preset(&self) -> LegPreset {
-        LegPreset::of(self.leg)
+        LegPreset::of(self.leg).scaled(self.k())
     }
     pub fn chassis_preset(&self) -> ChassisPreset {
+        if self.morph.torso == Torso::Humanoid && self.build != Build::Compact {
+            return ChassisPreset::truck(self.leg);
+        }
         ChassisPreset::of(self.leg)
     }
     pub fn lift_preset(&self, base: BaseKind) -> Option<LiftPreset> {

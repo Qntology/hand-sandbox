@@ -3,10 +3,10 @@ use std::sync::Mutex;
 
 use serde::Serialize;
 
-use crate::balance::{Body, G, KNEE_LEVER_WALK_M, REACTION_DELAY_S};
+use crate::balance::{Body, G, REACTION_DELAY_S};
 use crate::contact::{self, SoleModel, TOE_HINGE_FL};
-use crate::kin::{self, KinLoads, KinPose, ANKLE_H_M, SHANK_M, THIGH_M};
-use crate::parts::*;
+use crate::dims::Dims;
+use crate::kin::{self, KinLoads, KinPose};
 use crate::surface::{self, SurfaceProps};
 
 use super::{ActEvent, ActKind, ActRollout, ActSample, Draw, Outcome, Part, SAMPLE_S};
@@ -68,8 +68,8 @@ pub fn impact_mass_kg(body: &Body) -> f32 {
 }
 
 pub fn walking_com_z(body: &Body) -> f32 {
-    let bend = (KNEE_LEVER_WALK_M / SHANK_M).clamp(0.0, 0.9).asin();
-    body.com_height_m() - (THIGH_M + SHANK_M) * (1.0 - bend.cos())
+    let bend = (body.dims.knee_lever_walk_m / body.dims.shank_m()).clamp(0.0, 0.9).asin();
+    body.com_height_m() - (body.dims.thigh_m() + body.dims.shank_m()) * (1.0 - bend.cos())
 }
 
 pub fn com_excursion_m(speed: f32, leg_m: f32) -> f32 {
@@ -79,9 +79,9 @@ pub fn com_excursion_m(speed: f32, leg_m: f32) -> f32 {
     (a.1 + (b.1 - a.1) * u) / PERSON_LEG_M * leg_m
 }
 
-pub fn com_rise_room_m() -> f32 {
-    let bend = (KNEE_LEVER_WALK_M / SHANK_M).clamp(0.0, 0.9).asin();
-    (THIGH_M + SHANK_M) * (1.0 - bend.cos())
+pub fn com_rise_room_m(d: &Dims) -> f32 {
+    let bend = (d.knee_lever_walk_m / d.shank_m()).clamp(0.0, 0.9).asin();
+    (d.thigh_m() + d.shank_m()) * (1.0 - bend.cos())
 }
 
 fn interp(table: &[(f32, f32)], x: f32) -> f32 {
@@ -177,26 +177,26 @@ impl StepModel {
     }
 }
 
-fn step_lean(z_c: f32, foot_m: f32, step_m: f32, step_s: f32, ds_frac: f32) -> (f32, f32, f32, f32) {
+fn step_lean(d: &Dims, z_c: f32, foot_m: f32, step_m: f32, step_s: f32, ds_frac: f32) -> (f32, f32, f32, f32) {
     let speed = step_m / step_s.max(1e-3);
-    let amp = com_excursion_m(speed, HIP_M).min(2.0 * com_rise_room_m());
+    let amp = com_excursion_m(speed, d.hip_m).min(2.0 * com_rise_room_m(d));
     let m = StepModel { lam: step_m, step_s, t_ds: ds_frac * step_s, z_c, amp, foot_m };
     let (x0, v0) = m.periodic();
     (m.lean(x0, v0), amp, x0, v0)
 }
 
-static PLANS: Mutex<Option<HashMap<[u32; 5], GaitPlan>>> = Mutex::new(None);
+static PLANS: Mutex<Option<HashMap<[u32; 6], GaitPlan>>> = Mutex::new(None);
 
 pub fn plan(body: &Body, speed: f32, mu_est: f32, slope_deg: f32) -> GaitPlan {
-    plan_z(walking_com_z(body), body.leg.foot_len_m, speed, mu_est, slope_deg)
+    plan_z(&body.dims, walking_com_z(body), body.leg.foot_len_m, speed, mu_est, slope_deg)
 }
 
-pub fn plan_z(z_c: f32, foot_m: f32, speed: f32, mu_est: f32, slope_deg: f32) -> GaitPlan {
-    let key = [z_c.to_bits(), foot_m.to_bits(), speed.to_bits(), mu_est.to_bits(), slope_deg.to_bits()];
+pub fn plan_z(d: &Dims, z_c: f32, foot_m: f32, speed: f32, mu_est: f32, slope_deg: f32) -> GaitPlan {
+    let key = [d.hip_m.to_bits(), z_c.to_bits(), foot_m.to_bits(), speed.to_bits(), mu_est.to_bits(), slope_deg.to_bits()];
     if let Some(g) = PLANS.lock().ok().and_then(|p| p.as_ref().and_then(|m| m.get(&key).copied())) {
         return g;
     }
-    let g = plan_uncached(z_c, foot_m, speed, mu_est, slope_deg);
+    let g = plan_uncached(d, z_c, foot_m, speed, mu_est, slope_deg);
     if let Ok(mut p) = PLANS.lock() {
         let m = p.get_or_insert_with(HashMap::new);
         if m.len() > 4096 {
@@ -207,8 +207,8 @@ pub fn plan_z(z_c: f32, foot_m: f32, speed: f32, mu_est: f32, slope_deg: f32) ->
     g
 }
 
-fn plan_uncached(z_c: f32, foot_m: f32, speed: f32, mu_est: f32, slope_deg: f32) -> GaitPlan {
-    let l = HIP_M;
+fn plan_uncached(d: &Dims, z_c: f32, foot_m: f32, speed: f32, mu_est: f32, slope_deg: f32) -> GaitPlan {
+    let l = d.hip_m;
     let fr = speed * speed / (G * l);
     let ds_frac = ds_fraction(fr);
     let full = relative_step(fr) * l;
@@ -216,26 +216,26 @@ fn plan_uncached(z_c: f32, foot_m: f32, speed: f32, mu_est: f32, slope_deg: f32)
     let tan = slope_deg.to_radians().tan().abs();
     let room = mu_est - KEEP_MARGIN - tan;
     let mut step = full;
-    let mut at = step_lean(z_c, foot_m, step, step_s, ds_frac);
+    let mut at = step_lean(d, z_c, foot_m, step, step_s, ds_frac);
     let mut shortened = false;
     if at.0 > room {
         shortened = true;
         let (mut lo, mut hi) = (0.05 * l, full);
-        let low = step_lean(z_c, foot_m, lo, step_s, ds_frac);
+        let low = step_lean(d, z_c, foot_m, lo, step_s, ds_frac);
         if low.0 > room {
             step = lo;
             at = low;
         } else {
             for _ in 0..14 {
                 let mid = 0.5 * (lo + hi);
-                if step_lean(z_c, foot_m, mid, step_s, ds_frac).0 > room {
+                if step_lean(d, z_c, foot_m, mid, step_s, ds_frac).0 > room {
                     hi = mid;
                 } else {
                     lo = mid;
                 }
             }
             step = lo;
-            at = step_lean(z_c, foot_m, step, step_s, ds_frac);
+            at = step_lean(d, z_c, foot_m, step, step_s, ds_frac);
         }
     }
     let (lean, amp, x0, v0) = at;
@@ -321,7 +321,7 @@ pub fn walk(body: &Body, ground: &SurfaceProps, mu_belief: Option<f32>, slope_de
     let n_ss = (t_ss / SAMPLE_S).ceil().max(1.0) as usize;
     let path_ds: Vec<ComState> = (0..n_ds).map(|i| com_at(&g, i as f32 / n_ds as f32 * t_ds)).collect();
     let path_ss: Vec<ComState> = (0..n_ss).map(|i| com_at(&g, t_ds + i as f32 / n_ss as f32 * t_ss)).collect();
-    let half_w = 0.5 * STANCE_WIDTH_M;
+    let half_w = 0.5 * body.dims.stance_m;
     let m_imp = impact_mass_kg(body);
     let k_ground = super::material::ground_stiffness(crate::surface::Surface::from_id(ground.id).unwrap_or_default());
     let k_eff = 1.0 / (1.0 / SOLE_STIFFNESS + 1.0 / k_ground);
@@ -418,8 +418,8 @@ pub fn walk(body: &Body, ground: &SurfaceProps, mu_belief: Option<f32>, slope_de
             let bw = (m * (G + c.az) + fz_extra) / (m * G);
             peak = peak.max(bw);
             low = low.min(bw);
-            let mut pose = KinPose::stand(cargo_kg);
-            pose.hip = [c.x, c.z + (HIP_M - body.com_height_m())];
+            let mut pose = KinPose::stand(body, cargo_kg);
+            pose.hip = [c.x, c.z + (body.dims.hip_m - body.com_height_m())];
             pose.feet[stance] = [0.0, 0.0];
             pose.feet[swing] = [-lam, 0.0];
             pose.toe_deg = log.toe;
@@ -444,7 +444,7 @@ pub fn walk(body: &Body, ground: &SurfaceProps, mu_belief: Option<f32>, slope_de
         }
         if slipped {
             slips += 1;
-            let (fell, slide) = slip_outcome(&g, mu);
+            let (fell, slide) = slip_outcome(&body.dims, &g, mu);
             stats.push(StepStat { index: k, stance, mu, rcof: g.rcof, slip_p: p, slipped, fell, slide_m: slide, impact_n: f_imp, grf_peak_bw: peak, grf_min_bw: low, cone_use_max: use_max, toe_push_n: push.0 });
             if fell {
                 events.push(ActEvent::new(t0 + t_ds * 0.5, "fall", format!("미끄러져 넘어짐: 마찰 {mu:.2} < 필요 {:.2}, {:.0} mm 미끄러짐", g.rcof, slide * 1000.0), &[Part::Foot, Part::FootJoints, Part::Waist], Some(slide), false));
@@ -457,8 +457,8 @@ pub fn walk(body: &Body, ground: &SurfaceProps, mu_belief: Option<f32>, slope_de
         for (i, c) in path_ss.iter().enumerate() {
             let u = i as f32 / n_ss as f32;
             let t = u * t_ss;
-            let mut pose = KinPose::stand(cargo_kg);
-            pose.hip = [c.x, c.z + (HIP_M - body.com_height_m())];
+            let mut pose = KinPose::stand(body, cargo_kg);
+            pose.hip = [c.x, c.z + (body.dims.hip_m - body.com_height_m())];
             pose.feet[stance] = [0.0, 0.0];
             let sw = super::min_jerk(u);
             pose.feet[swing] = [-lam + 2.0 * lam * sw, (SWING_LIFT_M * (std::f32::consts::PI * u).sin()).max(SWING_OFF_M)];
@@ -505,8 +505,8 @@ pub fn walk(body: &Body, ground: &SurfaceProps, mu_belief: Option<f32>, slope_de
         ("loading_rate_bw_s", f_imp / (m * G) / (0.5 * dt_imp).max(1e-4)),
         ("slip_rate", slips as f32 / walked.max(1.0)),
         ("slip_p_mean", stats.iter().map(|s| s.slip_p).sum::<f32>() / walked.max(1.0)),
-        ("relative_step", g.step_m / HIP_M),
-        ("froude", g.speed * g.speed / (G * HIP_M)),
+        ("relative_step", g.step_m / body.dims.hip_m),
+        ("froude", g.speed * g.speed / (G * body.dims.hip_m)),
         ("com_amp_m", g.com_amp_m),
         ("duration_s", t0),
     ];
@@ -579,13 +579,13 @@ pub fn pose_at(body: &Body, g: &GaitPlan, stance: usize, u: f32, cargo_kg: f32) 
     let t_ss = g.step_s - t_ds;
     let lam = g.step_m;
     let swing = 1 - stance;
-    let ys = if stance == 0 { -0.5 * STANCE_WIDTH_M } else { 0.5 * STANCE_WIDTH_M };
+    let ys = if stance == 0 { -0.5 * body.dims.stance_m } else { 0.5 * body.dims.stance_m };
     let t = u.clamp(0.0, 1.0) * g.step_s;
     let c = com_at(g, t);
     let toes = toe_angles(body, g, cargo_kg, t);
-    let mut pose = KinPose::stand(cargo_kg);
+    let mut pose = KinPose::stand(body, cargo_kg);
     pose.feet[stance] = [0.0, 0.0];
-    pose.hip = [c.x, c.z + (HIP_M - body.com_height_m())];
+    pose.hip = [c.x, c.z + (body.dims.hip_m - body.com_height_m())];
     pose.toe_deg[stance] = toes[0];
     let loads = KinLoads { accel: [c.ax, 0.0, c.az], ..KinLoads::default() };
     if t < t_ds {
@@ -603,14 +603,14 @@ pub fn pose_at(body: &Body, g: &GaitPlan, stance: usize, u: f32, cargo_kg: f32) 
     }
 }
 
-pub fn slip_outcome(g: &GaitPlan, mu: f32) -> (bool, f32) {
+pub fn slip_outcome(d: &Dims, g: &GaitPlan, mu: f32) -> (bool, f32) {
     let mu_k = 0.85 * mu;
     let a_slide = (G * (g.rcof - mu_k)).max(0.05 * G);
     let slide = 0.5 * a_slide * REACTION_DELAY_S * REACTION_DELAY_S + g.speed * REACTION_DELAY_S * (g.rcof - mu_k).max(0.0) / g.rcof.max(1e-3);
     let omega = (G / g.com_z.max(0.1)).sqrt();
     let capture = 0.5 * g.step_m + g.speed / omega;
-    let reach = 2.0 * (THIGH_M + SHANK_M) * 0.8f32.sin();
-    (slide > FALL_SLIDE_LEG * HIP_M || capture + slide > reach, slide)
+    let reach = 2.0 * (d.thigh_m() + d.shank_m()) * 0.8f32.sin();
+    (slide > FALL_SLIDE_LEG * d.hip_m || capture + slide > reach, slide)
 }
 
 fn shift(mut p: KinPose, dx: f32) -> KinPose {
@@ -620,13 +620,14 @@ fn shift(mut p: KinPose, dx: f32) -> KinPose {
     p
 }
 
-pub fn leg_angles(hip: [f32; 2], ankle: [f32; 2]) -> Option<f32> {
-    kin::knee_ik(hip, [ankle[0], ankle[1].max(ANKLE_H_M)]).map(|k| k.1)
+pub fn leg_angles(d: &Dims, hip: [f32; 2], ankle: [f32; 2]) -> Option<f32> {
+    kin::knee_ik(d, hip, [ankle[0], ankle[1].max(d.ankle_m)]).map(|k| k.1)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parts::{BodyPlan, Tier};
     use crate::base::BaseKind;
     use crate::hand::FingerCount;
     use crate::surface::Surface;
@@ -666,7 +667,7 @@ mod tests {
     fn the_com_bobs_and_the_stance_force_has_two_humps_and_a_valley() {
         let b = legs(Tier::Mid);
         let g = plan(&b, 0.9, Surface::Firm.props().mu_foot, 0.0);
-        assert!(g.com_amp_m > 0.008 && g.com_amp_m < 2.0 * com_rise_room_m(), "{g:?}");
+        assert!(g.com_amp_m > 0.008 && g.com_amp_m < 2.0 * com_rise_room_m(&Dims::COMPACT), "{g:?}");
         let end = com_at(&g, g.step_s);
         assert!((end.x - g.step_m - g.x0).abs() < 0.01 && (end.v - g.v0).abs() < 0.02, "{end:?} vs {g:?}");
         assert!(g.v0 > 0.0 && (0..20).all(|i| com_at(&g, i as f32 * g.step_s / 20.0).v > 0.0), "always moving on");

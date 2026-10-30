@@ -96,7 +96,7 @@ fn the_physics_holds_its_own_laws_across_the_presets() {
             let pk = |c: &collide::Collision| c.pulse.as_ref().map_or(0.0, |p| p.peak_n);
             assert!(pk(&fast) > pk(&slow), "{plan} {base:?}: {} vs {}", pk(&fast), pk(&slow));
             assert!(fast.v_after[0] < 0.9, "{plan} {base:?}: the wall takes speed off");
-            let f = fall::fall(&FallInput::lost_balance(&b, KinPose::stand(0.0), FallCause::Pushed, 180.0, 0.3, Surface::Firm));
+            let f = fall::fall(&FallInput::lost_balance(&b, KinPose::stand_compact(0.0), FallCause::Pushed, 180.0, 0.3, Surface::Firm));
             assert!(f.fell && f.lying.down(), "{plan} {base:?}: {:?}", f.rollout.events);
             if base == BaseKind::HumanFoot {
                 assert_eq!(f.get_up.can, !f.get_up.needs_help, "{plan}: {:?}", f.get_up);
@@ -104,7 +104,7 @@ fn the_physics_holds_its_own_laws_across_the_presets() {
                 assert!(!f.get_up.can && f.get_up.needs_help && f.get_up.righting_force_n > 0.0, "{plan} {base:?}: {:?}", f.get_up);
             }
             let main = f.main.as_ref().expect("a fall strikes");
-            let com_z = kin::solve(&b, &KinPose::stand(0.0), &KinLoads::default()).com[2];
+            let com_z = kin::solve(&b, &KinPose::stand_compact(0.0), &KinLoads::default()).com[2];
             assert!(main.energy_j <= b.mass_kg() * 9.81 * com_z * 1.05 + 1.0, "{plan} {base:?}: {} J from a {com_z} m CoM", main.energy_j);
         }
     }

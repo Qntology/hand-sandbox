@@ -14,13 +14,20 @@ use crate::runtime::{label_ko, FrameView, Runtime, Submission};
 pub const MIN_CELLS: usize = 32;
 pub const MAX_CELLS: usize = 160;
 
-pub const COMMANDS: [&str; 38] = [
+pub const COMMANDS: [&str; 45] = [
     "act_status",
     "crew_add",
     "crew_clear",
     "crew_mode",
     "crew_status",
     "camera_rig",
+    "rig_presets",
+    "rig_design",
+    "rig_import",
+    "rig_keep_design",
+    "rig_validate",
+    "rig_apply",
+    "rig_delete",
     "inventory_drop",
     "world_reset",
     "body_reset",
@@ -942,6 +949,9 @@ impl Runtime {
 
     pub fn api_call(&mut self, cmd: &str, args: &Value) -> Result<Value, String> {
         if let Some(r) = self.api_test_call(cmd, args) {
+            return r;
+        }
+        if let Some(r) = self.rig_call(cmd, args) {
             return r;
         }
         match cmd {

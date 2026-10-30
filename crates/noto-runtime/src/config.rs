@@ -130,7 +130,7 @@ impl Default for RuntimeConfig {
             seed: 7,
             cells: 64,
             noto: default_noto(),
-            body: BodyPlan::default(),
+            body: BodyPlan::standard(),
             terrain: world_sim::TerrainKind::Open,
             camera: CameraCfg::default(),
             gates: GateCfg::default(),

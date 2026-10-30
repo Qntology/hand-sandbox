@@ -20,6 +20,7 @@ ui/
    ├─ sim.js world-view.js world-map.js world-panel.js     월드 · 시뮬레이션 · 프레임 폴링 (미니맵의 후진 · 회전 표시)
    ├─ body-hud.js quest-panel.js command-bar.js            오버레이와 오른쪽 패널
    ├─ pick-hud.js        줍기 절차 HUD (world_frame.procedure: 다가가기 → 고개 숙여 응시 → 비전 확인 → 자세 낮춤 → 쥐기 → 들어올림)
+   ├─ rig-editor.js      로봇 설계 탭 (SolidCraft iframe · 프리셋 · 왕복 · 투입)
    ├─ depth-view.js      깊이 · 카메라 탭 (정렬 깊이 · 원출력 · 정답 · ADE20K 분할 · 법선)
    ├─ hand-canvas.js hand-panel.js vision-upload.js        손·발 측면도와 파지 시험
    ├─ logs.js analysis.js timeseries.js data-panel.js device.js
@@ -75,6 +76,15 @@ cargo run --release -p noto-runtime --example serve [포트] [ui 폴더]   # 기
 | `models_cancel` / `models_delete` | — / `id` | 받기 취소(`.part` 남김) · 모델 파일 삭제(월드가 멈춤) |
 | `models_activate` | 없음 | 네 모델을 선택한 장치에 올리고 월드에 연결. 이 전에는 `world_new`·`sim_step`·`command_submit`·`perception_scan`·`test_start`·`test_step`이 거부됨 |
 | `depth_view` | `quality` | 머리 카메라 화면에 깊이 모델을 돌린 결과와 정답 깊이(같은 색 척도), 지표, 카메라 상태 |
+| `rig_presets` | 없음 | 기본 로봇 프리셋과 저장한 로봇, 지금 몸 |
+| `rig_design` | `id` | 편집기에 넣을 설계(부품 · 재질 · 관절)와 저장한 `.sc` |
+| `rig_validate` | `id` | 측정값과 투입 전 검사 |
+| `rig_import` | `name, urdf, meshes` | URDF · STL(base64)을 재어 프리셋으로 저장 |
+| `rig_keep_design` | `id, design` | 다시 열 수 있게 `.sc`를 함께 저장 |
+| `rig_apply` | `id` | 그 몸을 다음 `world_new`의 몸으로 |
+| `rig_delete` | `id` | 저장한 로봇 삭제 |
+
+`rig_*` 명령은 모의 백엔드에 없습니다. 탭은 개발용 서버나 Tauri 앱에서 씁니다.
 
 기존 명령(`presets`, `hand_geometry`, `grasp_test`, `drive_courses`, `dictionary`, `devices`, `select_device`,
 `classify_image`, `default_paths`, `synthesize`, `load_dictionary`, `dataset_summary`)도 그대로 호출합니다.
@@ -89,6 +99,7 @@ Tauri 이벤트는 쓰지 않고 `setInterval` 로 폴링합니다: `world_frame
 
 ## 제약
 
-- CSP: `script-src 'self'`, 이미지는 `self` · `data:` · `blob:` 만 허용합니다. 원격 글꼴·CDN·인라인 스크립트는 쓰지 않습니다.
+- CSP: `script-src 'self'`, 이미지는 `self` · `data:` · `blob:` 만 허용합니다. 원격 글꼴·CDN·인라인 스크립트는 쓰지 않습니다. SolidCraft 때문에 `'wasm-unsafe-eval'`과 `worker-src 'self' blob:`을 더했습니다.
+- `ui/vendor/solidcraft`는 받아 쓰는 폴더입니다(`fetch_solidcraft.bat`). 고치지 않습니다.
 - 동적 문자열은 `textContent` 와 DOM 생성으로만 넣습니다(`innerHTML` 미사용).
 - 파일 하나는 약 600줄 이하로 유지합니다.

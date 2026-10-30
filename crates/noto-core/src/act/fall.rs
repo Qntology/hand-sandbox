@@ -1220,7 +1220,7 @@ pub fn get_up_squat(body: &Body) -> Option<kin::KinReport> {
         let hx = -0.22 + 0.02 * i as f32;
         for j in 0..13 {
             let pd = 5.0 * j as f32;
-            let pose = KinPose { hip: [hx, ANKLE_SQUAT_HIP_M], pelvis_deg: pd, shoulder_deg: [70.0, 70.0], elbow_deg: [10.0, 10.0], ..KinPose::stand(0.0) };
+            let pose = KinPose { hip: [hx, ankle_squat_hip_m(&body.dims)], pelvis_deg: pd, shoulder_deg: [70.0, 70.0], elbow_deg: [10.0, 10.0], ..KinPose::stand(body, 0.0) };
             let r = kin::solve_fast(body, &pose, &KinLoads::default());
             if r.out_of_range.is_empty() && best.map_or(true, |b| r.margin > b.1) {
                 best = Some((pose, r.margin));
@@ -1230,7 +1230,9 @@ pub fn get_up_squat(body: &Body) -> Option<kin::KinReport> {
     best.map(|(p, _)| kin::solve(body, &p, &KinLoads::default()))
 }
 
-pub const ANKLE_SQUAT_HIP_M: f32 = kin::ANKLE_H_M + 0.45 * (HIP_M - kin::ANKLE_H_M);
+pub fn ankle_squat_hip_m(d: &crate::dims::Dims) -> f32 {
+    d.ankle_m + 0.45 * (d.hip_m - d.ankle_m)
+}
 
 pub(crate) fn get_up(body: &Body, lying: &LyingPose, damage: &[JointHit], probes: &[Probe], pl: &Planar) -> GetUp {
     let th = lying.tilt_deg.to_radians();
@@ -1317,8 +1319,8 @@ mod tests {
     #[test]
     fn a_taller_body_falls_longer_and_hits_harder() {
         let b = body(Tier::Mid, BaseKind::HumanFoot);
-        let tall = fall(&FallInput::lost_balance(&b, KinPose::stand(0.0), FallCause::Pushed, 0.0, 0.3, Surface::Firm));
-        let low_pose = KinPose { hip: [-0.06, HIP_M - 0.18], pelvis_deg: 25.0, ..KinPose::stand(0.0) };
+        let tall = fall(&FallInput::lost_balance(&b, KinPose::stand_compact(0.0), FallCause::Pushed, 0.0, 0.3, Surface::Firm));
+        let low_pose = KinPose { hip: [-0.06, crate::dims::Dims::COMPACT.hip_m - 0.18], pelvis_deg: 25.0, ..KinPose::stand_compact(0.0) };
         let low = fall(&FallInput::lost_balance(&b, low_pose, FallCause::Pushed, 0.0, 0.3, Surface::Firm));
         assert!(tall.fell && low.fell, "{:?} {:?}", tall.rollout.events, low.rollout.events);
         let (mt, ml) = (tall.main.clone().unwrap(), low.main.clone().unwrap());
@@ -1330,7 +1332,7 @@ mod tests {
         assert!(tall.get_up.can && !tall.get_up.needs_help, "{:?}", tall.get_up);
         assert!(matches!(mt.segment, Segment::Head | Segment::Chest | Segment::Arm | Segment::Hand), "{mt:?}");
         assert!(tall.head_v.unwrap() > tall.pelvis_v.unwrap(), "the head is further from the edge than the pelvis");
-        let side = fall(&FallInput::lost_balance(&b, KinPose::stand(0.0), FallCause::Pushed, 90.0, 0.3, Surface::Firm));
+        let side = fall(&FallInput::lost_balance(&b, KinPose::stand_compact(0.0), FallCause::Pushed, 90.0, 0.3, Surface::Firm));
         assert!(side.fell && side.pelvis_v.unwrap() > 0.5, "{:?}", side.pelvis_v);
         let head = tall.lying.place([0.0, 0.0, 1.14]);
         assert!(head[0] > 0.8 && head[2] < 0.3, "{head:?}");
@@ -1339,9 +1341,9 @@ mod tests {
     #[test]
     fn wheels_cannot_get_up_and_soft_ground_hits_softer() {
         let w = body(Tier::Mid, BaseKind::Wheel);
-        let f = fall(&FallInput::lost_balance(&w, KinPose::stand(0.0), FallCause::Pushed, 180.0, 0.3, Surface::Firm));
+        let f = fall(&FallInput::lost_balance(&w, KinPose::stand_compact(0.0), FallCause::Pushed, 180.0, 0.3, Surface::Firm));
         assert!(f.fell && !f.get_up.can && f.get_up.needs_help && f.get_up.righting_force_n > 0.0, "{:?} {:?}", f.get_up, f.rollout.events);
-        let g = fall(&FallInput::lost_balance(&w, KinPose::stand(0.0), FallCause::Pushed, 180.0, 0.3, Surface::Sand));
+        let g = fall(&FallInput::lost_balance(&w, KinPose::stand_compact(0.0), FallCause::Pushed, 180.0, 0.3, Surface::Sand));
         let (pf, pg) = (f.main.unwrap(), g.main.unwrap());
         assert!(pg.peak_n < pf.peak_n && pg.contact_s > pf.contact_s, "{} vs {}", pg.peak_n, pf.peak_n);
     }
@@ -1349,15 +1351,15 @@ mod tests {
     #[test]
     fn a_bumper_catches_a_wheeled_base_going_over_slowly_and_a_fast_one_rolls_over_it() {
         let w = body(Tier::Mid, BaseKind::Wheel);
-        let solved = kin::solve(&w, &KinPose::stand(0.0), &KinLoads::default());
+        let solved = kin::solve(&w, &KinPose::stand_compact(0.0), &KinLoads::default());
         let pl = Planar::of(&collide::mass_props_of(&w, &solved), solved.support, [1.0, 0.0]);
-        let catch = kin::BUMPER_Z_M[0].atan2(kin::WHEEL_R_M + kin::BUMPER_GAP_M).to_degrees();
+        let catch = crate::dims::Dims::COMPACT.bumper_z_m[0].atan2(crate::dims::Dims::COMPACT.wheel_r_m + crate::dims::Dims::COMPACT.bumper_gap_m).to_degrees();
         assert!(catch > pl.tip_angle(pl.ahead_m).to_degrees(), "the bumper catches past the tip angle");
-        let slow = fall(&FallInput::lost_balance(&w, KinPose::stand(0.0), FallCause::Bumped, 0.0, 0.01, Surface::Firm));
+        let slow = fall(&FallInput::lost_balance(&w, KinPose::stand_compact(0.0), FallCause::Bumped, 0.0, 0.01, Surface::Firm));
         assert!(slow.strikes.iter().any(|s| s.link == "bumper"), "{:?}", slow.strikes.iter().map(|s| s.link).collect::<Vec<_>>());
         assert!(slow.fell && !slow.lying.down() && (slow.lying.tilt_deg - catch).abs() < 1.5, "{:?} {:?}", slow.lying.tilt_deg, slow.rollout.events);
         assert!(slow.get_up.needs_help);
-        let fast = fall(&FallInput::lost_balance(&w, KinPose::stand(0.0), FallCause::Bumped, 0.0, 1.0, Surface::Firm));
+        let fast = fall(&FallInput::lost_balance(&w, KinPose::stand_compact(0.0), FallCause::Bumped, 0.0, 1.0, Surface::Firm));
         assert!(fast.fell && fast.lying.down(), "{:?}", fast.lying.tilt_deg);
         let first = |l: &[&str]| fast.strikes.iter().position(|s| l.contains(&s.link));
         assert!(first(&["bumper"]).is_some() && first(&["bumper"]) < first(&["trunk", "head"]), "the bumper strikes first: {:?}", fast.strikes.iter().map(|s| s.link).collect::<Vec<_>>());
@@ -1366,8 +1368,8 @@ mod tests {
     #[test]
     fn an_edge_fall_lands_harder_than_a_fall_on_the_flat() {
         let w = body(Tier::Mid, BaseKind::Track);
-        let flat = fall(&FallInput::lost_balance(&w, KinPose::stand(0.0), FallCause::Pushed, 180.0, 0.3, Surface::Firm));
-        let edge = fall(&FallInput { drop_m: 0.8, ..FallInput::lost_balance(&w, KinPose::stand(0.0), FallCause::Edge, 180.0, 0.3, Surface::Firm) });
+        let flat = fall(&FallInput::lost_balance(&w, KinPose::stand_compact(0.0), FallCause::Pushed, 180.0, 0.3, Surface::Firm));
+        let edge = fall(&FallInput { drop_m: 0.8, ..FallInput::lost_balance(&w, KinPose::stand_compact(0.0), FallCause::Edge, 180.0, 0.3, Surface::Firm) });
         assert!(edge.rollout.events[0].kind == "edge_fall" && edge.fell);
         assert!(edge.main.as_ref().unwrap().v_n > flat.main.as_ref().unwrap().v_n, "{:?} vs {:?}", edge.main, flat.main);
         assert!(edge.lying.com[2] < 0.0, "below the edge: {:?}", edge.lying.com);
@@ -1419,7 +1421,7 @@ mod tests {
                 let b = body(tier, base);
                 for dir in [0.0f32, 90.0, 180.0] {
                     for drop in [0.0f32, 0.05, 0.5] {
-                        let inp = FallInput { drop_m: drop, ..FallInput::lost_balance(&b, KinPose::stand(0.0), FallCause::Edge, dir, 0.3, Surface::Firm) };
+                        let inp = FallInput { drop_m: drop, ..FallInput::lost_balance(&b, KinPose::stand_compact(0.0), FallCause::Edge, dir, 0.3, Surface::Firm) };
                         run(&inp, format!("{tier:?} {base:?} dir {dir} drop {drop}"));
                     }
                 }
@@ -1431,14 +1433,14 @@ mod tests {
                 for dir in [0.0f32, 45.0, 90.0, 135.0, 180.0] {
                     for speed in [0.0f32, 0.3, 1.0] {
                         for drop in [0.15f32, 0.5] {
-                            run(&FallInput::over_edge(&b, KinPose::stand(0.0), dir, speed, drop, Surface::Firm), format!("{tier:?} {base:?} over edge dir {dir} at {speed} m/s drop {drop}"));
+                            run(&FallInput::over_edge(&b, KinPose::stand_compact(0.0), dir, speed, drop, Surface::Firm), format!("{tier:?} {base:?} over edge dir {dir} at {speed} m/s drop {drop}"));
                         }
                     }
                 }
                 for dir in [45.0f32, 135.0] {
                     for omega0 in [0.05f32, 1.5] {
                         for drop in [0.0f32, 0.1, 0.5] {
-                            let inp = FallInput { drop_m: drop, ..FallInput::lost_balance(&b, KinPose::stand(0.0), FallCause::Edge, dir, omega0, Surface::Firm) };
+                            let inp = FallInput { drop_m: drop, ..FallInput::lost_balance(&b, KinPose::stand_compact(0.0), FallCause::Edge, dir, omega0, Surface::Firm) };
                             run(&inp, format!("{tier:?} {base:?} dir {dir} ω0 {omega0} drop {drop}"));
                         }
                     }
@@ -1446,10 +1448,10 @@ mod tests {
                 for ground in [Surface::Sand, Surface::Water] {
                     for dir in [0.0f32, 90.0, 180.0] {
                         for drop in [0.0f32, 0.5] {
-                            let inp = FallInput { drop_m: drop, ..FallInput::lost_balance(&b, KinPose::stand(0.0), FallCause::Edge, dir, 0.3, ground) };
+                            let inp = FallInput { drop_m: drop, ..FallInput::lost_balance(&b, KinPose::stand_compact(0.0), FallCause::Edge, dir, 0.3, ground) };
                             run(&inp, format!("{tier:?} {base:?} {ground:?} dir {dir} drop {drop}"));
                         }
-                        run(&FallInput::over_edge(&b, KinPose::stand(0.0), dir, 0.3, 0.5, ground), format!("{tier:?} {base:?} {ground:?} over edge dir {dir}"));
+                        run(&FallInput::over_edge(&b, KinPose::stand_compact(0.0), dir, 0.3, 0.5, ground), format!("{tier:?} {base:?} {ground:?} over edge dir {dir}"));
                     }
                 }
             }

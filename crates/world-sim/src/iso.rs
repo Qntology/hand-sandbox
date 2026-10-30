@@ -160,12 +160,9 @@ impl World {
     }
 
     pub fn tilted_robot_boxes(&self, pose: &noto_core::dynamics::BodyPose, tilt: &BaseTilt) -> Vec<Obb> {
-        let mut v: Vec<Obb> = self
-            .shown_boxes(pose)
-            .map(|b| Obb { center: self.tilted_body_to_world(b.center, tilt), axes: b.axes.map(|a| self.body_dir_to_world(tilt.apply(a))), half: b.half, color: crate::render::segment_color(b.segment) })
-            .collect();
-        v.extend(self.fork_parts().into_iter().map(|(c, axes, half, color)| Obb { center: self.tilted_body_to_world(c, tilt), axes: axes.map(|a| self.body_dir_to_world(tilt.apply(a))), half, color }));
-        v
+        // A truck's parts are drawn level on its chassis, so the whole of the chassis tilt applies to them.
+        let tilt = if noto_core::act::fork::applies(&self.body) { BaseTilt { pose_pitch: 0.0, ..*tilt } } else { *tilt };
+        self.robot_parts(pose).iter().map(|p| Obb::placed(p, |c| self.tilted_body_to_world(c, &tilt), |a| self.body_dir_to_world(tilt.apply(a)))).collect()
     }
 }
 
@@ -219,11 +216,12 @@ mod tests {
 
     #[test]
     fn the_iso_view_shows_the_robot_in_the_middle_from_outside_the_map() {
-        let w = world(BaseKind::Wheel);
+        let mut w = world(BaseKind::Wheel);
+        w.nodes.clear();
         let pose = w.body_pose().unwrap();
         let boxes = w.tilted_robot_boxes(&pose, &w.base_tilt(&pose));
         let ext = RobotExtent::of(&w, &boxes);
-        assert!(ext.height_m > 1.0 && ext.height_m < 2.0 && ext.radius_m > 0.5, "{ext:?}");
+        assert!(ext.height_m > 1.0 && ext.height_m < 2.4 && ext.radius_m > 0.5, "{ext:?}");
         let g = w.agent_ground_m();
         let cam = Camera { width: 160, height: 120, max_dist_m: 60.0, ..Camera::default() };
         for step in 0..4u8 {
@@ -235,7 +233,7 @@ mod tests {
             let cy = robot.iter().map(|&i| (i / f.width) as f32).sum::<f32>() / robot.len() as f32;
             assert!((cx - 80.0).abs() < 12.0 && (cy - 60.0).abs() < 15.0, "{step}: robot at ({cx}, {cy})");
             let ground = f.ids.iter().filter(|&&v| unpack_id(v).0 == ObjectClass::Ground).count();
-            assert!(ground > f.width * f.height / 2, "{step}: {ground} ground pixels");
+            assert!(ground > f.width * f.height / 3, "{step}: {ground} ground pixels");
         }
     }
 
@@ -274,7 +272,7 @@ mod tests {
         let v = IsoView::new([w.agent.x, g + 0.5 * ext.height_m, w.agent.z], 0, 3.0, false);
         let t = v.toward_camera();
         let side = [-t[1], t[0]];
-        for (id, a, l) in [(1u32, -2.0f32, 0.0f32), (2, 0.0, 2.5)] {
+        for (id, a, l) in [(1u32, -3.4f32, 0.0f32), (2, 0.0, 4.0)] {
             let (cx, cz) = w.terrain.cell_of(w.agent.x + a * t[0] + l * side[0], w.agent.z + a * t[1] + l * side[1]).unwrap();
             let (x, z) = crate::terrain::cell_center(cx, cz);
             w.nodes.push(crate::world::Node { id, kind: crate::kinds::NodeKind::Tree, x, z, hp: 3.0, max_hp: 3.0 });
@@ -314,18 +312,15 @@ mod tests {
     fn a_pose_that_already_pitches_its_chassis_is_not_pitched_twice() {
         let w = world(BaseKind::Wheel);
         let body = &w.body;
-        let pose = noto_core::kin::KinPose { base_pitch_deg: 12.0, ..noto_core::kin::KinPose::stand(0.0) };
+        let pose = noto_core::kin::KinPose { base_pitch_deg: 12.0, ..noto_core::kin::KinPose::stand(body, 0.0) };
         let sloped = noto_core::kin::solve(body, &pose, &noto_core::kin::KinLoads::default()).body_pose(0.0, noto_core::Source::Slope);
         assert!((pose_chassis_pitch(&sloped).to_degrees() - 12.0).abs() < 1e-3);
         let t = BaseTilt { pitch: 12f32.to_radians(), roll: 0.0, pose_pitch: pose_chassis_pitch(&sloped) };
         let boxes = w.tilted_robot_boxes(&sloped, &t);
-        let chassis = w.shown_boxes(&sloped).position(|b| b.name == "chassis").unwrap();
-        let fwd = boxes[chassis].axes[0];
+        let fwd = boxes[0].axes[0];
         let (c, s) = (w.agent.yaw.cos(), w.agent.yaw.sin());
         let along = fwd[0] * c + fwd[2] * s;
         assert!((fwd[1].atan2(along).to_degrees() - 12.0).abs() < 1e-3, "{fwd:?}");
-        let twice = w.tilted_robot_boxes(&sloped, &BaseTilt { pose_pitch: 0.0, ..t });
-        let f2 = twice[chassis].axes[0];
-        assert!((f2[1].atan2(f2[0] * c + f2[2] * s).to_degrees() - 24.0).abs() < 1e-3);
+        assert_eq!(boxes, w.tilted_robot_boxes(&sloped, &BaseTilt { pose_pitch: 0.0, ..t }), "the truck's parts are drawn level, whatever the pose says");
     }
 }

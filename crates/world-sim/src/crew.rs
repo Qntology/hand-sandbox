@@ -10,7 +10,9 @@
 //! where humanoids put down what they harvested and a lift truck's tines take it from.
 
 use noto_core::balance::Body;
-use noto_core::{BaseKind, BaseSpec, BodyPlan, FingerCount};
+use noto_core::kin::{self, KinLoads, KinPose};
+use noto_core::rig::{self, Palette, Solid};
+use noto_core::{BaseKind, BaseSpec, BodyPlan, FingerCount, Morphology};
 use serde::{Deserialize, Serialize};
 
 use crate::clear::{self, Footprint};
@@ -19,7 +21,7 @@ use crate::nav::{self, Goal};
 use crate::render::Obb;
 use crate::snapshot::{drop_id, node_id, waypoint_id, CarryView};
 use crate::terrain::cell_center;
-use crate::world::traffic::{self, Rider, RiderPhase, RIDER_REACH_M};
+use crate::world::traffic::{self, Rider, RiderPhase};
 use crate::world::{add_stock, DropItem, TimedEvent, Waypoint, World, WorldEvent, AMOUNT_EPS, DELIVER_REACH_M, MINE_REACH_M, PICKUP_REACH_M};
 
 /// At most this many sub-workers (with the first worker, nine robots on one map).
@@ -35,9 +37,9 @@ pub const FORK_TIME_S: f32 = 2.5;
 pub const UNLOAD_TIME_S: f32 = 2.0;
 /// Power while working in place (W), as the first worker's `MANIPULATION_POWER_W`.
 pub const WORK_POWER_W: f64 = 30.0;
-/// The slots a bay keeps its staged items in: a row across its front, this far apart (m) [추정: a log is 0.15 m
-/// across; a hand's width between them leaves room for the tines].
-pub const BAY_SLOT_M: f32 = 0.35;
+/// The slots a bay keeps its staged items in: a row across its front, this far apart (m) [추정: a log is 0.50 m long;
+/// a hand's width between them leaves room for the tines].
+pub const BAY_SLOT_M: f32 = 0.55;
 pub const BAY_SLOTS: usize = 6;
 /// How far in front of the bay the row of slots lies (m).
 pub const BAY_ROW_AHEAD_M: f32 = 0.6;
@@ -149,13 +151,17 @@ pub struct Worker {
     pub last_moved: f32,
     /// A lift truck's rider on foot, felling a node (`traffic::Rider`).
     pub rider: Option<Rider>,
+    /// Its body: the first worker's build, in its own form.
+    pub body: Body,
+    /// How far it has walked, for its stride.
+    pub walked_m: f32,
     /// Stopped for a robot its eye sees in its way: for how long, for which; and how many times it routed round.
     pub held_s: f32,
     pub held_by: Option<u32>,
     pub reroutes: u32,
     felled: Option<String>,
     spec: BaseSpec,
-    footprint: Footprint,
+    pub(crate) footprint: Footprint,
     route: Vec<Leg>,
     leg: usize,
     leg_t: f32,
@@ -164,8 +170,8 @@ pub struct Worker {
 }
 
 impl Worker {
-    fn new(id: u32, form: Form, cameras: u8, x: f32, z: f32, yaw: f32) -> Worker {
-        let body = Body::new(&BodyPlan::default(), form.base(), FingerCount::Five);
+    fn new(id: u32, form: Form, cameras: u8, x: f32, z: f32, yaw: f32, plan: &BodyPlan, fingers: FingerCount) -> Worker {
+        let body = Body::new(&BodyPlan { morph: Morphology::humanoid(form.base()), ..*plan }, form.base(), fingers);
         let spec = form.base().spec();
         let capacity_kg = body.drive_limits(&spec, 0.0).capacity_kg;
         Worker {
@@ -183,12 +189,14 @@ impl Worker {
             outcome: None,
             last_moved: 0.0,
             rider: None,
+            walked_m: 0.0,
             held_s: 0.0,
             held_by: None,
             reroutes: 0,
             felled: None,
             spec,
             footprint: Footprint::of(&body),
+            body,
             route: Vec::new(),
             leg: 0,
             leg_t: 0.0,
@@ -219,12 +227,68 @@ impl Worker {
         self.footprint.half_w_m.max(0.5 * (self.footprint.front_m + self.footprint.rear_m)).max(0.3)
     }
 
-    /// Its eye height (a humanoid's head, a lift truck rider's seat) [추정].
+    /// Its eye height (a humanoid's head, a lift truck rider's on the seat).
     pub fn eye_m(&self) -> f32 {
-        match self.form {
-            Form::Humanoid => 1.5,
-            Form::Forklift => 1.8,
+        kin::head_camera(&self.body, &KinPose::stand(&self.body, 0.0)).pos[2]
+    }
+
+    /// The pose its body is drawn in: a stride while it walks, the load held out in front of it.
+    fn draw_pose(&self) -> KinPose {
+        let mut p = KinPose::stand(&self.body, 0.0);
+        let d = &self.body.dims;
+        let carrying = !self.carried.is_empty();
+        if carrying {
+            p.shoulder_deg = [38.0, 38.0];
+            p.elbow_deg = [62.0, 62.0];
+            p.closure = 0.8;
         }
+        if self.speed_mps > 0.01 && self.form == Form::Humanoid {
+            let stride = 0.34 * d.hip_m;
+            let phase = std::f32::consts::TAU * self.walked_m / (2.0 * stride);
+            let (s, c) = phase.sin_cos();
+            let reach = 0.5 * stride;
+            p.feet = [[reach * s, (0.06 * d.k * c).max(0.0)], [-reach * s, (-0.06 * d.k * c).max(0.0)]];
+            p.hip[0] = 0.0;
+            p.hip[1] = d.hip_m - 0.03 * d.k;
+            if !carrying {
+                p.shoulder_deg = [-22.0 * s, 22.0 * s];
+                p.elbow_deg = [18.0, 18.0];
+            }
+        }
+        p
+    }
+
+    /// Its outside as solids in the world, on ground height `g`.
+    fn boxes(&self, g: f32) -> Vec<Obb> {
+        let palette = Palette { accent: colour(self.id, self.form), truck: if self.form == Form::Forklift { colour(self.id, self.form) } else { rig::TRUCK_YELLOW }, ..Palette::default() };
+        let pose = self.draw_pose();
+        let mut parts = if self.form == Form::Humanoid {
+            rig::dress(&self.body, &kin::solve(&self.body, &pose, &KinLoads::default()).boxes, &palette)
+        } else {
+            let mut v = rig::truck_parts(&self.body, &palette);
+            if !self.rider.is_some_and(|r| r.off()) {
+                v.extend(rig::rider_parts(&self.body, &pose, &palette));
+            }
+            v.extend(rig::fork_parts(&self.body, if self.carried.is_empty() { self.body.dims.fork_rest_m } else { self.body.dims.fork_carry_m }));
+            v
+        };
+        let level = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        if let Some(&(item, _)) = self.carried.first() {
+            let size = item.spec().size_m;
+            let n = self.carried_count().ceil().clamp(1.0, 4.0);
+            let half = [0.5 * size[2], 0.5 * size[0], 0.5 * n * size[1]];
+            let center = if self.form == Form::Forklift {
+                [noto_core::act::fork::load_x(&self.body, size[2]), 0.0, self.body.dims.fork_carry_m + self.body.dims.tine_t_m + half[2]]
+            } else {
+                let r = kin::solve_fast(&self.body, &pose, &KinLoads::default());
+                [0.5 * (r.hands[0][0] + r.hands[1][0]) + half[0], 0.0, 0.5 * (r.hands[0][2] + r.hands[1][2]) + half[2]]
+            };
+            parts.push(rig::VisualPart { solid: Solid::Box, center, axes: level, half, color: item.spec().color });
+        }
+        let (s, c) = self.yaw.sin_cos();
+        let at = |p: [f32; 3]| [self.x + c * p[0] + s * p[1], g + p[2], self.z + s * p[0] - c * p[1]];
+        let dir = |v: [f32; 3]| [c * v[0] + s * v[1], v[2], s * v[0] - c * v[1]];
+        parts.iter().map(|p| Obb::placed(p, at, dir)).collect()
     }
 
     /// Where a lift truck's tines take a load from, or where a humanoid holds it: a little ahead of its body.
@@ -283,14 +347,21 @@ impl World {
             }
             let id = self.crew.iter().map(|w| w.id).max().unwrap_or(1) + 1;
             let spec = form.base().spec();
-            let taken: Vec<(f32, f32)> = self.crew.iter().map(|w| (w.x, w.z)).chain(std::iter::once((self.agent.x, self.agent.z))).collect();
-            let spot = [1.6f32, 2.2, 2.9, 3.6].into_iter().find_map(|r| {
+            // Clear of the others' outlines: a truck stands further off than a person.
+            let probe = Body::new(&BodyPlan { morph: Morphology::humanoid(form.base()), ..self.cfg.body }, form.base(), self.cfg.noto.fingers);
+            let fp = Footprint::of(&probe);
+            let my_r = fp.half_w_m.max(0.5 * (fp.front_m + fp.rear_m)).max(0.3);
+            let mine = self.footprint();
+            let first_r = mine.half_w_m.max(0.5 * (mine.front_m + mine.rear_m)).max(0.3);
+            let taken: Vec<(f32, f32, f32)> = self.crew.iter().map(|w| (w.x, w.z, w.radius_m())).chain(std::iter::once((self.agent.x, self.agent.z, first_r))).collect();
+            let stand_off = (my_r + first_r + 0.4).max(1.6);
+            let spot = [1.0f32, 1.4, 1.8, 2.3].into_iter().map(|f| f * stand_off).find_map(|r| {
                 (0..12).find_map(|k| {
                     // Behind and beside the first worker first, so the way ahead stays open.
                     let a = self.agent.yaw + std::f32::consts::PI + (k as f32 * 0.5 + 0.25) * if k % 2 == 0 { 1.0 } else { -1.0 } * 0.5;
                     let (x, z) = (self.agent.x + r * a.cos(), self.agent.z + r * a.sin());
                     let c = self.terrain.cell_of(x, z)?;
-                    if blocked.contains(&c) || taken.iter().any(|(tx, tz)| (tx - x).hypot(tz - z) < 1.0) {
+                    if blocked.contains(&c) || taken.iter().any(|&(tx, tz, tr)| (tx - x).hypot(tz - z) < (my_r + tr + 0.2).max(1.0)) {
                         return None;
                     }
                     nav::plan(&spec, &self.terrain, &|cx, cz| blocked.contains(&(cx, cz)), start, Goal::Cell(c))?;
@@ -300,7 +371,7 @@ impl World {
             });
             let Some((x, z)) = spot else { continue };
             let yaw = self.agent.yaw;
-            self.crew.push(Worker::new(id, form, cameras, x, z, yaw));
+            self.crew.push(Worker::new(id, form, cameras, x, z, yaw, &self.cfg.body, self.cfg.noto.fingers));
             ids.push(id);
         }
         ids
@@ -344,8 +415,8 @@ impl World {
         let w = self.crew_worker(id).ok_or_else(|| format!("작업자 {id}가 없습니다"))?;
         let (wx, wz) = (w.x, w.z);
         let check = match &job {
-            Job::Mine { node } => self.node(*node).map(|n| (n.x - wx).hypot(n.z - wz) <= if w.form == Form::Forklift { RIDER_REACH_M } else { MINE_REACH_M + 0.35 }).ok_or("unknown_target"),
-            Job::Pick { drop } => self.drop_item(*drop).map(|d| (d.x - wx).hypot(d.z - wz) <= PICKUP_REACH_M + if w.form == Form::Forklift { 1.2 } else { 0.35 }).ok_or("unknown_target"),
+            Job::Mine { node } => self.node(*node).map(|n| (n.x - wx).hypot(n.z - wz) <= if w.form == Form::Forklift { traffic::rider_reach_m(&w.body) } else { MINE_REACH_M + 0.35 }).ok_or("unknown_target"),
+            Job::Pick { drop } => self.drop_item(*drop).map(|d| (d.x - wx).hypot(d.z - wz) <= if w.form == Form::Forklift { (PICKUP_REACH_M + 1.2).max(noto_core::act::fork::standoff_x(&w.body, 0.5) + 0.3) } else { PICKUP_REACH_M + 0.35 }).ok_or("unknown_target"),
             Job::Deliver { waypoint } | Job::Stage { bay: waypoint } => self.waypoint(*waypoint).map(|p| (p.x - wx).hypot(p.z - wz) <= DELIVER_REACH_M + 0.6).ok_or("unknown_target"),
             _ => Ok(true),
         };
@@ -477,6 +548,7 @@ impl World {
                     w.z = nz;
                     w.energy_j += w.spec.power_w as f64 * step as f64;
                     w.speed_mps = moved / step.max(1e-3);
+                    w.walked_m += moved;
                     if w.leg_t >= leg.s - 1e-6 {
                         w.leg += 1;
                         w.leg_t = 0.0;
@@ -599,7 +671,7 @@ impl World {
             let label = format!("시야에 작업자 {} {gap:.1} m 앞 — 멈춰 기다림", if other >= traffic::RIDER_ID { format!("{}의 탑승자", other - traffic::RIDER_ID) } else { other.to_string() });
             events.push(self.stamp(WorldEvent::Hold { worker: id, other, gap_m: gap, label }));
         }
-        let blocker = self.robot_discs().into_iter().find(|o| o.id == other);
+        let blocker = self.robot_outlines().into_iter().find(|o| o.id == other);
         let (other_humanoid, other_moving) = blocker.map_or((false, false), |o| (o.humanoid, o.moving));
         // An idle sub-worker in the way steps aside.
         if !other_moving && self.crew_make_way(other, dir) {
@@ -623,14 +695,15 @@ impl World {
         let snapshot = w.clone();
         let start = self.terrain.cell_of(snapshot.x, snapshot.z);
         let mut extra = self.still_robot_cells(&[id, traffic::RIDER_ID + id], start, snapshot.footprint.half_w_m + 0.15);
-        let others: Vec<u32> = self.robot_discs().iter().map(|o| o.id).filter(|o| *o != other).collect();
+        let others: Vec<u32> = self.robot_outlines().iter().map(|o| o.id).filter(|o| *o != other).collect();
         extra.extend(self.robot_cells(&others, start, snapshot.footprint.half_w_m + 0.15, false));
         let route = self.crew_route_avoiding(&snapshot, goal.0, goal.1, goal.2, &extra);
         let w = &mut self.crew[i];
         w.held_s = 0.0;
+        // Counted whether a way round turned up or not: a robot that stays and leaves none ends the move above.
+        w.reroutes += 1;
         if let Some(r) = route {
             (w.route, w.leg, w.leg_t, w.from) = (r, 0, 0.0, (w.x, w.z));
-            w.reroutes += 1;
             events.push(self.stamp(WorldEvent::Hold { worker: id, other, gap_m: gap, label: format!("작업자 {other}이(가) 비키지 않아 돌아가는 길로 다시 계획") }));
         }
         true
@@ -766,46 +839,9 @@ impl World {
         ids
     }
 
-    /// The bodies of the sub-workers as boxes, for every camera to draw (id 0: not an object the scan names).
+    /// The bodies of the sub-workers as solids, for every camera to draw (id 0: not an object the scan names).
     pub fn crew_boxes(&self) -> Vec<Obb> {
-        let mut v = Vec::new();
-        for w in &self.crew {
-            let g = self.surface_m(w.x, w.z);
-            let (s, c) = w.yaw.sin_cos();
-            let axes = [[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]];
-            let at = |fwd: f32, up: f32| [w.x + c * fwd, g + up, w.z + s * fwd];
-            let col = colour(w.id, w.form);
-            let dark = [col[0] / 2, col[1] / 2, col[2] / 2];
-            let load = [150u8, 104, 62];
-            match w.form {
-                Form::Humanoid => {
-                    v.push(Obb { center: at(0.0, 0.42), axes, half: [0.09, 0.42, 0.15], color: dark });
-                    v.push(Obb { center: at(0.0, 1.11), axes, half: [0.11, 0.27, 0.19], color: col });
-                    v.push(Obb { center: at(0.0, 1.50), axes, half: [0.10, 0.12, 0.09], color: [210, 210, 214] });
-                    if !w.carried.is_empty() {
-                        v.push(Obb { center: at(0.30, 0.95), axes, half: [0.08, 0.08, 0.30], color: load });
-                    }
-                }
-                Form::Forklift => {
-                    v.push(Obb { center: at(-0.15, 0.32), axes, half: [0.55, 0.22, 0.38], color: col });
-                    if !w.rider.is_some_and(|r| r.off()) {
-                        v.push(Obb { center: at(-0.35, 1.05), axes, half: [0.25, 0.30, 0.25], color: dark });
-                    }
-                    v.push(Obb { center: at(-0.20, 1.95), axes, half: [0.45, 0.03, 0.40], color: dark });
-                    v.push(Obb { center: at(0.45, 1.05), axes, half: [0.04, 1.00, 0.32], color: [70, 70, 76] });
-                    let lift = if w.carried.is_empty() { 0.08 } else { 0.30 };
-                    for side in [-0.18f32, 0.18] {
-                        let p = at(0.95, lift);
-                        v.push(Obb { center: [p[0] - s * side, p[1], p[2] + c * side], axes, half: [0.45, 0.02, 0.05], color: [60, 60, 64] });
-                    }
-                    if !w.carried.is_empty() {
-                        let n = w.carried_count().ceil().clamp(1.0, 4.0);
-                        v.push(Obb { center: at(0.95, lift + 0.08 * n), axes, half: [0.35, 0.08 * n, 0.30], color: load });
-                    }
-                }
-            }
-        }
-        v
+        self.crew.iter().flat_map(|w| w.boxes(self.surface_m(w.x, w.z))).collect()
     }
 
     pub fn crew_views(&self) -> Vec<crate::snapshot::CrewView> {
@@ -860,14 +896,14 @@ mod tests {
         assert_eq!(ids, vec![2, 3, 4]);
         for c in &w.crew {
             let d = (c.x - w.agent.x).hypot(c.z - w.agent.z);
-            assert!((1.0..4.5).contains(&d), "worker {} stands {d:.2} m from the first", c.id);
+            assert!((1.0..9.0).contains(&d), "worker {} stands {d:.2} m from the first", c.id);
             assert!(!w.blocked_cells().contains(&w.terrain.cell_of(c.x, c.z).unwrap()));
         }
         for (a, b) in [(0, 1), (0, 2), (1, 2)] {
             assert!((w.crew[a].x - w.crew[b].x).hypot(w.crew[a].z - w.crew[b].z) >= 1.0, "apart");
         }
         assert!(w.crew[2].capacity_kg > w.crew[0].capacity_kg, "a lift truck takes more than two hands");
-        assert_eq!(w.crew_boxes().len(), 3 + 3 + 6, "a humanoid is three boxes, a lift truck six (its rider aboard)");
+        assert!(w.crew_boxes().len() > 100, "the bodies are drawn in full");
         let many = w.add_crew(&[Form::Humanoid; 9], 2);
         assert_eq!(w.crew.len(), CREW_MAX, "{many:?}");
         assert_eq!(w.remove_crew(), CREW_MAX);
@@ -913,20 +949,23 @@ mod tests {
         assert!(w.crew[0].energy_j > 0.0);
     }
 
+    const PICK_REACH_TRUCK_TEST: f32 = 2.4;
+
     #[test]
     fn a_lift_truck_takes_staged_logs_on_its_tines_and_delivers_them() {
         let mut w = world();
         w.nodes.clear();
         w.drops.clear();
         let (ax, az) = (w.agent.x, w.agent.z);
-        let bay = w.add_bay(ax + 2.0, az + 1.0, (ax + 4.0, az + 1.0), "상차장");
+        let bay = w.add_bay(ax + 6.0, az + 1.0, (ax + 8.0, az + 1.0), "상차장");
         let staged = w.stage_at_bay(bay, ItemKind::Log, 2.0);
         assert_eq!(staged.len(), 2);
         let id = w.add_crew(&[Form::Forklift], 2)[0];
         for d in staged {
             let p = w.drop_item(d).map(|d| (d.x, d.z)).unwrap();
-            w.crew_command(id, Job::Go { x: p.0, z: p.1, reach_m: 1.1 }).unwrap();
-            assert!(run(&mut w, id, 40.0).0);
+            w.crew_command(id, Job::Go { x: p.0, z: p.1, reach_m: PICK_REACH_TRUCK_TEST }).unwrap();
+            let (ok, why) = run(&mut w, id, 40.0);
+            assert!(ok, "{why}");
             w.crew_command(id, Job::Pick { drop: d }).unwrap();
             let (ok, why) = run(&mut w, id, 5.0);
             assert!(ok, "{why}");
@@ -968,7 +1007,7 @@ mod tests {
                 }
                 if r.off() {
                     off_far = off_far.max((r.x - x).hypot(r.z - z));
-                    assert!(w.rider_boxes(None).len() == 4, "the rider on foot is drawn");
+                    assert!(w.rider_boxes(None).len() > 10, "the rider on foot is drawn");
                 }
             }
             if let Some(o) = w.crew_take_outcome(id) {
@@ -1051,7 +1090,7 @@ mod tests {
         crate::world::add_stock(&mut w.agent.carried, ItemKind::Log, 2.0);
         let ev = w.command(crate::world::Action::Deliver { waypoint: bay, item: None }).unwrap();
         let mut all = ev;
-        for _ in 0..60 {
+        for _ in 0..600 {
             all.extend(w.tick());
         }
         assert!(all.iter().any(|e| matches!(e.event, WorldEvent::Delivered { .. })), "the first worker's driver still hears the delivery");

@@ -380,7 +380,9 @@ pub fn roi_tiles(tiles: &[Tile], sc: &TileScene, cfg: &RoiCfg) -> (Vec<Tile>, Sc
     (kept, f)
 }
 
-fn median_depth(f: &Frame, t: &Tile) -> Option<f32> {
+/// How far a tile's object is: the nearer quartile of the depths in its middle. The object stands in front of what lies
+/// behind it, and a tree's trunk fills less of its tile than the ground beyond, where the median falls.
+fn tile_depth(f: &Frame, t: &Tile) -> Option<f32> {
     let (x0, x1) = (t.x + t.w / 4, (t.x + t.w * 3 / 4).max(t.x + t.w / 4 + 1));
     let (y0, y1) = (t.y + t.h / 4, (t.y + t.h * 3 / 4).max(t.y + t.h / 4 + 1));
     let mut v: Vec<f32> = Vec::new();
@@ -396,7 +398,7 @@ fn median_depth(f: &Frame, t: &Tile) -> Option<f32> {
         return None;
     }
     v.sort_by(|a, b| a.total_cmp(b));
-    Some(v[v.len() / 2])
+    Some(v[v.len() / 4])
 }
 
 /// The thing in a tile, measured from the depth: how far its top stands above the ground it is on (`top_m`), how
@@ -539,7 +541,7 @@ pub fn candidates_from_tiles(tiles: &[Tile], scores: &[Vec<EntityScore>], table:
         let Some((kind, link)) = table.get(&best.id).cloned() else { continue };
         let runner = ranked.get(1);
         let bbox = [tile.x as f32 / fw, tile.y as f32 / fh, (tile.x + tile.w) as f32 / fw, (tile.y + tile.h) as f32 / fh];
-        let depth = median_depth(frame, tile);
+        let depth = tile_depth(frame, tile);
         let (cx, cy) = tile.center();
         let world = depth.and_then(|d| sc.camera.world_point3_in(sc.view, cx, cy, d)).map(|p| centre_from_surface(sc.view, p, centre_offset_m(kind)));
         out.push(Candidate {
@@ -737,10 +739,10 @@ mod tests {
             with_scene(&w, &f, &cam, |sc| object_extent(sc, &tiles[hit]).expect("the object stands up out of the ground"))
         };
         let (tree, boulder) = (probe(NodeKind::Tree, "tree"), probe(NodeKind::Boulder, "boulder"));
-        assert!(tree.top_m > 1.3 && tree.top_m < 1.9, "{tree:?}");
+        assert!(tree.clipped && tree.top_m > 1.3, "the frame cuts a tree's top off from here: {tree:?}");
         assert!(boulder.top_m > 0.4 && boulder.top_m < 0.8 && boulder.lift_m < 0.1, "{boulder:?}");
         let g = |label: &str, e: &Extent| plausibility(table.prior(label).unwrap(), e, &cfg.verify);
-        assert!(g("tree", &tree) > 0.9 && g("boulder", &tree) < 0.3, "a 1.6 m thing with a floating crown is no boulder: {} {}", g("tree", &tree), g("boulder", &tree));
+        assert!(g("tree", &tree) > 0.9 && g("boulder", &tree) < 0.3, "a thing taller than the frame is no boulder: {} {}", g("tree", &tree), g("boulder", &tree));
         assert!(g("boulder", &boulder) > 0.9 && g("log", &boulder) < 0.6 && g("tree", &boulder) < 0.2, "{} {} {}", g("boulder", &boulder), g("log", &boulder), g("tree", &boulder));
         let (w, cam) = world_with_ahead(NodeKind::Tree, 2.6);
         let f = w.render(&cam);

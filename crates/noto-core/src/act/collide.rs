@@ -2,7 +2,7 @@ use serde::Serialize;
 
 use crate::balance::{Body, G, REACTION_DELAY_S};
 use crate::base::BaseKind;
-use crate::kin::{self, KinLoads, KinPose, KinReport, WHEEL_R_M};
+use crate::kin::{self, KinLoads, KinPose, KinReport};
 use crate::parts::*;
 use crate::surface::{self, Surface};
 use crate::wear;
@@ -1068,7 +1068,7 @@ pub struct BumpInput<'a> {
 
 impl<'a> BumpInput<'a> {
     pub fn wall(body: &'a Body, speed: f32, obstacle: Obstacle, ground: Surface) -> BumpInput<'a> {
-        BumpInput { body, pose: KinPose::stand(0.0), speed_mps: speed, heading_deg: 0.0, obstacle, obstacle_top_m: f32::INFINITY, obstacle_bottom_m: 0.0, obstacle_speed_mps: 0.0, ground, max_step_m: body.base.spec().max_step_m }
+        BumpInput { body, pose: KinPose::stand(body, 0.0), speed_mps: speed, heading_deg: 0.0, obstacle, obstacle_top_m: f32::INFINITY, obstacle_bottom_m: 0.0, obstacle_speed_mps: 0.0, ground, max_step_m: body.base.spec().max_step_m }
     }
 
     pub fn curb(body: &'a Body, speed: f32, height_m: f32, ground: Surface) -> BumpInput<'a> {
@@ -1120,10 +1120,10 @@ pub fn first_contact(body: &Body, r: &KinReport, dir: [f32; 2], bottom_m: f32, t
     let (contactor, normal, point) = match link {
         "bumper" => (Contactor::Bumper, back, p),
         "wheel" | "track" => {
-            let h = top_m.min(WHEEL_R_M).max(0.0);
-            let reach = (WHEEL_R_M * WHEEL_R_M - (WHEEL_R_M - h) * (WHEEL_R_M - h)).max(0.0).sqrt();
+            let h = top_m.min(body.dims.wheel_r_m).max(0.0);
+            let reach = (body.dims.wheel_r_m * body.dims.wheel_r_m - (body.dims.wheel_r_m - h) * (body.dims.wheel_r_m - h)).max(0.0).sqrt();
             let axle_u = 0.5 * body.support_len_m;
-            let d = [-reach, WHEEL_R_M - h];
+            let d = [-reach, body.dims.wheel_r_m - h];
             let dl = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-6);
             let nrm = [u[0] * d[0] / dl, u[1] * d[0] / dl, d[1] / dl];
             let pt = [u[0] * (axle_u + reach), u[1] * (axle_u + reach), h];
@@ -1201,8 +1201,8 @@ pub(crate) fn base_parts(body: &Body) -> Vec<Part> {
 }
 
 pub fn step_reach_m(body: &Body, dir: [f32; 2]) -> f32 {
-    let fore = 2.0 * (kin::THIGH_M + kin::SHANK_M) * 0.8f32.sin();
-    let side = kin::Rom::of(body).stance_out_max_m + 0.5 * STANCE_WIDTH_M;
+    let fore = 2.0 * (body.dims.thigh_m() + body.dims.shank_m()) * 0.8f32.sin();
+    let side = kin::Rom::of(body).stance_out_max_m + 0.5 * body.dims.stance_m;
     let n = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt().max(1e-6);
     let (c, s) = ((dir[0] / n).abs(), (dir[1] / n).abs());
     1.0 / ((c / fore).powi(2) + (s / side.max(1e-3)).powi(2)).sqrt()
@@ -1276,7 +1276,7 @@ pub fn actuator_of(body: &Body, joint: &str) -> Option<Actuator> {
 }
 
 fn obstacle_ko(inp: &BumpInput) -> String {
-    let low = inp.obstacle.mass_kg().is_none() && inp.obstacle_top_m.is_finite() && inp.obstacle_top_m < HIP_M;
+    let low = inp.obstacle.mass_kg().is_none() && inp.obstacle_top_m.is_finite() && inp.obstacle_top_m < inp.body.dims.hip_m;
     if low {
         let mat = match inp.obstacle {
             Obstacle::Drywall => "석고보드",
@@ -1431,7 +1431,7 @@ pub fn bump(inp: &BumpInput) -> Collision {
     let mut second: Option<Box<Collision>> = None;
     let mut outcome = if climbable { Outcome::ok() } else if detected { Outcome::fail("collision", format!("{}에 {:.0} N으로 부딪혀 멈춤", what_ko, pulse_r.peak_n)) } else { Outcome::fail("bump", format!("{}에 닿아 막힘 ({:.0} N, 감지 문턱 아래)", what_ko, pulse_r.peak_n)) };
     let fixed = inp.obstacle.mass_kg().is_none();
-    let wall_high = fixed && inp.obstacle_top_m >= HIP_M;
+    let wall_high = fixed && inp.obstacle_top_m >= body.dims.hip_m;
     if legged {
         let v_u = s_after[0];
         let w0 = (G / pl.com_z.max(0.1)).sqrt();
@@ -1903,7 +1903,7 @@ mod tests {
     fn mass_props_match_the_body() {
         for base in [BaseKind::HumanFoot, BaseKind::Wheel] {
             let b = body(Tier::Mid, base);
-            let mp = mass_props(&b, &KinPose::stand(0.0));
+            let mp = mass_props(&b, &KinPose::stand_compact(0.0));
             assert!((mp.mass_kg - b.mass_kg()).abs() < 1e-3);
             let iy = mp.about([0.0, 1.0, 0.0]);
             let k = (iy / mp.mass_kg).sqrt();
@@ -1990,7 +1990,7 @@ mod tests {
         let t = c.tip.expect("it goes over");
         assert!((t.dir_deg - 180.0).abs() < 1e-3 && t.omega > 0.0 && t.pivot[0] > 0.0, "{t:?}");
         assert_eq!(c.rollout.outcome.code, Some("tip"));
-        let f = super::super::fall::fall(&super::super::fall::FallInput::from_tip(&b, KinPose::stand(0.0), &t, super::super::fall::FallCause::Bumped, Surface::Firm));
+        let f = super::super::fall::fall(&super::super::fall::FallInput::from_tip(&b, KinPose::stand_compact(0.0), &t, super::super::fall::FallCause::Bumped, Surface::Firm));
         assert!(f.fell && f.lying.down() && f.get_up.needs_help, "{:?}", f.rollout.events);
     }
 
@@ -2034,7 +2034,7 @@ mod tests {
     #[test]
     fn a_falling_object_hits_the_head_with_its_drop_energy() {
         let b = body(Tier::Mid, BaseKind::Wheel);
-        let hit = |h: f32, m: f32| struck_by(&HitInput { body: &b, pose: KinPose::stand(0.0), object: FallingObject::dropped(ItemMaterial::Wood, m, 0.15, h), point: None, ground: Surface::Firm });
+        let hit = |h: f32, m: f32| struck_by(&HitInput { body: &b, pose: KinPose::stand_compact(0.0), object: FallingObject::dropped(ItemMaterial::Wood, m, 0.15, h), point: None, ground: Surface::Firm });
         let low = hit(0.5, 2.4);
         let high = hit(2.0, 2.4);
         assert!((high.v_close_mps - (2.0 * G * 2.0f32).sqrt()).abs() < 1e-3);
@@ -2060,7 +2060,7 @@ mod tests {
     #[test]
     fn a_kin_body_force_moves_the_zmp_and_zero_changes_nothing() {
         let b = body(Tier::Mid, BaseKind::Wheel);
-        let p = KinPose::stand(0.0);
+        let p = KinPose::stand_compact(0.0);
         let r0 = kin::solve(&b, &p, &KinLoads::default());
         let r1 = kin::solve(&b, &p, &KinLoads { body_point: [0.1, 0.0, 1.0], ..KinLoads::default() });
         assert_eq!(r0, r1);

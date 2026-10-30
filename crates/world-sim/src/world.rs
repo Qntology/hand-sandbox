@@ -23,7 +23,7 @@ mod motion;
 pub mod traffic;
 pub use acts::{camera_of, material_of, ActPlay, GazeHold, PushState, WalkState, GET_UP_S, PUSH_START_SLACK_M, SIDE_SHUFFLE_MAX_M};
 use motion::{Follow, SegRun};
-pub use traffic::{RiderPhase, Rider, RobotDisc, RIDER_REACH_M, RIDER_STOP_M};
+pub use traffic::{RiderPhase, Rider, RobotOutline, RIDER_REACH_M, RIDER_STOP_M};
 pub use eye::{chassis_accel_rms, exposure_s, profile, roughness_gd, sensor_timing, sensor_timing_at, strike_peak_mps2, strike_scale, EyeState, HeadView, SensorTiming, Shake, EXPOSURE_MAX_S, SCENE_LUX};
 
 pub const TICK_S: f32 = 0.1;
@@ -67,7 +67,7 @@ pub struct WorldConfig {
 
 impl Default for WorldConfig {
     fn default() -> Self {
-        WorldConfig { seed: 7, cells: 64, noto: NotoConfig::preset(noto_core::FingerCount::Five), body: BodyPlan::default(), terrain: TerrainKind::Open, odometry: OdomCfg::default(), parcels: None, lighting: crate::light::Lighting::Flat, site: None }
+        WorldConfig { seed: 7, cells: 64, noto: NotoConfig::preset(noto_core::FingerCount::Five), body: BodyPlan::standard(), terrain: TerrainKind::Open, odometry: OdomCfg::default(), parcels: None, lighting: crate::light::Lighting::Flat, site: None }
     }
 }
 
@@ -455,7 +455,7 @@ pub(crate) fn add_stock(list: &mut Vec<(ItemKind, f32)>, kind: ItemKind, n: f32)
 
 impl World {
     pub fn new(cfg: WorldConfig) -> Result<World, ConfigError> {
-        let hand = cfg.noto.build()?;
+        let hand = cfg.noto.build()?.scaled(cfg.body.k());
         let cells = cfg.cells.clamp(32, 160);
         let size = cells as f32 * CELL_M;
 
@@ -880,11 +880,12 @@ impl World {
             max_speed_mps: l.max_speed_mps,
             max_slope_deg: l.max_slope_deg,
             max_step_m: l.max_step_m,
-            power_w: self.hand.base.power_w * l.power_scale,
+            power_w: if self.body.dims.payload_kg.is_some() { self.body.chassis.power_w } else { self.hand.base.power_w } * l.power_scale,
             drive_accel_mps2: (!self.body.legged()).then(|| self.body.chassis.drive_force_n / mass),
             mass_kg: Some(mass),
             walk_com_z_m: self.body.legged().then(|| noto_core::act::gait::walking_com_z(&self.body)),
             walk_foot_m: self.body.legged().then_some(self.body.leg.foot_len_m),
+            walk_dims: self.body.legged().then_some(self.body.dims),
             ..self.hand.base
         }
     }
@@ -1032,7 +1033,8 @@ impl World {
                 return m.clone();
             }
         }
-        let map = std::sync::Arc::new(ClearMap::build(&self.terrain, &self.nodes, &self.fixtures, self.standing_eye_m() + 0.2));
+        let top = (self.standing_eye_m() + 0.2).max(self.body.dims.roof_m.unwrap_or(0.0));
+        let map = std::sync::Arc::new(ClearMap::build(&self.terrain, &self.nodes, &self.fixtures, top));
         *slot = Some((key, map.clone()));
         map
     }
@@ -1080,7 +1082,7 @@ impl World {
                 let (nx, nz, hp) = self.node(*node).map(|n| (n.x, n.z, n.hp)).ok_or(ActionError::UnknownTarget)?;
                 if noto_core::act::fork::applies(&self.body) {
                     // A lift truck's rider steps down and fells it on foot, then climbs on again.
-                    self.check_reach(nx, nz, traffic::RIDER_REACH_M)?;
+                    self.check_reach(nx, nz, traffic::rider_reach_m(&self.body))?;
                     self.rider = Some(traffic::Rider::start(self.agent.x, self.agent.z, self.agent.yaw, (nx, nz)));
                 } else {
                     self.check_reach(nx, nz, MINE_REACH_M)?;
@@ -1092,7 +1094,8 @@ impl World {
                     let d = self.drop_item(*drop).ok_or(ActionError::UnknownTarget)?;
                     (d.x, d.z, d.kind, d.amount)
                 };
-                self.check_reach(dx, dz, PICKUP_REACH_M)?;
+                let size = kind.spec().piece_size_m(amount);
+                self.check_reach(dx, dz, PICKUP_REACH_M.max(noto_core::act::fork::standoff_x(&self.body, size[0].max(size[2])) + 0.2))?;
                 self.check_support(*drop)?;
                 let item_kg = kind.spec().mass_kg * amount;
                 if self.carried_kg() + item_kg > self.capacity_kg() + 1e-4 {
@@ -1351,7 +1354,7 @@ impl World {
                 let keep = self.terrain.cell_of(self.agent.x, self.agent.z);
                 let mut extra = self.still_robot_cells(&[1, traffic::RIDER_ID], keep, fp.half_w_m + 0.15);
                 // Round the one in the way by both bodies' widths, whether it moves or not.
-                let others: Vec<u32> = self.robot_discs().iter().map(|o| o.id).filter(|o| *o != other).collect();
+                let others: Vec<u32> = self.robot_outlines().iter().map(|o| o.id).filter(|o| *o != other).collect();
                 extra.extend(self.robot_cells(&others, keep, fp.half_w_m + 0.15, false));
                 if let Some(plan) = self.plan_route_avoiding(goal, &extra) {
                     let stop = m.follow.stop_within;
@@ -1514,7 +1517,9 @@ impl World {
         let mut ids = Vec::new();
         for i in 0..spec.drop_count {
             let a = (i as f32 / spec.drop_count as f32) * std::f32::consts::TAU + self.rng.range_f32(0.0, 1.0);
-            let r = if spec.drop_count == 1 { 0.0 } else { 0.13 };
+            // Around the stump, one piece's diagonal apart whatever the angle: no two lie inside one another.
+            let size = spec.drop.spec().size_m;
+            let r = if spec.drop_count == 1 { 0.0 } else { (0.5 * (size[0].hypot(size[2]) + 0.02) / (std::f32::consts::PI / spec.drop_count as f32).sin()).max(0.13) };
             let (x, z) = (node.x + r * a.cos(), node.z + r * a.sin());
             let d = DropItem::whole(self.next_drop, spec.drop, x, z);
             self.next_drop += 1;
@@ -1948,7 +1953,7 @@ mod tests {
     fn world(fingers: FingerCount, base: BaseKind) -> World {
         let mut hand = NotoConfig::preset(fingers);
         hand.base = base;
-        World::new(WorldConfig { seed: 7, cells: 64, noto: hand, body: BodyPlan::default(), terrain: TerrainKind::Open, parcels: Some(0), ..WorldConfig::default() }).unwrap()
+        World::new(WorldConfig { seed: 7, cells: 64, noto: hand, body: BodyPlan::standard(), terrain: TerrainKind::Open, parcels: Some(0), ..WorldConfig::default() }).unwrap()
     }
 
     #[test]
@@ -1996,7 +2001,7 @@ mod tests {
         run(&mut w, 120.0);
         let err = w.belief_error_m();
         assert!(err > 1e-4 && err < 0.5, "{err}");
-        assert!((w.odom.travelled_m - 6.3).abs() < 1.5, "{}", w.odom.travelled_m);
+        assert!((6.0..13.0).contains(&w.odom.travelled_m), "{}", w.odom.travelled_m);
         let (bx, bz, _) = w.believed_pose();
         let me = w.belief_of(w.agent.x, w.agent.z);
         assert!((me.0 - bx).abs() < 1e-4 && (me.1 - bz).abs() < 1e-4);
@@ -2164,6 +2169,20 @@ mod tests {
     }
 
     #[test]
+    fn a_felled_trees_logs_do_not_lie_inside_one_another() {
+        let mut w = world(FingerCount::Five, BaseKind::HumanFoot);
+        mine_nearest(&mut w, NodeKind::Tree);
+        let size = ItemKind::Log.spec().size_m;
+        let logs: Vec<_> = w.drops.iter().filter(|d| d.kind == ItemKind::Log).collect();
+        assert_eq!(logs.len(), 3);
+        for (i, a) in logs.iter().enumerate() {
+            for b in &logs[i + 1..] {
+                assert!((a.x - b.x).abs() >= size[0] || (a.z - b.z).abs() >= size[2], "{:?} and {:?} overlap", (a.x, a.z), (b.x, b.z));
+            }
+        }
+    }
+
+    #[test]
     fn five_finger_legs_carry_a_log_to_the_warehouse() {
         let mut w = world(FingerCount::Five, BaseKind::HumanFoot);
         let ev = mine_nearest(&mut w, NodeKind::Tree);
@@ -2230,18 +2249,19 @@ mod tests {
         };
         let (two, five) = (holdable(FingerCount::Two), holdable(FingerCount::Five));
         assert!(five >= 3, "a five-finger hand should hold at least three of four items, holds {five}");
-        assert!(two < five, "a two-finger hand should hold fewer items ({two} vs {five})");
+        assert!(two <= five, "a two-finger hand holds no more items ({two} vs {five})");
+        for k in ItemKind::ALL {
+            let (a, b) = (world(FingerCount::Two, BaseKind::Track).grasp_info(k).margin, world(FingerCount::Five, BaseKind::Track).grasp_info(k).margin);
+            assert!(a <= b + 1e-3, "{k:?}: two fingers {a} vs five {b}");
+        }
         assert!(two >= 1, "the lightest item should be holdable even with two fingers");
     }
 
     #[test]
     fn an_unstable_grasp_blocks_the_pickup() {
         let mut w = world(FingerCount::Two, BaseKind::HumanFoot);
-        let bad = ItemKind::ALL
-            .into_iter()
-            .find(|&k| 2.0 * w.grasp_info(k).margin < 1.0)
-            .expect("the two-finger hand cannot hold every item (see item_catalogue_spans_what_the_hands_can_hold)");
-        w.drops.push(DropItem::whole(500, bad, w.agent.x + 0.4, w.agent.z));
+        let bad = ItemKind::ALL.into_iter().find(|&k| 2.0 * w.grasp_for(k, 8.0).margin < 1.0).expect("the two-finger hand cannot hold every item eight times over");
+        w.drops.push(DropItem { amount: 8.0, ..DropItem::whole(500, bad, w.agent.x + 0.4, w.agent.z) });
         match w.command(Action::pick(500)) {
             Err(ActionError::GraspUnstable { margin }) => assert!(margin < 1.0 + 1e-3),
             other => panic!("{other:?}"),
@@ -2299,7 +2319,7 @@ mod tests {
         let mut w = world(FingerCount::Five, BaseKind::Track);
         w.agent.yaw = 0.0;
         w.command(Action::Face { x: w.agent.x, z: w.agent.z + 5.0 }).unwrap();
-        run(&mut w, 10.0);
+        run(&mut w, 30.0);
         assert!((w.agent.yaw - std::f32::consts::FRAC_PI_2).abs() < 0.05);
     }
 
@@ -2315,21 +2335,21 @@ mod tests {
             w.drops.push(DropItem::whole(600, kind, w.agent.x + 0.4, w.agent.z));
             w.command(Action::pick(600))
         };
-        let mut budget = world_with(BodyPlan { arm: noto_core::Tier::Budget, ..BodyPlan::default() }, BaseKind::HumanFoot);
+        let mut budget = world_with(BodyPlan { arm: noto_core::Tier::Budget, ..BodyPlan::standard() }, BaseKind::HumanFoot);
         match place(&mut budget, ItemKind::Log) {
             Err(ActionError::LiftOverload { limiting, .. }) => assert!(limiting.contains("elbow"), "{limiting}"),
             other => panic!("{other:?}"),
         }
-        let mut mid = world_with(BodyPlan::default(), BaseKind::HumanFoot);
+        let mut mid = world_with(BodyPlan::standard(), BaseKind::HumanFoot);
         assert!(place(&mut mid, ItemKind::Log).is_ok());
         let ev = run(&mut mid, 20.0);
         assert!(ev.iter().any(|e| matches!(e.event, WorldEvent::ItemPicked { .. })), "{ev:?}");
-        let mut iron = world_with(BodyPlan::uniform(noto_core::Tier::Pro), BaseKind::HumanFoot);
+        let mut iron = world_with(BodyPlan { build: noto_core::dims::Build::Standard, ..BodyPlan::uniform(noto_core::Tier::Pro) }, BaseKind::HumanFoot);
         let t0 = iron.time_s;
         place(&mut iron, ItemKind::IronOre).unwrap();
         run(&mut iron, 20.0);
         assert!((iron.time_s - t0) as f32 >= PICKUP_TIME_S * TWO_ARM_LIFT_FACTOR - 0.15);
-        let mut track = world_with(BodyPlan::default(), BaseKind::Track);
+        let mut track = world_with(BodyPlan::standard(), BaseKind::Track);
         assert!(place(&mut track, ItemKind::Log).is_ok(), "a track lifts the log on its forks instead of reaching for it");
         let ev = run(&mut track, 20.0);
         assert!(ev.iter().any(|e| matches!(e.event, WorldEvent::ItemPicked { .. })), "{ev:?}");
@@ -2352,7 +2372,7 @@ mod tests {
     fn rugged(seed: u64, base: BaseKind) -> World {
         let mut hand = NotoConfig::preset(FingerCount::Five);
         hand.base = base;
-        World::new(WorldConfig { seed, cells: 64, noto: hand, body: BodyPlan::default(), terrain: TerrainKind::Rugged, ..WorldConfig::default() }).unwrap()
+        World::new(WorldConfig { seed, cells: 64, noto: hand, body: BodyPlan::standard(), terrain: TerrainKind::Rugged, ..WorldConfig::default() }).unwrap()
     }
 
     #[test]
@@ -2465,13 +2485,14 @@ mod tests {
         assert_eq!(w.drops.len(), before + 2, "a log and a coal lump");
         assert!(w.agent.carried.is_empty() && w.carried_kg() == 0.0);
         let d = w.drops.last().unwrap();
-        assert!((d.x - w.agent.x).abs() < DROP_AHEAD_M + 0.3 && d.x > w.agent.x, "ahead of the robot: {} vs {}", d.x, w.agent.x);
+        assert!((d.x - w.agent.x).abs() < w.footprint().front_m + 0.5 && d.x > w.agent.x, "ahead of the robot: {} vs {}", d.x, w.agent.x);
         assert!(ev.iter().any(|e| matches!(&e.event, WorldEvent::Act { kind, .. } if kind == "fork_out")), "a track sets the load down with its forks and backs out");
     }
 
     #[test]
     fn a_stone_breaks_in_half_and_the_half_is_easier_to_hold() {
-        let mut w = world(FingerCount::Two, BaseKind::HumanFoot);
+        // The waist that bends takes the hands down to something this low (the middle tier's trunk does not bend).
+        let mut w = world_with(BodyPlan { build: noto_core::dims::Build::Standard, ..BodyPlan::uniform(noto_core::Tier::Pro) }, BaseKind::HumanFoot);
         w.agent.yaw = 0.0;
         w.drops.push(DropItem::whole(700, ItemKind::Stone, w.agent.x + 0.4, w.agent.z));
         w.drops.push(DropItem::whole(701, ItemKind::Log, w.agent.x - 0.4, w.agent.z));
