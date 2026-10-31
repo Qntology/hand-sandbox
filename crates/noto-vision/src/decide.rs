@@ -371,7 +371,8 @@ pub const LANDMARK_CENTRE_FRAC: f32 = 0.2;
 /// bearing, which scales the range error by the same ratio.
 pub fn scale_usable(fix: &Fix, s: &Sighting) -> bool {
     let centre = s.sigma.hypot(LANDMARK_CENTRE_FRAC * s.extent) / s.sigma.max(1e-6);
-    let near = s.depth_range_m.is_some_and(|d| d >= 0.5);
+    // Rays that meet can still be of two targets, when a track jumps from tree to tree: no depth model is off by that much.
+    let near = s.depth_range_m.is_some_and(|d| d >= 0.5 && (0.5..=2.0).contains(&(fix.range_m / d)));
     fix.rays >= 3 && fix.residual_m <= 0.15 && fix.sigma_m * centre <= 0.15 * fix.range_m && (1.5..=9.0).contains(&fix.range_m) && near
 }
 
@@ -501,6 +502,7 @@ mod tests {
         let fix = triangulate(&rays, 6.0).unwrap();
         let s = Sighting { extent: 0.0, sigma: 0.0073, ..sight(2, Pose { x: 0.0, z: 0.4, yaw: 0.0, eye_m: 0.5 }, target, 1) };
         assert!(scale_usable(&fix, &s), "a point-like target: the rays' noise is all there is ({fix:?})");
+        assert!(!scale_usable(&fix, &Sighting { depth_range_m: Some(fix.range_m * 3.0), ..s.clone() }), "a range three times off the depth is another target");
         let tree = Sighting { extent: 10f32.to_radians(), ..s };
         assert!(!scale_usable(&fix, &tree), "a tree 10° wide: its centre alone moves the range by more than 15 %");
         let wide: Vec<Bearing> = [-2.0f32, 0.0, 2.0]

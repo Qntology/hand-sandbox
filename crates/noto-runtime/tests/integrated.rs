@@ -35,8 +35,9 @@ fn three_passes_record_keyframes_ml_tracks_decisions_and_success_rates() {
     let span = fixed.last().unwrap()["tick"].as_u64().unwrap() - fixed[0]["tick"].as_u64().unwrap();
     assert!((span / 10) as usize + 2 >= fixed.len(), "fixed 10-tick interval");
     assert!(st["game"]["video"].as_u64().unwrap() as usize > fixed.len(), "the video has more frames than keyframes");
+    // The standard wheeled body is a 1 t lift truck: the 4.2 kg log goes on its tines rather than being shoved.
     let m = moments(game);
-    assert!(m.contains(&"fork_in") && m.contains(&"fork_up"), "the lift's moments are keyframes: {m:?}");
+    assert!(m.contains(&"fork_in") && m.contains(&"fork_up"), "the fork lift's moments are keyframes: {m:?}");
     assert!(game.iter().all(|k| !k["ml"].is_null()), "every keyframe analysed");
     let tracked = game.iter().filter(|k| !k["ml"]["target"].is_null()).count();
     assert!(tracked > 0, "the target was tracked on some keyframes");

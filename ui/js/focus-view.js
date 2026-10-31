@@ -19,7 +19,7 @@ export const PART_KO = Object.fromEntries(FOCUS_PARTS.map((p) => [p.id, p.ko]));
 export const DRAWN_PARTS = ['hand', 'hand_joints', 'foot', 'foot_joints', 'waist', 'neck', 'wheel', 'track'];
 
 export const EVENT_KO = {
-  fork_in: '포크 넣음', fork_up: '포크 들어올림', fork_out: '포크 뺌',
+  fork_down: '포크 내림', fork_in: '포크 넣음', fork_up: '포크 들어올림', fork_out: '포크 뺌',
   bend_bottom: '굽힘 바닥', contact: '접촉', lift_off: '들림', hold: '들어 올림', slip: '미끄러짐', pivot: '손 안에서 돎', drop: '떨어뜨림',
   stowed: '적재', release: '놓음', impact: '착지 충격', stall: '관절 멈춤', miss: '빈손', reach_fail: '닿지 않음', foot_slip: '발 미끄러짐',
   fall: '넘어짐', breakaway: '밀기 시작', turn_slide: '돌다 미끄러짐', push_lost: '밀던 물체 놓침', collision: '충돌', arrive: '도착', stuck: '헛돎', wheel_slip: '바퀴 미끄러짐',

@@ -113,6 +113,9 @@ pub fn ground_depth(intr: &Intrinsics, pose: &Pose, px: f32, py: f32, height: Op
             let d = h / -r[1];
             (d <= max_m).then_some(d)
         }
+        // Unbounded, a ray that does not descend meets only ground rising above the eye and would march on for ever
+        // where there is none: like a flat ground, it meets nothing.
+        Some(_) if !max_m.is_finite() && r[1] >= -1e-6 => None,
         Some(f) => {
             let above = |d: f32| h + d * r[1] - f(pose.x + d * r[0], pose.z + d * r[2]);
             let step = 0.1f32;
@@ -465,12 +468,13 @@ mod tests {
         let m = ground_depth(&c, &p, 100.0, 200.0, Some(&flat), 30.0).unwrap();
         let e = ground_depth(&c, &p, 100.0, 200.0, None, 30.0).unwrap();
         assert!((m - e).abs() < 0.01, "{m} vs {e}");
-        assert!(ground_depth(&c, &p, 192.0, 2.0, Some(&flat), f32::INFINITY).is_none(), "a ray over the horizon ends");
         let (yaw, x0, z0) = (p.yaw, p.x, p.z);
         let step = move |x: f32, z: f32| if ((x - x0) * yaw.cos() + (z - z0) * yaw.sin()) > 2.0 { 0.5 } else { 0.0 };
         let s = ground_depth(&c, &p, 192.0, 140.0, Some(&step), 30.0).unwrap();
         let open = ground_depth(&c, &p, 192.0, 140.0, None, 30.0).unwrap();
         assert!(s < open, "{s} < {open}");
+        assert!(ground_depth(&c, &p, 192.0, 2.0, Some(&flat), f32::INFINITY).is_none(), "above the horizon with no range limit");
+        assert!(ground_depth(&c, &p, 192.0, 140.0, Some(&step), f32::INFINITY).is_some_and(|d| (d - s).abs() < 1e-3));
     }
 
     #[test]
