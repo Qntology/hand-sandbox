@@ -1,0 +1,70 @@
+/* 탑뷰의 교통 지도식 CCTV — 로봇 머리 위 말풍선(1인칭 · 깊이 · 포크 카메라 작은 화면), 번호표, 연결선, 확대 비교 창. */
+.cctv-layer { position: absolute; inset: 0; z-index: 5; overflow: hidden; pointer-events: none; }
+.cctv-lines { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.cctv-lines line { stroke: rgba(250, 250, 250, 0.45); stroke-width: 1; stroke-dasharray: 3 3; }
+.cctv-lines line.sel { stroke: var(--warning); stroke-dasharray: none; }
+
+.unit-tag-pin {
+  position: absolute; left: 0; top: 0; min-width: 22px; height: 16px; margin: -8px 0 0 -11px; padding: 0 4px;
+  display: inline-flex; align-items: center; justify-content: center; border-radius: 999px;
+  background: rgba(9, 9, 11, 0.8); border: 1px solid var(--border-strong); color: var(--text-bright);
+  font-family: var(--font-mono); font-size: 0.58rem; font-weight: 600; white-space: nowrap;
+  pointer-events: auto; cursor: pointer; transition: transform 0.16s linear; z-index: 2;
+}
+.unit-tag-pin.sel { border-color: var(--warning); box-shadow: 0 0 0 2px rgba(214, 182, 94, 0.45); }
+.unit-tag-pin.fallen { border-color: var(--danger); color: var(--danger); }
+.unit-tag-pin.loaded { background: rgba(214, 182, 94, 0.28); }
+
+.cctv {
+  position: absolute; left: 0; top: 0; width: 186px; padding: 4px 5px 5px; display: flex; flex-direction: column; gap: 3px;
+  background: var(--glass-strong); border: 1px solid var(--border-light); border-radius: 8px; color: var(--text);
+  pointer-events: auto; cursor: pointer; transition: transform 0.16s linear, border-color 0.15s; z-index: 1;
+}
+.cctv.fresh, .unit-tag-pin.fresh { transition: none; } /* 처음 놓을 때는 왼쪽 위에서 날아오지 않게 */
+.cctv:hover { border-color: var(--border-strong); }
+.cctv.sel { border-color: var(--warning); }
+.cctv.compact { width: 110px; }
+.cctv-head { display: flex; align-items: baseline; gap: 5px; font-size: 0.6rem; white-space: nowrap; overflow: hidden; }
+.cctv-head b { flex-shrink: 0; font-weight: 600; }
+.cctv-status { min-width: 0; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; }
+.cctv-tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 3px; }
+.cctv.compact .cctv-tiles { grid-template-columns: minmax(0, 1fr); }
+.cctv.compact .cctv-tile + .cctv-tile { display: none; }
+.cctv-tile { position: relative; margin: 0; aspect-ratio: 4 / 3; overflow: hidden; border-radius: 4px; background: var(--bg-plot); border: 1px solid var(--border-cell); }
+.cctv-tile img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.cctv-tile figcaption { position: absolute; left: 0; right: 0; bottom: 0; padding: 0 3px; font-size: 0.5rem; line-height: 1.5; color: #fff; background: rgba(0, 0, 0, 0.5); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* 조준점: 1인칭 타일 가운데 십자 */
+.cctv-tile.aim::before, .cctv-tile.aim::after { content: ''; position: absolute; z-index: 1; background: rgba(255, 255, 255, 0.65); }
+.cctv-tile.aim::before { left: 50%; top: calc(50% - 6px); width: 1px; height: 12px; }
+.cctv-tile.aim::after { top: 50%; left: calc(50% - 6px); height: 1px; width: 12px; }
+.cctv-foot { display: flex; gap: 4px; }
+.cctv-foot .vt-btn { flex: 1; min-height: 18px; padding: 0 4px; font-size: 0.56rem; background: var(--bg-card); }
+.cctv.compact .cctv-foot .vt-btn { font-size: 0.5rem; padding: 0 2px; }
+
+/* 줍기 · 포크 상차 절차 */
+.cctv-proc { display: flex; flex-direction: column; gap: 2px; padding-top: 2px; border-top: 1px solid var(--border-light); font-size: 0.56rem; line-height: 1.35; }
+.cp-title { color: var(--text-bright); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cp-steps { list-style: none; display: flex; gap: 2px; }
+.cp-steps li { flex: 1; height: 4px; border-radius: 2px; background: var(--bg-active); }
+.cp-steps li.done { background: var(--success); }
+.cp-steps li.active { background: var(--warning); animation: pulse 1s ease-in-out infinite; }
+.cp-steps li.failed { background: var(--danger); }
+.cp-now { color: var(--text); overflow-wrap: anywhere; }
+.cp-check { padding-left: 4px; border-left: 2px solid var(--border-strong); color: var(--text-dim); overflow-wrap: anywhere; }
+.cp-check.ok { border-left-color: var(--success); color: var(--text-bright); }
+.cp-check.fail { border-left-color: var(--danger); color: #f0a5a5; }
+.cp-check.wait { border-left-color: var(--warning); }
+
+/* 확대 비교 창 */
+.cz-card { width: min(1120px, 100%); max-height: 100%; }
+.cz-head { padding: 8px 10px 8px 14px; }
+.cz-head h3 { flex: 1; min-width: 0; font-size: 0.8rem; font-weight: 600; color: var(--text-bright); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cz-head .ov-close { margin-left: 0; }
+.cz-body { flex: 1; min-height: 0; overflow: auto; padding: 10px 14px 12px; }
+.cz-body .empty-note { min-height: 120px; }
+.cz-body .depth-img { aspect-ratio: 3 / 2; object-fit: cover; }
+
+@media (prefers-reduced-motion: reduce) {
+  .cctv, .unit-tag-pin { transition: none; }
+  .cp-steps li.active { animation: none; }
+}

@@ -4,7 +4,9 @@
 import { DICTIONARY } from './mock-data.js';
 import * as hand from './mock-hand.js';
 import * as mw from './mock-world.js';
-import { renderFrame } from './mock-render.js';
+import * as rig from './mock-rig.js';
+import * as units from './mock-units.js';
+import { depthView, renderFrame, renderUnit } from './mock-render.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const hash = (s) => {
@@ -79,6 +81,7 @@ function worldNew(a) {
   if (!Number.isFinite(a.seed) || a.seed < 0) throw 'seed 는 0 이상의 숫자여야 합니다';
   if (!(a.size >= 16 && a.size <= 256)) throw 'size 는 16~256 셀이어야 합니다';
   if (!a.config?.fingers) throw 'config(NotoConfig)가 필요합니다';
+  rig.rememberPlan(a.body);
   return mw.worldNew(a);
 }
 
@@ -128,14 +131,15 @@ const handlers = {
     ].map(([id, label, role_ko, repo, bytes]) => ({ id, label, role_ko, repo, revision: '(모의)', license: 'Apache-2.0', dir: '(브라우저 모의)', files: [], bytes, have: 0, present: false })),
   }),
   models_download: async () => { throw '모델 받기는 Tauri 앱에서만 됩니다'; },
-  depth_view: async () => { throw '깊이 · 카메라 탭은 실제 Rust 런타임(개발 서버 또는 Tauri)에서만 동작합니다'; },
+  depth_view: depthView,
   models_cancel: async () => { throw '모델 받기는 Tauri 앱에서만 됩니다'; },
   models_delete: async () => { throw '모델 삭제는 Tauri 앱에서만 됩니다'; },
   models_activate: async () => { throw '모델 불러오기는 Tauri 앱에서만 됩니다'; },
   test_status: async () => ({ active: false }),
   test_start: async () => { throw '통합 테스트는 실제 Rust 런타임(개발 서버 또는 Tauri)에서만 동작합니다'; },
-  body_presets: async () => { throw '부품 프리셋 물리는 실제 Rust 런타임에서 계산합니다'; },
-  body_plan_eval: async () => { throw '부품 프리셋 물리는 실제 Rust 런타임에서 계산합니다'; },
+  body_presets: rig.bodyPresets,
+  body_plan_eval: rig.bodyPlanEval,
+  world_body: rig.worldBody,
   ttm_use: async () => { throw '브라우저 모의 백엔드에서는 Granite TTM 을 불러올 수 없습니다. Tauri 앱에서 사용하세요'; },
   test_cancel: async () => ({ active: false }),
   inventory_drop: mw.inventoryDrop,
@@ -146,7 +150,17 @@ const handlers = {
   crew_clear: mw.crewClear,
   crew_mode: mw.crewMode,
   crew_status: mw.crewStatusCall,
+  crew_remove: units.crewRemove,
   camera_rig: mw.cameraRig,
+  units_list: units.unitsList,
+  unit_frame: renderUnit,
+  unit_apply: rig.unitApply,
+  rig_presets: rig.rigPresets,
+  rig_design: rig.rigDesign,
+  rig_validate: rig.rigValidate,
+  rig_delete: rig.rigDelete,
+  rig_prompt: rig.rigPrompt,
+  rig_commit: rig.rigCommit,
   world_terrain: async () => { throw '모의 백엔드에는 지형 격자가 없습니다'; },
 };
 
@@ -154,6 +168,6 @@ export async function invoke(cmd, args = {}) {
   const h = handlers[cmd];
   if (!h) throw `unknown command ${cmd}`;
   const out = await h(args ?? {});
-  if (cmd === 'world_frame') return out; // 문자열이 큰 응답은 복사하지 않는다
+  if (cmd === 'world_frame' || cmd === 'unit_frame') return out; // 문자열이 큰 응답은 복사하지 않는다
   return out === undefined ? null : JSON.parse(JSON.stringify(out));
 }

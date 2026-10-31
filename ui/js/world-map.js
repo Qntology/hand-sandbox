@@ -283,7 +283,6 @@ export function initWorldMap() {
   bus.on('world-new', loadTerrain);
   bus.on('snapshot', draw);
   bus.on('quests', draw);
-  bus.on('layout', draw);
   observeResize($('minimap'), draw);
   draw();
 }

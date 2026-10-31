@@ -1,8 +1,9 @@
-// 토스트 스택과 상태줄 메시지.
+// 토스트 스택과 상태줄 메시지, 명령줄 위의 한 줄 결과.
 import { $, el } from './util.js';
 
 let stack = null;
 let msgTimer = null;
+let cmdTimer = null;
 
 function ensureStack() {
   if (!stack) {
@@ -36,4 +37,15 @@ export function setStatus(message, isError = false) {
     node.textContent = '';
     node.classList.remove('err');
   }, isError ? 8000 : 12000);
+}
+
+/** 명령줄 바로 위의 한 줄 결과. kind: ok | err | info (info 는 다음 메시지까지 남는다) */
+export function cmdToast(kind, text) {
+  const t = $('cmd-toast');
+  t.hidden = false;
+  t.className = `cmd-toast ${kind}`;
+  t.textContent = text;
+  t.title = text;
+  clearTimeout(cmdTimer);
+  if (kind !== 'info') cmdTimer = setTimeout(() => { t.hidden = true; }, kind === 'err' ? 9000 : 7000);
 }

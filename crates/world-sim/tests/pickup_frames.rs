@@ -2,6 +2,7 @@
 //   set PICKUP_FRAMES_DIR=...   (PNG files and a line per frame)
 //   cargo test -p world-sim --test pickup_frames -- --ignored --nocapture
 use noto_core::{BaseKind, FingerCount, NotoConfig};
+use world_sim::clear::Footprint;
 use world_sim::world::{Action, DropItem, WorldConfig};
 use world_sim::{Camera, ItemKind, World};
 
@@ -12,7 +13,9 @@ fn world(base: BaseKind) -> World {
     w.nodes.clear();
     w.drops.clear();
     w.agent.yaw = 0.0;
-    let (x, z) = (w.agent.x + 0.6, w.agent.z);
+    // In front of the body: what lies under a hull is shoved out of its way.
+    let ahead = if base == BaseKind::HumanFoot { 0.6 } else { Footprint::of(&w.body).hull_m + 0.4 };
+    let (x, z) = (w.agent.x + ahead, w.agent.z);
     w.drops.push(DropItem::whole(77, ItemKind::Log, x, z));
     w
 }
@@ -120,7 +123,8 @@ fn the_head_camera_follows_the_log_up_while_the_hands_lift_it() {
     let (mut frames, mut worst, mut rise) = (0, 0.0f32, (f32::INFINITY, f32::NEG_INFINITY));
     while w.busy() {
         w.tick();
-        let Some((_, _, c)) = w.hand_load() else { continue };
+        // Once it is stowed the act is over and the log just rides in the hands.
+        let Some((_, _, c)) = w.hand_load().filter(|_| w.busy()) else { continue };
         assert_eq!(w.lifted_drop(), Some(77), "the log leaves the ground while it is in the hands");
         let at = w.body_to_world(c);
         rise = (rise.0.min(at[1]), rise.1.max(at[1]));

@@ -11,9 +11,16 @@
 //! behind (a dead end between obstacles), the base does not spin on the spot: it backs straight out the way it came
 //! in, as a driver reverses out of a blind alley, to the first place it can turn, turns there and goes on forward. A
 //! turn asked for in such a place (the search looking about, facing an item) backs out first the same way.
+//!
+//! Nothing moves the body without asking first. Every pose it takes passes `PoseCheck`, against the solids of the map,
+//! the other robots and what lies on the ground; where neither the pursuit arc nor the route line will do, the way is
+//! shut: the base stops there. If it was going fast enough to touch, that is a collision, and `act::collide::bump` says
+//! what it did to the robot and its load (a fall, a jolt). Then it plans again round what stopped it.
 
 use super::*;
+use crate::clear::{Plate, Solid, SolidKind};
 use crate::steer::{self, Seg, TurnCaps, TurnKind};
+use noto_core::act::collide::{self, BumpInput, Obstacle};
 
 pub const LOOKAHEAD_MIN_M: f32 = 0.35;
 pub const LOOKAHEAD_MAX_M: f32 = 1.0;
@@ -35,6 +42,24 @@ pub const STEER_RATE_RAD_S: f32 = 1.0;
 pub const BACK_OUT_STEP_M: f32 = 0.1;
 /// The farthest a base backs straight out of a dead end looking for room to turn (m) [추정].
 pub const BACK_OUT_MAX_M: f32 = 6.0;
+/// How many times a move plans again round what shut its way before it gives up.
+pub const MAX_REPLANS: u32 = 8;
+/// How far short of its reach a body stopped by what it was going for still counts as there (m).
+pub const ARRIVED_SHORT_M: f32 = 0.15;
+/// How far short of it a body settles for when a robot that will not move stands in the way (m).
+pub const ROBOT_SHORT_M: f32 = 0.4;
+/// A move that has not taken the body `STUCK_M` from where it was in `STUCK_S` is going nowhere, whatever the body is
+/// busy with: a truck in a tight spot can shunt back and forth for minutes (m, s) [추정].
+pub const STUCK_M: f32 = 1.0;
+pub const STUCK_S: f64 = 40.0;
+/// How far a stopped base backs off to make room to plan again from (m), longest first.
+pub const BACK_OFF_M: [f32; 3] = [1.2, 0.8, 0.4];
+/// How many routes are tried for one that takes the whole body.
+pub const FIT_TRIES: usize = 6;
+/// Slower than this a touch is a nudge, not a collision (m/s) [추정].
+pub const BUMP_MIN_MPS: f32 = 0.12;
+/// How long a robot waits for another in its way before it plans round it (s).
+pub const ROBOT_WAIT_S: f32 = 2.0;
 
 #[derive(Clone, Debug)]
 pub(crate) struct SegRun {
@@ -46,11 +71,15 @@ pub(crate) struct SegRun {
     pub start: (f32, f32, f32),
     pub wait_left: f32,
     pub forced: bool,
+    /// Stopped short: its next pose ran into something that was not there when it was planned.
+    pub blocked: bool,
+    /// The share of full speed it is doing, built up from rest with a load on.
+    pub pace: f32,
 }
 
 impl SegRun {
     pub fn new(m: steer::Maneuver, at: (f32, f32, f32)) -> SegRun {
-        SegRun { kind: m.kind, label_ko: m.label_ko, segs: m.segs, i: 0, u: 0.0, start: at, wait_left: 0.0, forced: false }
+        SegRun { kind: m.kind, label_ko: m.label_ko, segs: m.segs, i: 0, u: 0.0, start: at, wait_left: 0.0, forced: false, blocked: false, pace: 0.0 }
     }
 
     pub fn done(&self) -> bool {
@@ -77,6 +106,12 @@ pub(crate) struct Follow {
     pub stall_s: f32,
     pub stop_within: Option<((f32, f32), f32)>,
     pub steer: f32,
+    /// How long it has stood for another robot in the way (s).
+    pub robot_wait_s: f32,
+    /// How fast it is turning to the route line (rad/s), built up and let down with a load on.
+    pub spin: f32,
+    /// It is backing off to plan again once it has.
+    pub then_replan: bool,
 }
 
 impl Follow {
@@ -91,6 +126,11 @@ impl Follow {
         let len = (self.cum[k] - self.cum[k - 1]).max(1e-6);
         let u = ((s - self.cum[k - 1]) / len).clamp(0.0, 1.0);
         (a.0 + (b.0 - a.0) * u, a.1 + (b.1 - a.1) * u)
+    }
+
+    /// The points still ahead on the route.
+    pub fn ahead(&self) -> Vec<(f32, f32)> {
+        self.path.iter().zip(&self.cum).filter(|(_, c)| **c > self.s).map(|(p, _)| *p).collect()
     }
 
     /// Lengths along the route again after its points moved.
@@ -148,17 +188,28 @@ pub(crate) fn follow_of(start: (f32, f32), edges: &[EdgePlan]) -> Follow {
     f
 }
 
+/// What stopped a pose.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Stop {
+    Solid(f32, Solid),
+    Robot(u32),
+}
+
 /// Whether the base may take a pose: its centre on dry ground of the map, off blocked cells and no curb or ledge
-/// away from the height it measures from, and its outline `clear::TOUCH_GAP_M` off anything it can hit (or no
-/// closer than it already is, when it starts closer).
+/// away from the height it measures from, and its body `clear::TOUCH_GAP_M` off anything it can hit (or no closer than
+/// it already is, when it starts closer, so a body caught in a tight spot can only get out of it). What lies loose on
+/// the ground is not in this: it gives way (`shove_loose`).
 pub(crate) struct PoseCheck {
     map: std::sync::Arc<ClearMap>,
     fp: Footprint,
     blocked: HashSet<Cell>,
     here: Cell,
     pub h0: f32,
-    step: f32,
+    /// The most the ground may change from the height it measures from: a step, and a cell's worth of the steepest
+    /// slope. What it cannot climb stands as a ledge in the map; this keeps the base's centre on its own level.
+    climb: f32,
     gap: f32,
+    others: Vec<(u32, Plate)>,
 }
 
 impl PoseCheck {
@@ -169,16 +220,61 @@ impl PoseCheck {
     pub fn ok_from(&self, t: &Terrain, x: f32, z: f32, yaw: f32, h_ref: f32) -> bool {
         let centre = match t.cell_of(x, z) {
             Some(c) if c == self.here && (h_ref - self.h0).abs() < 1e-6 => true,
-            Some(c) => !t.is_water(c.0, c.1) && !self.blocked.contains(&c) && (t.height_m(c.0, c.1) + t.curb_m(c.0, c.1) - h_ref).abs() <= self.step + 0.01,
+            Some(c) => !t.is_water(c.0, c.1) && !self.blocked.contains(&c) && (t.height_m(c.0, c.1) + t.curb_m(c.0, c.1) - h_ref).abs() <= self.climb,
             None => false,
         };
-        centre && self.fp.room(&self.map, x, z, yaw) >= self.gap
+        centre && self.clear(x, z, yaw)
+    }
+
+    /// Whether the body keeps its gap at that pose.
+    pub fn clear(&self, x: f32, z: f32, yaw: f32) -> bool {
+        room_at(&self.fp, &self.map, &self.others, x, z, yaw) >= self.gap
+    }
+
+    /// What is nearest the body at that pose, and how far (m; negative inside it).
+    pub fn stopped_by(&self, x: f32, z: f32, yaw: f32) -> Option<Stop> {
+        let plates = body_plates(&self.fp, x, z, yaw);
+        let robot = self.others.iter().flat_map(|(id, o)| plates.iter().map(move |p| (*id, p.gap(o)))).min_by(|a, b| a.1.total_cmp(&b.1));
+        let solid = self.fp.nearest(&self.map, x, z, yaw);
+        if let Some((id, _)) = robot.filter(|r| r.1 <= solid.map_or(f32::INFINITY, |s| s.0) && r.1 < clear::TOUCH_GAP_M) {
+            return Some(Stop::Robot(id));
+        }
+        solid.filter(|s| s.0 < clear::TOUCH_GAP_M).map(|s| Stop::Solid(s.0, s.1))
     }
 
     /// How high the ground stands at the cell under (`x`, `z`) (m).
-    pub fn ground_m(t: &Terrain, x: f32, z: f32) -> f32 {
+    pub(crate) fn ground_m(t: &Terrain, x: f32, z: f32) -> f32 {
         t.cell_of(x, z).map_or(0.0, |c| t.height_m(c.0, c.1) + t.curb_m(c.0, c.1))
     }
+}
+
+/// As far as `ds` from `from` toward `to`: a base does not jump back onto a line it has come off.
+fn step_toward(from: (f32, f32), to: (f32, f32), ds: f32) -> (f32, f32) {
+    let d = (to.0 - from.0).hypot(to.1 - from.1);
+    if d <= ds {
+        return to;
+    }
+    (from.0 + (to.0 - from.0) * ds / d, from.1 + (to.1 - from.1) * ds / d)
+}
+
+/// The hull, and the tines when it has them.
+fn body_plates(fp: &Footprint, x: f32, z: f32, yaw: f32) -> Vec<Plate> {
+    let mut v = vec![fp.hull(x, z, yaw)];
+    v.extend(fp.tines(x, z, yaw).map(|t| t.0));
+    v
+}
+
+fn room_at(fp: &Footprint, map: &ClearMap, others: &[(u32, Plate)], x: f32, z: f32, yaw: f32) -> f32 {
+    let mut r = fp.room(map, x, z, yaw);
+    if !others.is_empty() {
+        let plates = body_plates(fp, x, z, yaw);
+        for (_, o) in others {
+            for p in &plates {
+                r = r.min(p.gap(o));
+            }
+        }
+    }
+    r
 }
 
 impl World {
@@ -190,20 +286,36 @@ impl World {
         self.hand.base.kind == noto_core::BaseKind::Track
     }
 
+    /// Whether this body has room to stand at a pose.
+    pub fn stands_clear(&self, x: f32, z: f32, yaw: f32) -> bool {
+        self.footprint().room(&self.clear_map(), x, z, yaw) >= clear::TOUCH_GAP_M
+    }
+
+    /// Whether `body` could stand at a spot and turn right round there.
+    pub fn turns_clear(&self, body: &Body, x: f32, z: f32) -> bool {
+        let (fp, map) = (Footprint::of(body), self.clear_map());
+        (0..8).all(|k| fp.room(&map, x, z, k as f32 * std::f32::consts::FRAC_PI_4) >= clear::TOUCH_GAP_M)
+    }
+
     /// What the base may do with its body here (`PoseCheck`), measured from where it stands now.
     pub(crate) fn pose_check(&self) -> PoseCheck {
         let here = self.agent_cell();
         let map = self.clear_map();
         let fp = self.footprint();
-        let now = fp.room(&map, self.agent.x, self.agent.z, self.agent.yaw);
+        let others: Vec<(u32, Plate)> = self.other_robots().iter().map(|o| (o.id, Plate::of_pose(o.x, o.z, o.yaw, o.front, o.rear, o.half_w))).collect();
+        let now = room_at(&fp, &map, &others, self.agent.x, self.agent.z, self.agent.yaw);
         PoseCheck {
-            gap: clear::TOUCH_GAP_M.min(now - 0.005).max(0.0),
+            gap: clear::TOUCH_GAP_M.min(now - 1e-3),
             map,
             fp,
             blocked: self.blocked_cells(),
             here,
             h0: self.terrain.height_m(here.0, here.1) + self.terrain.curb_m(here.0, here.1),
-            step: self.drive_spec().max_step_m,
+            climb: {
+                let spec = self.drive_spec();
+                spec.max_step_m + 0.01 + CELL_M * spec.max_slope_deg.to_radians().tan()
+            },
+            others,
         }
     }
 
@@ -342,11 +454,22 @@ impl World {
         };
         let left = (1.0 - run.u) * total;
         let t = left.min(remaining).max(0.0);
-        run.u = if total > 1e-6 { (run.u + t / total).min(1.0) } else { 1.0 };
+        // With a load on, a turn or a shunt starts and stops within what its friction stands.
+        let pace = self.load_pace(run, &seg, total, t);
+        run.u = if total > 1e-6 { (run.u + pace * t / total).min(1.0) } else { 1.0 };
         let (x, z, yaw) = steer::along(run.start, &seg, run.u);
+        // A manoeuvre is planned clear, but the world moves on while it runs, and a forced scrub has no plan to go by.
+        if !self.pose_check().clear(x, z, wrap_angle(yaw)) {
+            run.blocked = true;
+            run.i = run.segs.len();
+            run.wait_left = 0.0;
+            self.agent.speed_mps = 0.0;
+            return t.max(1e-4);
+        }
         let moved = (x - self.agent.x).hypot(z - self.agent.z);
         (self.agent.x, self.agent.z, self.agent.yaw) = (x, z, wrap_angle(yaw));
-        self.agent.speed_mps = speed;
+        self.shove_loose();
+        self.agent.speed_mps = speed * pace;
         let scrub = match (seg, caps.kind) {
             (Seg::Pivot { .. }, TurnKind::Skid) => if run.forced { 2.0 } else { 1.3 },
             _ => 1.0,
@@ -370,12 +493,80 @@ impl World {
         t
     }
 
-    pub(crate) fn start_follow(&self, edges: &[EdgePlan]) -> Follow {
+    /// The share of a manoeuvre's full speed a loaded base keeps this moment: it builds up and comes down at no more
+    /// than the load stands, reckoned where the load sits for a turn on the spot.
+    fn load_pace(&self, run: &mut SegRun, seg: &Seg, total: f32, dt: f32) -> f32 {
+        let Some(a) = self.load_accel() else { return 1.0 };
+        let (full, left) = match *seg {
+            Seg::Pivot { angle } => {
+                let lever = self.load_lever_m();
+                (angle.abs() * lever / total.max(1e-3), (1.0 - run.u) * angle.abs() * lever)
+            }
+            Seg::Drive { .. } => (seg.length_m() / total.max(1e-3), (1.0 - run.u) * seg.length_m()),
+        };
+        let up = run.pace + a * dt / full.max(1e-3);
+        let down = (2.0 * a * left.max(0.0)).sqrt() / full.max(1e-3) + 0.05;
+        run.pace = up.min(down).clamp(0.05, 1.0);
+        run.pace
+    }
+
+    /// The route of `edges` as the body will drive it: pushed off what it passes and fitted to the body.
+    fn fitted_route(&self, edges: &[EdgePlan]) -> Follow {
         let mut f = follow_of((self.agent.x, self.agent.z), edges);
         let map = self.clear_map();
         let fp = self.footprint();
         clear::centre_path(&map, &mut f.path, fp.half_w_m + clear::MIN_GAP_M, fp.half_w_m + clear::COMFORT_GAP_M);
+        clear::fit_path(&map, &fp, &mut f.path, clear::TOUCH_GAP_M + 0.01);
         f.measure();
+        f
+    }
+
+    /// Where a planned route will not take the whole body: the cells of the corners and stretches where it swings into
+    /// something. The planner sees a width; a lift truck's tines reach well out in front of that, and swing.
+    fn route_faults(&self, plan: &nav::Plan) -> Vec<Cell> {
+        let f = self.fitted_route(&plan.edges);
+        let (map, fp) = (self.clear_map(), self.footprint());
+        let hits = |x: f32, z: f32, yaw: f32| fp.room(&map, x, z, yaw) < clear::TOUCH_GAP_M;
+        let mut out = Vec::new();
+        for i in 1..f.path.len().saturating_sub(1) {
+            let (a, b, c) = (f.path[i - 1], f.path[i], f.path[i + 1]);
+            let (inward, outward) = ((b.1 - a.1).atan2(b.0 - a.0), (c.1 - b.1).atan2(c.0 - b.0));
+            let turn = wrap_angle(outward - inward);
+            let round = (0..=4).any(|k| hits(b.0, b.1, inward + turn * k as f32 / 4.0));
+            let along = (1..4).any(|k| {
+                let u = k as f32 / 4.0;
+                hits(b.0 + (c.0 - b.0) * u, b.1 + (c.1 - b.1) * u, outward)
+            });
+            if round || along {
+                out.extend(self.terrain.cell_of(b.0, b.1));
+            }
+        }
+        out
+    }
+
+    /// `plan` or, where the whole body will not go along it, the route that keeps off the corners it will not make. The
+    /// cells of `avoid` stay shut. The first plan stands when there is nothing better.
+    pub(crate) fn fit_plan(&self, plan: nav::Plan, goal: Goal, avoid: &HashSet<Cell>) -> nav::Plan {
+        let here = self.agent_cell();
+        let mut shut = avoid.clone();
+        let mut now = plan;
+        let first = now.clone();
+        for _ in 0..FIT_TRIES {
+            let faults: Vec<Cell> = self.route_faults(&now).into_iter().filter(|c| *c != here && !matches!(goal, Goal::Cell(g) if g == *c)).collect();
+            if faults.is_empty() {
+                return now;
+            }
+            shut.extend(faults);
+            match self.plan_route_avoiding(goal, &shut) {
+                Some(p) => now = p,
+                None => return first,
+            }
+        }
+        first
+    }
+
+    pub(crate) fn start_follow(&self, edges: &[EdgePlan]) -> Follow {
+        let mut f = self.fitted_route(edges);
         let caps = self.turn_caps();
         if f.path.len() < 2 || caps.kind == TurnKind::Holonomic {
             return f;
@@ -397,16 +588,36 @@ impl World {
     }
 
     /// One step of path following. Returns the time used.
-    pub(super) fn advance_follow(&mut self, m: &mut MoveState, remaining: f32, events: &mut Vec<TimedEvent>, done: &mut Option<(bool, Option<String>)>) -> f32 {
+    pub(crate) fn advance_follow(&mut self, m: &mut MoveState, remaining: f32, events: &mut Vec<TimedEvent>, done: &mut Option<(bool, Option<String>)>) -> f32 {
+        let (now, here) = (self.time_s, (self.agent.x, self.agent.z));
+        match m.anchor {
+            Some((at, _)) if (at.0 - here.0).hypot(at.1 - here.1) >= STUCK_M => m.anchor = Some((here, now)),
+            Some((_, since)) if now - since >= STUCK_S => {
+                self.agent.speed_mps = 0.0;
+                *done = Some((false, Some("blocked".into())));
+                return 0.0;
+            }
+            Some(_) => {}
+            None => m.anchor = Some((here, now)),
+        }
         if let Some(run) = m.follow.man.as_mut() {
             let mut r = run.clone();
             let span: f32 = r.segs.iter().map(|s| s.length_m()).sum();
             let t = self.advance_run(&mut r, remaining);
+            let blocked = r.blocked;
             m.follow.man = (!r.done() || r.wait_left > 0.0).then_some(r);
             if m.follow.man.is_none() {
                 m.follow.s = m.follow.project((self.agent.x, self.agent.z), m.follow.s, 1.5 + span);
             }
             m.elapsed_s += t;
+            if blocked {
+                m.follow.then_replan = false;
+                let at = (self.agent.x, self.agent.z, self.agent.yaw);
+                return self.way_shut(m, at, t.max(1e-4), events, done);
+            }
+            if m.follow.man.is_none() && std::mem::take(&mut m.follow.then_replan) {
+                self.plan_again(m, events, done);
+            }
             return t.max(1e-4);
         }
         let total = m.follow.total_m();
@@ -422,11 +633,14 @@ impl World {
         }
         let e = m.edges[k];
         self.agent.terrain_margin = Some(e.margin);
+        self.walk.step_lift_m = e.step_m;
         let power = self.drive_spec().power_w as f64;
         if e.pause_s > 0.0 && !m.announced_pause {
             m.announced_pause = true;
             m.pause_left = e.pause_s;
             events.push(self.stamp(WorldEvent::CurbClimbed { height_m: e.step_m }));
+            let worker = self.acting_id();
+            self.take_step(&e, worker, events);
         }
         if m.pause_left > 0.0 {
             let t = m.pause_left.min(remaining);
@@ -446,7 +660,10 @@ impl World {
         }
         let left = (total - m.follow.s).max(0.0).min(total);
         if left <= GOAL_TOL_M || (pos.0 - goal.0).hypot(pos.1 - goal.1) <= GOAL_TOL_M {
-            (self.agent.x, self.agent.z) = goal;
+            // The last few centimetres are an evening-up of the books, which a load on board would feel as a jolt.
+            if self.load_accel().is_none() && self.pose_check().clear(goal.0, goal.1, self.agent.yaw) {
+                (self.agent.x, self.agent.z) = goal;
+            }
             m.idx = m.edges.len() - 1;
             *done = Some((true, None));
             return 0.0;
@@ -468,6 +685,20 @@ impl World {
         let near_end = to_goal < FINAL_APPROACH_M && alpha.abs() > 0.6;
         let stalled = m.follow.stall_s > STALL_S;
         if caps.kind != TurnKind::Holonomic && (alpha.abs() > stop_at || near_end || stalled) && dist > 0.03 {
+            // A loaded base comes to a stand before it turns: it does not stop dead with its load going on.
+            if let Some(a) = self.load_accel().filter(|_| self.agent.speed_mps > 0.15) {
+                let dt = remaining.min(SUBSTEP_S);
+                let v = (self.agent.speed_mps - a * dt).max(0.0);
+                let dir = if m.follow.reverse { -1.0 } else { 1.0 };
+                let (s, c) = self.agent.yaw.sin_cos();
+                let (nx, nz) = (pos.0 + dir * c * v * dt, pos.1 + dir * s * v * dt);
+                if self.free_ahead(nx, nz) && check.ok(&self.terrain, nx, nz, self.agent.yaw) {
+                    (self.agent.x, self.agent.z) = (nx, nz);
+                    self.agent.speed_mps = v;
+                    m.elapsed_s += dt;
+                    return dt;
+                }
+            }
             m.follow.stall_s = 0.0;
             m.follow.steer = 0.0;
             if m.follow.turns >= MAX_STOP_TURNS {
@@ -505,8 +736,25 @@ impl World {
         if caps.kind != TurnKind::Holonomic && kappa.abs() > 1e-3 {
             v = v.min(caps.speed_on_radius(1.0 / kappa.abs(), v).max(MIN_CURVE_MPS));
         }
-        let brake = self.planned_accel(e.slope_deg, self.ground_at(e.to), -1.0).max(0.3);
-        v = v.min((2.0 * brake * left).sqrt() + 0.05);
+        // With a load on the corner and the stop are taken within what its friction stands (`cargo`), and a step it has
+        // seen at a walk. The ramps are the base's own: a body does not reach its speed at once.
+        let load = self.load_accel();
+        if let Some(a) = load.filter(|_| kappa.abs() > 1e-3) {
+            v = v.min((a / kappa.abs()).sqrt().max(MIN_CURVE_MPS));
+        }
+        if let Some(limit) = self.step_speed_limit() {
+            v = v.min(limit);
+        }
+        // It stops where it comes within reach, which can be well short of the route's end.
+        let stop_in = m.follow.stop_within.map_or(left, |(p, reach)| left.min(((pos.0 - p.0).hypot(pos.1 - p.1) - reach).max(0.0)));
+        let brake = self.planned_accel(e.slope_deg, self.ground_at(e.to), -1.0).max(0.3).min(load.unwrap_or(f32::INFINITY));
+        v = v.min((2.0 * brake * stop_in).sqrt() + 0.05);
+        let pull = self.planned_accel(e.slope_deg, self.ground_at(e.to), 1.0).max(0.3).min(load.unwrap_or(f32::INFINITY));
+        let was = self.agent.speed_mps;
+        v = v.min(was + pull * dt);
+        if load.is_some() {
+            v = v.max(was - brake * dt);
+        }
         let ds = (v * dt).min(left + 0.01);
         let before = (self.agent.x, self.agent.z, self.agent.yaw);
         let (nx, nz, nyaw) = match caps.kind {
@@ -517,16 +765,34 @@ impl World {
             _ if m.follow.reverse => steer::along(before, &Seg::Drive { dir: -1.0, kappa: -kappa, len: ds }, 1.0),
             _ => steer::along(before, &Seg::Drive { dir: 1.0, kappa, len: ds }, 1.0),
         };
-        // The pursuit arc cuts corners: where it would bring the body against something, keep to the route line.
+        // The pursuit arc cuts corners: where it would bring the body against something, keep to the route line, and
+        // turn toward it no faster than the base turns. Where that will not do either, the way is shut.
         let (nx, nz, nyaw) = if self.free_ahead(nx, nz) && check.ok(&self.terrain, nx, nz, nyaw) {
             (nx, nz, nyaw)
         } else {
-            let p = m.follow.point_at(m.follow.s + ds);
+            let line = m.follow.point_at(m.follow.s + ds);
             let ahead = m.follow.point_at(m.follow.s + ds + 0.1);
-            let yaw = (ahead.1 - p.1).atan2(ahead.0 - p.0) + if m.follow.reverse { std::f32::consts::PI } else { 0.0 };
-            (p.0, p.1, yaw)
+            let want = (ahead.1 - line.1).atan2(ahead.0 - line.0) + if m.follow.reverse { std::f32::consts::PI } else { 0.0 };
+            let err = wrap_angle(want - self.agent.yaw);
+            let p = step_toward(pos, line, ds);
+            let (mut rate, mut ramp) = (caps.pivot_rad_s.max(CREEP_RAD_S), f32::INFINITY);
+            if let Some(a) = load {
+                let lever = self.load_lever_m();
+                (rate, ramp) = (rate.min((a / lever).sqrt()), a / lever);
+            }
+            m.follow.spin += ((err / dt).clamp(-rate, rate) - m.follow.spin).clamp(-ramp * dt, ramp * dt);
+            let yaw = self.agent.yaw + m.follow.spin * dt;
+            // The route line is the plan's own: the planner has judged its ground, and only the body is left to check.
+            if self.free_ahead(p.0, p.1) && check.clear(p.0, p.1, yaw) {
+                (p.0, p.1, yaw)
+            } else if err.abs() > 1e-3 && check.clear(pos.0, pos.1, yaw) {
+                (pos.0, pos.1, yaw)
+            } else {
+                return self.way_shut(m, (nx, nz, nyaw), dt, events, done);
+            }
         };
         (self.agent.x, self.agent.z, self.agent.yaw) = (nx, nz, wrap_angle(nyaw));
+        self.shove_loose();
         m.follow.s = m.follow.project((nx, nz), m.follow.s, ds + 0.3);
         if m.follow.s > m.follow.best_s + 0.02 {
             (m.follow.best_s, m.follow.stall_s) = (m.follow.s, 0.0);
@@ -541,6 +807,10 @@ impl World {
             let props = self.ground_at(e.to).surface().props();
             self.odom_over = noto_core::act::cruise_slip(&self.drive_spec(), props, e.slope_deg).map_or(0.0, |s| s / (1.0 - s).max(0.05));
         }
+        let worker = self.acting_id();
+        let follow = std::mem::take(&mut m.follow);
+        self.watch_steps(&follow, moved, dt, worker, events);
+        m.follow = follow;
         if let Some(why) = self.walk_steps(moved, &e, events) {
             *done = Some((false, Some(format!("fall: {why}"))));
             return dt;
@@ -549,20 +819,208 @@ impl World {
         dt
     }
 
+    /// What lies loose on the ground gives way to the body: a truck's bumper shoves a log along, nothing that lies about
+    /// here weighs enough to stop one, and a walker's shins do the same to what it cannot step over. It goes out by the
+    /// nearest side of the hull, if there is ground to go to.
+    pub(crate) fn shove_loose(&mut self) {
+        let fp = self.footprint();
+        let hull = fp.hull(self.agent.x, self.agent.z, self.agent.yaw);
+        let v = (-hull.u.1, hull.u.0);
+        let held = self.act.as_ref().and_then(|p| p.lifting);
+        let mut moved = Vec::new();
+        for d in self.drops.iter().filter(|d| d.support.is_ground() && Some(d.id) != held) {
+            let size = d.kind.spec().piece_size_m(d.amount);
+            if size[1] <= fp.over_m {
+                continue;
+            }
+            let plate = Plate { c: (d.x, d.z), u: (1.0, 0.0), half: (0.5 * size[0], 0.5 * size[2]) };
+            if hull.gap(&plate) >= 0.0 {
+                continue;
+            }
+            let reach = 0.5 * size[0].max(size[2]) + 0.01;
+            let (rx, rz) = (d.x - hull.c.0, d.z - hull.c.1);
+            let (along, across) = (rx * hull.u.0 + rz * hull.u.1, rx * v.0 + rz * v.1);
+            let (ea, ec) = (hull.half.0 + reach - along.abs(), hull.half.1 + reach - across.abs());
+            let (px, pz) = if ea < ec { (hull.u.0 * ea * along.signum(), hull.u.1 * ea * along.signum()) } else { (v.0 * ec * across.signum(), v.1 * ec * across.signum()) };
+            moved.push((d.id, d.x + px, d.z + pz));
+        }
+        let blocked = if moved.is_empty() { HashSet::new() } else { self.blocked_cells() };
+        for (id, x, z) in moved {
+            let open = self.terrain.cell_of(x, z).is_some_and(|c| !self.terrain.is_water(c.0, c.1) && !blocked.contains(&c));
+            if let Some(d) = self.drops.iter_mut().find(|d| d.id == id).filter(|_| open) {
+                (d.x, d.z) = (x, z);
+            }
+        }
+    }
+
+    /// The robot in the first worker's place in the motion code: the first worker, or the sub-worker having its turn.
+    pub(crate) fn acting_id(&self) -> u32 {
+        self.crew_turn.unwrap_or(1)
+    }
+
+    /// The pose ahead (`at`) cannot be taken. The base stops; if it touches, that is a collision. Then it plans again.
+    fn way_shut(&mut self, m: &mut MoveState, at: (f32, f32, f32), dt: f32, events: &mut Vec<TimedEvent>, done: &mut Option<(bool, Option<String>)>) -> f32 {
+        let v = self.agent.speed_mps;
+        let stop = self.pose_check().stopped_by(at.0, at.1, at.2);
+        self.agent.speed_mps = 0.0;
+        m.follow.steer = 0.0;
+        // Against the very thing it was going for, and all but there: it is as near as its body lets it come. From
+        // further off a rock by the target is only something to go round.
+        if let (Some((p, reach)), Some(Stop::Solid(_, s))) = (m.follow.stop_within, stop) {
+            if s.rect.dist(p.0, p.1) <= 0.3 && (self.agent.x - p.0).hypot(self.agent.z - p.1) <= reach + ARRIVED_SHORT_M {
+                *done = Some((true, None));
+                return dt.max(1e-4);
+            }
+        }
+        match stop {
+            Some(Stop::Robot(id)) => {
+                // Bodies do not push through each other: wait for it, ask it to stand aside, then go round it.
+                if self.crew_turn.is_none() {
+                    let dir = self.travel_dir();
+                    self.crew_make_way(id, dir);
+                }
+                m.follow.robot_wait_s += dt;
+                if m.follow.robot_wait_s < ROBOT_WAIT_S {
+                    return dt.max(1e-4);
+                }
+                m.follow.robot_wait_s = 0.0;
+                // Someone stands at the very place, and it is nearly there: no nearer while they do.
+                if m.follow.stop_within.is_some_and(|(p, reach)| (self.agent.x - p.0).hypot(self.agent.z - p.1) <= reach + ROBOT_SHORT_M) {
+                    *done = Some((true, None));
+                    return dt.max(1e-4);
+                }
+            }
+            Some(Stop::Solid(gap, solid)) if gap <= 0.0 && v >= BUMP_MIN_MPS => {
+                if let Some(why) = self.bump_into(&solid, v, events) {
+                    *done = Some((false, Some(format!("fall: {why}"))));
+                    return dt.max(1e-4);
+                }
+            }
+            _ => {}
+        }
+        self.replan_move(m, events, done);
+        dt.max(1e-4)
+    }
+
+    /// What running into `solid` at `speed` does: the shock of it, through the same impact model the benchmarks score,
+    /// and the jolt to the load. A fall is what comes back.
+    fn bump_into(&mut self, solid: &Solid, speed: f32, events: &mut Vec<TimedEvent>) -> Option<String> {
+        let g = self.agent_ground_m();
+        let (obstacle, what) = match solid.kind {
+            SolidKind::Tree => (Obstacle::Wood, "나무"),
+            SolidKind::Rock => (Obstacle::Rock, "바위"),
+            SolidKind::Ledge => (Obstacle::Concrete, "단차"),
+            SolidKind::Fixture | SolidKind::Water => (Obstacle::Concrete, "벽"),
+        };
+        let inp = BumpInput {
+            body: &self.body,
+            pose: self.current_kin_pose(),
+            speed_mps: speed,
+            heading_deg: 0.0,
+            obstacle,
+            obstacle_top_m: (solid.y1 - g).max(0.02),
+            obstacle_bottom_m: (solid.y0 - g).max(0.0),
+            obstacle_speed_mps: 0.0,
+            ground: self.ground_here().surface(),
+            max_step_m: self.drive_spec().max_step_m,
+        };
+        let c = collide::bump(&inp);
+        let peak_n = c.pulse.as_ref().map_or(0.0, |p| p.peak_n);
+        let contact_s = c.pulse.as_ref().map_or(0.02, |p| p.contact_s);
+        let fell = c.tip.is_some();
+        let worker = self.acting_id();
+        let label = format!("{what}에 {speed:.1} m/s로 부딪힘: {peak_n:.0} N · {:.1} g{}", c.a_peak_g, if fell { " → 넘어짐" } else { "" });
+        events.push(self.stamp(WorldEvent::Bump { worker, what: what.into(), peak_n, a_g: c.a_peak_g, speed_mps: speed, fell, label: label.clone() }));
+        self.jolt_cargo([-speed, 0.0], contact_s, worker, events);
+        if !fell {
+            return None;
+        }
+        self.spill_all(worker, events);
+        self.fallen_until = Some(self.time_s + GET_UP_S as f64);
+        Some(label)
+    }
+
+    /// Plans again round what shut the way; from the second time, from a little further back, as a driver who cannot
+    /// make the turn backs up first.
+    fn replan_move(&mut self, m: &mut MoveState, events: &mut Vec<TimedEvent>, done: &mut Option<(bool, Option<String>)>) {
+        m.replans += 1;
+        if m.goal.is_none() || m.replans > MAX_REPLANS {
+            *done = Some((false, Some("blocked".into())));
+            return;
+        }
+        if m.replans >= 2 {
+            if let Some(run) = self.back_off() {
+                m.follow.man = Some(run);
+                m.follow.then_replan = true;
+                return;
+            }
+        }
+        self.plan_again(m, events, done);
+    }
+
+    /// Straight back from where it stands, as far as is clear.
+    fn back_off(&self) -> Option<SegRun> {
+        let check = self.pose_check();
+        let (x0, z0, yaw) = (self.agent.x, self.agent.z, self.agent.yaw);
+        let (s, c) = yaw.sin_cos();
+        let free = |d: f32| {
+            let n = (d / steer::SAMPLE_M).ceil() as usize;
+            (1..=n).map(|k| k as f32 * steer::SAMPLE_M).all(|t| self.free_ahead(x0 - c * t, z0 - s * t) && check.clear(x0 - c * t, z0 - s * t, yaw))
+        };
+        let d = BACK_OFF_M.into_iter().find(|d| free(*d))?;
+        let label = format!("길이 막혀 {d:.1} m {}한 뒤 다시 계획", self.back_word());
+        Some(self.backed_turn(d, steer::Maneuver { kind: "none", label_ko: String::new(), segs: vec![], time_s: 0.0 }, label))
+    }
+
+    /// Plans a new route from here, round the stretch just ahead that shut the way.
+    fn plan_again(&mut self, m: &mut MoveState, events: &mut Vec<TimedEvent>, done: &mut Option<(bool, Option<String>)>) {
+        let Some(goal) = m.goal else {
+            *done = Some((false, Some("blocked".into())));
+            return;
+        };
+        let here = self.agent_cell();
+        let mut shut = self.loose_cells(goal);
+        shut.extend(self.still_others(self.footprint().half_w_m + 0.15));
+        for d in [0.3f32, 0.6, 0.9] {
+            let p = m.follow.point_at(m.follow.s + d);
+            shut.extend(self.terrain.cell_of(p.0, p.1).filter(|c| *c != here));
+        }
+        let plan = self.plan_route_avoiding(goal, &shut).or_else(|| self.plan_route(goal));
+        let Some(plan) = plan.map(|p| self.fit_plan(p, goal, &shut)) else {
+            *done = Some((false, Some("blocked".into())));
+            return;
+        };
+        let stop = m.follow.stop_within;
+        let mut follow = self.start_follow(&plan.edges);
+        follow.stop_within = stop;
+        let (replans, elapsed_s) = (m.replans, m.elapsed_s);
+        *m = MoveState { edges: plan.edges, idx: 0, pause_left: 0.0, progress_s: 0.0, announced_pause: false, elapsed_s, follow, anchor: m.anchor, held_s: 0.0, held_by: None, reroutes: m.reroutes, goal: m.goal, replans };
+        let worker = self.acting_id();
+        events.push(self.stamp(WorldEvent::Hold { worker, other: 0, gap_m: 0.0, label: format!("길이 막혀 돌아가는 길로 다시 계획 ({replans}/{MAX_REPLANS})") }));
+    }
+
     /// Fallback after too many stops to turn: slide along the path line itself, facing along it.
     #[allow(clippy::too_many_arguments)]
     fn advance_on_rails(&mut self, m: &mut MoveState, e: &EdgePlan, remaining: f32, left: f32, v_edge: f32, events: &mut Vec<TimedEvent>, done: &mut Option<(bool, Option<String>)>) -> f32 {
         let dt = remaining.min(SUBSTEP_S);
-        let ds = (v_edge * dt).min(left);
+        let load = self.load_accel();
+        let pull = self.planned_accel(e.slope_deg, self.ground_at(e.to), 1.0).max(0.3).min(load.unwrap_or(f32::INFINITY));
+        let brake = self.planned_accel(e.slope_deg, self.ground_at(e.to), -1.0).max(0.3).min(load.unwrap_or(f32::INFINITY));
+        let v = v_edge.min((2.0 * brake * left).sqrt() + 0.05).min(self.agent.speed_mps + pull * dt);
+        let ds = (v * dt).min(left);
         let pos = (self.agent.x, self.agent.z);
-        let p = m.follow.point_at(m.follow.s + ds);
+        let line = m.follow.point_at(m.follow.s + ds);
         let ahead = m.follow.point_at(m.follow.s + ds + 0.1);
+        let p = step_toward(pos, line, ds);
         let flip = if m.follow.reverse { std::f32::consts::PI } else { 0.0 };
-        if (ahead.0 - p.0).hypot(ahead.1 - p.1) > 1e-4 {
-            self.agent.yaw = wrap_angle((ahead.1 - p.1).atan2(ahead.0 - p.0) + flip);
+        let rate = self.turn_caps().pivot_rad_s.max(CREEP_RAD_S).min(load.map_or(f32::INFINITY, |a| (a / self.load_lever_m()).sqrt()));
+        let yaw = if (ahead.0 - p.0).hypot(ahead.1 - p.1) > 1e-4 { self.agent.yaw + wrap_angle((ahead.1 - p.1).atan2(ahead.0 - p.0) + flip - self.agent.yaw).clamp(-rate * dt, rate * dt) } else { self.agent.yaw };
+        if !self.pose_check().ok(&self.terrain, p.0, p.1, yaw) {
+            return self.way_shut(m, (p.0, p.1, yaw), dt, events, done);
         }
+        self.agent.yaw = wrap_angle(yaw);
         (self.agent.x, self.agent.z) = p;
-        m.follow.s += ds;
+        m.follow.s = m.follow.project(p, m.follow.s, ds + 0.3);
         let moved = (p.0 - pos.0).hypot(p.1 - pos.1);
         self.agent.speed_mps = moved / dt.max(1e-6);
         m.elapsed_s += dt;
@@ -720,16 +1178,16 @@ mod tests {
         (worst, trace)
     }
 
-    /// A pocket one cell wide round the base: trees left and right of it and across its end, open behind it. Returns
+    /// A pocket one cell wide round the base: rocks left and right of it and across its end, open behind it. Returns
     /// where the pocket opens (x).
     fn pocket(w: &mut World) -> f32 {
         use crate::kinds::NodeKind;
         let (cx, cz) = w.agent_cell();
         for x in cx - 3..=cx + 2 {
-            plant(w, NodeKind::Tree, (x, cz - 1));
-            plant(w, NodeKind::Tree, (x, cz + 1));
+            plant(w, NodeKind::Boulder, (x, cz - 1));
+            plant(w, NodeKind::Boulder, (x, cz + 1));
         }
-        plant(w, NodeKind::Tree, (cx + 2, cz));
+        plant(w, NodeKind::Boulder, (cx + 2, cz));
         cell_center(cx - 3, cz).0
     }
 

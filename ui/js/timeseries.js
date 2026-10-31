@@ -1,4 +1,4 @@
-// 하단 '시계열' 탭: ts_forecast 의 이력 선 + P10~P90 띠 + P50 선을 캔버스에 그린다.
+// 기록·분석 모달의 '시계열 · SDS' 탭: ts_forecast 의 이력 선 + P10~P90 띠 + P50 선을 캔버스에 그린다.
 import { call } from './api.js';
 import { refreshSds } from './analysis.js';
 import { bus, state } from './state.js';
@@ -7,7 +7,7 @@ import { $, clear, cssVar, el, fitCanvas, fmt, observeResize } from './util.js';
 const REFRESH_MS = 5000;
 const FALLBACK = { vision: ['score', 'margin'], search: ['score'], motion: ['success'] };
 let hover = null; // 마우스가 가리키는 x 인덱스
-let bottomTab = 'log';
+let tab = null;
 let busy = false;
 
 function alpha(hex, a) {
@@ -212,11 +212,11 @@ export function initTimeseries() {
   $('ts-refresh').addEventListener('click', refreshForecast);
   bus.on('sds', syncSelectors);
   bus.on('tab', ({ group, name }) => {
-    if (group !== 'bottom') return;
-    bottomTab = name;
+    if (group !== 'analysis') return;
+    tab = name;
     if (name === 'ts') refreshSds().then(() => { syncSelectors(); refreshForecast(); });
   });
-  setInterval(() => { if (bottomTab === 'ts' && !document.hidden) refreshSds().then(() => { syncSelectors(); refreshForecast(); }); }, REFRESH_MS);
+  setInterval(() => { if (tab === 'ts' && !document.hidden) refreshSds().then(() => { syncSelectors(); refreshForecast(); }); }, REFRESH_MS);
   syncSelectors();
   draw();
   return refreshForecast();

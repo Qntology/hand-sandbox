@@ -1,4 +1,5 @@
-// 손·발 구성, 물체·파지 시험, 파지 결과, 발별 주행 비교. 기존 app.js 의 기능을 그대로 옮겼다.
+// 손·발 구성, 물체·파지 시험, 파지 결과, 발별 주행 비교(프리셋 Drop-up). 기존 app.js 의 기능을 그대로 옮겼다.
+// 손 구성은 월드 전체의 설정이고(state.config, 재생성 때 적용), 발은 고른 유닛의 초안이다(state.draftBase, ✅ 유닛에 적용 때 적용).
 // 같은 Tauri 커맨드(presets, hand_geometry, grasp_test, drive_courses, dictionary)를 같은 인자로 호출한다.
 import { call } from './api.js';
 import { bus, state } from './state.js';
@@ -66,6 +67,23 @@ function renderJointSelects() {
   }
 }
 
+const draftBase = () => state.draftBase ?? state.config.base;
+
+/** 측면도·비교표·물리 요약은 고르는 중인 발로 보인다. */
+function draftChanged() {
+  updateSummaries();
+  requestRefresh();
+  refreshDrive();
+  bus.emit('draft-base', draftBase());
+}
+
+/** 유닛을 고르면 그 유닛의 발을 초안으로 놓는다 (null 이면 월드의 발). */
+export function setDraftBase(base) {
+  state.draftBase = base;
+  for (const input of $('base-choices').querySelectorAll('input')) input.checked = input.value === draftBase();
+  draftChanged();
+}
+
 function renderBaseChoices() {
   const wrap = $('base-choices');
   clear(wrap);
@@ -74,12 +92,10 @@ function renderBaseChoices() {
     const sub = Number.isFinite(s.max_speed_mps)
       ? `최고 ${fmt.n(s.max_speed_mps, 1)} m/s · 경사 ${fmt.n(s.max_slope_deg, 0)}° · 턱 ${fmt.n(s.max_step_m * 100, 1)} cm`
       : '';
-    const input = el('input', { type: 'radio', name: 'base', value: s.kind, checked: s.kind === state.config.base });
+    const input = el('input', { type: 'radio', name: 'base', value: s.kind, checked: s.kind === draftBase() });
     input.addEventListener('change', () => {
-      state.config.base = input.value;
-      configChanged();
-      requestRefresh();
-      refreshDrive();
+      state.draftBase = input.value;
+      draftChanged();
     });
     wrap.append(el('label', { class: 'tree-item tree-item-2l' }, input,
       el('span', { class: 'tree-text' }, el('span', { class: 'tree-name', text: b.label_ko }), sub ? el('span', { class: 'tree-sub', text: sub }) : null)));
@@ -117,8 +133,8 @@ function configChanged() {
 function updateSummaries() {
   const j = state.config.joints;
   $('sum-hand').textContent = `${state.config.fingers}지 · ${j.segments}관절 · ${j.actuation.mode === 'coupled' ? `결합 ${fmt.n(j.actuation.ratio)}` : '직접'}`;
-  const base = state.presets?.bases.find((b) => b.base.kind === state.config.base);
-  $('sum-foot').textContent = base ? base.label_ko : state.config.base;
+  const base = state.presets?.bases.find((b) => b.base.kind === draftBase());
+  $('sum-foot').textContent = base ? base.label_ko : draftBase();
 }
 
 // ── 물체 ────────────────────────────────────────────────────────
@@ -188,7 +204,7 @@ async function refreshAll() {
 
 const refreshGeometry = coalesce(async () => {
   try {
-    state.geometry = await call('hand_geometry', { config: state.config, closure: Number($('closure').value) });
+    state.geometry = await call('hand_geometry', { config: { ...state.config, base: draftBase() }, closure: Number($('closure').value) });
     $('geom-note').textContent =
       `손가락 최대 도달 ${(state.geometry.reach_m * 100).toFixed(1)} cm · ` +
       `손바닥 ${(state.geometry.palm[0] * 100).toFixed(0)} × ${(state.geometry.palm[1] * 100).toFixed(0)} mm`;
@@ -203,7 +219,7 @@ const refreshGrasp = coalesce(async () => {
     state.grasp = null;
   } else {
     try {
-      state.grasp = await call('grasp_test', { config: state.config, payload: payload(), setup: setup() });
+      state.grasp = await call('grasp_test', { config: { ...state.config, base: draftBase() }, payload: payload(), setup: setup() });
     } catch {
       state.grasp = null;
     }
@@ -227,7 +243,7 @@ async function refreshDrive() {
   }
   for (const row of rows) {
     const r = table.insertRow();
-    if (row.base.kind === state.config.base) r.className = 'current';
+    if (row.base.kind === draftBase()) r.className = 'current';
     r.insertCell().textContent = row.label_ko;
     const pass = r.insertCell();
     pass.textContent = row.report.passable ? '통과' : '실패';
@@ -256,7 +272,7 @@ function renderGrasp() {
   clear(box);
   const g = state.grasp;
   if (!g) {
-    box.append(el('p', { class: 'empty-note', text: '파지 시뮬레이션을 켜면 결과가 표시됩니다. (손·발 측면도 화면의 \'물체 파지 시뮬레이션\')' }));
+    box.append(el('p', { class: 'empty-note', text: '위의 \'물체 파지 시뮬레이션\'을 켜면 결과가 표시됩니다.' }));
     $('sum-grasp').textContent = '시뮬레이션 꺼짐';
     return;
   }

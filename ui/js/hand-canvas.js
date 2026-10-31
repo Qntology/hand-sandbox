@@ -1,6 +1,6 @@
 // 손·발 2D 측면도 그리기. 기존 app.js 의 draw()/drawBase() 를 옮겼고,
-// 큰 화면과 PiP(작은 화면) 모두에서 같은 코드로 그리도록 선·점 크기를 캔버스 크기에 맞춰 줄인다.
-import { bus, state } from './state.js';
+// 프리셋 Drop-up 의 아코디언에서 어떤 크기로 열려도 선·점 크기를 캔버스 크기에 맞춰 줄인다.
+import { state } from './state.js';
 import { $, clamp, cssVar, fitCanvas, observeResize } from './util.js';
 
 function bounds(geom, grasp) {
@@ -42,7 +42,7 @@ function palette() {
   };
 }
 
-/** compact=true 이면 축 문구를 생략하고 여백을 줄인다(PiP). */
+/** compact=true 이면 축 문구를 생략하고 여백을 줄인다. */
 export function drawHandCanvas(canvas, { compact = false } = {}) {
   const fit = fitCanvas(canvas);
   if (!fit) return;
@@ -182,16 +182,11 @@ function drawBase(ctx, kind, X, Y, scale, C, lw) {
   }
 }
 
-/** 큰 캔버스와 PiP 를 모두 다시 그린다. 보이지 않는(크기 0) 캔버스는 건너뛴다. */
+/** 측면도를 다시 그린다. 아코디언이 접혀 크기가 0 이면 건너뛰고, 펼쳐지면 크기 변화로 다시 그린다. */
 export function redrawHand() {
-  const big = $('hand-canvas');
-  const pip = $('pip-canvas');
-  if (big) drawHandCanvas(big);
-  if (pip) drawHandCanvas(pip, { compact: true });
+  drawHandCanvas($('hand-canvas'));
 }
 
 export function initHandCanvas() {
   observeResize($('hand-canvas'), redrawHand);
-  observeResize($('pip-canvas'), redrawHand);
-  bus.on('tab', redrawHand);
 }

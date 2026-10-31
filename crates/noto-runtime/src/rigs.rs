@@ -1,7 +1,7 @@
-//! Robot presets: the built-in bodies and those saved from the CAD editor embedded in the app. The editor is a page in
-//! this app's own window; what comes back from it is a URDF and its meshes, measured into a body here (`noto_core::rig`)
-//! and kept in the runtime folder, so a saved robot is a preset like the others: it can be chosen, simulated, and
-//! opened again.
+//! Robot presets: the built-in bodies and those made by the AI edits (`mcp`). A made robot arrives as a URDF and its
+//! meshes, from a CAD package run out of sight in the web view or from the runtime's own export; it is measured into a
+//! body here (`noto_core::rig`) and kept in the runtime folder, so a saved robot is a preset like the others: it can be
+//! chosen, simulated and edited again.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -30,6 +30,8 @@ pub struct SavedRig {
 pub struct RigShelf {
     pub saved: Vec<SavedRig>,
     pub dir: Option<PathBuf>,
+    /// What each unit's next body would be, between a prompt and its commit.
+    pub pending: HashMap<u32, crate::mcp::PendingRig>,
 }
 
 /// The base models.
@@ -59,7 +61,13 @@ fn slug(name: &str) -> String {
     }
 }
 
-fn base64(bytes: &[u8]) -> String {
+/// The key a made robot's statistics go under: its id and a hash of its design, so a changed design starts afresh.
+pub(crate) fn sds_key(name: &str, design: &str) -> String {
+    let hash = design.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01B3));
+    format!("scraft:{}:{:08x}", slug(name), hash as u32)
+}
+
+pub(crate) fn base64(bytes: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len() / 3 * 4 + 4);
     for c in bytes.chunks(3) {
@@ -74,6 +82,10 @@ fn base64(bytes: &[u8]) -> String {
 
 fn body_for(build: Build, base: BaseKind) -> Body {
     Body::new(&BodyPlan { build, morph: noto_core::Morphology::humanoid(base), ..BodyPlan::standard() }, base, FingerCount::Five)
+}
+
+pub(crate) fn body_of(build: Build, base: BaseKind) -> Body {
+    body_for(build, base)
 }
 
 /// What the world asks of a body before it is sent out: does it stand, does it fit the doors, can it take a log.
@@ -142,14 +154,15 @@ fn load_folder(dir: &Path) -> Option<(String, String, HashMap<String, Vec<u8>>)>
 impl RigShelf {
     /// Loads the robots saved in `dir` (the runtime folder's `rigs`).
     pub fn open(dir: Option<PathBuf>) -> RigShelf {
-        let mut shelf = RigShelf { saved: Vec::new(), dir };
+        let mut shelf = RigShelf { saved: Vec::new(), dir, pending: HashMap::new() };
         let Some(root) = shelf.dir.clone() else { return shelf };
         let Ok(entries) = std::fs::read_dir(&root) else { return shelf };
         for e in entries.flatten() {
             let path = e.path();
             let Some((name, text, files)) = load_folder(&path) else { continue };
             let Ok(u) = urdf::parse(&text) else { continue };
-            let Ok(spec) = RigSpec::from_urdf(&u, &name, &files) else { continue };
+            let Ok(mut spec) = RigSpec::from_urdf(&u, &name, &files) else { continue };
+            spec.sds_key = std::fs::read_to_string(path.join("sds_key.txt")).ok().map(|k| k.trim().to_string());
             let form = spec.form;
             let id = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
             shelf.saved.push(SavedRig { id, name, rig_id: rig::register(spec), form, dir: Some(path) });
@@ -160,7 +173,7 @@ impl RigShelf {
 }
 
 impl Runtime {
-    fn rig_preset(&self, id: &str) -> Result<(Build, BaseKind), String> {
+    pub(crate) fn rig_preset(&self, id: &str) -> Result<(Build, BaseKind), String> {
         if let Some(p) = BUILT_IN.iter().find(|p| p.0 == id) {
             return Ok((p.3, p.4));
         }
@@ -168,15 +181,29 @@ impl Runtime {
         Ok((Build::Rig(s.rig_id), s.form.base()))
     }
 
+    /// The preset a body is, by id and name.
+    pub(crate) fn rig_name_of(&self, build: Build, base: BaseKind) -> (String, String) {
+        if let Some(p) = BUILT_IN.iter().find(|p| p.3 == build && p.4 == base) {
+            return (p.0.to_string(), p.1.to_string());
+        }
+        self.rigs.saved.iter().find(|r| Build::Rig(r.rig_id) == build).map_or((String::new(), String::new()), |r| (r.id.clone(), r.name.clone()))
+    }
+
     fn rig_list(&self) -> Value {
         let built: Vec<Value> = BUILT_IN.iter().map(|(id, name, note, build, base)| json!({"id": id, "name_ko": name, "note_ko": note, "build": build, "base": base_id(*base), "builtin": true})).collect();
-        let saved: Vec<Value> = self.rigs.saved.iter().map(|r| json!({"id": r.id, "name_ko": r.name, "note_ko": format!("{} · 편집기에서 저장", r.form.label_ko()), "build": Build::Rig(r.rig_id), "base": base_id(r.form.base()), "builtin": false})).collect();
+        let saved: Vec<Value> = self.rigs.saved.iter().map(|r| json!({"id": r.id, "name_ko": r.name, "note_ko": format!("{} · AI 수정", r.form.label_ko()), "build": Build::Rig(r.rig_id), "base": base_id(r.form.base()), "builtin": false})).collect();
         let current = BUILT_IN.iter().find(|p| p.3 == self.cfg.body.build && p.4 == self.cfg.noto.base).map(|p| p.0.to_string()).or_else(|| self.rigs.saved.iter().find(|r| Build::Rig(r.rig_id) == self.cfg.body.build).map(|r| r.id.clone()));
         json!({"presets": built.into_iter().chain(saved).collect::<Vec<_>>(), "current": current})
     }
 
     fn rig_import(&mut self, args: &Value) -> Result<Value, String> {
         let name = args.get("name").and_then(Value::as_str).filter(|n| !n.trim().is_empty()).unwrap_or("새 로봇").trim().to_string();
+        self.rig_import_as(&name, args, None)
+    }
+
+    /// Measures a URDF and its meshes into a preset called `name`, keeping its statistics under `sds_key`.
+    pub(crate) fn rig_import_as(&mut self, name: &str, args: &Value, sds_key: Option<String>) -> Result<Value, String> {
+        let name = name.to_string();
         let text = args.get("urdf").and_then(Value::as_str).ok_or("urdf 가 필요합니다")?;
         let mut files: HashMap<String, Vec<u8>> = HashMap::new();
         if let Some(m) = args.get("meshes").and_then(Value::as_object) {
@@ -186,14 +213,16 @@ impl Runtime {
             }
         }
         let u = urdf::parse(text)?;
-        let spec = RigSpec::from_urdf(&u, &name, &files)?;
+        let mut spec = RigSpec::from_urdf(&u, &name, &files)?;
+        spec.sds_key = sds_key.clone();
         let form = spec.form;
         let warnings = spec.warnings.clone();
         // Saving under a name that exists replaces that robot.
         let id = slug(&name);
         if let Some(i) = self.rigs.saved.iter().position(|r| r.id == id) {
             let old = self.rigs.saved.remove(i);
-            if Build::Rig(old.rig_id) != self.cfg.body.build {
+            let worn = Build::Rig(old.rig_id) == self.cfg.body.build || self.world.crew.iter().any(|w| w.body.plan.build == Build::Rig(old.rig_id));
+            if !worn {
                 rig::remove(old.rig_id);
             }
         }
@@ -204,6 +233,9 @@ impl Runtime {
             std::fs::create_dir_all(d).map_err(|e| format!("로봇 폴더를 만들 수 없습니다: {e}"))?;
             std::fs::write(d.join("robot.urdf"), text).map_err(|e| e.to_string())?;
             std::fs::write(d.join("name.txt"), &name).map_err(|e| e.to_string())?;
+            if let Some(k) = &sds_key {
+                std::fs::write(d.join("sds_key.txt"), k).map_err(|e| e.to_string())?;
+            }
             for (f, b) in &files {
                 std::fs::write(d.join(f), b).map_err(|e| e.to_string())?;
             }

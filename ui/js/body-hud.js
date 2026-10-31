@@ -1,7 +1,7 @@
-// 타르코프식 신체 상태 HUD: 인라인 SVG 실루엣 7영역 + 부위 목록 + 상태 효과 칩.
-// 데이터는 sim_step / body_status 의 BodyStatus. 모든 문자열은 textContent 로만 넣는다.
+// 타르코프식 신체 상태 HUD(우측 유닛 HUD 윗부분): 인라인 SVG 실루엣 7영역 + 부위 목록 + 상태 효과 칩.
+// 데이터는 sim_step / body_status 의 BodyStatus 와 units_list. 모든 문자열은 textContent 로만 넣는다.
 import { bus, state } from './state.js';
-import { $, clear, el, fmt, LEVEL_KO, svgEl } from './util.js';
+import { $, clear, el, fmt, LEVEL_KO, levelOf, svgEl } from './util.js';
 import { refreshTooltip } from './layout.js';
 import { resetBody } from './world-panel.js';
 
@@ -121,6 +121,44 @@ function highlight(partId, on) {
   r.li.classList.toggle('hl', on);
 }
 
+// ── 고른 유닛 ───────────────────────────────────────────────────
+/** 서브 작업자는 런타임이 부위별 BodyStatus 를 주지 않는다: units_list 로 아는 배터리·적재만 채우고 나머지는 '—' 로 둔다. */
+function subBody(u) {
+  const part = (id, ratio, value, max, detail) => ({ id, ratio, value, max, level: levelOf(ratio), detail });
+  const parts = [];
+  if (Number.isFinite(u.battery_ratio)) parts.push(part('thorax', u.battery_ratio, u.battery_ratio * 100, 100, `배터리 ${fmt.pct(u.battery_ratio)}`));
+  if (u.capacity_kg > 0) parts.push(part('stomach', 1 - u.carried_kg / u.capacity_kg, u.carried_kg, u.capacity_kg, `적재 ${fmt.n(u.carried_kg, 1)} / ${fmt.n(u.capacity_kg, 1)} kg`));
+  return { parts, effects: [] };
+}
+
+const BASE_KO = { human_foot: '사람 발', wheel: '4륜 바퀴', mecanum: '메카넘', track: '트랙' };
+
+/** 고른 유닛의 머리글과 요약 줄. 최초 작업자는 body_status 의 전체 지표, 서브 작업자는 아는 값만. */
+function renderUnit() {
+  const id = state.selectedUnit;
+  const u = id == null ? null : state.unitInfo.get(id) ?? state.units.find((x) => x.id === id) ?? null;
+  $('bh-title').textContent = id == null ? '🦾 유닛 신체 상태' : `🦾 유닛 #${id} 신체 상태`;
+  const box = clear($('bh-unit'));
+  const sub = !!u && !u.first;
+  $('bh-note').textContent = sub
+    ? '서브 작업자는 부위별 신체 지표를 측정하지 않아 배터리·적재만 보입니다.'
+    : '로봇의 손은 1개입니다. 양쪽 팔 영역은 해부학적 좌우가 아니라 손의 두 지표(파지·관절)입니다.';
+  $('bh-reset').hidden = sub;
+  $('body-effects').hidden = sub;
+  if (u) {
+    const rows = [
+      ['체형', `${u.rig_name_ko ?? u.label_ko ?? u.form}`],
+      ['발 · 카메라', `${BASE_KO[u.base] ?? u.base ?? '—'} · ${u.cameras === 2 ? '2캠 SGBM' : '1캠 TIPSv2'}`],
+      ['지금', u.status_ko ?? '—'],
+    ];
+    // 실린 물건은 프레임의 units 에만 온다(탑뷰). 없으면 줄을 두지 않는다.
+    const load = state.units.find((x) => x.id === id)?.load ?? [];
+    if (load.length) rows.push(['적재', load.map((l) => `${l.label_ko} ×${l.count}`).join(', ')]);
+    box.append(...rows.flatMap(([k, v]) => [el('span', { class: 'k', text: k }), el('span', { class: 'v', text: v })]));
+  }
+  render(sub ? subBody(u) : state.body);
+}
+
 export function initBodyHud() {
   build();
   render(null);
@@ -131,12 +169,6 @@ export function initBodyHud() {
   });
   hud.addEventListener('mouseleave', () => { for (const id of refs.keys()) highlight(id, false); });
   $('bh-reset').addEventListener('click', () => resetBody());
-  $('bh-toggle').addEventListener('click', () => {
-    const folded = hud.classList.toggle('folded');
-    $('bh-toggle').setAttribute('aria-expanded', String(!folded));
-    $('bh-toggle').setAttribute('aria-label', folded ? '신체 상태 펼치기' : '신체 상태 접기');
-    $('bh-toggle').textContent = folded ? '▸' : '▾';
-  });
-  bus.on('body', render);
-  if (state.body) render(state.body);
+  for (const ev of ['body', 'unit', 'unit-info']) bus.on(ev, renderUnit);
+  renderUnit();
 }

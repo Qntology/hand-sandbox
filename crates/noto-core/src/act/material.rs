@@ -55,6 +55,32 @@ pub fn pad_on(item: ItemMaterial) -> Friction {
     Friction { mean, cov: PAD_MU_COV }
 }
 
+/// An item on bare steel, the tines of a lift truck (static, kinetic) [추정: handbook ranges for dry contact].
+pub fn on_steel(item: ItemMaterial) -> (Friction, Friction) {
+    let s = match item {
+        ItemMaterial::Wood => 0.45,
+        ItemMaterial::Stone => 0.50,
+        ItemMaterial::Coal => 0.45,
+        ItemMaterial::IronOre => 0.55,
+        ItemMaterial::Cardboard => 0.35,
+    };
+    let share = if item == ItemMaterial::Cardboard { CARDBOARD_KINETIC_SHARE } else { KINETIC_SHARE };
+    (Friction { mean: s, cov: GROUND_SLIDE_COV }, Friction { mean: share * s, cov: GROUND_SLIDE_COV })
+}
+
+/// One piece of an item on another of the same kind (static, kinetic) [추정].
+pub fn on_itself(item: ItemMaterial) -> (Friction, Friction) {
+    let s = match item {
+        ItemMaterial::Wood => 0.40,
+        ItemMaterial::Stone => 0.60,
+        ItemMaterial::Coal => 0.45,
+        ItemMaterial::IronOre => 0.60,
+        ItemMaterial::Cardboard => 0.40,
+    };
+    let share = if item == ItemMaterial::Cardboard { CARDBOARD_KINETIC_SHARE } else { KINETIC_SHARE };
+    (Friction { mean: s, cov: GROUND_SLIDE_COV }, Friction { mean: share * s, cov: GROUND_SLIDE_COV })
+}
+
 pub const GROUND_SLIDE_COV: f32 = 0.10;
 pub const KINETIC_SHARE: f32 = 0.9;
 pub const CARDBOARD_KINETIC_SHARE: f32 = 0.75;

@@ -1,12 +1,12 @@
-// 게임 채팅줄 같은 명령 입력: Enter → command_submit, 한 줄 결과/오류, ↑↓ 기록.
-// 뷰포트 툴바의 '테스트 실행'도 같은 submitCommand 를 쓴다. '자동 기록'이 켜져 있으면 명령이
-// 통합 테스트로 기록되고(지금 월드에서 1 게임 → 2 ML 인식 → 3 ML 결정), 기록 중에 낸 명령은 차례를 기다린다.
+// 게임 채팅줄 같은 일체형 명령 입력: Enter → command_submit, 한 줄 결과/오류, ↑↓ 기록.
+// '기록'이 켜져 있으면 명령이 통합 테스트로 기록되고(지금 월드에서 1 게임 → 2 ML 인식 → 3 ML 결정), 기록 중에 낸 명령은 차례를 기다린다.
+// 유닛을 고른 동안에는 같은 줄이 AI(MCP) 3D 외형 수정 프롬프트로 바뀐다(unit-select.js 가 입력 칸을 바꾸고, 제출은 rig-mcp.js 로 간다).
 import { call } from './api.js';
 import { bus, state } from './state.js';
 import { $, fmt, storageGet, storageSet } from './util.js';
 import { refreshQuests, setPlaying } from './sim.js';
-import { selectCenterTab } from './layout.js';
-import { setStatus } from './toast.js';
+import { cmdToast, setStatus } from './toast.js';
+import { submitRigPrompt } from './rig-mcp.js';
 
 const HISTORY_KEY = 'noto-sandbox.cmd-history';
 const ACTION_KO = {
@@ -19,7 +19,6 @@ let history = [];
 let idx = 0;
 let draft = '';
 let busy = false;
-let toastTimer = null;
 
 export function describeDestination(d) {
   if (!d) return null;
@@ -34,16 +33,6 @@ export function summarize(p) {
   if (p.item_label_ko || p.item_id) parts.push(`${p.item_label_ko ?? p.item_id}${p.count != null ? ` ×${p.count}` : ''}`);
   const dest = describeDestination(p.destination);
   return dest ? `${parts.join(' · ')} → ${dest}` : parts.join(' · ');
-}
-
-function showToast(kind, text) {
-  const t = $('cmd-toast');
-  t.hidden = false;
-  t.className = `cmd-toast ${kind}`;
-  t.textContent = text;
-  t.title = text;
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { t.hidden = true; }, kind === 'err' ? 9000 : 7000);
 }
 
 /** 통합 테스트 기록(게임 → ML 인식 → ML 결정)은 로봇 한 대의 통과를 다시 돌리므로 서브 작업자가 없을 때만. */
@@ -68,38 +57,37 @@ export async function submitCommand(raw, opts = {}) {
       let msg = `${head} · 신뢰도 ${fmt.pct(r.parsed?.confidence ?? NaN)} · ${MODE_KO[r.mode] ?? r.mode}`;
       if (r.recording) msg += ' · 통합 테스트 기록 중';
       if (!opts.quietHistory) pushHistory(text);
-      if (!r.stopped && $('tl-cmd')) $('tl-cmd').value = text;
       await refreshQuests();
       if (!state.playing && (r.quest_id || r.queued || r.recording)) {
         setPlaying(true);
         msg += ' · 재생 시작';
       }
-      showToast('ok', msg);
+      cmdToast('ok', msg);
       setStatus(`명령 실행: ${summarize(r.parsed)}${splitNote}`);
     } else {
-      showToast('err', `✕ ${r.error ?? '명령을 해석하지 못했습니다'}`);
+      cmdToast('err', `✕ ${r.error ?? '명령을 해석하지 못했습니다'}`);
     }
     return r;
   } catch (e) {
-    showToast('err', `✕ ${e.message}`);
+    cmdToast('err', `✕ ${e.message}`);
     setStatus(`command_submit: ${e.message}`, true);
     return null;
   }
 }
 
-async function submit(raw) {
-  const text = raw.trim();
+/** 입력 칸의 문장을 보내는 동안 줄을 잠그고, 성공하면 비운다. */
+async function submitFrom(input, send) {
+  const text = input.value.trim();
   if (!text || busy) return;
   busy = true;
   $('command-send').disabled = true;
-  $('command-input').readOnly = true;
+  input.readOnly = true;
   try {
-    const r = await submitCommand(text);
-    if (r?.ok) $('command-input').value = '';
+    const r = await send(text);
+    if (r?.ok) input.value = '';
   } finally {
     busy = false;
     $('command-send').disabled = false;
-    const input = $('command-input');
     input.readOnly = false;
     input.focus();
   }
@@ -128,8 +116,18 @@ function onKeydown(e) {
     input.value = idx === history.length ? draft : history[idx];
     input.setSelectionRange(input.value.length, input.value.length);
   } else if (e.key === 'Escape') {
-    if (input.value) input.value = '';
-    else input.blur();
+    escapeInput(e);
+  }
+}
+
+/** ESC: 글이 있으면 지우기만 하고(판을 닫거나 선택을 풀지 않는다), 없으면 입력을 떠나 전역 ESC 로 넘긴다. */
+function escapeInput(e) {
+  const input = e.currentTarget;
+  if (input.value) {
+    input.value = '';
+    e.stopPropagation();
+  } else {
+    input.blur();
   }
 }
 
@@ -141,10 +139,13 @@ export function initCommandBar() {
   }
   idx = history.length;
   const input = $('command-input');
+  const rig = $('rig-input');
   input.addEventListener('keydown', onKeydown);
+  rig.addEventListener('keydown', (e) => { if (!e.isComposing && e.key === 'Escape') escapeInput(e); });
   $('command-bar').addEventListener('submit', (e) => {
     e.preventDefault();
-    submit(input.value);
+    if (state.selectedUnit != null) submitFrom(rig, (text) => submitRigPrompt(state.selectedUnit, text));
+    else submitFrom(input, submitCommand);
   });
   // 게임처럼 Enter 나 / 로 입력줄에 바로 포커스
   document.addEventListener('keydown', (e) => {
@@ -153,7 +154,6 @@ export function initCommandBar() {
     const a = document.activeElement;
     if (a && a !== document.body && !a.matches?.('canvas, .gcode-console')) return;
     e.preventDefault();
-    selectCenterTab('world');
-    input.focus();
+    (state.selectedUnit != null ? rig : input).focus();
   });
 }

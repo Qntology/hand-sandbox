@@ -8,6 +8,7 @@ pub mod fusion;
 pub mod locate;
 pub mod pyramid;
 pub mod sam;
+pub mod stairs;
 mod sam_decoder;
 pub mod stereo;
 pub mod tips;

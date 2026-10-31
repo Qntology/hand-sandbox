@@ -35,14 +35,14 @@ export const state = {
   teamSize: 1,
   activeRobot: 1,
   crew: null,
-  centerTab: 'world',
   mock: false,
   playing: false,
   speed: 1,
-  toggles: { boxes: true, path: true, oracle: false, body: true, quest: true, pip: true },
+  toggles: { cctv: true, boxes: true, path: true, oracle: false },
 
   terrain: 'rugged',
   worldConfigKey: null,
+  worldPlanKey: null,
   snapshot: null,
   frame: null,
   detections: [],
@@ -58,4 +58,10 @@ export const state = {
   device: null,
   models: null,
   modelCatalog: null,
+
+  selectedUnit: null, // 월드에서 고른 유닛 id (없으면 null)
+  units: [], // world_frame.units: 탑뷰 프레임 위 로봇 (u, v 는 프레임 안 0..1)
+  unitInfo: new Map(), // units_list: id → 배터리·체형까지 든 항목
+  draftBase: null, // 프리셋 Drop-up 에서 고른 발 (적용 전)
+  rigChecks: [], // 프리셋 Drop-up 에서 고른 체형의 투입 전 검사
 };

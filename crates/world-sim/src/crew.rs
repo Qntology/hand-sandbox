@@ -1,10 +1,11 @@
 //! Sub-workers (서브 작업자): robots added around the first worker (the world's `agent`, worker 1) that share its world —
 //! the trees they fell, the drops they pick up, the loading bay they stage at, the waypoints they stock. Each runs a
-//! lighter simulation than the first worker: it plans on the same terrain and clearance map with its own base
-//! (`BaseKind::spec`, its body's footprint), moves along that plan at the plan's own edge times, swings at a node at
-//! the first worker's mining rate per hand, and picks up, stages and delivers in fixed times — no joint dynamics, no
-//! camera frames of its own. The runtime's crew dispatcher (`noto-runtime::crew`) hands out the jobs; the heavy vision
-//! pipeline runs for one robot at a time, so a crew costs about one robot's vision.
+//! lighter simulation than the first worker where the work is concerned: it swings at a node at the first worker's
+//! mining rate per hand, and picks up, stages and delivers in fixed times — no joint dynamics, no camera frames of its
+//! own. On the move it is no lighter. It plans on its own clearance map with its own base and follows that plan on the
+//! first worker's code (`world::turns`): the same checks against what it can hit, the same collisions, the same load
+//! coming off in the same corners. The runtime's crew dispatcher (`noto-runtime::crew`) hands out the jobs; the heavy
+//! vision pipeline runs for one robot at a time, so a crew costs about one robot's vision.
 //!
 //! A loading bay (상차장) is a waypoint whose deliveries become drops on the ground in a row of slots in front of it:
 //! where humanoids put down what they harvested and a lift truck's tines take it from.
@@ -22,7 +23,7 @@ use crate::render::Obb;
 use crate::snapshot::{drop_id, node_id, waypoint_id, CarryView};
 use crate::terrain::cell_center;
 use crate::world::traffic::{self, Rider, RiderPhase};
-use crate::world::{add_stock, DropItem, TimedEvent, Waypoint, World, WorldEvent, AMOUNT_EPS, DELIVER_REACH_M, MINE_REACH_M, PICKUP_REACH_M};
+use crate::world::{add_stock, CargoRide, DropItem, MoveState, Stride, TimedEvent, WalkState, Waypoint, World, WorldEvent, AMOUNT_EPS, DELIVER_REACH_M, MINE_REACH_M, PICKUP_REACH_M};
 
 /// At most this many sub-workers (with the first worker, nine robots on one map).
 pub const CREW_MAX: usize = 8;
@@ -124,13 +125,6 @@ impl Job {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct Leg {
-    x: f32,
-    z: f32,
-    s: f32,
-}
-
 #[derive(Clone, Debug)]
 pub struct Worker {
     pub id: u32,
@@ -160,12 +154,14 @@ pub struct Worker {
     pub held_by: Option<u32>,
     pub reroutes: u32,
     felled: Option<String>,
-    spec: BaseSpec,
+    pub(crate) spec: BaseSpec,
     pub(crate) footprint: Footprint,
-    route: Vec<Leg>,
-    leg: usize,
-    leg_t: f32,
-    from: (f32, f32),
+    /// The move it is on.
+    pub(crate) mv: Option<MoveState>,
+    pub walk: WalkState,
+    pub ride: CargoRide,
+    pub stride: Stride,
+    pub fallen_until: Option<f64>,
     work_left_s: f32,
 }
 
@@ -197,16 +193,39 @@ impl Worker {
             spec,
             footprint: Footprint::of(&body),
             body,
-            route: Vec::new(),
-            leg: 0,
-            leg_t: 0.0,
-            from: (x, z),
+            mv: None,
+            walk: WalkState::default(),
+            ride: CargoRide::default(),
+            stride: Stride::default(),
+            fallen_until: None,
             work_left_s: 0.0,
         }
     }
 
+    /// Puts it in another body where it stands. The job it was on stops.
+    pub(crate) fn rebody(&mut self, plan: BodyPlan, base: BaseKind, fingers: FingerCount) {
+        self.body = Body::new(&BodyPlan { morph: Morphology::humanoid(base), ..plan }, base, fingers);
+        self.form = Form::of_base(base);
+        self.spec = base.spec();
+        self.capacity_kg = self.body.drive_limits(&self.spec, 0.0).capacity_kg;
+        self.footprint = Footprint::of(&self.body);
+        self.walk = WalkState::default();
+        self.ride = CargoRide::default();
+        self.stride = Stride::default();
+        self.mv = None;
+        self.rider = None;
+        self.job = Job::Idle;
+        self.outcome = Some((false, "몸이 바뀌어 하던 일을 멈춤".into()));
+        self.speed_mps = 0.0;
+    }
+
     pub fn carried_kg(&self) -> f32 {
         self.carried.iter().map(|(k, n)| k.spec().mass_kg * n).sum()
+    }
+
+    /// Its outline on the ground (`clear::Footprint`).
+    pub fn footprint(&self) -> Footprint {
+        self.footprint
     }
 
     pub fn carried_count(&self) -> f32 {
@@ -238,9 +257,10 @@ impl Worker {
         let d = &self.body.dims;
         let carrying = !self.carried.is_empty();
         if carrying {
-            p.shoulder_deg = [38.0, 38.0];
-            p.elbow_deg = [62.0, 62.0];
-            p.closure = 0.8;
+            let held = noto_core::act::cocarry::carry_pose(&self.body, noto_core::act::cocarry::carry_hand_z(&self.body));
+            p.shoulder_deg = held.shoulder_deg;
+            p.elbow_deg = held.elbow_deg;
+            p.closure = held.closure;
         }
         if self.speed_mps > 0.01 && self.form == Form::Humanoid {
             let stride = 0.34 * d.hip_m;
@@ -249,7 +269,7 @@ impl Worker {
             let reach = 0.5 * stride;
             p.feet = [[reach * s, (0.06 * d.k * c).max(0.0)], [-reach * s, (-0.06 * d.k * c).max(0.0)]];
             p.hip[0] = 0.0;
-            p.hip[1] = d.hip_m - 0.03 * d.k;
+            p.hip[1] = d.hip_m - 0.03 * d.k - self.stride.crouch_m;
             if !carrying {
                 p.shoulder_deg = [-22.0 * s, 22.0 * s];
                 p.elbow_deg = [18.0, 18.0];
@@ -269,7 +289,8 @@ impl Worker {
             if !self.rider.is_some_and(|r| r.off()) {
                 v.extend(rig::rider_parts(&self.body, &pose, &palette));
             }
-            v.extend(rig::fork_parts(&self.body, if self.carried.is_empty() { self.body.dims.fork_rest_m } else { self.body.dims.fork_carry_m }));
+            let travelling = self.mv.is_some() || !self.carried.is_empty();
+            v.extend(rig::fork_parts(&self.body, if travelling { self.body.dims.fork_carry_m } else { self.body.dims.fork_rest_m }));
             v
         };
         let level = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
@@ -277,11 +298,12 @@ impl Worker {
             let size = item.spec().size_m;
             let n = self.carried_count().ceil().clamp(1.0, 4.0);
             let half = [0.5 * size[2], 0.5 * size[0], 0.5 * n * size[1]];
+            let shift = self.ride.state.shift;
             let center = if self.form == Form::Forklift {
-                [noto_core::act::fork::load_x(&self.body, size[2]), 0.0, self.body.dims.fork_carry_m + self.body.dims.tine_t_m + half[2]]
+                [noto_core::act::fork::load_x(&self.body, size[2]) + shift[0], shift[1], self.body.dims.fork_carry_m + self.body.dims.tine_t_m + half[2]]
             } else {
                 let r = kin::solve_fast(&self.body, &pose, &KinLoads::default());
-                [0.5 * (r.hands[0][0] + r.hands[1][0]) + half[0], 0.0, 0.5 * (r.hands[0][2] + r.hands[1][2]) + half[2]]
+                [0.5 * (r.hands[0][0] + r.hands[1][0]) + half[0] + shift[0], shift[1], 0.5 * (r.hands[0][2] + r.hands[1][2]) + half[2]]
             };
             parts.push(rig::VisualPart { solid: Solid::Box, center, axes: level, half, color: item.spec().color });
         }
@@ -340,6 +362,7 @@ impl World {
     pub fn add_crew(&mut self, forms: &[Form], cameras: u8) -> Vec<u32> {
         let mut ids = Vec::new();
         let blocked = self.blocked_cells();
+        let map = self.clear_map();
         let start = self.terrain.cell_of(self.agent.x, self.agent.z).unwrap_or((0, 0));
         for &form in forms {
             if self.crew.len() >= CREW_MAX {
@@ -362,6 +385,10 @@ impl World {
                     let (x, z) = (self.agent.x + r * a.cos(), self.agent.z + r * a.sin());
                     let c = self.terrain.cell_of(x, z)?;
                     if blocked.contains(&c) || taken.iter().any(|&(tx, tz, tr)| (tx - x).hypot(tz - z) < (my_r + tr + 0.2).max(1.0)) {
+                        return None;
+                    }
+                    let (px, pz) = cell_center(c.0, c.1);
+                    if fp.room(&map, px, pz, self.agent.yaw) < clear::TOUCH_GAP_M {
                         return None;
                     }
                     nav::plan(&spec, &self.terrain, &|cx, cz| blocked.contains(&(cx, cz)), start, Goal::Cell(c))?;
@@ -391,6 +418,19 @@ impl World {
         crew.len()
     }
 
+    /// Takes one sub-worker off the map; what it carried goes down where it stood.
+    pub fn remove_worker(&mut self, id: u32) -> bool {
+        let Some(i) = self.crew.iter().position(|w| w.id == id) else { return false };
+        let w = self.crew.remove(i);
+        for (k, n) in &w.carried {
+            if *n > AMOUNT_EPS {
+                let d = DropItem { amount: *n, ..DropItem::whole(self.next_drop_id(), *k, w.x, w.z) };
+                self.drops.push(d);
+            }
+        }
+        true
+    }
+
     pub fn crew_worker(&self, id: u32) -> Option<&Worker> {
         self.crew.iter().find(|w| w.id == id)
     }
@@ -403,11 +443,12 @@ impl World {
     pub fn crew_command(&mut self, id: u32, job: Job) -> Result<(), String> {
         let route = match &job {
             Job::Go { x, z, reach_m } => {
-                let w = self.crew_worker(id).ok_or_else(|| format!("작업자 {id}가 없습니다"))?;
+                let i = self.crew.iter().position(|w| w.id == id).ok_or_else(|| format!("작업자 {id}가 없습니다"))?;
+                let w = &self.crew[i];
                 if (w.x - x).hypot(w.z - z) <= *reach_m {
-                    Some(Vec::new())
+                    None
                 } else {
-                    Some(self.crew_route(w, *x, *z, *reach_m).ok_or_else(|| format!("작업자 {id}: ({x:.1}, {z:.1})로 가는 길이 없습니다"))?)
+                    Some(self.crew_route(i, *x, *z, *reach_m).ok_or_else(|| format!("작업자 {id}: ({x:.1}, {z:.1})로 가는 길이 없습니다"))?)
                 }
             }
             _ => None,
@@ -417,7 +458,8 @@ impl World {
         let check = match &job {
             Job::Mine { node } => self.node(*node).map(|n| (n.x - wx).hypot(n.z - wz) <= if w.form == Form::Forklift { traffic::rider_reach_m(&w.body) } else { MINE_REACH_M + 0.35 }).ok_or("unknown_target"),
             Job::Pick { drop } => self.drop_item(*drop).map(|d| (d.x - wx).hypot(d.z - wz) <= if w.form == Form::Forklift { (PICKUP_REACH_M + 1.2).max(noto_core::act::fork::standoff_x(&w.body, 0.5) + 0.3) } else { PICKUP_REACH_M + 0.35 }).ok_or("unknown_target"),
-            Job::Deliver { waypoint } | Job::Stage { bay: waypoint } => self.waypoint(*waypoint).map(|p| (p.x - wx).hypot(p.z - wz) <= DELIVER_REACH_M + 0.6).ok_or("unknown_target"),
+            // A lift truck sets a load down at the end of its tines.
+            Job::Deliver { waypoint } | Job::Stage { bay: waypoint } => self.waypoint(*waypoint).map(|p| (p.x - wx).hypot(p.z - wz) <= (DELIVER_REACH_M + 0.6).max(if w.form == Form::Forklift { w.footprint.front_m + 0.3 } else { 0.0 })).ok_or("unknown_target"),
             _ => Ok(true),
         };
         match check {
@@ -437,10 +479,7 @@ impl World {
             _ => None,
         };
         let w = self.crew_worker_mut(id).expect("looked up above");
-        w.route = route.unwrap_or_default();
-        w.leg = 0;
-        w.leg_t = 0.0;
-        w.from = (w.x, w.z);
+        w.mv = route;
         w.work_left_s = work;
         w.outcome = None;
         w.held_s = 0.0;
@@ -461,41 +500,11 @@ impl World {
         self.crew_worker_mut(id)?.outcome.take()
     }
 
-    fn crew_route(&self, w: &Worker, x: f32, z: f32, reach_m: f32) -> Option<Vec<Leg>> {
+    fn crew_route(&mut self, i: usize, x: f32, z: f32, reach_m: f32) -> Option<MoveState> {
+        let w = &self.crew[i];
         let start = self.terrain.cell_of(w.x, w.z)?;
         let robots = self.still_robot_cells(&[w.id, traffic::RIDER_ID + w.id], Some(start), w.footprint.half_w_m + 0.15);
-        self.crew_route_avoiding(w, x, z, reach_m, &robots).or_else(|| self.crew_route_avoiding(w, x, z, reach_m, &std::collections::HashSet::new()))
-    }
-
-    fn crew_route_avoiding(&self, w: &Worker, x: f32, z: f32, reach_m: f32, extra: &std::collections::HashSet<(usize, usize)>) -> Option<Vec<Leg>> {
-        let mut blocked = self.blocked_cells();
-        blocked.extend(extra.iter().copied());
-        let map = self.clear_map();
-        let start = self.terrain.cell_of(w.x, w.z)?;
-        let plan = [clear::MIN_GAP_M, clear::TIGHT_GAP_M].into_iter().find_map(|gap| {
-            let room = nav::Room { map: &map, need_m: w.footprint.half_w_m + gap, soft_m: w.footprint.half_w_m + clear::COMFORT_GAP_M };
-            nav::plan_room(&w.spec, &self.terrain, &|cx, cz| blocked.contains(&(cx, cz)), Some(&room), start, Goal::Within { x, z, reach_m }, None)
-        })?;
-        let mut legs: Vec<Leg> = plan
-            .edges
-            .iter()
-            .map(|e| {
-                let (cx, cz) = cell_center(e.to.0, e.to.1);
-                Leg { x: cx, z: cz, s: (e.move_time_s + e.pause_s).max(0.05) }
-            })
-            .collect();
-        // The last leg ends at the reach circle around the goal rather than at the cell's centre.
-        if let Some(last) = legs.last_mut() {
-            let (dx, dz) = (last.x - x, last.z - z);
-            let d = dx.hypot(dz);
-            if d > reach_m && d > 1e-3 {
-                let k = (d - reach_m * 0.9) / d;
-                let (px, pz) = (x + dx * (1.0 - k), z + dz * (1.0 - k));
-                last.x = px;
-                last.z = pz;
-            }
-        }
-        Some(legs)
+        self.worker_move(i, x, z, reach_m, &robots).or_else(|| self.worker_move(i, x, z, reach_m, &std::collections::HashSet::new()))
     }
 
     /// Advances every sub-worker by `dt`.
@@ -516,51 +525,42 @@ impl World {
             w.outcome = Some((ok, what));
             w.job = Job::Idle;
             w.speed_mps = 0.0;
-            w.route.clear();
+            w.mv = None;
         };
+        if self.crew[i].fallen_until.is_some_and(|t| self.time_s < t) {
+            self.crew[i].speed_mps = 0.0;
+            return;
+        }
+        if !matches!(job, Job::Go { .. }) {
+            self.crew[i].ride.at_rest();
+        }
         match job {
             Job::Idle => self.crew[i].speed_mps = 0.0,
             Job::Park { x, z } => {
-                let w = &mut self.crew[i];
-                w.speed_mps = 0.0;
-                let want = (z - w.z).atan2(x - w.x);
-                let turn = wrap(want - w.yaw).clamp(-1.2 * dt, 1.2 * dt);
-                w.yaw = wrap(w.yaw + turn);
+                self.crew[i].speed_mps = 0.0;
+                self.crew_turn_to(i, x, z, dt);
             }
             Job::Go { x, z, reach_m } => {
                 if self.crew_hold(i, dt, (x, z, reach_m), events) {
                     return;
                 }
+                let Some(mut m) = self.crew[i].mv.take() else {
+                    finish(&mut self.crew[i], true, "도착".into());
+                    return;
+                };
+                let was = (self.crew[i].x, self.crew[i].z);
+                let step = self.worker_step(i, &mut m, dt, events);
                 let w = &mut self.crew[i];
-                let mut left = dt;
-                while left > 1e-6 && w.leg < w.route.len() {
-                    let leg = w.route[w.leg];
-                    let step = (leg.s - w.leg_t).min(left);
-                    w.leg_t += step;
-                    left -= step;
-                    let k = (w.leg_t / leg.s).clamp(0.0, 1.0);
-                    let (nx, nz) = (w.from.0 + (leg.x - w.from.0) * k, w.from.1 + (leg.z - w.from.1) * k);
-                    let moved = (nx - w.x).hypot(nz - w.z);
-                    if moved > 1e-4 {
-                        w.yaw = (nz - w.z).atan2(nx - w.x);
-                    }
-                    w.x = nx;
-                    w.z = nz;
-                    w.energy_j += w.spec.power_w as f64 * step as f64;
-                    w.speed_mps = moved / step.max(1e-3);
-                    w.walked_m += moved;
-                    if w.leg_t >= leg.s - 1e-6 {
-                        w.leg += 1;
-                        w.leg_t = 0.0;
-                        w.from = (leg.x, leg.z);
-                    }
+                w.walked_m += (w.x - was.0).hypot(w.z - was.1);
+                if step.lost {
+                    let d = self.drops.last().map_or(String::new(), |d| drop_id(d.id));
+                    finish(&mut self.crew[i], false, format!("cargo_lost:{d}"));
+                    return;
                 }
-                if w.leg >= w.route.len() {
-                    let want = (z - w.z).atan2(x - w.x);
-                    if (x - w.x).hypot(z - w.z) > 0.05 {
-                        w.yaw = want;
-                    }
-                    finish(w, true, "도착".into());
+                match step.done {
+                    Some((true, _)) => finish(w, true, "도착".into()),
+                    Some((false, why)) => finish(w, false, why.unwrap_or_else(|| "blocked".into())),
+                    None => w.mv = Some(m),
                 }
             }
             Job::Mine { node } if self.crew[i].rider.is_some() => self.crew_rider_step(i, node, dt, events),
@@ -570,8 +570,8 @@ impl World {
                     return;
                 };
                 let (nx, nz) = (n.x, n.z);
+                self.crew_turn_to(i, nx, nz, dt);
                 let w = &mut self.crew[i];
-                w.yaw = (nz - w.z).atan2(nx - w.x);
                 w.energy_j += WORK_POWER_W * dt as f64;
                 // The first worker's rate for five fingers, a hand per robot.
                 let rate = 1.0f32;
@@ -646,17 +646,30 @@ impl World {
         }
     }
 
+    /// Turns a standing sub-worker toward (`x`, `z`) at a walker's pace, as far as its body has room to swing.
+    fn crew_turn_to(&mut self, i: usize, x: f32, z: f32, dt: f32) {
+        let w = &self.crew[i];
+        let turn = wrap((z - w.z).atan2(x - w.x) - w.yaw).clamp(-1.2 * dt, 1.2 * dt);
+        if turn.abs() < 1e-4 {
+            return;
+        }
+        let yaw = wrap(w.yaw + turn);
+        if self.as_worker(i, |world| world.pose_check().clear(world.agent.x, world.agent.z, yaw)) {
+            self.crew[i].yaw = yaw;
+        }
+    }
+
     /// The way-ahead check of a sub-worker on the move: a robot its eye sees in its way stops it; one that stays has
     /// it route round (a humanoid sooner than a lift truck). True while it waits.
     fn crew_hold(&mut self, i: usize, dt: f32, goal: (f32, f32, f32), events: &mut Vec<TimedEvent>) -> bool {
         let w = &self.crew[i];
         let (id, form) = (w.id, w.form);
-        let dir = match w.route.get(w.leg) {
-            Some(l) if (l.x - w.x).hypot(l.z - w.z) > 1e-3 => (l.z - w.z).atan2(l.x - w.x),
+        let path: Vec<(f32, f32)> = w.mv.as_ref().map_or(Vec::new(), |m| m.follow.ahead());
+        let dir = match path.first() {
+            Some(l) if (l.0 - w.x).hypot(l.1 - w.z) > 1e-3 => (l.1 - w.z).atan2(l.0 - w.x),
             _ => w.yaw,
         };
         let me = traffic::Looker { id, at: (w.x, w.z), dir, half_w: w.footprint.half_w_m, front: w.footprint.front_m, speed: w.spec.max_speed_mps.min(1.0), eye_m: w.eye_m() };
-        let path: Vec<(f32, f32)> = w.route[w.leg.min(w.route.len())..].iter().map(|l| (l.x, l.z)).collect();
         let Some((other, gap)) = self.robot_in_way(&me, &path) else {
             let w = &mut self.crew[i];
             w.held_s = 0.0;
@@ -689,21 +702,20 @@ impl World {
             // Blocked every way round: the move fails, and whoever gave it picks another target.
             w.outcome = Some((false, format!("작업자 {other}에 막혀 갈 길이 없음")));
             w.job = Job::Idle;
-            w.route.clear();
+            w.mv = None;
             return true;
         }
-        let snapshot = w.clone();
-        let start = self.terrain.cell_of(snapshot.x, snapshot.z);
-        let mut extra = self.still_robot_cells(&[id, traffic::RIDER_ID + id], start, snapshot.footprint.half_w_m + 0.15);
+        let (start, half) = (self.terrain.cell_of(w.x, w.z), w.footprint.half_w_m);
+        let mut extra = self.still_robot_cells(&[id, traffic::RIDER_ID + id], start, half + 0.15);
         let others: Vec<u32> = self.robot_outlines().iter().map(|o| o.id).filter(|o| *o != other).collect();
-        extra.extend(self.robot_cells(&others, start, snapshot.footprint.half_w_m + 0.15, false));
-        let route = self.crew_route_avoiding(&snapshot, goal.0, goal.1, goal.2, &extra);
+        extra.extend(self.robot_cells(&others, start, half + 0.15, false));
+        let route = self.worker_move(i, goal.0, goal.1, goal.2, &extra);
         let w = &mut self.crew[i];
         w.held_s = 0.0;
         // Counted whether a way round turned up or not: a robot that stays and leaves none ends the move above.
         w.reroutes += 1;
         if let Some(r) = route {
-            (w.route, w.leg, w.leg_t, w.from) = (r, 0, 0.0, (w.x, w.z));
+            w.mv = Some(r);
             events.push(self.stamp(WorldEvent::Hold { worker: id, other, gap_m: gap, label: format!("작업자 {other}이(가) 비키지 않아 돌아가는 길로 다시 계획") }));
         }
         true
@@ -973,7 +985,8 @@ mod tests {
         assert_eq!(w.crew[0].carried_count(), 2.0);
         let wh = w.waypoint_by_key("warehouse").map(|p| (p.id, p.x, p.z)).unwrap();
         w.crew_command(id, Job::Go { x: wh.1, z: wh.2, reach_m: DELIVER_REACH_M - 0.3 }).unwrap();
-        assert!(run(&mut w, id, 200.0).0, "drove to the warehouse");
+        let (ok, why) = run(&mut w, id, 200.0);
+        assert!(ok, "drove to the warehouse: {why} at {:?}", (w.crew[0].x, w.crew[0].z));
         w.crew_command(id, Job::Deliver { waypoint: wh.0 }).unwrap();
         assert!(run(&mut w, id, 5.0).0);
         assert_eq!(w.waypoint(wh.0).unwrap().stock_of(ItemKind::Log), 2.0);

@@ -1,4 +1,4 @@
-// 하단 '통합 테스트' 탭: 게임 로직 → ML 로직 통합 테스트를 영상 편집기처럼 보여 준다.
+// 기록·분석 모달의 '통합 테스트' 탭: 게임 로직 → ML 로직 통합 테스트를 영상 편집기처럼 보여 준다.
 //   1줄 게임: 고정 간격 키프레임 (게임 로직이 퀘스트를 수행하며 촬영)
 //   행위: 행위의 물리 순간(접촉 · 들림 · 미끄러짐 · 충격 · 넘어짐 …)마다 찍은 키프레임 — 위 칸 게임, 아래 칸 ML 결정
 //   시각: 로봇이 본 때(패턴 · 행위 직전 · 기억이 흐려 응시)와 보지 않고 기억으로 한 행위, 믿음 위치 오차(보라 선)
@@ -7,7 +7,7 @@
 //   4줄 SDS: 키프레임마다 트랙별(깊이·위치·추적·결정·혼합·밸런스·행위) z-점수
 // '보기' 선택에서 1인칭 대신 부위(손 모양 · 손 관절 · 발 모양 · 발 관절 · 허리 · 목 관절 · 바퀴 · 트랙)를 고르면
 // 1·3줄과 행위 줄의 칸이 그 순간의 부위 그림(키프레임의 FocusFrame)으로 바뀌어, 움직이는 부위를 키프레임마다 따라갈 수 있다.
-// 명령은 위 뷰포트 툴바(tl-cmd · 테스트 실행 · 중지)나 월드 화면 입력줄에서 낸다. '자동 기록'이 켜져 있으면
+// 명령은 하단 입력줄(#command-bar)에서 낸다. '기록'이 켜져 있으면
 // 재생 루프(sim_step)가 기록을 진행시키고, 응답의 test 요약이 바뀔 때마다 test_status 로 줄을 다시 그린다.
 // 이미지는 보이는 칸만 test_keyframe 으로 받는다.
 import { call } from './api.js';
@@ -36,7 +36,6 @@ const KIND_KO = { search: '탐색 회전', triangulate: '삼각 측량', approac
 const TILE_W = 96;
 
 let status = null;
-let busy = false; // 명령 요청이 오가는 중
 let lastBrief = ''; // sim_step 응답의 test 요약 (바뀌면 test_status 를 다시 받는다)
 let fetching = false;
 let finishedId = null; // 끝난 기록의 DB 미러를 한 번만
@@ -122,7 +121,7 @@ function renderLanes() {
   if (!status?.active) {
     lanes.game.append(el('div', { class: 'tl-empty', text: state.mock
       ? '통합 테스트는 실제 Rust 런타임에서만 동작합니다. 개발 서버(cargo run -p noto-runtime --example serve)나 Tauri 앱에서 여세요.'
-      : '위 툴바의 명령 칸이나 월드 화면 입력줄에 명령을 넣고 실행하세요. "자동 기록"이 켜져 있으면 재생하는 동안 1 게임(지금 월드에서 촬영) → 2 ML 인식 → 3 ML 결정(명령을 시작한 순간의 월드를 복제해 다시 수행)이 저절로 쌓입니다.' }));
+      : '하단 입력줄에 명령을 넣고 실행하세요. "🔴 기록"이 켜져 있으면 재생하는 동안 1 게임(지금 월드에서 촬영) → 2 ML 인식 → 3 ML 결정(명령을 시작한 순간의 월드를 복제해 다시 수행)이 저절로 쌓입니다.' }));
     return;
   }
   observer = new IntersectionObserver(onVisible, { root: $('tl-scroll'), rootMargin: '0px 200px' });
@@ -470,11 +469,10 @@ function renderToolbar() {
     for (const [k, v] of [['깊이', m.depth], ['위치', m.locate], ['추적', m.track]]) modes.append(el('span', { class: `tl-chip ${String(v).startsWith('stand-in') ? 'stand' : 'real'}`, text: `${k} ${v}` }));
     modes.append(el('span', { class: `tl-chip ${m.ttm ? 'real' : ''}`, text: m.ttm ? 'TTM 연결' : 'TTM 없음(융합만)' }));
   }
-  $('tl-run').disabled = busy;
   renderLive(null);
 }
 
-// 뷰포트 툴바의 기록 표시: ● 기록 중 · 단계 · 키프레임 수 · 대기 명령
+// 퀘스트 헤더 옆의 기록 표시: ● 기록 중 · 단계 · 키프레임 수 · 대기 명령 (누르면 이 탭이 열린다)
 function renderLive(brief) {
   const box = $('tl-live');
   const b = brief ?? (status?.active ? { active: true, live: status.live, phase: status.phase, game: status.game?.keyframes?.length ?? 0, decide: status.decide?.keyframes?.length ?? 0, perceived: status.perceive?.done ?? 0 } : null);
@@ -489,21 +487,6 @@ function renderLive(brief) {
     ? `기록 완료 · 게임 ${b.game} · 결정 ${b.decide}${q}`
     : `${PHASE_KO[b.phase] ?? b.phase} · 게임 ${b.game}${b.phase !== 'game' ? ` · 분석 ${b.perceived}` : ''}${b.phase === 'decide' ? ` · 결정 ${b.decide}` : ''}${q}`;
   box.title = b.command ? `기록 중인 명령: ${b.command}` : '';
-}
-
-/** 툴바 '테스트 실행': 툴바 명령 칸의 문장을 입력줄과 같은 길(command_submit + 자동 기록)로 낸다. */
-async function runFromToolbar() {
-  const text = $('tl-cmd').value.trim();
-  if (!text || busy) return;
-  if (state.mock && $('tl-record').checked) toast('실제 런타임 필요', '통합 테스트 기록은 개발 서버나 Tauri 앱에서만 됩니다. 명령만 실행합니다.', 'warn');
-  busy = true;
-  renderToolbar();
-  try {
-    await submitCommand(text);
-  } finally {
-    busy = false;
-    renderToolbar();
-  }
 }
 
 async function cancel() {
@@ -565,21 +548,13 @@ async function mirrorDb(quiet) {
 
 export function initTestTimeline() {
   build();
-  $('tl-run').addEventListener('click', runFromToolbar);
   $('tl-stop').addEventListener('click', cancel);
-  $('tl-cmd').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); runFromToolbar(); }
-  });
   bus.on('sim-test', onSimTest);
   bus.on('command', (c) => { if (c?.recording || c?.queued) refreshStatus(true); });
   bus.on('world-new', () => { status = null; cache.clear(); sel = null; renderLanes(); renderToolbar(); });
   renderToolbar();
   bus.on('tab', ({ group, name }) => {
-    if (group !== 'bottom' || name !== 'test') return;
-    // 네 줄과 검사기가 보이도록 하단 패널을 넉넉히 연다.
-    const root = document.documentElement;
-    const h = parseFloat(getComputedStyle(root).getPropertyValue('--bottom-h')) || 220;
-    if (h < 380) root.style.setProperty('--bottom-h', `${Math.min(460, Math.round(window.innerHeight * 0.48))}px`);
+    if (group !== 'analysis' || name !== 'test') return;
     if (!status && !state.mock) call('test_status', {}, { quiet: true }).then((s) => { status = s; renderLanes(); renderToolbar(); }).catch(() => {});
   });
 }

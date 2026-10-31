@@ -175,8 +175,10 @@ pub fn along(p: Pose2, seg: &Seg, u: f32) -> Pose2 {
         Seg::Pivot { angle } => (x, z, yaw + angle * u),
         Seg::Drive { dir, kappa, len } => {
             let s = dir * len * u;
-            if kappa.abs() < 1e-6 {
-                (x + s * yaw.cos(), z + s * yaw.sin(), yaw)
+            let bend = kappa * s;
+            if bend.abs() < 1e-3 {
+                // Nearly straight: the two ends of the arc below would be the same number in f32, and it would not move.
+                (x + s * (yaw + 0.5 * bend).cos(), z + s * (yaw + 0.5 * bend).sin(), yaw + bend)
             } else {
                 let y1 = yaw + kappa * s;
                 (x + (y1.sin() - yaw.sin()) / kappa, z - (y1.cos() - yaw.cos()) / kappa, y1)
@@ -313,6 +315,16 @@ mod tests {
 
     fn spec(kind: BaseKind, mass: f32) -> BaseSpec {
         BaseSpec { mass_kg: Some(mass), ..kind.spec() }
+    }
+
+    #[test]
+    fn a_nearly_straight_arc_goes_as_far_as_it_says() {
+        // A base pulling away: millimetres at a time, on a heading a turn left all but exact.
+        let (x0, z0, yaw) = (17.2f32, 5.99f32, 0.973f32);
+        for kappa in [0.0, 5e-6, -5e-6, 1e-3, 0.5] {
+            let (x, z, _) = along((x0, z0, yaw), &Seg::Drive { dir: 1.0, kappa, len: 0.006 }, 1.0);
+            assert!(((x - x0).hypot(z - z0) - 0.006).abs() < 2e-5, "{kappa}: {x} {z}");
+        }
     }
 
     #[test]

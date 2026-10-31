@@ -1,6 +1,6 @@
 @echo off
 rem =====================================================================
-rem  Fetches the SolidCraft web package this app embeds: the official
+rem  Fetches the SolidCraft web package AI edits run out of sight: the official
 rem  release, pinned by version and SHA-256, unpacked to ui/vendor/solidcraft.
 rem  SolidCraft is MIT OR Apache-2.0; its licences and NOTICE come with it.
 rem =====================================================================

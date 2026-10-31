@@ -41,6 +41,8 @@ pub const PARK_BEHIND_M: f32 = 1.4;
 pub const FORK_REACH_M: f32 = 1.1;
 /// A team quest that has not moved on for this long fails (s).
 pub const STALL_S: f64 = 420.0;
+/// How many trips in a row may end with the way shut before a lane gives up.
+const MAX_LANE_SHUT: u32 = 6;
 const NOTES_MAX: usize = 60;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +144,9 @@ pub struct Lane {
     pub picks: Vec<u32>,
     #[serde(skip)]
     avoid: HashSet<u32>,
+    /// Trips in a row that ended with the way shut.
+    #[serde(skip)]
+    shut: u32,
     pub note: String,
 }
 
@@ -200,7 +205,7 @@ pub struct Crew {
 
 impl Lane {
     pub fn idle(worker: u32, form: Form) -> Lane {
-        Lane { worker, form, role: Role::Solo, quest: None, stage: Stage::Idle, item: None, want: 0, done: 0.0, dest: None, picks: Vec::new(), avoid: HashSet::new(), note: String::new() }
+        Lane { worker, form, role: Role::Solo, quest: None, stage: Stage::Idle, item: None, want: 0, done: 0.0, dest: None, picks: Vec::new(), avoid: HashSet::new(), shut: 0, note: String::new() }
     }
 }
 
@@ -383,7 +388,7 @@ impl Runtime {
                     let _ = q.start(tick);
                 }
                 if let Some(lane) = self.crew.lanes.get_mut(&w) {
-                    *lane = Lane { role: Role::Solo, quest: Some(id.clone()), stage: Stage::Idle, item: Some(item), want: share, done: 0.0, dest: dest_id, picks: Vec::new(), avoid: HashSet::new(), note: String::new(), ..lane.clone() };
+                    *lane = Lane { role: Role::Solo, quest: Some(id.clone()), stage: Stage::Idle, item: Some(item), want: share, done: 0.0, dest: dest_id, picks: Vec::new(), avoid: HashSet::new(), shut: 0, note: String::new(), ..lane.clone() };
                 }
             }
         }
@@ -459,7 +464,7 @@ impl Runtime {
         for lane in self.crew.lanes.values_mut() {
             let role = if lane.form == Form::Humanoid { Role::Harvester } else { Role::Hauler };
             let stage = if role == Role::Hauler { Stage::ToPark } else { Stage::Idle };
-            *lane = Lane { role, quest: Some(qid.clone()), stage, item: Some(item), want: 0, done: 0.0, dest: Some(dest_id), picks: Vec::new(), avoid: HashSet::new(), note: String::new(), ..lane.clone() };
+            *lane = Lane { role, quest: Some(qid.clone()), stage, item: Some(item), want: 0, done: 0.0, dest: Some(dest_id), picks: Vec::new(), avoid: HashSet::new(), shut: 0, note: String::new(), ..lane.clone() };
         }
         let ids = self.world.crew.iter().map(|w| w.id).collect::<Vec<_>>();
         for id in ids {
@@ -496,6 +501,9 @@ impl Runtime {
                 && self.world.nodes.iter().all(|n| (n.x - x).hypot(n.z - z) > 0.8)
                 && self.world.ground_at(self.world.terrain.cell_of(x, z).unwrap_or((0, 0))) != world_sim::Ground::Water
         };
+        let truck = self.world.crew.iter().find(|w| w.form == Form::Forklift).map_or(&self.world.body, |w| &w.body);
+        // Where a truck can park and turn round if there is such a place; a tight one only when there is none.
+        for room_to_turn in [true, false] {
         for &(nx, nz, _) in sources.iter().take(6) {
             let toward = (dz - nz).atan2(dx - nx);
             for r in [2.4f32, 3.0, 3.6] {
@@ -511,7 +519,7 @@ impl Runtime {
                     });
                     let behind = self.park_behind();
                     let park = (bx - fx * behind, bz - fz * behind);
-                    if !(clear(bx, bz) && row && clear(park.0, park.1)) {
+                    if !(clear(bx, bz) && row && clear(park.0, park.1)) || (room_to_turn && !self.world.turns_clear(truck, park.0, park.1)) {
                         continue;
                     }
                     let goal = Goal::Within { x: park.0, z: park.1, reach_m: 0.4 };
@@ -520,6 +528,7 @@ impl Runtime {
                     }
                 }
             }
+        }
         }
         None
     }
@@ -674,6 +683,7 @@ impl Runtime {
             return;
         }
         self.team_events(events);
+        self.spilled(events);
         let ids: Vec<u32> = self.crew.lanes.keys().copied().collect();
         for id in ids {
             if self.world.crew_worker(id).is_none() {
@@ -684,6 +694,24 @@ impl Runtime {
         }
         self.main_role_step();
         self.team_flow();
+    }
+
+    /// A load that came off is to be fetched again by whoever lost it, and is no longer on anyone's count.
+    fn spilled(&mut self, events: &[TimedEvent]) {
+        for te in events {
+            let WorldEvent::CargoLost { worker, amount, drop, .. } = &te.event else { continue };
+            let id: Option<u32> = drop.get(1..).and_then(|s| s.parse().ok());
+            let role = if *worker == 1 { self.crew.team.as_ref().map(|t| t.main_role) } else { self.crew.lanes.get(worker).map(|l| l.role) };
+            if let (Some(lane), Some(d)) = (self.crew.lanes.get_mut(worker), id) {
+                lane.picks.insert(0, d);
+            }
+            if let (Some(t), Some(role)) = (self.crew.team.as_mut(), role) {
+                match role {
+                    Role::Harvester => t.harvested = (t.harvested - amount).max(0.0),
+                    _ => t.loaded = (t.loaded - amount).max(0.0),
+                }
+            }
+        }
     }
 
     /// The first worker's part, read off its own events: what it picked up, put down at the bay, delivered.
@@ -798,11 +826,15 @@ impl Runtime {
                 let bay = self.crew.team.as_ref().map(|t| t.bay);
                 match bay.map(|b| self.world.crew_command(id, Job::Stage { bay: b })) {
                     Some(Ok(())) => lane.stage = Stage::Staging,
-                    _ => lane.stage = Stage::Idle,
+                    _ => {
+                        lane.shut += 1;
+                        lane.stage = Stage::Idle;
+                    }
                 }
             }
             (Stage::Staging, Some((true, ids))) => {
                 let n = parse_drops(&ids).len() as f32;
+                lane.shut = 0;
                 lane.done += n;
                 if let Some(t) = self.crew.team.as_mut() {
                     t.staged += n;
@@ -816,23 +848,51 @@ impl Runtime {
                     lane.stage = Stage::Delivering;
                     self.lane_quest_to(&lane, StepKind::Deliver, None);
                 }
-                _ => lane.stage = Stage::Idle,
+                _ => {
+                    lane.shut += 1;
+                    lane.stage = Stage::Idle;
+                }
             },
             (Stage::Delivering, Some((true, place))) => {
+                lane.shut = 0;
                 lane.done += self.moved_by(id);
                 self.note(id, "인도", format!("{place}에 {} 인도 ({}/{})", item.spec().label_ko, lane.done, lane.want));
                 lane.stage = Stage::Idle;
             }
-            (Stage::ToBay, Some((false, why))) | (Stage::ToDest, Some((false, why))) | (Stage::Staging, Some((false, why))) | (Stage::Delivering, Some((false, why))) => {
+            // The way ended short of the place: it may reach from there.
+            (Stage::ToDest, Some((false, why))) => match lane.dest.map(|w| self.world.crew_command(id, Job::Deliver { waypoint: w })) {
+                Some(Ok(())) => {
+                    lane.stage = Stage::Delivering;
+                    self.lane_quest_to(&lane, StepKind::Deliver, None);
+                }
+                _ => {
+                    lane.shut += 1;
+                    lane.note = why;
+                    lane.stage = Stage::Idle;
+                }
+            },
+            (Stage::ToBay, Some((false, why))) | (Stage::Staging, Some((false, why))) | (Stage::Delivering, Some((false, why))) => {
+                lane.shut += 1;
                 lane.note = why;
                 lane.stage = Stage::Idle;
             }
             _ => {}
         }
+        if lane.shut > MAX_LANE_SHUT {
+            lane.shut = 0;
+            self.fail_lane(id, &mut lane, "길이 막혀 더 갈 수 없습니다");
+        }
         if lane.stage == Stage::Idle {
             self.lane_next(id, &mut lane, step, reach_pick);
         }
         self.crew.lanes.insert(id, lane);
+    }
+
+    /// How near a place a sub-worker goes to put something down: a lift truck sets it down at the end of its tines, so
+    /// it need not squeeze in among whoever else stands there.
+    fn place_reach(&self, id: u32) -> f32 {
+        let tines = self.world.crew_worker(id).filter(|w| w.form == Form::Forklift).map_or(0.0, |w| w.footprint().front_m - 0.3);
+        (DELIVER_REACH_M - 0.4).max(tines)
     }
 
     /// How much a sub-worker's last delivery or staging put down.
@@ -854,7 +914,7 @@ impl Runtime {
             // Carry what it has to the bay once full, out of drops to pick, or once the team has enough.
             if carried > 0.0 && (!room || lane.picks.is_empty() || !more) {
                 if let Some((bx, bz)) = self.world.waypoint(team.bay).map(|p| (p.x, p.z)) {
-                    if self.world.crew_command(id, Job::Go { x: bx, z: bz, reach_m: DELIVER_REACH_M - 0.4 }).is_ok() {
+                    if self.world.crew_command(id, Job::Go { x: bx, z: bz, reach_m: self.place_reach(id) }).is_ok() {
                         lane.stage = Stage::ToBay;
                         return;
                     }
@@ -902,7 +962,7 @@ impl Runtime {
         let need = lane.want as f32 - lane.done;
         if carried > 0.0 && (carried >= need - 1e-3 || !room || lane.picks.is_empty()) {
             if let Some((x, z)) = lane.dest.and_then(|w| self.world.waypoint(w)).map(|p| (p.x, p.z)) {
-                match self.world.crew_command(id, Job::Go { x, z, reach_m: DELIVER_REACH_M - 0.4 }) {
+                match self.world.crew_command(id, Job::Go { x, z, reach_m: self.place_reach(id) }) {
                     Ok(()) => {
                         lane.stage = Stage::ToDest;
                         self.lane_quest_to(lane, StepKind::Carry, None);
@@ -998,9 +1058,7 @@ impl Runtime {
                 lane.stage = Stage::Parked;
             }
             (Stage::ToDest, Some((true, _))) => {
-                if self.world.crew_command(id, Job::Deliver { waypoint: team.dest }).is_ok() {
-                    lane.stage = Stage::Delivering;
-                }
+                lane.stage = if self.world.crew_command(id, Job::Deliver { waypoint: team.dest }).is_ok() { Stage::Delivering } else { Stage::Parked };
             }
             (Stage::Delivering, Some((true, _))) => {
                 let n = self.moved_by(id);
@@ -1017,7 +1075,12 @@ impl Runtime {
                 }
                 return;
             }
-            (Stage::ToDest, Some((false, why))) | (Stage::Delivering, Some((false, why))) => {
+            (Stage::ToDest, Some((false, why))) if self.world.crew_command(id, Job::Deliver { waypoint: team.dest }).is_err() => {
+                lane.note = why;
+                lane.stage = Stage::Parked;
+            }
+            (Stage::ToDest, Some((false, _))) => lane.stage = Stage::Delivering,
+            (Stage::Delivering, Some((false, why))) => {
                 lane.note = why;
                 lane.stage = Stage::Parked;
             }
@@ -1035,7 +1098,7 @@ impl Runtime {
                 }
             } else if carried > 0.0 && (lane.picks.is_empty() || !room) {
                 let (x, z) = self.world.waypoint(team.dest).map(|p| (p.x, p.z)).unwrap_or_default();
-                if self.world.crew_command(id, Job::Go { x, z, reach_m: DELIVER_REACH_M - 0.4 }).is_ok() {
+                if self.world.crew_command(id, Job::Go { x, z, reach_m: self.place_reach(id) }).is_ok() {
                     lane.stage = Stage::ToDest;
                     self.note(id, "⑥ 운반", format!("{} {carried}개를 싣고 {}로", team.item.spec().label_ko, team.dest_ko));
                 }

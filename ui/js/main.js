@@ -10,7 +10,7 @@ import { initVisionUpload } from './vision-upload.js';
 import { initDataPanel } from './data-panel.js';
 import { initDevice } from './device.js';
 import { initModels, modelsReady } from './models.js';
-import { initSim, newWorld } from './sim.js';
+import { initSim } from './sim.js';
 import { initWorldPanel } from './world-panel.js';
 import { initWorldView } from './world-view.js';
 import { initWorldMap } from './world-map.js';
@@ -24,7 +24,13 @@ import { initTimeseries } from './timeseries.js';
 import { initTestTimeline } from './test-timeline.js';
 import { initPresets } from './presets.js';
 import { initCrewPanel } from './crew-panel.js';
-import { initRigEditor } from './rig-editor.js';
+import { initOverlays } from './overlays.js';
+import { initAnalysisModal } from './analysis-modal.js';
+import { initUnitSelect } from './unit-select.js';
+import { initUnitHud } from './unit-hud.js';
+import { initUnitPreset } from './unit-preset.js';
+import { initCctv } from './cctv.js';
+import { initCctvZoom } from './cctv-zoom.js';
 
 const recentErrors = new Map();
 
@@ -56,14 +62,14 @@ async function main() {
   const mock = await initApi();
   $('sb-mock').hidden = !mock;
   document.body.dataset.backend = mock ? 'mock' : 'tauri';
-  if (mock) {
-    document.title = 'Noto 물류 로봇 시뮬레이터 (모의 백엔드)';
-    window.__notoSandbox = { state, bus }; // 브라우저 개발·스모크 테스트용
-  }
+  if (mock) document.title = 'Noto 물류 로봇 시뮬레이터 (모의 백엔드)';
+  if (mock || window.__devServer) window.__notoSandbox = { state, bus }; // 브라우저 개발·스모크 테스트용
   wireErrors();
   showVersion();
 
   initLayout();
+  initOverlays();
+  initAnalysisModal();
   initHandCanvas();
   initBodyHud();
   initQuestPanel();
@@ -77,10 +83,14 @@ async function main() {
   initDepthView();
   initTimeseries();
   initTestTimeline();
+  initUnitSelect();
+  initUnitHud();
+  initCctv();
+  initCctvZoom();
 
   // 손·발 프리셋이 있어야 월드 생성(NotoConfig 전달)과 PiP 가 의미가 있으므로 먼저 기다린다.
   await initHandPanel().catch(() => {});
-  await Promise.allSettled([initDevice(), initDataPanel(), initLogs(), initPresets(), initRigEditor()]);
+  await Promise.allSettled([initDevice(), initDataPanel(), initLogs(), initPresets(), initUnitPreset()]);
   // 필수 모델(SigLIP2 · TTM · TIPSv2 · SAM)이 장치에 올라가기 전에는 월드를 만들지 않는다.
   await initModels().catch(() => {});
   await modelsReady();

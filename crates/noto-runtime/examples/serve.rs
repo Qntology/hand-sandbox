@@ -14,7 +14,8 @@ const SHIM: &str = r#"<script>
   const WORLD = new Set(['world_new','sim_step','world_frame','command_submit','quest_list','perception_scan','body_status','sds_status','ts_forecast','log_tail','models_status',
     'test_start','test_step','test_status','test_keyframe','test_video','test_stats','test_cancel','body_presets','body_plan_eval','body_plan_set','world_body','test_db_mirror',
     'inventory_drop','world_reset','body_reset','world_terrain','nn_status','physics_status','depth_view',
-    'crew_add','crew_clear','crew_mode','crew_status','camera_rig','rig_presets','rig_design','rig_import','rig_keep_design','rig_validate','rig_apply','rig_delete']);
+    'crew_add','crew_clear','crew_remove','crew_mode','crew_status','camera_rig','rig_presets','rig_design','rig_import','rig_keep_design','rig_validate','rig_apply','rig_delete',
+    'units_list','unit_frame','unit_apply','rig_prompt','rig_edit','rig_params','rig_commit']);
   let mock = null;
   window.__TAURI__ = { core: { invoke: async (cmd, args) => {
     if (!WORLD.has(cmd)) {
@@ -96,6 +97,15 @@ fn handle(mut s: TcpStream, ui: &Path, rt: &Mutex<Runtime>) {
     }
 
     if method == "POST" {
+        if path == "/mcp" {
+            let call = |name: &str, args: &Value| match rt.lock() {
+                Ok(mut r) => r.api_call(name, args),
+                Err(_) => Err("월드 잠금이 깨졌습니다".to_string()),
+            };
+            let (status, out) = noto_runtime::mcp::http_reply(&call, headers.get("origin").map(String::as_str), &body);
+            respond(&mut s, status, "application/json", &out);
+            return;
+        }
         if let Some(cmd) = path.strip_prefix("/invoke/") {
             let args: Value = if body.is_empty() { Value::Null } else { serde_json::from_slice(&body).unwrap_or(Value::Null) };
             let result = if cmd == "test_db_mirror" {
@@ -154,7 +164,7 @@ fn main() -> anyhow::Result<()> {
     let rt = Arc::new(Mutex::new(Runtime::new(RuntimeConfig::default(), &lexicon, Some(&data_dir))?));
     let ui = Arc::new(ui.canonicalize()?);
     let listener = TcpListener::bind(("127.0.0.1", port))?;
-    println!("http://127.0.0.1:{port}/  (ui: {}, 로그·SDS: {})", ui.display(), data_dir.display());
+    println!("http://127.0.0.1:{port}/  (ui: {}, 로그·SDS: {})  MCP: POST http://127.0.0.1:{port}/mcp", ui.display(), data_dir.display());
     for conn in listener.incoming().flatten() {
         let (rt, ui) = (Arc::clone(&rt), Arc::clone(&ui));
         thread::spawn(move || handle(conn, &ui, &rt));

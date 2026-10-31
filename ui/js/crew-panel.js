@@ -1,7 +1,7 @@
-// 작업자 · 협업 트랙: 최초 작업자 주위에 서브 작업자 N명을 추가하고(crew_add), 명령을 나누는 방식(트랙)을 고른다.
+// 작업자 · 협업 트랙: 좌상단 소환 줄에서 최초 작업자 주위에 서브 작업자를 놓고(crew_add), 명령을 나누는 방식(트랙)을 고른다.
 //   개별 트랙 — 명령 수량을 작업자 수로 나눠 각자 탐색 → 채취 → 줍기 → 운반 → 인도 (작업자마다 퀘스트 하나).
 //   협업 트랙 — ① 편성 ② 상차장 ③ 채취(휴머노이드) ④ 적치 ⑤ 상차(지게차 포크) ⑥ 운반 ⑦ 인도를 한 퀘스트로.
-// 오른쪽 '협업 플로우'에는 단계별 수와 작업자별 레인, 흐름 기록을 그린다. 같은 모듈이 눈의 카메라 대수
+// 퀘스트 Drop-up 의 '협업 단계'에는 단계별 수와 작업자별 레인, 흐름 기록을 그린다. 같은 모듈이 최초 작업자의 카메라 대수
 // (1대 단안 TIPSv2 · 2대 스테레오 SGBM, camera_rig)도 맡는다.
 import { call } from './api.js';
 import { bus, state } from './state.js';
@@ -59,7 +59,7 @@ function renderFlow(v) {
   clear(box);
   const t = v?.team;
   if (!v || (!t && !(v.count > 0))) {
-    box.append(el('p', { class: 'hint', text: '작업자를 추가하면 여기에 협업 흐름이 보입니다. 왼쪽 "작업자 · 협업 트랙"에서 인원과 트랙을 고르세요.' }));
+    box.append(el('p', { class: 'hint', text: '작업자를 소환하면 여기에 협업 흐름이 보입니다. 좌상단 ➕ 소환 줄에서 작업자를 놓고 트랙을 고르세요.' }));
     $('sum-flow').textContent = '';
     return;
   }
@@ -108,15 +108,6 @@ function renderFlow(v) {
   $('sum-flow').textContent = t ? `${fmt.n(t.counts?.delivered ?? 0, 0)}/${t.want}${t.done ? ' 완료' : ''}` : v.mode_ko;
 }
 
-function syncToolbar(v) {
-  const btn = $('tg-coop-agent');
-  if (!btn) return;
-  const n = (v?.count ?? 0) + 1;
-  btn.textContent = `작업자 ${n}명 · ${v?.mode === 'team' ? '협업' : '개별'}`;
-  btn.classList.toggle('active', n > 1);
-  btn.setAttribute('aria-pressed', n > 1 ? 'true' : 'false');
-}
-
 function apply(v) {
   if (!v) return;
   state.crew = v;
@@ -125,7 +116,6 @@ function apply(v) {
   if ($('crew-mode') && v.mode) $('crew-mode').value = v.mode;
   renderList(v);
   renderFlow(v);
-  syncToolbar(v);
   bus.emit('crew', v);
 }
 
@@ -138,15 +128,13 @@ export async function refreshCrew({ force = false } = {}) {
   return pending;
 }
 
-async function addCrew() {
-  const btn = $('crew-add');
+async function addCrew(btn, form) {
   btn.disabled = true;
   try {
-    const count = Math.max(1, Math.min(8, Math.floor(Number($('crew-count').value) || 1)));
-    const r = await call('crew_add', { count, form: $('crew-form').value, cameras: Number($('pp-cameras')?.value || 1), mode: $('crew-mode').value });
+    const r = await call('crew_add', { count: 1, form, cameras: Number($('pp-cameras')?.value || 1), mode: $('crew-mode').value });
     if (r?.snapshot) bus.emit('snapshot', r.snapshot);
     apply(r?.crew);
-    const added = (r?.crew?.workers ?? []).filter((w) => !w.first).slice(-count).map((w) => `${w.id}(${FORM_KO[w.form] ?? w.form})`).join(', ');
+    const added = (r?.crew?.workers ?? []).filter((w) => !w.first).slice(-1).map((w) => `${w.id}(${FORM_KO[w.form] ?? w.form})`).join(', ');
     toast('작업자 추가', `최초 작업자 주위에 ${added} — ${r?.crew?.mode_ko ?? ''}`, 'ok');
     setStatus(`서브 작업자 ${r?.crew?.count ?? 0}명 · ${r?.crew?.mode_ko ?? ''}`);
   } catch {
@@ -167,6 +155,17 @@ async function clearCrew() {
   }
 }
 
+/** 서브 작업자 하나 제거 (CCTV 말풍선의 🗑). */
+export async function removeCrew(id) {
+  try {
+    await call('crew_remove', { id });
+    toast('작업자', `서브 작업자 #${id}를 뺐습니다`, 'ok');
+    await refreshCrew({ force: true });
+  } catch {
+    /* api-error 가 표시 */
+  }
+}
+
 async function setMode(mode) {
   try {
     apply(await call('crew_mode', { mode }));
@@ -176,8 +175,8 @@ async function setMode(mode) {
   }
 }
 
-/** 눈의 카메라 대수: 1대(단안, TIPSv2) 또는 2대(스테레오, SGBM · TIPSv2 안 씀). */
-async function setCameras(n) {
+/** 최초 작업자 눈의 카메라 대수: 1대(단안, TIPSv2) 또는 2대(스테레오, SGBM · TIPSv2 안 씀). */
+export async function setCameras(n) {
   try {
     const v = await call('camera_rig', { cameras: n });
     state.models = { ...(state.models ?? {}), ...v };
@@ -193,20 +192,17 @@ async function setCameras(n) {
 }
 
 export function initCrewPanel() {
-  $('crew-add')?.addEventListener('click', addCrew);
-  $('crew-clear')?.addEventListener('click', clearCrew);
-  $('crew-mode')?.addEventListener('change', (e) => setMode(e.target.value));
-  $('pp-cameras')?.addEventListener('change', (e) => setCameras(Number(e.target.value) || 1));
-  $('tg-coop-agent')?.addEventListener('click', () => {
-    const next = state.crew?.mode === 'team' ? 'solo' : 'team';
-    setMode(next);
-  });
+  for (const [id, form] of [['crew-add-humanoid', 'humanoid'], ['crew-add-forklift', 'forklift']]) {
+    $(id).addEventListener('click', (e) => addCrew(e.currentTarget, form));
+  }
+  $('crew-clear').addEventListener('click', clearCrew);
+  $('crew-mode').addEventListener('change', (e) => setMode(e.target.value));
   bus.on('snapshot', () => refreshCrew());
   bus.on('world-new', () => refreshCrew({ force: true }));
+  // 유닛을 고른 동안의 카메라 선택은 그 유닛의 것이다(unit-preset.js).
   bus.on('models', (m) => {
-    if (m?.cameras && $('pp-cameras') && Number($('pp-cameras').value) !== m.cameras) $('pp-cameras').value = String(m.cameras);
+    if (state.selectedUnit == null && m?.cameras && Number($('pp-cameras').value) !== m.cameras) $('pp-cameras').value = String(m.cameras);
   });
   renderFlow(null);
-  syncToolbar(null);
   return refreshCrew({ force: true });
 }

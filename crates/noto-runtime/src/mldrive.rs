@@ -149,7 +149,8 @@ impl Runtime {
             destination,
             cur: 0,
             phase,
-            decider: Decider::new(DecideCfg { reach_m: ARRIVE_SURFACE_M, ..DecideCfg::default() }),
+            // A lift truck stops with its tines short of the target and its rider walks the rest.
+            decider: Decider::new(DecideCfg { reach_m: if noto_core::act::fork::applies(&self.world.body) { world_sim::world::traffic::rider_stop_m(&self.world.body) } else { ARRIVE_SURFACE_M }, ..DecideCfg::default() }),
             queue: VecDeque::new(),
             running: false,
             done: None,
@@ -327,6 +328,14 @@ impl Runtime {
                         let why = reason.unwrap_or_else(|| "unknown".into());
                         if why == "cancelled" {
                             return fail("cancelled", "중지되었습니다");
+                        }
+                        if why == "cargo_lost" || why == "blocked" {
+                            t.queue.clear();
+                            self.log("quest", Level::Warn, format!("[ML] 이동이 끊김 ({why}) — 다시 판단"), None);
+                            if t.phase == MlPhase::Look {
+                                t.decider.move_failed();
+                            }
+                            return Flow::Continue;
                         }
                         if why.starts_with("fall") {
                             t.falls += 1;
@@ -729,11 +738,12 @@ impl Runtime {
         }
         let (ax, az) = (self.world.agent.x, self.world.agent.z);
         let at_w = self.world.true_of(at.0, at.1);
+        let reach = if noto_core::act::fork::applies(&self.world.body) { world_sim::world::traffic::rider_reach_m(&self.world.body) } else { MINE_REACH_M };
         let near = self
             .world
             .nodes
             .iter()
-            .filter(|n| (n.x - ax).hypot(n.z - az) <= MINE_REACH_M)
+            .filter(|n| (n.x - ax).hypot(n.z - az) <= reach)
             .map(|n| (n.id, n.x, n.z, (n.x - at_w.0).hypot(n.z - at_w.1)))
             .filter(|n| n.3 <= TOUCH_FROM_ESTIMATE_M)
             .min_by(|a, b| a.3.total_cmp(&b.3));
