@@ -17,6 +17,11 @@ use crate::vision::{gaze_to_see, memory_ok, Memory, ASSOC_RATIO, ASSOC_REACH_M, 
 pub(crate) const MAX_GRASP_TRIES: u32 = 3;
 pub(crate) const MAX_PUSH_TRIES: u32 = 3;
 pub(crate) const MAX_FALLS: u32 = 3;
+/// How many pieces a quest goes back for, and how many times a shut way is tried again, before it gives up.
+pub(crate) const MAX_SPILLS: u32 = 6;
+pub(crate) const MAX_BLOCKS: u32 = 4;
+/// A height change read from the depth that is a step and not a thing in the way (m).
+const STEP_READ_MAX_M: f32 = 0.30;
 pub(crate) const TOUCH_PIECE_M: f32 = 0.25;
 pub(crate) const SIDE_SPOT_REACH_M: f32 = 0.36;
 pub(crate) const PLACE_REACH_M: f32 = DELIVER_REACH_M - 0.5;
@@ -141,6 +146,8 @@ pub(crate) struct Task {
     pub drop_idx: usize,
     pub rounds: u32,
     pub pick_retry: bool,
+    /// The last order to go nearer an item: which one, and how far off it was given.
+    pub pick_order: Option<(u32, f32)>,
     pub trip: Option<Trip>,
     pub trips: u32,
     pub last_cargo: Option<(u32, String)>,
@@ -156,6 +163,8 @@ pub(crate) struct Task {
     pub delivered: Vec<(String, f32)>,
     pub grasp_tries: u32,
     pub falls: u32,
+    pub spills: u32,
+    pub blocks: u32,
     pub push: Option<PushJob>,
     pub pushed: Vec<(String, f32)>,
     pub mem: HashMap<u32, Memory>,
@@ -265,6 +274,7 @@ impl Task {
             drop_idx: 0,
             rounds: 0,
             pick_retry: false,
+            pick_order: None,
             trip: None,
             trips: 0,
             last_cargo: None,
@@ -284,6 +294,8 @@ impl Task {
             delivered: Vec::new(),
             grasp_tries: 0,
             falls: 0,
+            spills: 0,
+            blocks: 0,
             push: None,
             pushed: Vec::new(),
             mem: HashMap::new(),
@@ -465,8 +477,12 @@ impl Runtime {
                 }
                 WorldEvent::ItemSplit { piece, .. } => t.split_piece = parse_id(piece),
                 WorldEvent::BatteryDepleted => return fail("battery_depleted", "배터리가 방전되어 멈췄습니다"),
+                WorldEvent::CargoLost { worker: 1, item, amount, drop, .. } => self.go_back_for(t, *item, *amount, drop),
                 _ => {}
             }
+        }
+        if t.spills > MAX_SPILLS {
+            return fail("cargo_lost", format!("짐을 {}번 떨어뜨려 그만둠", t.spills));
         }
         if let Some(act) = t.act.clone() {
             return match t.done.take() {
@@ -484,6 +500,22 @@ impl Runtime {
             return Flow::Continue;
         }
         self.next_action(t)
+    }
+
+    /// A piece came off on the way. It is not carried any more, so the quest goes back for it before it goes on.
+    fn go_back_for(&mut self, t: &mut Task, item: ItemKind, amount: f32, drop: &str) {
+        t.spills += 1;
+        let (Some(id), Some(k)) = (parse_id(drop), t.targets.iter().position(|x| x.item == item)) else { return };
+        t.targets[k].picked = (t.targets[k].picked - amount).max(0.0);
+        t.cur = k;
+        t.drop_idx = t.drop_idx.min(t.drops.len());
+        t.drops.insert(t.drop_idx, id);
+        t.trip = None;
+        t.push = None;
+        t.deliver_idx = 0;
+        t.pick_retry = false;
+        let name = item.spec().label_ko;
+        self.goto_phase(t, Phase::Collect, &format!("떨어뜨린 {name}{} 다시 주우러 감", eul_reul(name)));
     }
 
     fn goto_phase(&mut self, t: &mut Task, to: Phase, note: &str) {
@@ -551,6 +583,10 @@ impl Runtime {
                     self.fork_cross = None;
                 }
                 self.log_world_events(&ev);
+                // It looks where it is going before it starts: a load picked up by a step is the likeliest to go.
+                if matches!(act, Act::Move(_)) {
+                    self.step_odo_m = f32::NEG_INFINITY;
+                }
                 t.act = Some(act);
                 t.done = None;
                 t.act_started_s = self.world.time_s;
@@ -1085,7 +1121,11 @@ impl Runtime {
                     }
                 }
             }
-            if dist > far_m && !side_here {
+            // An order that brought it no nearer is not given twice: the cell it stands in already counts as there, or
+            // it stands against what the item lies by. From here it reaches or it does not.
+            let no_nearer = t.pick_order.is_some_and(|(i, d)| i == id && dist >= d - 0.02);
+            if dist > far_m && !side_here && !no_nearer {
+                t.pick_order = Some((id, dist));
                 t.act_predicted_s = self.world.plan_route(Goal::Within { x: m.x, z: m.z, reach_m: stop_m }).map(|p| p.time_s);
                 let r = match self.issue(t, Action::MoveTo { x: m.x, z: m.z, reach_m: stop_m }, Act::Move(MoveFor::Drop)) {
                     Err(ActionError::NoPath) => self.issue(t, Action::MoveTo { x: m.x, z: m.z, reach_m: PICKUP_REACH_M - 0.1 }, Act::Move(MoveFor::Drop)),
@@ -1100,6 +1140,11 @@ impl Runtime {
                     }
                     Err(e) => fail(e.code(), action_error_ko(&e)),
                 };
+            }
+            if dist > far_m && !side_here && dist > if forks { stop_m + 0.2 } else { PICKUP_REACH_M } {
+                self.log("quest", Level::Warn, format!("{name}에 더 다가갈 수 없어 건너뜀 ({dist:.2} m)"), None);
+                t.drop_idx += 1;
+                continue;
             }
             // Lined up, a lift truck looks at the item once more before its fork procedure, as an operator does once
             // aligned: the odometry since it was remembered (the rider's fell on foot, the turns of the line-up) has
@@ -1186,6 +1231,14 @@ impl Runtime {
                         Err(e) => fail(e.code(), action_error_ko(&e)),
                     }
                 }
+                // Tried from where the body gets to: this one lies where it cannot be had, which is no reason to give
+                // up on the others.
+                Err(ActionError::OutOfReach { .. }) => {
+                    self.log("quest", Level::Warn, format!("{name}에 다가가도 손이 닿지 않아 건너뜀"), None);
+                    t.pick_retry = false;
+                    t.drop_idx += 1;
+                    Flow::Continue
+                }
                 Err(ActionError::CapacityExceeded { carried_kg, item_kg, capacity_kg }) => {
                     let fit = ((capacity_kg - carried_kg + 1e-3) / item_kg).floor().max(0.0);
                     let picked = t.target().picked;
@@ -1257,7 +1310,9 @@ impl Runtime {
             .find(|&(x, z, a)| {
                 let from = (x, z, a + std::f32::consts::PI);
                 let (tx, tz) = self.world.true_of(x, z);
-                self.world.terrain.cell_of(tx, tz).is_some_and(|c| !self.world.terrain.is_water(c.0, c.1) && !self.world.blocked_cells().contains(&c)) && !self.fork_path_blocked(id, at, from)
+                let cell_ok = self.world.terrain.cell_of(tx, tz).is_some_and(|c| !self.world.terrain.is_water(c.0, c.1) && !self.world.blocked_cells().contains(&c));
+                // A rock or a trunk by the item is as much in the way of the tines as another item.
+                cell_ok && self.world.stands_clear(tx, tz, a + std::f32::consts::PI) && !self.fork_path_blocked(id, at, from)
             })
             .map(|(x, z, _)| (x, z))
     }
@@ -1870,6 +1925,10 @@ impl Runtime {
         }
         self.take_fix(t);
         self.log("quest", Level::Warn, format!("{name}에 손이 닿지 않음 — 보고 더 다가감"), None);
+        // The hands just proved the pose wrong, so what the eyes see beats the map: a flag this close is where it looks.
+        let now = self.world.tick;
+        let key = t.destination.as_deref().unwrap_or_default();
+        let (x, z) = self.gates.landmarks().iter().find(|l| l.kind == EntKind::Waypoint && l.link == key && l.last_tick == now).map_or((x, z), |l| (l.x, l.z));
         let r = match self.issue(t, Action::MoveTo { x, z, reach_m: PLACE_REACH_M - 0.5 }, Act::Move(why.clone())) {
             Err(ActionError::NoPath) => self.issue(t, Action::MoveTo { x, z, reach_m: PLACE_REACH_M }, Act::Move(why)),
             r => r,
@@ -1941,7 +2000,62 @@ impl Runtime {
         Flow::Done
     }
 
+    /// While it carries and moves, a walker reads the ground ahead for steps, off the depth it has. What stands higher
+    /// than a step is something to walk round, not over. A truck has no knees to bend and its rider looks past the mast;
+    /// the world's own look along the way is enough for its speed.
+    pub(crate) fn step_look(&mut self) {
+        if self.world.carried_kg() <= AMOUNT_EPS || !self.world.body.legged() {
+            return;
+        }
+        self.world.stride.external_eye = true;
+        let odo = self.world.odom.travelled_m;
+        if (odo - self.step_odo_m).abs() < world_sim::world::steps::STEP_LOOK_EVERY_M {
+            return;
+        }
+        self.step_odo_m = odo;
+        let cam = self.cam;
+        let frame = self.world.render(&cam);
+        let truth = crate::ml::KeyTruth::capture(&self.world, &frame);
+        let rgb = noto_vision::Rgb::new(frame.width as u32, frame.height as u32, frame.rgb.clone());
+        let (intr, pose) = (crate::record::intrinsics(&self.world, &cam), crate::record::odometry(&self.world, &cam));
+        let right = self.stereo_baseline().map(|b| self.world.render_right(&cam, b));
+        let fix = self.ml.fix.clone();
+        let (depth, source) = match &mut self.ml.depth {
+            crate::ml::DepthEngine::Model(m) if m.stereo_rig().is_some() => {
+                let pair = right.as_ref().map(|r| noto_vision::Rgb::new(r.width as u32, r.height as u32, r.rgb.clone()));
+                (pair.and_then(|p| m.infer_pair(&rgb, &p).ok()), "SGBM")
+            }
+            crate::ml::DepthEngine::Model(m) => {
+                let max = m.max_depth_m();
+                let scene = m.infer_scene(&rgb, noto_vision::SceneHeads::ALL).ok();
+                let depth = scene.map(|s| {
+                    let mut d = s.depth;
+                    if let (Some(max), Some(cfg)) = (max, &fix.align) {
+                        noto_vision::ground_align_with(&mut d, s.normals.as_ref().filter(|_| fix.normals), &intr, &pose, None, Some(max), cfg);
+                    }
+                    d
+                });
+                (depth, "TIPSv2")
+            }
+            crate::ml::DepthEngine::StandIn(s) => (Some(s.run(&truth)), "깊이 대역"),
+        };
+        let Some(depth) = depth else { return };
+        if let Some(read) = noto_vision::stairs::read_step(&depth, &intr, &pose, &noto_vision::stairs::StepCfg::default()).filter(|r| r.height_m.abs() <= STEP_READ_MAX_M) {
+            let mut ev = Vec::new();
+            self.world.note_step(read.height_m, read.dist_m, source, 1, &mut ev);
+            self.log_world_events(&ev);
+        }
+    }
+
+    /// The look down, by hand: for a robot driven outside a quest.
+    pub fn step_look_now(&mut self) {
+        self.step_look();
+    }
+
     fn while_running(&mut self, t: &mut Task, act: &Act) {
+        if matches!(act, Act::Move(_)) {
+            self.step_look();
+        }
         match act {
             Act::Move(MoveFor::Approach(_)) => {
                 let me = self.me();
@@ -2044,6 +2158,17 @@ impl Runtime {
             if why == "cancelled" {
                 return fail("cancelled", "중지되었습니다");
             }
+            if why == "cargo_lost" {
+                return Flow::Continue;
+            }
+            if why == "blocked" && matches!(act, Act::Move(_)) && !matches!(act, Act::Move(MoveFor::Approach(_))) {
+                t.blocks += 1;
+                if t.blocks > MAX_BLOCKS {
+                    return fail("blocked", "길이 막혀 더 갈 수 없습니다");
+                }
+                self.log("quest", Level::Warn, format!("길이 막혀 멈춤 — 다시 시도 {}/{MAX_BLOCKS}", t.blocks), None);
+                return Flow::Continue;
+            }
             if why.starts_with("fall") {
                 t.falls += 1;
                 let ground = self.world.ground_here().id();
@@ -2096,6 +2221,15 @@ impl Runtime {
                 Act::Move(MoveFor::Approach(id)) => {
                     self.gates.note_unreachable(id);
                     self.goto_phase(t, Phase::Locate, &format!("접근 실패({why}), 다른 대상을 찾음"));
+                    t.reset_locate();
+                    Flow::Continue
+                }
+                // A lift truck's rider found no way to it on foot.
+                Act::Mine(_) if why == "unknown_target" => {
+                    if let Some(id) = t.target_lm {
+                        self.gates.note_unreachable(id);
+                    }
+                    self.goto_phase(t, Phase::Locate, "걸어서 갈 길이 없어 다른 대상을 찾음");
                     t.reset_locate();
                     Flow::Continue
                 }

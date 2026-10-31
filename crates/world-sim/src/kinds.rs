@@ -195,6 +195,17 @@ impl NodeKind {
         let s = self.spec();
         s.hardness * if s.hand_natural { 1.5 } else { 5.0 }
     }
+
+    /// What it is made of as boxes on its cell's centre: (bottom, top, half width) above the ground (m). The camera
+    /// draws these and a body runs into these, so what is seen is what stops it.
+    pub fn solids(self) -> &'static [(f32, f32, f32)] {
+        match self {
+            // A young pine [추정]: the crown starts above a lift truck's guard, so the trunk is what stands in the way.
+            NodeKind::Tree => &[(0.0, 2.9, 0.14), (2.35, 3.25, 1.05), (3.25, 4.05, 0.80), (4.05, 4.70, 0.46)],
+            NodeKind::Boulder => &[(0.0, 0.40, 0.24), (0.40, 0.60, 0.16)],
+            NodeKind::CoalOre | NodeKind::IronOre => &[(0.0, 0.5, 0.24)],
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

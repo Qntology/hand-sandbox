@@ -196,6 +196,8 @@ pub struct FrameOut {
     pub tick: u64,
     pub detections: Vec<Detection>,
     pub overlay: Option<Value>,
+    /// Where each robot came out on the picture, on the map view.
+    pub marks: Vec<world_sim::render::UnitMark>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -284,6 +286,8 @@ pub struct Runtime {
     pub(crate) quests: QuestBook,
     pub(crate) task: Option<Task>,
     pub(crate) last_scan: Option<ScanReport>,
+    /// How far the odometry had run at the last look at the ground ahead (m).
+    pub(crate) step_odo_m: f32,
     pub(crate) gaze_check: Option<crate::vision::GazeCheck>,
     /// A lift truck's rider and carriage camera on the item it is picking up, each checked against the other.
     pub(crate) fork_cross: Option<crate::vision::CrossCheck>,
@@ -341,6 +345,7 @@ impl Runtime {
             quests: QuestBook::new(),
             task: None,
             last_scan: None,
+            step_odo_m: 0.0,
             gaze_check: None,
             fork_cross: None,
             pending_fix: None,
@@ -389,6 +394,7 @@ impl Runtime {
 
     pub(crate) fn log_world_events(&mut self, events: &[TimedEvent]) {
         for te in events {
+            let physics = matches!(te.event, WorldEvent::Bump { .. } | WorldEvent::CargoSlip { .. } | WorldEvent::CargoLost { .. } | WorldEvent::StepSeen { .. } | WorldEvent::StepTaken { .. });
             let (level, msg) = match &te.event {
                 WorldEvent::ActionStarted { action } => (Level::Debug, format!("동작 시작 {action}")),
                 WorldEvent::ActionDone { action, ok, reason } => (
@@ -418,8 +424,12 @@ impl Runtime {
                 WorldEvent::Crew { worker, label, ok, .. } => (if *ok { Level::Info } else { Level::Warn }, format!("[작업자 {worker}] {label}")),
                 WorldEvent::Rider { worker, label, .. } => (Level::Info, format!("[작업자 {worker}] {label}")),
                 WorldEvent::Hold { worker, label, .. } => (Level::Info, format!("[작업자 {worker}] {label}")),
+                WorldEvent::Bump { worker, label, fell, .. } => (if *fell { Level::Error } else { Level::Warn }, format!("[작업자 {worker}] {label}")),
+                WorldEvent::CargoSlip { worker, label, .. } => (Level::Warn, format!("[작업자 {worker}] {label}")),
+                WorldEvent::CargoLost { worker, label, .. } => (Level::Error, format!("[작업자 {worker}] {label}")),
+                WorldEvent::StepSeen { worker, label, .. } | WorldEvent::StepTaken { worker, label, .. } => (Level::Info, format!("[작업자 {worker}] {label}")),
             };
-            self.audit.log("world", level, msg, Some(tidy(json!({"tick": te.tick, "time_s": te.time_s, "event": te.event}))));
+            self.audit.log(if physics { "physics" } else { "world" }, level, msg, Some(tidy(json!({"tick": te.tick, "time_s": te.time_s, "event": te.event}))));
         }
     }
 
@@ -1246,6 +1256,7 @@ impl Runtime {
 
     pub fn frame_sized(&mut self, view: FrameView, width: u32, height: u32, quality: f32) -> Result<FrameOut> {
         let mut overlay = None;
+        let mut marks = Vec::new();
         let (frame, detections) = match view {
             FrameView::Agent => {
                 let cam = Camera { width: width.clamp(32, 2048) as usize, height: height.clamp(32, 2048) as usize, ..self.cam };
@@ -1281,7 +1292,11 @@ impl Runtime {
                 self.world.fork_cam = false;
                 (f, Vec::new())
             }
-            FrameView::Top => (self.world.render_top(height.clamp(32, 2048) as usize, 24.0), Vec::new()),
+            FrameView::Top => {
+                let (f, m) = world_sim::render::render_map(&self.world, width.clamp(32, 2048) as usize, height.clamp(32, 2048) as usize);
+                marks = m;
+                (f, Vec::new())
+            }
             FrameView::Chase { orbit_deg } => {
                 let cam = Camera { width: width.clamp(32, 2048) as usize, height: height.clamp(32, 2048) as usize, fov_deg: 64.0, max_dist_m: 30.0, ..self.cam };
                 let (f, o) = crate::chase::render(&self.world, &cam, orbit_deg as f32);
@@ -1309,6 +1324,7 @@ impl Runtime {
             tick: frame.tick,
             detections,
             overlay,
+            marks,
             webp: enc.bytes,
         })
     }

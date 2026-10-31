@@ -25,7 +25,7 @@ impl Build {
         match self {
             Build::Compact => "compact".into(),
             Build::Standard => "standard".into(),
-            Build::Rig(id) => format!("rig{id}"),
+            Build::Rig(id) => crate::rig::get(id).and_then(|r| r.sds_key.clone()).unwrap_or_else(|| format!("rig{id}")),
         }
     }
 }

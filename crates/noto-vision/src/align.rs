@@ -96,6 +96,9 @@ impl AlignFit {
     }
 }
 
+/// How far a ray over uneven ground is followed (m): past any map, it has gone over the horizon.
+const GROUND_RAY_MAX_M: f32 = 200.0;
+
 pub fn ground_depth(intr: &Intrinsics, pose: &Pose, px: f32, py: f32, height: Option<HeightFn>, max_m: f32) -> Option<f32> {
     let r = intr.ray(pose.yaw, px, py);
     let h = pose.eye_m;
@@ -115,7 +118,7 @@ pub fn ground_depth(intr: &Intrinsics, pose: &Pose, px: f32, py: f32, height: Op
             let step = 0.1f32;
             let mut prev = 0.0f32;
             let mut d = step;
-            while d <= max_m {
+            while d <= max_m.min(GROUND_RAY_MAX_M) {
                 if above(d) <= 0.0 {
                     let (mut lo, mut hi) = (prev, d);
                     for _ in 0..12 {
@@ -462,6 +465,7 @@ mod tests {
         let m = ground_depth(&c, &p, 100.0, 200.0, Some(&flat), 30.0).unwrap();
         let e = ground_depth(&c, &p, 100.0, 200.0, None, 30.0).unwrap();
         assert!((m - e).abs() < 0.01, "{m} vs {e}");
+        assert!(ground_depth(&c, &p, 192.0, 2.0, Some(&flat), f32::INFINITY).is_none(), "a ray over the horizon ends");
         let (yaw, x0, z0) = (p.yaw, p.x, p.z);
         let step = move |x: f32, z: f32| if ((x - x0) * yaw.cos() + (z - z0) * yaw.sin()) > 2.0 { 0.5 } else { 0.0 };
         let s = ground_depth(&c, &p, 192.0, 140.0, Some(&step), 30.0).unwrap();

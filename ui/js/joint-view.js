@@ -1,6 +1,6 @@
 // 3인칭 '관절 물리' 오버레이: world_frame(view: 'chase:<궤도>')가 돌려주는 overlay 를 그린다.
 // 관절 점(토크/피크 비율 색, 포화 고리, 멈춤 X), 무게중심과 그 수직선, 동적 ZMP, 지지 다각형, 지면 반력 화살표,
-// 그리고 오른쪽 아래 패널에 이번 자세 변화의 관절별 토크/피크 시계열과 관절 표. 계산은 모두 Rust(noto_core::dynamics)에서 한다.
+// 그리고 유닛 HUD 에 이번 자세 변화의 관절별 토크/피크 시계열과 관절 표. 계산은 모두 Rust(noto_core::dynamics)에서 한다.
 import { $, clear, el } from './util.js';
 
 const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -156,14 +156,16 @@ function drawChart(m) {
   }
 }
 
-/** 오른쪽 아래 관절 표와 노트. */
-export function renderJointPanel(o) {
-  const panel = $('joint-panel');
+/** 유닛 HUD 의 관절 표와 노트. o 가 없으면 비운다(waiting 은 비운 자리에 남길 말). */
+export function renderJointPanel(o, waiting = '') {
   if (!o) {
-    panel.hidden = true;
+    $('jp-state').textContent = '';
+    drawChart(null);
+    clear($('jp-rows'));
+    const empty = clear($('jp-notes'));
+    if (waiting) empty.append(el('li', { text: waiting }));
     return;
   }
-  panel.hidden = false;
   const m = o.motion;
   $('jp-state').textContent = m
     ? `${m.source_ko} · ${o.plan} · 최소 여유 ${fmt(m.min_margin, 2)}${m.feasible ? '' : ' · 불가'}`

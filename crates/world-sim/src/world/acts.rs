@@ -10,6 +10,8 @@ pub const PUSH_START_SLACK_M: f32 = 0.40;
 pub const SHUFFLE_MPS: f32 = 0.2;
 pub const SIDE_SHUFFLE_MAX_M: f32 = 0.5;
 pub const PILE_PIECE_H_M: f32 = 0.12;
+/// How long a slipping foot takes to catch (s) [추정: about a reaction].
+const REACTION_JOLT_S: f32 = 0.1;
 
 #[derive(Clone, Debug)]
 pub struct ActPlay {
@@ -64,6 +66,8 @@ pub struct WalkState {
     pub slips: u32,
     pub plan: Option<(gait::GaitPlan, Ground, i32)>,
     pub last_mu: Option<f32>,
+    /// The step it is going over (m): the swinging foot clears that.
+    pub step_lift_m: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -165,7 +169,7 @@ impl World {
             ((at.0 - self.agent.x) * k, (at.1 - self.agent.z) * k, (dist - planned[0]).abs())
         };
         let shuffle = step / SHUFFLE_MPS;
-        if shuffle > 0.05 && !self.can_step_to(self.agent.x + step_x, self.agent.z + step_z) {
+        if shuffle > 0.05 && !(self.can_step_to(self.agent.x + step_x, self.agent.z + step_z) && self.pose_check().clear(self.agent.x + step_x, self.agent.z + step_z, self.agent.yaw)) {
             let dist = (at.0 - self.agent.x).hypot(at.1 - self.agent.z);
             return Err(ActionError::OutOfReach { distance_m: dist, reach_m: (dist - step).max(0.0) });
         }
@@ -240,7 +244,8 @@ impl World {
         if let Some(g) = self.gaze.filter(|_| fork::applies(&self.body)) {
             return g.pose.fork_m;
         }
-        if self.carried_kg() > AMOUNT_EPS {
+        // On the move the tines ride at travel height, over curbs, whether they carry anything or not.
+        if self.carried_kg() > AMOUNT_EPS || matches!(self.active, Some((_, Active::Move(_)))) {
             self.body.dims.fork_carry_m
         } else {
             self.body.dims.fork_rest_m
@@ -259,10 +264,26 @@ impl World {
     /// What the hands hold off the ground now, as (kind, piece size, centre in the body frame): the item from
     /// lift-off until it goes into the bay, where the eyes follow it.
     pub fn hand_load(&self) -> Option<(ItemKind, [f32; 3], [f32; 3])> {
-        let p = self.act.as_ref().filter(|p| p.rollout.kind == ActKind::Grasp && p.lifting.is_some())?;
-        let s = p.rollout.sample_at(p.t()).filter(|s| matches!(s.phase, "lift" | "stow"))?;
-        let (k, amount) = p.object?;
-        Some((k, k.spec().piece_size_m(amount), s.object?))
+        if let Some(p) = self.act.as_ref().filter(|p| p.rollout.kind == ActKind::Grasp && p.lifting.is_some()) {
+            if let (Some(s), Some((k, amount))) = (p.rollout.sample_at(p.t()).filter(|s| matches!(s.phase, "lift" | "stow")), p.object) {
+                return Some((k, k.spec().piece_size_m(amount), s.object?));
+            }
+        }
+        self.carried_load()
+    }
+
+    /// What a walker carries in its two hands, as `hand_load`: on the middle of the hands, where the ride has moved it.
+    pub fn carried_load(&self) -> Option<(ItemKind, [f32; 3], [f32; 3])> {
+        if !self.body.legged() {
+            return None;
+        }
+        let (k, amount) = *self.agent.carried.iter().rev().find(|(_, n)| *n > AMOUNT_EPS)?;
+        let size = k.spec().piece_size_m(amount.min(1.0));
+        let (pose, loads, _) = self.act_pose()?;
+        let r = hkin::solve_fast(&self.body, &pose, &loads);
+        let (a, b) = (r.hands[0], r.hands[1]);
+        let s = self.ride.state.shift;
+        Some((k, size, [0.5 * (a[0] + b[0]) + s[0] + 0.5 * size[2], 0.5 * (a[1] + b[1]) + s[1], 0.5 * (a[2] + b[2]) + 0.5 * size[1]]))
     }
 
     /// What rides on the tines now, as (kind, piece size, centre in the body frame), bottom first.
@@ -296,7 +317,8 @@ impl World {
             while rest > AMOUNT_EPS && out.len() < 6 {
                 let a = rest.min(1.0);
                 let size = k.spec().piece_size_m(a);
-                out.push((*k, size, [fork::load_x(&self.body, size[0].max(size[2])), 0.0, z + 0.5 * size[1]]));
+                let s = self.ride.state.shift;
+                out.push((*k, size, [fork::load_x(&self.body, size[0].max(size[2])) + s[0], s[1], z + 0.5 * size[1]]));
                 z += size[1];
                 rest -= a;
             }
@@ -354,7 +376,7 @@ impl World {
             return true;
         }
         let near = (to.0 as i32 - from.0 as i32).abs() <= 1 && (to.1 as i32 - from.1 as i32).abs() <= 1;
-        near && !self.blocked_cells().contains(&to) && self.plan_route(Goal::Cell(to)).is_some_and(|p| p.edges.len() == 1)
+        near && !self.blocked_cells().contains(&to) && self.plan_route_avoiding(Goal::Cell(to), &HashSet::new()).is_some_and(|p| p.edges.len() == 1)
     }
 
     pub(super) fn start_release(&mut self, pieces: &[(ItemKind, f32)], waypoint: Option<u32>) -> f32 {
@@ -429,9 +451,11 @@ impl World {
         for ev in out {
             events.push(self.stamp(ev));
         }
-        // The odometry takes this motion with the rest of the step (`World::step`), once.
-        if let Some(to) = to {
+        // The odometry takes this motion with the rest of the step (`World::step`), once. The base drives itself here
+        // too, and what stands in its way stops it here as anywhere.
+        if let Some(to) = to.filter(|to| self.pose_check().clear(to.0, to.1, to.2)) {
             (self.agent.x, self.agent.z, self.agent.yaw) = (to.0, to.1, wrap_angle(to.2));
+            self.shove_loose();
         }
     }
 
@@ -512,16 +536,23 @@ impl World {
             }
             self.walk.slips += 1;
             let (fell, slide) = gait::slip_outcome(&self.body.dims, &g, mu);
-            self.odom.foot_slid(slide);
+            if self.crew_turn.is_none() {
+                self.odom.foot_slid(slide);
+            }
             let side = if self.walk.stance == 0 { "오른" } else { "왼" };
             if fell {
                 let label = format!("{side}발이 미끄러져 넘어짐: 마찰 {mu:.2} < 필요 {:.2}, {:.0} mm", g.rcof, slide * 1000.0);
                 events.push(self.stamp(WorldEvent::Act { act: "walk".into(), kind: "fall".into(), label: label.clone(), ok: false, value: Some(slide), parts: vec!["foot".into(), "foot_joints".into(), "waist".into()] }));
+                let worker = self.acting_id();
+                self.spill_all(worker, events);
                 self.fallen_until = Some(self.time_s + GET_UP_S as f64);
                 return Some(label);
             }
             let label = format!("{side}발 미끄러짐 {:.0} mm → 회복 (마찰 {mu:.2} < 필요 {:.2})", slide * 1000.0, g.rcof);
             events.push(self.stamp(WorldEvent::Act { act: "walk".into(), kind: "foot_slip".into(), label, ok: true, value: Some(slide), parts: vec!["foot".into(), "foot_joints".into()] }));
+            // The foot going from under it jerks the load about as far as it slid.
+            let worker = self.acting_id();
+            self.jolt_cargo([0.0, slide / REACTION_JOLT_S], REACTION_JOLT_S, worker, events);
         }
         None
     }
@@ -538,10 +569,37 @@ impl World {
         if self.body.legged() && matches!(&self.active, Some((_, Active::Move(_)))) && self.agent.speed_mps > 0.0 {
             let (g, _, _) = self.walk.plan.clone()?;
             let u = (self.walk.since_step_m / g.step_m.max(1e-3)).clamp(0.0, 1.0);
-            let (pose, loads, _) = gait::pose_at(&self.body, &g, self.walk.stance, u, self.carried_kg());
-            return Some((pose, loads, Source::FootLift));
+            let (mut pose, loads, _) = gait::pose_at(&self.body, &g, self.walk.stance, u, self.carried_kg());
+            // The foot in the air goes over a step, not through it.
+            let lift = (self.walk.step_lift_m + 0.03) / gait::SWING_LIFT_M;
+            if lift > 1.0 {
+                pose.feet[1 - self.walk.stance][1] *= lift;
+            }
+            return Some((self.crouched(self.carrying(pose)), loads, Source::FootLift));
+        }
+        if self.body.legged() && self.carried_kg() > AMOUNT_EPS {
+            let held = self.gaze.map_or(KinPose::stand(&self.body, self.carried_kg()), |g| g.pose);
+            return Some((self.crouched(self.carrying(held)), KinLoads::default(), Source::Quiet));
         }
         self.gaze.map(|g| (g.pose, KinLoads::default(), Source::Quiet))
+    }
+
+    /// `pose` with the load in two hands before the body, and the head tipped to the ground a stride ahead while it
+    /// walks, where the next step is. Empty hands swing as they do.
+    fn carrying(&self, mut pose: KinPose) -> KinPose {
+        if self.carried_kg() <= AMOUNT_EPS {
+            return pose;
+        }
+        let held = noto_core::act::cocarry::carry_pose(&self.body, noto_core::act::cocarry::carry_hand_z(&self.body));
+        pose.shoulder_deg = held.shoulder_deg;
+        pose.elbow_deg = held.elbow_deg;
+        pose.closure = held.closure;
+        if matches!(&self.active, Some((_, Active::Move(_)))) {
+            let cam = hkin::head_camera(&self.body, &pose);
+            let want = cam.pos[2].atan2(0.5 * (steps::STEP_LOOK_M[0] + steps::STEP_LOOK_M[1])).to_degrees();
+            pose.neck_deg = (pose.neck_deg + want - cam.pitch_down_deg).clamp(0.0, 35.0);
+        }
+        pose
     }
 
     pub(super) fn act_body_pose(&self) -> Option<BodyPose> {

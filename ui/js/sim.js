@@ -18,9 +18,7 @@ function applySnapshot(snap, reset = false) {
     state.trail.push([x, y]);
     if (state.trail.length > 600) state.trail.shift();
   }
-  const t = $('sim-time');
-  t.textContent = `틱 ${snap.tick} · ${snap.time_s.toFixed(1)} s`;
-  $('sb-tick').textContent = String(snap.tick);
+  $('sim-time').textContent = `틱 ${snap.tick} · ${snap.time_s.toFixed(1)} s`;
   $('sb-seed').textContent = String(snap.seed);
   bus.emit('snapshot', snap);
 }
@@ -48,6 +46,7 @@ export async function newWorld(seed, size, terrain = state.terrain ?? 'rugged') 
   try {
     const snap = await call('world_new', { seed, size, terrain, config: state.config, base: state.config.base, body: state.bodyPlan ?? null });
     state.worldConfigKey = JSON.stringify(state.config);
+    state.worldPlanKey = JSON.stringify(state.bodyPlan);
     state.detections = [];
     applySnapshot(snap, true);
     bus.emit('world-new', snap);
@@ -98,7 +97,7 @@ async function tick() {
 export function setPlaying(on) {
   if (on === state.playing) return;
   if (on && !state.snapshot) {
-    toast('월드가 아직 없습니다', '왼쪽 ③ 월드에서 재생성하세요.', 'warn');
+    toast('월드가 아직 없습니다', '좌상단 🌍 월드에서 재생성하세요.', 'warn');
     return;
   }
   state.playing = on;

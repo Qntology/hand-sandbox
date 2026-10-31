@@ -1,33 +1,47 @@
-// 월드 화면: world_frame(WebP) 폴링 → 캔버스, 탐지 박스 오버레이, 범례, 표시 토글.
+// 월드 화면: world_frame(WebP) 폴링 → 전체 화면 캔버스, 탐지 박스, 탐지 목록(분석 모달), 표시 토글.
 // 폴링은 약 6fps 이고, 이전 호출이 끝나지 않았거나 틱·옵션이 그대로면 건너뛴다.
-// 포커스 시점(focus:hand|side|low)은 행위가 쓰는 부위의 근접 화면과, 응답의 focus(FocusFrame)로 그 부위의 힘·관절 그림을 함께 보인다.
+// 프레임은 캔버스 비율대로 요청한다. 탑뷰는 런타임이 지도 전체를 그 비율 안에 맞춰 그리고 로봇마다 프레임 좌표(units)를 준다.
+// 3인칭·포커스 시점의 overlay · focus 는 'unit-detail' 로 넘겨 유닛 HUD 가 그린다.
 import { call } from './api.js';
 import { bus, state } from './state.js';
 import { $, clear, el, fmt, observeResize } from './util.js';
-import { drawJointOverlay, renderJointPanel } from './joint-view.js';
-import { DRAWN_PARTS, PART_KO, drawFocus, partAvailable, resolvePart } from './focus-view.js';
+import { drawJointOverlay } from './joint-view.js';
 import { renderPickHud, wantsForkCam } from './pick-hud.js';
+import { isOpen } from './overlays.js';
 
 const POLL_MS = 160;
 const RETRY_MS = 2500;
+const TOP_MAX_W = 1280; // 탑뷰는 화소당 비용이 작아 화면 폭까지 받는다
 let pending = false;
 let lastKey = '';
 let retryAt = 0;
 let drewOnce = false;
 
+const viewNow = () => $('view-select').value;
+
+/** 요청할 프레임 크기: 폭·품질은 #frame-preset, 높이는 캔버스 비율을 따른다. */
 function framePreset() {
-  const [width, height, quality] = $('frame-preset').value.split('x').map(Number);
-  return { width, height, quality };
+  const [preset, quality] = $('frame-preset').value.split('x').map(Number);
+  const wrap = $('world-wrap');
+  const W = wrap.clientWidth;
+  const H = wrap.clientHeight;
+  const aspect = W && H ? H / W : 2 / 3;
+  const width = viewNow() === 'top' ? Math.min(TOP_MAX_W, Math.max(preset, W)) : preset;
+  return { width, height: 2 * Math.round((width * aspect) / 2), quality };
 }
 
-// ── 배치: 프레임을 비율 유지로 맞추고, 크기에 따라 HUD 배치 단계를 정한다 ──
+/** 화면의 프레임 사각형(world-wrap 기준 px). CCTV · 유닛 선택이 u, v 를 화면 좌표로 바꿀 때 쓴다. */
+export function frameRect() {
+  const box = $('frame-box');
+  return { left: box.offsetLeft, top: box.offsetTop, width: box.offsetWidth, height: box.offsetHeight };
+}
+
+// ── 배치: 프레임을 비율 유지로 화면에 맞춘다 ─────────────────────
 function layoutFrame() {
   const wrap = $('world-wrap');
   const W = wrap.clientWidth;
   const H = wrap.clientHeight;
   if (!W || !H) return;
-  wrap.dataset.w = W >= 900 ? 'wide' : W >= 620 ? 'narrow' : 'tiny';
-  wrap.dataset.h = H < 380 ? 'short' : H < 520 ? 'mid' : 'tall';
   const fw = state.frame?.width ?? 3;
   const fh = state.frame?.height ?? 2;
   const s = Math.min(W / fw, H / fh);
@@ -68,13 +82,12 @@ async function drawFrame(f) {
   const sizeChanged = !state.frame || state.frame.width !== f.width || state.frame.height !== f.height;
   state.frame = { width: f.width, height: f.height, bytes: f.bytes, encode_ms: f.encode_ms, tick: f.tick };
   state.detections = f.detections ?? [];
-  // 3인칭: 관절 물리 오버레이(Rust 가 픽셀로 투영한 관절·CoM·ZMP)와 관절 표.
+  state.units = f.units ?? [];
+  // 3인칭: 관절 물리 오버레이(Rust 가 픽셀로 투영한 관절·CoM·ZMP). 표와 부위 그림은 유닛 HUD 에서.
   const chase = !!f.overlay;
   $('joint-layer').hidden = !chase;
   drawJointOverlay(f.overlay ?? null, f.width, f.height);
-  renderJointPanel(chase ? f.overlay : null);
-  lastFocus = f.focus ?? null;
-  renderFocusHud();
+  if (f.overlay || f.focus) bus.emit('unit-detail', { overlay: f.overlay ?? null, focus: f.focus ?? null });
   if (sizeChanged) layoutFrame();
   if (!drewOnce) {
     drewOnce = true;
@@ -94,41 +107,7 @@ async function drawFrame(f) {
   bus.emit('frame', state.frame);
 }
 
-// ── 포커스 시점의 부위 그림 ─────────────────────────────────────
-let lastFocus = null;
-
-/** 카메라마다 먼저 보일 부위: 손 근접 → 손 모양, 옆 → 허리, 낮게 → 발·바퀴·트랙 중 이 몸에 있는 것. */
-function defaultPart(cam, f) {
-  if (cam === 'hand') return 'hand';
-  if (cam === 'side') return 'waist';
-  return ['foot', 'wheel', 'track'].find((p) => partAvailable(f, p)) ?? 'foot';
-}
-
-function renderFocusHud() {
-  const view = $('view-select').value;
-  const f = lastFocus;
-  const hud = $('focus-hud');
-  hud.hidden = !view.startsWith('focus') || !f;
-  if (hud.hidden) return;
-  const cam = view.split(':')[1] ?? 'hand';
-  const pick = $('fh-part').value || 'auto';
-  // 자동: 지금 행위·사건이 다루는 부위, 없으면 카메라의 부위.
-  const part = pick === 'auto' ? ((f.parts ?? []).length ? resolvePart('auto', f) : defaultPart(cam, f)) : pick;
-  $('fh-title').textContent = `부위 포커스 · ${PART_KO[part] ?? part}`;
-  drawFocus($('fh-canvas'), f, part);
-  const cap = clear($('fh-cap'));
-  cap.append(`${f.action_ko ?? '행위 없음'}${f.phase ? ` · ${f.phase}` : ''} · 안정 여유 ${fmt.n(f.body?.margin, 2)} · 몸통 ${fmt.n(f.body?.trunk_deg, 0)}°`);
-  if (f.event) cap.append(el('div', { class: f.event_ok === false ? 'fail' : '', text: `${f.event}` }));
-}
-
-function initFocusHud() {
-  const sel = $('fh-part');
-  sel.append(el('option', { value: 'auto', text: '자동 (행위 부위)' }), ...DRAWN_PARTS.map((p) => el('option', { value: p, text: PART_KO[p] })));
-  sel.addEventListener('change', renderFocusHud);
-  observeResize($('fh-canvas'), renderFocusHud);
-}
-
-// ── 탐지 박스 · 범례 ────────────────────────────────────────────
+// ── 탐지 박스 · 목록 ────────────────────────────────────────────
 function tagText(d) {
   const base = `${d.label_ko} ${Math.round(d.score * 100)}${d.accepted ? '' : ' 보류'}`;
   return state.toggles.oracle ? `${base} · ${d.label_id}` : base;
@@ -184,10 +163,11 @@ async function drawForkCam(quality) {
 
 // ── 폴링 ────────────────────────────────────────────────────────
 async function poll(force = false) {
-  if (pending || state.centerTab !== 'world' || document.hidden || !state.snapshot) return;
+  // 분석 모달은 월드를 덮으므로 그동안은 받지 않는다(닫으면 틱이 달라 다음 주기에 받는다).
+  if (pending || document.hidden || !state.snapshot || isOpen('analysis-modal')) return;
   if (!force && Date.now() < retryAt) return;
   const p = framePreset();
-  const sel = $('view-select').value;
+  const sel = viewNow();
   const view = sel === 'chase' ? `chase:${$('orbit-range').value}` : sel;
   const key = `${state.snapshot.tick}|${p.width}x${p.height}q${p.quality}|${view}`;
   if (!force && key === lastKey) return;
@@ -218,13 +198,16 @@ function showEmpty(message, isError = false, onRetry = null) {
 }
 
 // ── 표시 토글 ───────────────────────────────────────────────────
+/** 탑뷰는 지도 전체가 화면이므로 미니맵은 다른 시점에서만 보인다. */
+function syncMinimap() {
+  $('vp-minimap').hidden = !state.toggles.path || viewNow() === 'top';
+}
+
 const TOGGLES = [
+  ['tg-cctv', 'cctv', () => bus.emit('frame', state.frame)],
   ['tg-boxes', 'boxes', () => renderDetections()],
-  ['tg-path', 'path', () => { $('vp-minimap').hidden = !state.toggles.path; }],
+  ['tg-path', 'path', syncMinimap],
   ['tg-oracle', 'oracle', () => renderDetections()],
-  ['tg-body', 'body', () => { $('body-hud').hidden = !state.toggles.body; }],
-  ['tg-quest', 'quest', () => { $('quest-tracker').hidden = !state.toggles.quest; }],
-  ['tg-pip', 'pip', () => { $('pip').hidden = !state.toggles.pip; }],
 ];
 
 function initToggles() {
@@ -237,29 +220,33 @@ function initToggles() {
       btn.classList.toggle('active', state.toggles[key]);
       apply();
     });
-    apply();
   }
+  syncMinimap();
 }
 
 export function initWorldView() {
   initToggles();
-  initFocusHud();
   observeResize($('world-wrap'), layoutFrame);
   layoutFrame();
-  const orbitShown = () => {
-    const chase = $('view-select').value === 'chase';
+  const syncView = () => {
+    const chase = viewNow() === 'chase';
     $('orbit-range').hidden = !chase;
     $('orbit-label').hidden = !chase;
+    syncMinimap();
   };
-  $('view-select').addEventListener('change', () => { orbitShown(); poll(true); });
+  $('view-select').addEventListener('change', () => {
+    syncView();
+    state.units = [];
+    bus.emit('view', viewNow());
+    poll(true);
+  });
   $('orbit-range').addEventListener('input', () => poll(true));
-  orbitShown();
+  syncView();
   $('frame-preset').addEventListener('change', () => poll(true));
   bus.on('world-new', () => { lastKey = ''; retryAt = 0; poll(true); });
+  // 틱은 그대로인데 화면이 바뀌는 일(작업자 소환·제거, 몸 교체): 받는 중이어도 다음 주기에 다시 받게 키를 지운다.
+  bus.on('frame-stale', () => { lastKey = ''; poll(true); });
   bus.on('world-error', (m) => showEmpty(`월드를 만들지 못했습니다: ${m}`, true, () => $('world-new').click()));
-  bus.on('tab', ({ group, name }) => {
-    if (group === 'center' && name === 'world') { layoutFrame(); poll(true); }
-  });
   setInterval(() => poll(false), POLL_MS);
   renderDetections();
 }

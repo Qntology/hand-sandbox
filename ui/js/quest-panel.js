@@ -1,8 +1,8 @@
-// 퀘스트: 오른쪽 퀘스트 카드 목록, 인벤토리(내려놓기 버튼), 보관 더미, 월드 화면의 퀘스트 트래커.
+// 퀘스트: 명령줄 위 고정 헤더(#quest-bar)와 그 헤더가 여는 Drop-up 의 퀘스트 카드 목록, 인벤토리(내려놓기 버튼), 보관 더미.
 // 매 틱 갱신되므로 카드별 서명(signature)이 같으면 DOM 을 그대로 두어 포커스와 깜빡임을 지킨다.
 import { bus, state } from './state.js';
 import { $, clear, el, fmt } from './util.js';
-import { panelOpen } from './layout.js';
+import { togglePanel } from './overlays.js';
 import { toast } from './toast.js';
 import { submitCommand } from './command-bar.js';
 
@@ -109,7 +109,7 @@ function renderList(quests) {
     if (!live.has(id)) { cards.get(id).node.remove(); cards.delete(id); }
   }
   if (!sorted.length) {
-    box.replaceChildren(el('p', { class: 'empty-note', text: '아직 퀘스트가 없습니다. 월드 화면 아래 입력줄에 명령을 입력하세요. 예: 철광석 3개 캐서 베이스캠프로 가져와' }));
+    box.replaceChildren(el('p', { class: 'empty-note', text: '아직 퀘스트가 없습니다. 아래 입력줄에 명령을 입력하세요. 예: 철광석 3개 캐서 베이스캠프로 가져와' }));
     cards.clear();
   } else if (wanted.length !== box.children.length || wanted.some((n, i) => box.children[i] !== n)) {
     box.replaceChildren(...wanted);
@@ -130,7 +130,7 @@ function notifyChanges(quests) {
   firstLoad = false;
 }
 
-// ── 트래커(월드 화면 우상단) ────────────────────────────────────
+// ── 고정 헤더(명령줄 위) ────────────────────────────────────────
 function renderTracker(quests) {
   const q = quests.find((x) => x.state === 'active') ?? quests.find((x) => x.state === 'pending')
     ?? [...quests].sort((a, b) => b.created_tick - a.created_tick)[0];
@@ -141,29 +141,16 @@ function renderTracker(quests) {
     $('qt-bar').style.width = '0%';
     badge.textContent = '없음';
     badge.className = 'badge badge-dim';
-    $('quest-tracker').dataset.quest = '';
     return;
   }
   const step = q.steps?.find((s) => s.state === 'active') ?? q.steps?.find((s) => s.state === 'failed') ?? q.steps?.find((s) => s.state === 'pending');
   const done = q.steps?.filter((s) => s.state === 'done').length ?? 0;
   $('qt-title').textContent = q.title;
   $('qt-step').textContent = q.state === 'done' ? '모든 단계를 마쳤습니다'
-    : step ? `${done + 1}/${q.steps.length} ${step.label_ko}${step.state === 'active' ? ` · ${Math.round((step.progress ?? 0) * 100)}%` : ''}` : '';
+    : step ? `${done + 1}/${q.steps.length} ${step.label_ko} (${Math.round(overall(q) * 100)}%)` : '';
   $('qt-bar').style.width = `${Math.round(overall(q) * 100)}%`;
   badge.textContent = STATE_KO[q.state] ?? q.state;
   badge.className = `badge ${STATE_BADGE[q.state] ?? 'badge-dim'}`;
-  $('quest-tracker').dataset.quest = q.id;
-}
-
-function focusQuest() {
-  const id = $('quest-tracker').dataset.quest;
-  panelOpen('panelRight');
-  const entry = id ? cards.get(id) : null;
-  if (!entry) return;
-  entry.node.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-  entry.node.classList.remove('flash');
-  void entry.node.offsetWidth; // 강제 리플로우: 같은 애니메이션을 다시 재생
-  entry.node.classList.add('flash');
 }
 
 // ── 인벤토리 ────────────────────────────────────────────────────
@@ -252,10 +239,9 @@ export function initQuestPanel() {
   $('inv-drop-all').addEventListener('click', () => dropFromInventory(null, true));
   bus.on('snapshot', renderStock);
   bus.on('quests', () => renderStock(state.snapshot));
-  const tracker = $('quest-tracker');
-  tracker.addEventListener('click', focusQuest);
-  tracker.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); focusQuest(); }
+  $('quest-bar').addEventListener('click', () => togglePanel('quest-dropup'));
+  bus.on('panel', ({ id, open }) => {
+    if (id === 'quest-dropup') $('qb-more').textContent = open ? '협업·인벤 닫기 ▼' : '협업·인벤 상세 ▲';
   });
   bus.on('quests', (qs) => { notifyChanges(qs); renderList(qs); renderTracker(qs); });
   bus.on('snapshot', renderInventory);

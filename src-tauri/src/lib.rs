@@ -6,9 +6,24 @@ pub mod views;
 
 use std::sync::Arc;
 
+/// Where an AI client reaches the robots (`noto_runtime::mcp`), on this machine only. `NOTO_MCP_PORT` moves it.
+const MCP_PORT: u16 = 8788;
+
 pub fn run() {
+    let app_state = Arc::new(state::AppState::new());
+    let mcp_state = app_state.clone();
+    let port = std::env::var("NOTO_MCP_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(MCP_PORT);
+    let call = Arc::new(move |name: &str, args: &serde_json::Value| {
+        if name == "command_submit" {
+            mcp_state.require_models()?;
+        }
+        mcp_state.with_world(|rt| rt.api_call(name, args))
+    });
+    if let Err(e) = noto_runtime::mcp::listen(port, call) {
+        eprintln!("MCP 서버를 열 수 없습니다 (127.0.0.1:{port}): {e}");
+    }
     tauri::Builder::default()
-        .manage(Arc::new(state::AppState::new()))
+        .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             commands::presets,
             commands::hand_geometry,

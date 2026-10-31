@@ -1,4 +1,4 @@
-// 깊이 · 카메라 탭: 머리 카메라가 지금 보는 화면에 깊이 모델(TIPSv2)을 돌린 결과를 렌더러의 정답 깊이와 같은 색 척도로 나란히 보이고,
+// 비전 · 깊이 탭의 깊이 칸과 CCTV 확대 창: 머리 카메라가 지금 보는 화면에 깊이 모델(TIPSv2)을 돌린 결과를 렌더러의 정답 깊이와 같은 색 척도로 나란히 보이고,
 // 머리 카메라의 높이·피치·팬·흔들림·모션 블러·IMU 추정 오차를 보인다(depth_view, world_frame 의 camera).
 import { call } from './api.js';
 import { bus, state } from './state.js';
@@ -35,29 +35,23 @@ export function cameraRows(c) {
   ];
 }
 
-function render(d) {
-  const box = clear($('depth-view'));
-  if (!d) {
-    box.append(el('p', { class: 'empty-note', text: '깊이 추정 실행을 누르면 지금 머리 카메라 화면에 깊이 모델을 돌립니다.' }));
-    return;
-  }
+/** depth_view 응답을 그림·범례·지표로 만든다. core 이면 왼쪽 카메라 · 추정 · 정답 세 장만 (확대 창). */
+export function depthBlocks(d, { core = false } = {}) {
   const m = d.metrics;
   const r = d.metrics_raw;
-  const tta = d.flip_tta ? ' · 좌우 반전 평균' : '';
-  $('depth-meta').textContent = `틱 ${d.tick} · ${d.mode} · ${d.device} · 추론 ${fmt.n(d.infer_ms, 0)} ms${tta}${d.max_depth_m ? ` · 모델 상한 ${fmt.n(d.max_depth_m, 0)} m` : ''}`;
   const [lo, hi] = d.scale_m ?? [0, 1];
   const st = d.stereo;
   const figs = [
     el('figure', {}, img(d.rgb_webp_base64, '머리 카메라 원본'), el('figcaption', { text: st ? '왼쪽 카메라 (기준 · SigLIP2 · SAM이 봄)' : '머리 카메라 (흔들림·블러 포함)' })),
-    st && d.right_webp_base64 ? el('figure', {}, img(d.right_webp_base64, '오른쪽 카메라'), el('figcaption', { text: `오른쪽 카메라 (기선 ${fmt.n(st.baseline_m * 100, 1)} cm 옆)` })) : null,
+    !core && st && d.right_webp_base64 ? el('figure', {}, img(d.right_webp_base64, '오른쪽 카메라'), el('figcaption', { text: `오른쪽 카메라 (기선 ${fmt.n(st.baseline_m * 100, 1)} cm 옆)` })) : null,
     el('figure', {}, img(d.pred_webp_base64, '깊이 추정'), el('figcaption', { text: st ? `SGBM 깊이 — Z = f·b/d, 매칭 못 한 화소는 비움(어둡게) · ${st.grid[0]}×${st.grid[1]}` : d.align ? `추정 깊이 — 지면 정렬 · 하늘 제외 (${d.mode})` : `추정 깊이 — ${d.mode}` })),
     el('figure', {}, img(d.truth_webp_base64, '렌더러 정답 깊이'), el('figcaption', { text: '정답 깊이 (렌더러)' })),
   ].filter(Boolean);
-  if (d.raw_webp_base64) figs.push(el('figure', {}, img(d.raw_webp_base64, '모델 원출력'), el('figcaption', { text: '모델 원출력 (실내 NYU 척도, 정렬 전)' })));
-  if (d.seg_webp_base64) figs.push(el('figure', {}, img(d.seg_webp_base64, 'ADE20K 분할'), el('figcaption', { text: `분할 (ADE20K) — 하늘 ${fmt.pct(d.sky?.frac ?? 0, 0)} 깊이에서 제외` })));
-  if (d.normals_webp_base64) figs.push(el('figure', {}, img(d.normals_webp_base64, '표면 법선'), el('figcaption', { text: `표면 법선 — 지면 아닌 후보 ${d.align?.off_ground_normals ?? 0}개를 정렬에서 뺌` })));
+  if (!core && d.raw_webp_base64) figs.push(el('figure', {}, img(d.raw_webp_base64, '모델 원출력'), el('figcaption', { text: '모델 원출력 (실내 NYU 척도, 정렬 전)' })));
+  if (!core && d.seg_webp_base64) figs.push(el('figure', {}, img(d.seg_webp_base64, 'ADE20K 분할'), el('figcaption', { text: `분할 (ADE20K) — 하늘 ${fmt.pct(d.sky?.frac ?? 0, 0)} 깊이에서 제외` })));
+  if (!core && d.normals_webp_base64) figs.push(el('figure', {}, img(d.normals_webp_base64, '표면 법선'), el('figcaption', { text: `표면 법선 — 지면 아닌 후보 ${d.align?.off_ground_normals ?? 0}개를 정렬에서 뺌` })));
   const fit = d.align;
-  box.append(
+  return [
     el('div', { class: 'depth-grid' }, ...figs),
     el('div', { class: 'depth-legend' },
       el('span', { text: `${fmt.n(lo, 1)} m 가까움` }),
@@ -74,7 +68,18 @@ function render(d) {
       ...(st ? [['지면 정렬', '건너뜀 — 스테레오 깊이는 이미 미터 (1/Z = a/Z + b 정렬 안 함)']] : []),
       ...cameraRows(d.camera),
     ]),
-  );
+  ];
+}
+
+function render(d) {
+  const box = clear($('depth-view'));
+  if (!d) {
+    box.append(el('p', { class: 'empty-note', text: '깊이 추정 실행을 누르면 지금 머리 카메라 화면에 깊이 모델을 돌립니다.' }));
+    return;
+  }
+  const tta = d.flip_tta ? ' · 좌우 반전 평균' : '';
+  $('depth-meta').textContent = `틱 ${d.tick} · ${d.mode} · ${d.device} · 추론 ${fmt.n(d.infer_ms, 0)} ms${tta}${d.max_depth_m ? ` · 모델 상한 ${fmt.n(d.max_depth_m, 0)} m` : ''}`;
+  box.append(...depthBlocks(d));
 }
 
 export async function runDepth() {
@@ -102,8 +107,8 @@ export function initDepthView() {
   $('depth-run').addEventListener('click', runDepth);
   $('depth-auto').addEventListener('change', (e) => setAuto(e.target.checked));
   bus.on('tab', ({ group, name }) => {
-    if (group !== 'bottom') return;
-    visible = name === 'depth';
+    if (group !== 'analysis') return;
+    visible = name === 'vision';
     if (visible && !state.depthView) runDepth();
   });
   render(null);

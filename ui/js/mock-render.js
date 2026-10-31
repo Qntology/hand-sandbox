@@ -1,6 +1,8 @@
 // 모의 프레임 렌더러: 오프스크린 캔버스에 단순한 가짜 3D 장면(하늘 그라데이션, 지면 체크 무늬, 나무·바위·광석 블록)을
 // 에이전트 기준으로 그리고 WebP 로 인코딩한다. 실제 world-sim 의 레이캐스터가 아니다.
+// 탑뷰는 지도 전체를 요청 크기에 맞춰 그리고 로봇마다 프레임 좌표(units)를 돌려준다. unit_frame · depth_view 도 여기서 그린다.
 import { DETECT_LABEL, procedureView, visibleObjects, world } from './mock-world.js';
+import { mockFocus, mockOverlay, unitRows } from './mock-units.js';
 
 // 1×1 무손실 WebP (캔버스를 쓸 수 없는 환경용 대체 프레임)
 const BLANK_WEBP = 'UklGRhoAAABXRUJQVlA4TA0AAAAvAAAAEAcQERGIiP4HAA==';
@@ -178,60 +180,184 @@ function drawForkView(ctx, w, h, W, dets) {
   }
 }
 
-function drawTopView(ctx, w, h, W, dets) {
-  const span = 28;
-  const s = w / span;
-  const [ax, ay] = W.agent.pos;
-  const X = (x) => w / 2 + (x - ax) * s;
-  const Y = (y) => h / 2 - (y - ay) * s;
-  ctx.fillStyle = '#2b4430'; ctx.fillRect(0, 0, w, h);
-  ctx.fillStyle = '#35553a'; ctx.fillRect(X(0), Y(W.bounds[1]), W.bounds[0] * s, W.bounds[1] * s);
-  ctx.strokeStyle = 'rgba(255,255,255,0.07)'; ctx.lineWidth = 1;
-  for (let g = 0; g <= Math.max(W.bounds[0], W.bounds[1]); g += 2) {
-    ctx.beginPath(); ctx.moveTo(X(g), 0); ctx.lineTo(X(g), h); ctx.moveTo(0, Y(g)); ctx.lineTo(w, Y(g)); ctx.stroke();
+/** 탑뷰 좌표: 지도 전체를 w×h 안에 비율 유지로 넣는다(+y 가 위쪽, 미니맵과 같다). */
+function topMap(w, h, W) {
+  const s = Math.min(w / W.bounds[0], h / W.bounds[1]);
+  const ox = (w - W.bounds[0] * s) / 2;
+  const oy = (h - W.bounds[1] * s) / 2;
+  return { s, X: (x) => ox + x * s, Y: (y) => h - oy - y * s };
+}
+
+function drawRobot(ctx, r, X, Y, s) {
+  ctx.save();
+  ctx.translate(X(r.pos[0]), Y(r.pos[1]));
+  ctx.rotate(-r.yaw);
+  if (r.form === 'forklift') {
+    ctx.fillStyle = '#3c3c44';
+    for (const y of [-0.38, 0.28]) ctx.fillRect(0.4 * s, y * s, 0.95 * s, 0.1 * s);
+    ctx.fillStyle = '#e8c028';
+    ctx.fillRect(-1.0 * s, -0.5 * s, 1.4 * s, 1.0 * s);
+  } else {
+    ctx.fillStyle = '#ec8034';
+    ctx.beginPath();
+    ctx.arc(0, 0, 0.32 * s, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#fafafa';
+    ctx.fillRect(0.2 * s, -0.06 * s, 0.32 * s, 0.12 * s);
   }
-  ctx.font = `${Math.max(10, Math.round(s * 0.45))}px sans-serif`;
+  ctx.restore();
+}
+
+function drawTopView(ctx, w, h, W) {
+  const { s, X, Y } = topMap(w, h, W);
+  ctx.fillStyle = '#16181a';
+  ctx.fillRect(0, 0, w, h);
+  ctx.fillStyle = '#35553a';
+  ctx.fillRect(X(0), Y(W.bounds[1]), W.bounds[0] * s, W.bounds[1] * s);
+  ctx.strokeStyle = 'rgba(255,255,255,0.07)';
+  ctx.lineWidth = 1;
+  for (let g = 0; g <= Math.max(W.bounds[0], W.bounds[1]); g += 2) {
+    ctx.beginPath();
+    ctx.moveTo(X(g), Y(0));
+    ctx.lineTo(X(g), Y(W.bounds[1]));
+    ctx.moveTo(X(0), Y(g));
+    ctx.lineTo(X(W.bounds[0]), Y(g));
+    ctx.stroke();
+  }
+  ctx.font = `${Math.max(10, Math.round(s * 0.5))}px sans-serif`;
   const r = { tree: 0.9, rock: 0.6, iron_ore: 0.55, coal_ore: 0.55, chest: 0.4, drop: 0.25, waypoint: 0.5 };
   const col = { tree: '#2f7a3c', rock: '#7d7f85', iron_ore: '#c4764a', coal_ore: '#25252a', chest: '#d6b65e', waypoint: '#4aa3df' };
-  for (const o of visibleObjects(30).reverse()) {
+  for (const o of visibleObjects(Infinity)) {
     const x = X(o.pos[0]);
     const y = Y(o.pos[1]);
-    if (x < -20 || y < -20 || x > w + 20 || y > h + 20) continue;
     const rad = (r[o.kind] ?? 0.4) * s;
     ctx.fillStyle = o.drop ? (DROP_COLOR[o.item_id] ?? '#ddd') : col[o.kind];
-    if (o.kind === 'waypoint') ctx.fillRect(x - rad * 0.6, y - rad * 0.6, rad * 1.2, rad * 1.2);
-    else { ctx.beginPath(); ctx.arc(x, y, rad, 0, Math.PI * 2); ctx.fill(); }
-    if (o.kind === 'waypoint') { ctx.fillStyle = '#d4d4d8'; ctx.fillText(o.label_ko, x + rad, y - rad); }
-    else if (o.dist < 12) dets.push({ o, bbox: [x - rad, y - rad, x + rad, y + rad] });
+    if (o.kind === 'waypoint') {
+      ctx.fillRect(x - rad * 0.6, y - rad * 0.6, rad * 1.2, rad * 1.2);
+      ctx.fillStyle = '#d4d4d8';
+      ctx.fillText(o.label_ko, x + rad, y - rad);
+    } else {
+      ctx.beginPath();
+      ctx.arc(x, y, rad, 0, Math.PI * 2);
+      ctx.fill();
+    }
   }
-  ctx.save(); ctx.translate(w / 2, h / 2); ctx.rotate(-W.agent.yaw);
-  ctx.fillStyle = '#fafafa'; ctx.beginPath(); ctx.moveTo(0.7 * s, 0); ctx.lineTo(-0.5 * s, 0.4 * s); ctx.lineTo(-0.5 * s, -0.4 * s); ctx.closePath(); ctx.fill();
-  ctx.restore();
+  for (const u of unitRows()) drawRobot(ctx, u, X, Y, s);
+}
+
+/** world_frame.units: 탑뷰 프레임 안의 로봇 자리. */
+function topUnits(w, h, W) {
+  const { X, Y } = topMap(w, h, W);
+  return unitRows().map(({ pos, yaw, battery_ratio, rig_id, rig_name_ko, ...u }) => ({ ...u, u: X(pos[0]) / w, v: Y(pos[1]) / h, yaw_deg: (yaw * 180) / Math.PI }));
+}
+
+function canvasFor(w, h) {
+  if (typeof document === 'undefined') return null;
+  cv = cv ?? document.createElement('canvas');
+  if (cv.width !== w) cv.width = w;
+  if (cv.height !== h) cv.height = h;
+  try {
+    return cv.getContext('2d');
+  } catch {
+    return null;
+  }
+}
+
+function encode(quality) {
+  const t0 = performance.now();
+  const url = cv.toDataURL('image/webp', Math.max(0.05, Math.min(1, (Number(quality) || 75) / 100)));
+  return { b64: url.slice(url.indexOf(',') + 1), encode_ms: performance.now() - t0 };
+}
+
+/** 가짜 깊이 색: 그려진 장면에 위(멂 · 파랑)에서 아래(가까움 · 빨강)로 색만 입힌다. */
+function tintDepth(ctx, w, h, shift = 0) {
+  const g = ctx.createLinearGradient(0, 0, 0, h);
+  g.addColorStop(0, '#30123b');
+  g.addColorStop(0.45 + shift, '#28bceb');
+  g.addColorStop(0.75 + shift / 2, '#edd03a');
+  g.addColorStop(1, '#7a0403');
+  ctx.globalCompositeOperation = 'color';
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, w, h);
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+/** 그 로봇의 자리·방향에서 그린다(에이전트 시점 그리기를 빌려 쓴다). */
+function fromUnit(W, r, draw) {
+  const a = W.agent;
+  const keep = { pos: a.pos, yaw: a.yaw };
+  a.pos = r.pos;
+  a.yaw = r.yaw;
+  try {
+    draw();
+  } finally {
+    Object.assign(a, keep);
+  }
+}
+
+export function renderUnit({ unit, width, height, quality, mode = 'rgb' }) {
+  const W = world();
+  if (!W) throw '월드가 없습니다. world_new 를 먼저 호출하세요';
+  const r = unitRows().find((u) => u.id === unit);
+  if (!r) throw `유닛 ${unit} 이 없습니다`;
+  const w = clampInt(width, 32, 1024);
+  const h = clampInt(height, 32, 1024);
+  const ctx = canvasFor(w, h);
+  let b64 = BLANK_WEBP;
+  if (ctx) {
+    fromUnit(W, r, () => {
+      if (mode === 'fork') drawForkView(ctx, w, h, W, []);
+      else drawAgentView(ctx, w, h, W, []);
+    });
+    if (mode === 'depth') tintDepth(ctx, w, h);
+    ({ b64 } = encode(quality));
+  }
+  return { webp_base64: b64, width: w, height: h, unit, mode, label_ko: r.label_ko, depth_name: r.cameras === 2 ? 'SGBM' : 'TIPSv2', procedure: r.first ? procedureView() : null };
+}
+
+function shot(W, w, h, quality, depth) {
+  const ctx = canvasFor(w, h);
+  if (!ctx) return BLANK_WEBP;
+  drawAgentView(ctx, w, h, W, []);
+  if (depth != null) tintDepth(ctx, w, h, depth);
+  return encode(quality).b64;
+}
+
+/** 깊이 · 카메라 탭과 CCTV 확대 창의 모의 값: 그림은 가짜 색칠이고 지표는 데모 숫자다. */
+export function depthView({ quality = 80 } = {}) {
+  const W = world();
+  if (!W) throw '월드가 없습니다. world_new 를 먼저 호출하세요';
+  const [w, h] = [480, 320];
+  const a = W.agent;
+  return {
+    tick: W.tick, mode: '모의 깊이', device: 'cpu (모의)', infer_ms: 12, flip_tta: false, max_depth_m: 80, scale_m: [0.5, 30],
+    rgb_webp_base64: shot(W, w, h, quality, null),
+    pred_webp_base64: shot(W, w, h, quality, 0.06),
+    truth_webp_base64: shot(W, w, h, quality, 0),
+    metrics: { absrel: 0.042, delta1: 0.96, rmse_m: 0.31, median_scale: 1.02 }, metrics_raw: { absrel: 0.11, delta1: 0.81, rmse_m: 0.62 },
+    align: { a: 0.98, b: 0.012, inliers: 142, candidates: 168, median_rel_err: 0.03, span_m: [1.2, 9.4] },
+    camera: {
+      eye_m: a.eye_m ?? 1, standing_eye_m: a.standing_eye_m ?? 1, mount_deg: a.mount_deg ?? -12, head_pitch_deg: a.head_pitch_deg ?? 0, pitch_deg: a.pitch_deg ?? -12, pan_deg: a.pan_deg ?? 0, roll_deg: 0, blur_px: 0.4,
+      shake: { source: 'rolling', pitch_deg: 0.2, dz_mm: 1.2, rate_dps: [2, 4, 1] },
+      sensor: { name: '모의 센서', rgb: '8비트', exposure_ms: 5, scene_lux: 20000, readout_ms: 8, gyro_arw_deg: 0.01 }, ground: '평지', est_err_deg: { pitch: 0.02, roll: 0.01 }, terrain_tilt_deg: [0, 0],
+    },
+  };
 }
 
 export function renderFrame({ width, height, quality, view }) {
   const W = world();
   if (!W) throw '월드가 없습니다. world_new 를 먼저 호출하세요';
-  const w = clampInt(width, 64, 1024);
-  const h = clampInt(height, 48, 768);
+  const w = clampInt(width, 32, 2048);
+  const h = clampInt(height, 32, 2048);
   const hits = [];
-  let ctx = null;
-  if (typeof document !== 'undefined') {
-    cv = cv ?? document.createElement('canvas');
-    if (cv.width !== w) cv.width = w;
-    if (cv.height !== h) cv.height = h;
-    try { ctx = cv.getContext('2d'); } catch { ctx = null; }
-  }
+  const ctx = canvasFor(w, h);
   let b64 = BLANK_WEBP;
   let encode_ms = 0;
   if (ctx) {
-    if (view === 'top') drawTopView(ctx, w, h, W, hits);
+    if (view === 'top') drawTopView(ctx, w, h, W);
     else if (view === 'fork') drawForkView(ctx, w, h, W, hits);
     else drawAgentView(ctx, w, h, W, hits);
-    const t0 = performance.now();
-    const url = cv.toDataURL('image/webp', Math.max(0.05, Math.min(1, (Number(quality) || 75) / 100)));
-    encode_ms = performance.now() - t0;
-    b64 = url.slice(url.indexOf(',') + 1);
+    ({ b64, encode_ms } = encode(quality));
   }
   const pad = b64.endsWith('==') ? 2 : b64.endsWith('=') ? 1 : 0;
   const detections = hits
@@ -240,7 +366,7 @@ export function renderFrame({ width, height, quality, view }) {
   const a = W.agent;
   const moving = (a.speed ?? 0) > 0.05;
   const shakePitch = moving ? Math.sin(W.tick * 0.9) * 0.35 : 0;
-  const camera = view === 'top' || view === 'fork' ? null : {
+  const camera = view !== 'agent' ? null : {
     eye_m: a.eye_m ?? 1.0,
     standing_eye_m: a.standing_eye_m ?? 1.0,
     mount_deg: a.mount_deg ?? -12.0,
@@ -262,5 +388,10 @@ export function renderFrame({ width, height, quality, view }) {
     const hit = hits.find((x) => x.o.id === procedure.target);
     if (hit) procedure.check = { ...procedure.check, bbox: hit.bbox.map((v, i) => Number(Math.max(0, Math.min(1, v / (i % 2 ? h : w))).toFixed(4))) };
   }
-  return { webp_base64: b64, width: w, height: h, bytes: Math.floor((b64.length * 3) / 4) - pad, encode_ms, tick: W.tick, detections, camera, procedure };
+  return {
+    webp_base64: b64, width: w, height: h, bytes: Math.floor((b64.length * 3) / 4) - pad, encode_ms, tick: W.tick, detections, camera, procedure,
+    units: view === 'top' ? topUnits(w, h, W) : [],
+    overlay: view.startsWith('chase') ? mockOverlay(w, h) : null,
+    focus: view.startsWith('focus') ? mockFocus() : null,
+  };
 }

@@ -1,4 +1,4 @@
-// 왼쪽 ③ 월드: 시드·크기·지형·재생성, 월드 리셋 · 신체 상태 리셋, 현재 월드 요약, 손·발 구성이 달라졌다는 안내.
+// 좌상단 🌍 월드 팝오버: 시드·크기·지형·재생성, 월드 리셋 · 신체 상태 리셋, 현재 월드 요약, 손·부품 구성이 달라졌다는 안내.
 import { call } from './api.js';
 import { bus, state } from './state.js';
 import { $, clear, el } from './util.js';
@@ -10,6 +10,7 @@ const KIND_KO = {
   rock: '바위', iron_ore: '철 광석', chest: '상자',
 };
 const TERRAIN_KO = { open: '열린 평지', rugged: '복합 지형' };
+const CELL_M = 0.5;
 
 function kv(k, v) {
   return [el('span', { class: 'k', text: k }), el('span', { class: 'v', text: v })];
@@ -35,12 +36,22 @@ function renderInfo(snap) {
   for (const [k, n] of Object.entries(counts)) box.append(...kv(KIND_KO[k] ?? k, `${n}개`));
   box.append(...kv('드롭', `${snap.drops.length}개`));
   summaryBase = `시드 ${snap.seed} · ${snap.bounds[0]}×${snap.bounds[1]} m${snap.terrain === 'rugged' ? ' · 복합' : ''}`;
+  const cells = (b) => Math.round(b / CELL_M);
+  $('world-pill').textContent = `🌍 월드: 시드 ${snap.seed} · ${cells(snap.bounds[0])}×${cells(snap.bounds[1])} ▾`;
+}
+
+/** 손 구성·부품 등급이 지금 월드와 다른가. 이 둘은 유닛별 제자리 교체가 없어 월드를 다시 만들어야 적용된다. */
+export function worldDirty() {
+  const hand = state.worldConfigKey != null && state.worldConfigKey !== JSON.stringify(state.config);
+  const plan = state.worldPlanKey != null && state.worldPlanKey !== JSON.stringify(state.bodyPlan);
+  return hand || plan;
 }
 
 function updateDirty() {
-  const dirty = state.worldConfigKey != null && state.worldConfigKey !== JSON.stringify(state.config);
+  const dirty = worldDirty();
   $('world-dirty').hidden = !dirty;
-  // ③이 접혀 있어도 알 수 있게 머리글 요약에 표시한다.
+  $('world-pill').classList.toggle('dirty', dirty);
+  // 팝오버가 닫혀 있어도 알 수 있게 알약 테두리와 머리글 요약에 표시한다.
   $('sum-world').textContent = dirty ? `${summaryBase} · 재생성 필요` : summaryBase;
 }
 
@@ -95,8 +106,7 @@ export function initWorldPanel() {
     renderInfo(snap);
     updateDirty();
   });
-  bus.on('config', updateDirty);
-  bus.on('world-new', updateDirty);
+  for (const ev of ['config', 'body-plan', 'world-new']) bus.on(ev, updateDirty);
   renderInfo(null);
   return run;
 }

@@ -1,9 +1,9 @@
-// 연산 장치 선택·칩, 그리고 SigLIP2 / TTM / 깊이 / 마스크 / 임베더 / SDS 상태 줄(상태줄과 ④ 사전·모델 공용).
+// 연산 장치 선택·칩, 그리고 SigLIP2 / TTM / 깊이 / 마스크 / 임베더 / SDS 상태 줄(상태줄과 🌍 월드 팝오버 공용).
 // 모델 받기·삭제·불러오기는 models.js 가 맡는다(네 모델은 필수라 끄는 스위치가 없다).
 import { call } from './api.js';
 import { bus, state } from './state.js';
 import { $, clear, el, fmt } from './util.js';
-import { openSection } from './layout.js';
+import { openPanel } from './overlays.js';
 import { setStatus } from './toast.js';
 
 export async function refreshDevices() {
@@ -115,7 +115,7 @@ export function updateModelLines() {
 export function initDevice() {
   $('device-select').addEventListener('change', onDeviceChanged);
   $('sb-device').addEventListener('click', () => {
-    openSection('secModel');
+    openPanel('world-popover');
     $('device-select').focus();
   });
   $('model-refresh').addEventListener('click', async () => {

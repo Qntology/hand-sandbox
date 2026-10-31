@@ -18,6 +18,7 @@ use crate::dynamics::LinkBox;
 use crate::kin::{self, KinLoads, KinPose};
 use crate::parts::Segment;
 
+pub mod edit;
 pub mod urdf;
 
 pub const SHELL: [u8; 3] = [226, 228, 232];
@@ -609,6 +610,8 @@ pub struct RigSpec {
     /// What a body built from this rig draws (`attach`).
     pub visuals: Vec<RigVisual>,
     pub warnings: Vec<String>,
+    /// The name its statistics go under, so one robot's learning does not mix with another's. Set when it is saved.
+    pub sds_key: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -860,7 +863,7 @@ impl RigSpec {
         };
         let joints = u.joints.iter().filter(|j| j.name != "chassis_fixed" && !j.name.ends_with("_fixed")).map(|j| RigJoint { name: j.name.clone(), kind: j.kind.clone(), parent: j.parent.clone(), child: j.child.clone(), at: frames.get(&j.child).map_or([0.0; 3], |f| f.t), limit: j.limit }).collect();
         let colors = u.links.iter().filter_map(|l| Some((l.name.clone(), l.color?))).collect();
-        Ok(RigSpec { name: name.to_string(), form, dims, masses, limits, joints, meshes, colors, visuals: Vec::new(), warnings })
+        Ok(RigSpec { name: name.to_string(), form, dims, masses, limits, joints, meshes, colors, visuals: Vec::new(), warnings, sds_key: None })
     }
 
     /// Degrees of freedom: the joints that move.

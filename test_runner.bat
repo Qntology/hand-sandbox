@@ -114,6 +114,9 @@ call :bench 17 source_split
 rem ---- 18-19: cross-area deviation ("uncanniness") report: core areas, then with camera and vision ----
 call :bench 18 uncanny_report
 call :bench 19 uncanny_runtime
+rem ---- 20-21: bodies stop at what they can hit; a sentence changes a unit's body and a lost load is fetched again ----
+call :bench 20 collisions
+call :bench 21 rig_mcp
 
 >>"%SUMMARY%" echo ========================================
 if "%FAILED%"=="0" (
