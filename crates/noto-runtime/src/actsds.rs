@@ -10,9 +10,9 @@ use world_sim::{TimedEvent, WorldEvent};
 use crate::record::{capture_keyframe, KeyEvent};
 use crate::runtime::Runtime;
 
-pub const KEY_KINDS: [&str; 32] = [
+pub const KEY_KINDS: [&str; 35] = [
     "bend_bottom", "contact", "lift_off", "hold", "slip", "pivot", "drop", "stowed", "release", "impact", "stall", "miss", "reach_fail", "foot_slip", "fall", "breakaway", "turn_slide", "push_lost", "collision", "arrive", "stuck", "wheel_slip", "bump", "tip", "hit", "edge_fall", "yield", "co_drop", "overload_share",
-    "incipient_slip", "heel_off", "toe_push",
+    "incipient_slip", "heel_off", "toe_push", "fork_in", "fork_up", "fork_out",
 ];
 
 pub const MOTION_EVENTS: [&str; 6] = ["foot_slip", "fall", "wheel_slip", "stuck", "collision", "push_lost"];
@@ -311,7 +311,7 @@ mod tests {
         assert_eq!(code_of(Some("battery_depleted")), "battery_depleted");
         assert_eq!(code_of(None), "failed");
         assert_eq!(code_of(Some(": x")), "failed");
-        assert!(KEY_KINDS.iter().all(|k| !k.is_empty()) && KEY_KINDS.len() == 32);
+        assert!(KEY_KINDS.iter().all(|k| !k.is_empty()) && KEY_KINDS.len() == 35);
         assert!(MOTION_EVENTS.iter().all(|k| KEY_KINDS.contains(k)), "every counted moment is a keyframe moment");
     }
 }

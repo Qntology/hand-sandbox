@@ -43,15 +43,8 @@
   --track-caps: 0.1em;
   --panel-header-h: 36px;
   --statusbar-h: 28px;
-  --rail-w: 56px;
-  --bar-h: 38px;
-  --left-min: 220px;
-  --left-w: 280px;
-  --right-min: 260px;
-  --right-w: 320px;
-  --bottom-min: 140px;
-  --bottom-h: 220px;
-  --resizer-size: 8px;
+  --hud-w: 304px;
+  --hub-w: 920px;
   --panel-transition: 0.3s cubic-bezier(0.4, 0, 0.2, 1);
 }
 

@@ -1,5 +1,4 @@
-/* 레이아웃 — 바탕 위에 떠 있는 카드 4개(좌·중·우·하단)와 8px 간격(= 리사이저), 28px 상태줄.
-   endmill-sandbox index.html 64~306행 구조를 그대로 옮기고, 키보드 포커스와 가운데 탭 줄만 더했다. */
+/* 레이아웃 — 풀스크린 월드 무대 하나와 28px 상태줄. 나머지는 모두 무대 위에 뜬다(overlay.css). */
 * { margin: 0; padding: 0; box-sizing: border-box; }
 html, body { height: 100%; overflow: hidden; }
 body {
@@ -8,8 +7,8 @@ body {
   background: var(--bg-darkest);
   color: var(--text);
   display: grid;
-  grid-template-rows: 1fr var(--statusbar-h);
-  grid-template-columns: 1fr;
+  grid-template-rows: minmax(0, 1fr) var(--statusbar-h);
+  grid-template-columns: minmax(0, 1fr);
   -webkit-font-smoothing: antialiased;
 }
 button, select, input { font-family: inherit; }
@@ -22,117 +21,7 @@ strong, b { font-weight: 600; color: var(--text-bright); }
 :focus-visible { outline: 2px solid var(--accent-strong); outline-offset: 1px; box-shadow: 0 0 0 4px var(--accent-glow); }
 input[type=text]:focus-visible, input[type=number]:focus-visible, select:focus-visible { outline: none; }
 
-/* ── 사이드바 머리 · 화면 전환 ─────────────────────────────────── */
-.sidebar-head { display: flex; align-items: center; gap: 10px; flex-shrink: 0; height: 52px; padding: 0 12px; border-bottom: 1px solid var(--border); }
-.sidebar-head .panel-toggle-btn { position: static; flex-shrink: 0; width: 30px; height: 30px; background: var(--bg-card); border-color: var(--border-light); color: var(--text-dim); border-radius: 8px; }
-.sidebar-head .panel-toggle-btn:hover { background: var(--bg-active); color: var(--text-bright); }
-.brand { min-width: 0; font-size: 0.7rem; font-weight: 600; letter-spacing: 0.16em; text-transform: uppercase; color: var(--text-bright); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.menu-group { display: flex; flex-direction: column; gap: 2px; padding: 10px 8px; }
-.menu-btn {
-  display: flex; align-items: center; gap: 12px; width: 100%; padding: 9px 10px;
-  background: transparent; border: none; border-radius: 8px; color: var(--text-dim);
-  font-size: 0.78rem; font-weight: 500; text-align: left; white-space: nowrap; cursor: pointer;
-  transition: background 0.15s, color 0.15s;
-}
-.menu-btn svg { width: 17px; height: 17px; flex-shrink: 0; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
-.menu-btn:hover { background: var(--bg-hover); color: var(--text-bright); }
-.menu-btn.active { background: var(--bg-active); color: var(--text-bright); }
-.group-label { margin: 0 14px; padding: 12px 0 6px; border-top: 1px solid var(--border); font-size: 0.6rem; font-weight: 600; letter-spacing: var(--track-caps); color: var(--text-muted); white-space: nowrap; overflow: hidden; }
-
-/* ── 카드 4개 + 리사이저 ───────────────────────────────────────── */
-.app-layout {
-  display: grid;
-  grid-template-columns: var(--left-w) var(--resizer-size) minmax(0, 1fr) var(--resizer-size) var(--right-w);
-  grid-template-rows: minmax(0, 1fr) var(--resizer-size) var(--bottom-h);
-  width: 100%;
-  height: 100%;
-  padding: var(--resizer-size);
-  overflow: hidden;
-}
-.app-layout > .panel-left,
-.app-layout > .panel-center,
-.app-layout > .panel-right,
-.app-layout > .panel-bottom {
-  background: var(--bg-panel);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-card);
-}
-.app-layout > .panel-left {
-  grid-row: 1 / -1; grid-column: 1; min-width: var(--left-min);
-  display: flex; flex-direction: column; overflow: hidden;
-  transition: width var(--panel-transition), min-width var(--panel-transition), opacity var(--panel-transition);
-}
-.app-layout > .panel-center { grid-row: 1; grid-column: 3; min-width: 200px; min-height: 0; overflow: hidden; display: flex; flex-direction: column; position: relative; }
-.app-layout > .panel-right {
-  grid-row: 1; grid-column: 5; min-width: var(--right-min);
-  display: flex; flex-direction: column; overflow: hidden;
-  transition: width var(--panel-transition), min-width var(--panel-transition), opacity var(--panel-transition);
-}
-.app-layout > .panel-bottom {
-  grid-row: 3; grid-column: 3 / -1; min-height: var(--bottom-min); overflow: hidden;
-  display: flex; flex-direction: column;
-  transition: height var(--panel-transition), min-height var(--panel-transition), opacity var(--panel-transition);
-}
-
-.resizer { background: transparent; position: relative; z-index: 10; touch-action: none; }
-.resizer::after { content: ''; position: absolute; border-radius: 2px; background: transparent; transition: background 0.15s; }
-.resizer:hover::after, .resizer.active::after, .resizer:focus-visible::after { background: var(--border-hover); }
-.resizer:focus-visible { outline: none; box-shadow: none; }
-.resizer-v { grid-row: 1; cursor: col-resize; width: var(--resizer-size); }
-.resizer-v::after { top: 14px; bottom: 14px; left: 50%; width: 2px; transform: translateX(-50%); }
-.resizer-v.left { grid-row: 1 / -1; grid-column: 2; }
-.resizer-v.right { grid-column: 4; }
-.resizer-h { grid-row: 2; grid-column: 3 / -1; cursor: row-resize; height: var(--resizer-size); }
-.resizer-h::after { left: 14px; right: 14px; top: 50%; height: 2px; transform: translateY(-50%); }
-
-.app-layout > .panel-left, .app-layout > .panel-right, .app-layout > .panel-bottom { position: relative; }
-
-/* 오른쪽은 접으면 열과 간격을 모두 비워 가운데가 끝까지 채우고, 펼치기 버튼은 가운데 툴바 끝(.vt-reopen)에 둔다.
-   아래는 접어도 머리글 한 줄이 남는다. */
-.app-layout:has(.panel-right.collapsed) { grid-template-columns: var(--left-w) var(--resizer-size) minmax(0, 1fr) 0 0; }
-.app-layout > .panel-right.collapsed,
-.app-layout:has(.panel-right.collapsed) .resizer-v.right { display: none; }
-.panel-bottom.collapsed { height: var(--bar-h) !important; min-height: 0 !important; }
-.panel-bottom.collapsed #secOutput { display: none !important; }
-
-.panel-toggle-btn {
-  position: absolute; top: 8px; right: 8px; width: 26px; height: 26px;
-  border: 1px solid var(--border-light); background: var(--bg-card); color: var(--text-dim);
-  font-size: 10px; cursor: pointer; border-radius: var(--radius);
-  display: flex; align-items: center; justify-content: center; z-index: 20;
-  transition: background 0.15s, color 0.15s, border-color 0.15s;
-}
-.panel-toggle-btn:hover { background: var(--bg-active); border-color: var(--border-hover); color: var(--text-bright); }
-.panel-bottom > .panel-toggle-btn { top: 5px; }
-
-/* 패널 제목줄: 이 영역이 무엇을 하는 곳인지 한 줄로 말한다 */
-.panel-title { display: flex; align-items: baseline; gap: 8px; min-width: 0; flex-shrink: 0; padding: 12px 40px 11px 14px; border-bottom: 1px solid var(--border-light); white-space: nowrap; overflow: hidden; }
-.panel-title b { font-size: 0.76rem; font-weight: 600; letter-spacing: 0.06em; color: var(--text-bright); }
-.panel-title small { font-size: 0.64rem; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; }
-.panel-scroll { flex: 1; min-height: 0; overflow-x: hidden; overflow-y: auto; }
-
-/* 왼쪽을 접으면 아이콘 레일로 남는다 — 화면 아이콘과 단계 번호만, 누르면 다시 펼침 */
-.panel-left.collapsed { width: var(--rail-w) !important; min-width: 0 !important; }
-.panel-left.collapsed .brand,
-.panel-left.collapsed .menu-btn span,
-.panel-left.collapsed .group-label,
-.panel-left.collapsed .sec-name,
-.panel-left.collapsed .step-sum,
-.panel-left.collapsed .chevron,
-.panel-left.collapsed .panel-section-body { display: none !important; }
-.panel-left.collapsed .sidebar-head { justify-content: center; padding: 0; }
-.panel-left.collapsed .menu-group { padding: 10px 7px; }
-.panel-left.collapsed .menu-btn { justify-content: center; padding: 10px 0; }
-.panel-left.collapsed .panel-section-header { justify-content: center; padding: 0; border-top-color: transparent; }
-.app-layout:has(.panel-left.collapsed) .resizer-v.left { pointer-events: none; }
-.app-layout:has(.panel-bottom.collapsed) .resizer-h { pointer-events: none; }
-.vt-btn.vt-reopen { display: none; margin-left: auto; }
-.app-layout:has(.panel-right.collapsed) .vt-btn.vt-reopen { display: inline-flex; }
-
-/* ── 가운데: 툴바 → 탭 줄 → 화면 ───────────────────────────────── */
-.center-tabs { border-top: 1px solid var(--border); }
-.center-pane { flex: 1; min-height: 0; min-width: 0; display: flex; flex-direction: column; position: relative; }
-.center-pane[hidden] { display: none; }
+.stage { position: relative; min-width: 0; min-height: 0; overflow: hidden; background: var(--bg-plot); }
 
 /* ── 상태 바 ───────────────────────────────────────────────────── */
 .status-bar {
@@ -151,9 +40,5 @@ input[type=text]:focus-visible, input[type=number]:focus-visible, select:focus-v
 .status-bar .sb-mock { color: var(--warning); border: 1px solid rgba(214, 182, 94, 0.45); background: rgba(214, 182, 94, 0.1); border-radius: var(--radius-sm); padding: 0 6px; font-weight: 600; }
 
 @media (max-width: 1100px) {
-  :root { --left-w: 200px; --right-w: 240px; --left-min: 200px; --right-min: 240px; }
   .status-bar .sb-opt { display: none; }
-}
-@media (prefers-reduced-motion: reduce) {
-  .app-layout > .panel-left, .app-layout > .panel-right, .app-layout > .panel-bottom { transition: none; }
 }

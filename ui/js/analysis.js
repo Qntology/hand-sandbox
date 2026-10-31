@@ -1,5 +1,4 @@
-// 분석: 비전 점수(perception_scan), 명령 해석 trace, SDS 상태(sds_status).
-// 하단 탭과 가운데 '분석' 탭이 같은 렌더러를 쓴다(데이터는 state 하나).
+// 분석: 비전 점수(perception_scan), 명령 해석 trace, SDS 상태(sds_status). 기록·분석 모달의 탭에 그린다.
 import { call } from './api.js';
 import { bus, state } from './state.js';
 import { $, clear, el, fmt } from './util.js';
@@ -28,20 +27,17 @@ function renderVision() {
   const meta = scan
     ? `모드 ${MODE_NOTE[scan.mode] ?? scan.mode} · 장치 ${scan.device} · 타일 ${scan.tiles} · 임베딩 ${fmt.n(scan.embed_ms, 1)} ms`
     : '아직 실행하지 않았습니다. 인식 실행을 누르면 현재 프레임을 타일로 나눠 사전 라벨 점수를 계산합니다.';
-  for (const [metaId, boxId] of [['scan-meta', 'vision-bars'], ['an-vision-meta', 'an-vision']]) {
-    $(metaId).textContent = meta;
-    const box = $(boxId);
-    clear(box);
-    if (scan?.labels?.length) box.append(scoreList(scan.labels));
-    else if (scan) box.append(el('p', { class: 'empty-note', text: '탐지된 라벨이 없습니다.' }));
-  }
+  $('scan-meta').textContent = meta;
+  const box = clear($('vision-bars'));
+  if (scan?.labels?.length) box.append(scoreList(scan.labels));
+  else if (scan) box.append(el('p', { class: 'empty-note', text: '탐지된 라벨이 없습니다.' }));
 }
 
 let scanning = false;
 export async function runScan() {
   if (scanning) return;
   scanning = true;
-  for (const id of ['scan-run', 'an-scan']) $(id).disabled = true;
+  $('scan-run').disabled = true;
   try {
     state.perception = await call('perception_scan', { topK: SCAN_TOP_K });
     bus.emit('perception', state.perception);
@@ -49,7 +45,7 @@ export async function runScan() {
     /* api-error 가 표시 */
   } finally {
     scanning = false;
-    for (const id of ['scan-run', 'an-scan']) $(id).disabled = false;
+    $('scan-run').disabled = false;
   }
 }
 
@@ -59,7 +55,7 @@ function kvRow(k, v) {
 }
 
 function traceView(cmd) {
-  if (!cmd) return el('p', { class: 'empty-note', text: '아직 명령이 없습니다. 월드 화면 아래 입력줄에 명령을 입력하면 해석 단계(정규화 → 어휘 일치 → n-gram 점수 → NMS → 역할 배정)가 여기에 남습니다.' });
+  if (!cmd) return el('p', { class: 'empty-note', text: '아직 명령이 없습니다. 아래 입력줄에 명령을 입력하면 해석 단계(정규화 → 어휘 일치 → n-gram 점수 → NMS → 역할 배정)가 여기에 남습니다.' });
   const p = cmd.parsed;
   const wrap = el('div', {});
   wrap.append(el('div', { class: 'pv-kv', style: 'margin-bottom:10px' },
@@ -91,11 +87,7 @@ function traceView(cmd) {
 }
 
 function renderTrace() {
-  for (const id of ['trace-view', 'an-trace']) {
-    const box = $(id);
-    clear(box);
-    box.append(traceView(state.lastCommand));
-  }
+  clear($('trace-view')).append(traceView(state.lastCommand));
 }
 
 // ── SDS ─────────────────────────────────────────────────────────
@@ -169,7 +161,6 @@ export async function refreshSds() {
 
 export function initAnalysis() {
   $('scan-run').addEventListener('click', runScan);
-  $('an-scan').addEventListener('click', runScan);
   $('an-sds-refresh').addEventListener('click', refreshSds);
   bus.on('perception', renderVision);
   bus.on('command', renderTrace);
@@ -182,15 +173,16 @@ export function initAnalysis() {
   setInterval(() => {
     if ($('scan-auto').checked && state.playing && !document.hidden) runScan();
   }, 4000);
-  // 분석 화면이 보이는 동안 SDS 상태를 주기적으로 갱신
+  // 시계열·SDS 탭이 보이는 동안 SDS 상태를 주기적으로 갱신
+  let tab = null;
   setInterval(() => {
-    if (state.centerTab === 'analysis' && !document.hidden) refreshSds();
+    if (tab === 'ts' && !document.hidden) refreshSds();
   }, SDS_POLL_MS);
   bus.on('tab', ({ group, name }) => {
-    if (group === 'center' && name === 'analysis') {
-      refreshSds();
-      if (!state.perception) runScan(); // 처음 열 때 한 번 자동 인식
-    }
+    if (group !== 'analysis') return;
+    tab = name;
+    if (name === 'ts') refreshSds();
+    if (name === 'vision' && !state.perception) runScan(); // 처음 열 때 한 번 자동 인식
   });
   return refreshSds();
 }

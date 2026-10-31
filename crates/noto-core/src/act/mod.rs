@@ -2,6 +2,7 @@ use serde::Serialize;
 
 use crate::kin::{KinLoads, KinPose};
 
+pub mod carry;
 pub mod cocarry;
 pub mod collide;
 pub mod drive;

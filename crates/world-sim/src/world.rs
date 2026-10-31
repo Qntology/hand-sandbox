@@ -18,11 +18,17 @@ use crate::snapshot::*;
 use crate::terrain::{cell_center, FlatZone, RuggedLayout, Terrain, TerrainKind, CELL_M};
 
 mod acts;
+pub mod cargo;
 mod eye;
 mod motion;
+pub mod steps;
 pub mod traffic;
+mod turns;
 pub use acts::{camera_of, material_of, ActPlay, GazeHold, PushState, WalkState, GET_UP_S, PUSH_START_SLACK_M, SIDE_SHUFFLE_MAX_M};
-use motion::{Follow, SegRun};
+pub use cargo::CargoRide;
+pub use steps::{StepSeen, Stride};
+pub(crate) use motion::Follow;
+use motion::{PoseCheck, SegRun};
 pub use traffic::{RiderPhase, Rider, RobotOutline, RIDER_REACH_M, RIDER_STOP_M};
 pub use eye::{chassis_accel_rms, exposure_s, profile, roughness_gd, sensor_timing, sensor_timing_at, strike_peak_mps2, strike_scale, EyeState, HeadView, SensorTiming, Shake, EXPOSURE_MAX_S, SCENE_LUX};
 
@@ -44,6 +50,8 @@ pub const AMOUNT_EPS: f32 = 1e-3;
 pub const CAMP_PARCEL_AHEAD_M: f32 = 2.0;
 pub const CAMP_PARCEL_RIGHT_M: f32 = 0.30;
 pub const PARCELS_PER_CELL: f32 = 1.0 / 700.0;
+/// The gap in the curb wall (cells).
+pub const GAP_CELLS: usize = 5;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorldConfig {
@@ -276,6 +284,16 @@ pub enum WorldEvent {
     Rider { worker: u32, phase: String, label: String },
     /// A robot stopped for another its eye saw in its way (`gap_m` between the outlines), or routed round it.
     Hold { worker: u32, other: u32, gap_m: f32, label: String },
+    /// A robot ran into something solid.
+    Bump { worker: u32, what: String, peak_n: f32, a_g: f32, speed_mps: f32, fell: bool, label: String },
+    /// A load started to slide on its support.
+    CargoSlip { worker: u32, item: ItemKind, shift_m: f32, use_ratio: f32, label: String },
+    /// A piece of the load came off and lies on the ground as `drop`.
+    CargoLost { worker: u32, item: ItemKind, amount: f32, drop: String, cause: String, label: String },
+    /// A step ahead, seen in time to bend the knees for it.
+    StepSeen { worker: u32, height_m: f32, dist_m: f32, crouch_m: f32, source: String, label: String },
+    /// A step taken with a load on.
+    StepTaken { worker: u32, height_m: f32, crouch_m: f32, a_z: f32, label: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -286,19 +304,29 @@ pub struct TimedEvent {
 }
 
 #[derive(Clone, Debug)]
-struct MoveState {
-    edges: Vec<EdgePlan>,
+pub(crate) struct MoveState {
+    pub(crate) edges: Vec<EdgePlan>,
     idx: usize,
     pause_left: f32,
     progress_s: f32,
     announced_pause: bool,
     elapsed_s: f32,
-    follow: Follow,
+    pub(crate) follow: Follow,
     /// Stopped for a robot in the way: for how long, for which, and how many times it routed round one.
     held_s: f32,
     held_by: Option<u32>,
     reroutes: u32,
     goal: Option<Goal>,
+    /// How many times its way was shut and it planned again (`motion`).
+    replans: u32,
+    /// Where it last was a good way from, and when it was there (`motion::STUCK_S`).
+    anchor: Option<((f32, f32), f64)>,
+}
+
+impl MoveState {
+    pub(crate) fn new(edges: Vec<EdgePlan>, follow: Follow, goal: Goal) -> MoveState {
+        MoveState { edges, idx: 0, pause_left: 0.0, progress_s: 0.0, announced_pause: false, elapsed_s: 0.0, follow, anchor: None, held_s: 0.0, held_by: None, reroutes: 0, goal: Some(goal), replans: 0 }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -365,14 +393,20 @@ pub struct World {
     pub gaze: Option<GazeHold>,
     /// The eye is the fork carriage camera instead of the rider's head (a wheeled base checking an item at the floor).
     pub fork_cam: bool,
-    /// The clearance map for the nodes standing now (`clear::ClearMap`), keyed by them.
-    room: Mutex<Option<(u64, std::sync::Arc<ClearMap>)>>,
+    /// The clearance maps for the nodes standing now (`clear::ClearMap`): one per kind of body, keyed by both.
+    room: Mutex<Vec<(u64, std::sync::Arc<ClearMap>)>>,
     /// Sub-workers sharing this world with the first worker (`crew`).
     pub crew: Vec<crate::crew::Worker>,
     /// A lift truck's rider on foot, felling a node (`traffic::Rider`).
     pub rider: Option<traffic::Rider>,
     /// The way each loading bay faces (bay waypoint id, yaw): its row of slots lies across that.
     pub(crate) bay_faces: Vec<(u32, f32)>,
+    /// How the load is riding (`cargo`), and the steps ahead (`steps`).
+    pub ride: CargoRide,
+    pub stride: Stride,
+    /// The sub-worker standing in for the first worker in the motion code this moment, and the robots it must miss.
+    pub(crate) crew_turn: Option<u32>,
+    pub(crate) turn_others: Vec<traffic::RobotOutline>,
 }
 
 impl Clone for World {
@@ -420,6 +454,10 @@ impl Clone for World {
             crew: self.crew.clone(),
             rider: self.rider,
             bay_faces: self.bay_faces.clone(),
+            ride: self.ride,
+            stride: self.stride.clone(),
+            crew_turn: self.crew_turn,
+            turn_others: self.turn_others.clone(),
         }
     }
 }
@@ -470,9 +508,10 @@ impl World {
             zones.push((wall_x, zc, 1.4));
             zc += 2.0;
         }
+        // Wide enough for a lift truck to drive through without scraping: a 1 m gap fits one only to the centimetre.
         let gap_from = (0.86 * cells as f32) as usize;
-        let gap_to = gap_from + 2;
-        let gap = (wall_x, (gap_from as f32 + 1.0) * CELL_M);
+        let gap_to = gap_from + GAP_CELLS;
+        let gap = (wall_x, (gap_from as f32 + 0.5 * GAP_CELLS as f32) * CELL_M);
         let way = [base_pos, (base_pos.0, gap.1), gap, wh_pos];
         let site_plan = cfg.site.as_ref().map(|sc| {
             let keep = site::Keep { base: base_pos, warehouse: wh_pos, wall_cx, way: way.to_vec(), way_m: 2.2 };
@@ -714,10 +753,14 @@ impl World {
             fixtures,
             gaze: None,
             fork_cam: false,
-            room: Mutex::new(None),
+            room: Mutex::new(Vec::new()),
             crew: Vec::new(),
             rider: None,
             bay_faces: Vec::new(),
+            ride: CargoRide::default(),
+            stride: Stride::default(),
+            crew_turn: None,
+            turn_others: Vec::new(),
         })
     }
 
@@ -995,16 +1038,38 @@ impl World {
     }
 
     /// A route that keeps the body clear of trees, rocks, walls and water: the half width and `clear::MIN_GAP_M` where
-    /// it can, `clear::TIGHT_GAP_M` where nothing roomier gets there, and no route where the body does not fit.
+    /// it can, `clear::TIGHT_GAP_M` where nothing roomier gets there, and no route where the body does not fit. It goes
+    /// round what lies on the ground if it can.
     pub fn plan_route(&self, goal: Goal) -> Option<nav::Plan> {
+        let mut robots = HashSet::new();
         if !self.crew.is_empty() {
             let keep = self.terrain.cell_of(self.agent.x, self.agent.z);
-            let robots = self.still_robot_cells(&[1, traffic::RIDER_ID], keep, self.footprint().half_w_m + 0.15);
-            if let Some(p) = self.plan_route_avoiding(goal, &robots) {
-                return Some(p);
+            robots = self.still_robot_cells(&[1, traffic::RIDER_ID], keep, self.footprint().half_w_m + 0.15);
+        }
+        let mut both = robots.clone();
+        both.extend(self.loose_cells(goal));
+        self.plan_route_avoiding(goal, &both).or_else(|| self.plan_route_avoiding(goal, &robots)).or_else(|| self.plan_route_avoiding(goal, &HashSet::new()))
+    }
+
+    /// The cells things lie in on the ground, for a route to go round; not those by the goal, or under the robot.
+    pub(crate) fn loose_cells(&self, goal: Goal) -> HashSet<Cell> {
+        let here = self.agent_cell();
+        let at = match goal {
+            Goal::Cell(c) => cell_center(c.0, c.1),
+            Goal::Within { x, z, .. } => (x, z),
+        };
+        let reach = match goal {
+            Goal::Cell(_) => 0.45,
+            Goal::Within { reach_m, .. } => reach_m + 0.3,
+        };
+        let mut out = HashSet::new();
+        for d in self.drops.iter().filter(|d| d.support.is_ground() && (d.x - at.0).hypot(d.z - at.1) > reach) {
+            let half = 0.5 * d.kind.spec().piece_size_m(d.amount)[0];
+            for dx in [-half, 0.0, half] {
+                out.extend(self.terrain.cell_of(d.x + dx, d.z).filter(|c| *c != here));
             }
         }
-        self.plan_route_avoiding(goal, &HashSet::new())
+        out
     }
 
     /// `plan_route` with `extra` cells blocked as well (the robots standing in the way).
@@ -1013,29 +1078,52 @@ impl World {
         blocked.extend(extra.iter().copied());
         let map = self.clear_map();
         let (spec, fp) = (self.drive_spec(), self.footprint());
-        [clear::MIN_GAP_M, clear::TIGHT_GAP_M].into_iter().find_map(|gap| {
+        let plan = [clear::MIN_GAP_M, clear::TIGHT_GAP_M].into_iter().find_map(|gap| {
             let room = nav::Room { map: &map, need_m: fp.half_w_m + gap, soft_m: fp.half_w_m + clear::COMFORT_GAP_M };
             nav::plan_room(&spec, &self.terrain, &|x, z| blocked.contains(&(x, z)), Some(&room), self.agent_cell(), goal, None)
-        })
+        })?;
+        Some(self.to_cell_centre(plan, goal))
     }
 
-    /// The body's outline on the ground (`clear::Footprint`).
-    pub fn footprint(&self) -> Footprint {
-        Footprint::of(&self.body)
-    }
-
-    /// How far everything the body can hit is from each point (`clear::ClearMap`), built again when a node goes.
-    pub fn clear_map(&self) -> std::sync::Arc<ClearMap> {
-        let key = self.nodes.iter().fold(self.nodes.len() as u64 ^ (self.fixtures.len() as u64) << 32, |h, n| (h ^ n.id as u64).wrapping_mul(0x0000_0100_0000_01B3));
-        let mut slot = self.room.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((k, m)) = slot.as_ref() {
-            if *k == key {
-                return m.clone();
-            }
+    /// The planner counts cells by their centres, so a body in a corner of a cell whose centre is within reach has an
+    /// empty route and is still out of reach. It goes to the centre.
+    fn to_cell_centre(&self, mut plan: nav::Plan, goal: Goal) -> nav::Plan {
+        let Goal::Within { x, z, reach_m } = goal else { return plan };
+        let (ax, az) = (self.agent.x, self.agent.z);
+        let c = self.agent_cell();
+        let (cx, cz) = cell_center(c.0, c.1);
+        let d = (cx - ax).hypot(cz - az);
+        if plan.edges.is_empty() && (ax - x).hypot(az - z) > reach_m && d > motion::GOAL_TOL_M {
+            let move_time_s = d / self.drive_spec().max_speed_mps.max(0.1);
+            plan.edges.push(nav::EdgePlan { from: c, to: c, horizontal_m: d, move_time_s, pause_s: 0.0, step_m: 0.0, slope_deg: 0.0, margin: 1.0, ground_limit_deg: 90.0, energy_factor: 1.0 });
+            plan.time_s += move_time_s;
+            plan.distance_m += d;
         }
-        let top = (self.standing_eye_m() + 0.2).max(self.body.dims.roof_m.unwrap_or(0.0));
-        let map = std::sync::Arc::new(ClearMap::build(&self.terrain, &self.nodes, &self.fixtures, top));
-        *slot = Some((key, map.clone()));
+        plan
+    }
+
+    /// The body's outline on the ground (`clear::Footprint`), with what rides on its tines.
+    pub fn footprint(&self) -> Footprint {
+        let load: f32 = self.agent.carried.iter().filter(|(_, n)| *n > AMOUNT_EPS).map(|(k, n)| k.spec().piece_size_m(n.min(1.0))[1] * n.ceil()).sum();
+        Footprint::of(&self.body).laden(load)
+    }
+
+    /// How far everything this body can hit is from each point (`clear::ClearMap`), built again when a node goes. A
+    /// ledge is one for the base that cannot take it, so each kind of body has its own map.
+    pub fn clear_map(&self) -> std::sync::Arc<ClearMap> {
+        let spec = self.drive_spec();
+        let top = Footprint::of(&self.body).top_m.max(self.standing_eye_m() + 0.2).max(self.body.dims.roof_m.unwrap_or(0.0));
+        let nodes = self.nodes.iter().fold(self.nodes.len() as u64 ^ (self.fixtures.len() as u64) << 32, |h, n| (h ^ n.id as u64).wrapping_mul(0x0000_0100_0000_01B3));
+        let key = [spec.max_step_m.to_bits(), spec.max_slope_deg.to_bits(), top.to_bits(), spec.kind as u32].into_iter().fold(nodes, |h, b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01B3));
+        let mut slot = self.room.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, m)) = slot.iter().find(|(k, _)| *k == key) {
+            return m.clone();
+        }
+        let map = std::sync::Arc::new(ClearMap::build_for(&self.terrain, &self.nodes, &self.fixtures, top, Some(&spec)));
+        if slot.len() >= 8 {
+            slot.remove(0);
+        }
+        slot.push((key, map.clone()));
         map
     }
 
@@ -1061,10 +1149,11 @@ impl World {
                     Goal::Within { x: *x, z: *z, reach_m: *reach_m }
                 };
                 let plan = self.plan_route(goal).ok_or(ActionError::NoPath)?;
+                let plan = self.fit_plan(plan, goal, &self.loose_cells(goal));
                 self.odom.new_move();
                 let mut follow = self.start_follow(&plan.edges);
                 follow.stop_within = (*reach_m > 0.0).then_some(((*x, *z), *reach_m));
-                Active::Move(MoveState { edges: plan.edges, idx: 0, pause_left: 0.0, progress_s: 0.0, announced_pause: false, elapsed_s: 0.0, follow, held_s: 0.0, held_by: None, reroutes: 0, goal: Some(goal) })
+                Active::Move(MoveState::new(plan.edges, follow, goal))
             }
             Action::Turn { yaw_deg } => {
                 let target = wrap_angle(yaw_deg.to_radians());
@@ -1247,6 +1336,11 @@ impl World {
         if self.active.is_none() {
             self.agent.speed_mps = 0.0;
         }
+        // A piece coming off stops the robot where it is: whoever drives it decides what next.
+        let driven = matches!(self.active, Some((_, Active::Move(_) | Active::Turn { .. })));
+        if self.ride_cargo(dt, driven, 1, &mut events) && driven {
+            self.finish(false, Some("cargo_lost".into()), &mut events);
+        }
         let after = (self.agent.x, self.agent.z, self.agent.yaw);
         self.odom.update(before, after, dt, self.odom_over);
         self.odom_over = 0.0;
@@ -1286,7 +1380,7 @@ impl World {
                         self.agent.yaw = *target;
                     }
                     self.agent.speed_mps = 0.0;
-                    done = Some((true, None));
+                    done = Some(if run.blocked { (false, Some("blocked".into())) } else { (true, None) });
                     used = 0.0;
                 } else {
                     used = self.advance_run(run, remaining).max(1e-4);
@@ -1360,7 +1454,7 @@ impl World {
                     let stop = m.follow.stop_within;
                     let mut follow = self.start_follow(&plan.edges);
                     follow.stop_within = stop;
-                    *m = MoveState { edges: plan.edges, idx: 0, pause_left: 0.0, progress_s: 0.0, announced_pause: false, elapsed_s: m.elapsed_s, follow, held_s: 0.0, held_by: None, reroutes: m.reroutes + 1, goal: m.goal };
+                    *m = MoveState { edges: plan.edges, idx: 0, pause_left: 0.0, progress_s: 0.0, announced_pause: false, elapsed_s: m.elapsed_s, follow, anchor: m.anchor, held_s: 0.0, held_by: None, reroutes: m.reroutes + 1, goal: m.goal, replans: m.replans };
                     events.push(self.stamp(WorldEvent::Hold { worker: 1, other, gap_m: gap, label: format!("작업자 {other}이(가) 비키지 않아 돌아가는 길로 다시 계획") }));
                     return true;
                 }
@@ -1520,7 +1614,7 @@ impl World {
             // Around the stump, one piece's diagonal apart whatever the angle: no two lie inside one another.
             let size = spec.drop.spec().size_m;
             let r = if spec.drop_count == 1 { 0.0 } else { (0.5 * (size[0].hypot(size[2]) + 0.02) / (std::f32::consts::PI / spec.drop_count as f32).sin()).max(0.13) };
-            let (x, z) = (node.x + r * a.cos(), node.z + r * a.sin());
+            let (x, z) = self.free_spot((node.x + r * a.cos(), node.z + r * a.sin()));
             let d = DropItem::whole(self.next_drop, spec.drop, x, z);
             self.next_drop += 1;
             ids.push(d.id);

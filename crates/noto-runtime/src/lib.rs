@@ -8,6 +8,7 @@ pub mod config;
 pub mod crew;
 mod driver;
 pub mod embedding;
+pub mod mcp;
 pub mod ml;
 mod mldrive;
 mod mlsds;

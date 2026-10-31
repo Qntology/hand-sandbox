@@ -1,10 +1,9 @@
-// 왼쪽 ⑤ '부품 프리셋': 머리·가슴·배·팔·다리(섀시) 등급을 고르면 물리 의미(질량, CoM 높이, 들 수 있는 물건,
+// 프리셋 Drop-up 의 부품 등급: 머리·가슴·배·팔·다리(섀시) 등급을 고르면 물리 의미(질량, CoM 높이, 들 수 있는 물건,
 // 속도·경사·턱·적재 한계, N:N 기준 이탈)를 body_plan_eval 로 바로 계산해 보여 준다. 모습은 그대로지만 물리는 바뀐다.
+// 한 줄 요약은 #pp-sum, 자세한 값은 아코디언의 #pp-detail 에 그린다. 적용은 월드 재생성으로 한다(unit-preset.js).
 import { call } from './api.js';
 import { bus, state } from './state.js';
 import { $, clear, debounce, el, fmt } from './util.js';
-import { toast } from './toast.js';
-import { newWorld } from './sim.js';
 
 const SEGS = [
   ['head', '머리 (목 · 카메라)'],
@@ -17,6 +16,7 @@ const NAMED_KO = { budget: '보급형 전체', mid: '중급형 전체', pro: '�
 
 let presets = null;
 let evalSeq = 0;
+let lastEval = null;
 
 function plan() {
   // 몸의 크기(build)는 로봇 프리셋이 정한다. 여기서는 등급만 고른다.
@@ -35,19 +35,31 @@ function r(x, d = 2) {
   return Number.isFinite(x) ? Number(x).toFixed(d) : '—';
 }
 
+/** 📊 한 줄 요약: 질량 · CoM 과 체형의 투입 전 검사(rig_validate). */
+function renderSummary() {
+  const box = clear($('pp-sum'));
+  const v = lastEval;
+  if (v) box.append(`📊 ${r(v.mass_kg, 1)} kg · CoM ${r(v.com_height_m)} m · 적재 ${r(v.limits_empty?.capacity_kg, 1)} kg`);
+  for (const c of state.rigChecks ?? []) {
+    box.append(' · ', el('span', { class: c.ok ? 'ok' : 'bad', title: c.detail, text: `${c.label} ${c.ok ? '✓' : '✗'}` }));
+  }
+}
+
 async function evaluate() {
   const seq = ++evalSeq;
   state.bodyPlan = plan();
   bus.emit('body-plan', state.bodyPlan);
   let v;
   try {
-    v = await call('body_plan_eval', { body: state.bodyPlan, base: state.config.base }, { quiet: true });
+    v = await call('body_plan_eval', { body: state.bodyPlan, base: state.draftBase ?? state.config.base }, { quiet: true });
   } catch (e) {
-    $('pp-sum').textContent = state.mock ? '모의 백엔드에서는 프리셋 물리를 계산하지 않습니다 (개발 서버 또는 Tauri 필요).' : `계산 실패: ${e.message}`;
+    $('pp-sum').textContent = `계산 실패: ${e.message}`;
     return;
   }
   if (seq !== evalSeq) return;
-  const box = clear($('pp-sum'));
+  lastEval = v;
+  renderSummary();
+  const box = clear($('pp-detail'));
   const e0 = v.limits_empty;
   const e8 = v.limits_loaded;
   box.append(el('div', { class: 'pv-kv' },
@@ -73,6 +85,15 @@ async function evaluate() {
 
 const later = debounce(evaluate, 150);
 
+/** 런타임이 지금 쓰는 몸(world_body 의 plan)을 폼과 월드 기준값으로 맞춘다. */
+export function setPlanFrom(p) {
+  setPlan(p);
+  state.bodyPlan = { ...state.bodyPlan, build: p.build ?? 'standard' };
+  state.bodyPlan = plan();
+  state.worldPlanKey = JSON.stringify(state.bodyPlan);
+  later();
+}
+
 export async function initPresets() {
   state.bodyPlan = { head: 'mid', chest: 'mid', belly: 'mid', arm: 'mid', leg: 'mid', battery_low: false, lift: false, build: 'standard' };
   for (const [id] of SEGS) $(`pp-${id}`).addEventListener('change', () => { $('pp-named').value = ''; later(); });
@@ -93,17 +114,9 @@ export async function initPresets() {
     if (map[n]) setPlan(map[n]);
     later();
   });
-  $('pp-apply').addEventListener('click', async () => {
-    try {
-      state.bodyPlan = plan();
-      const ok = await newWorld(Number($('world-seed').value) || 0, Number($('world-size').value) || 64);
-      if (ok) toast('프리셋 적용', `월드를 프리셋 ${$('sum-presets').textContent || ''}(으)로 다시 만들었습니다.`);
-    } catch {
-      /* api-error 가 알림 */
-    }
-  });
   bus.on('config', later);
-  bus.on('rig-applied', (r) => setPlan(r.plan));
+  bus.on('draft-base', later);
+  bus.on('rig-checks', renderSummary);
   try {
     const r0 = await call('body_presets', {}, { quiet: true });
     presets = r0.presets;

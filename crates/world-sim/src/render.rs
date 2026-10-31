@@ -285,23 +285,13 @@ impl<'a> Scene<'a> {
             let g = t.height_m(cx, cz) + t.curb_m(cx, cz);
             let id = pack_id(ObjectClass::Node, n.id);
             let spec = n.kind.spec();
-            match n.kind {
-                NodeKind::Tree => {
-                    // A young pine [추정]: the crown starts above a lift truck's guard, so the trunk is what stands in the way.
-                    s.add(cx, cz, Prim { aabb: bx(x, z, g, g + 2.9, 0.14, 0.14), id, color: spec.color, style: Style::Plain });
-                    for (y0, y1, half) in [(2.35, 3.25, 1.05), (3.25, 4.05, 0.80), (4.05, 4.70, 0.46)] {
-                        s.add_spanning(cx, cz, Prim { aabb: bx(x, z, g + y0, g + y1, half, half), id, color: [58, 122, 52], style: Style::Leaves });
-                    }
-                }
-                NodeKind::Boulder => {
-                    s.add(cx, cz, Prim { aabb: bx(x, z, g, g + 0.40, 0.24, 0.24), id, color: spec.color, style: Style::Plain });
-                    s.add(cx, cz, Prim { aabb: bx(x, z, g + 0.40, g + 0.60, 0.16, 0.16), id, color: spec.color, style: Style::Plain });
-                }
-                NodeKind::CoalOre => {
-                    s.add(cx, cz, Prim { aabb: bx(x, z, g, g + 0.5, 0.24, 0.24), id, color: STONE, style: Style::Fleck([28, 28, 32]) });
-                }
-                NodeKind::IronOre => {
-                    s.add(cx, cz, Prim { aabb: bx(x, z, g, g + 0.5, 0.24, 0.24), id, color: STONE, style: Style::Fleck([206, 150, 120]) });
+            for (k, &(y0, y1, half)) in n.kind.solids().iter().enumerate() {
+                let aabb = bx(x, z, g + y0, g + y1, half, half);
+                match n.kind {
+                    NodeKind::Tree if k > 0 => s.add_spanning(cx, cz, Prim { aabb, id, color: [58, 122, 52], style: Style::Leaves }),
+                    NodeKind::Tree | NodeKind::Boulder => s.add(cx, cz, Prim { aabb, id, color: spec.color, style: Style::Plain }),
+                    NodeKind::CoalOre => s.add(cx, cz, Prim { aabb, id, color: STONE, style: Style::Fleck([28, 28, 32]) }),
+                    NodeKind::IronOre => s.add(cx, cz, Prim { aabb, id, color: STONE, style: Style::Fleck([206, 150, 120]) }),
                 }
             }
         }
@@ -1381,13 +1371,58 @@ fn put(rgb: &mut [u8], w: usize, h: usize, x: i32, y: i32, c: [u8; 3]) {
 
 pub fn render_top(world: &World, size_px: usize, span_m: f32) -> Frame {
     let n = size_px.max(16);
+    top_view(world, n, n, (world.agent.x, world.agent.z), span_m / n as f32, true)
+}
+
+/// The whole map from above, letterboxed into `width` × `height`, with every robot drawn to scale. `marks` says where
+/// each robot came out on the picture (0 to 1 across and down).
+pub fn render_map(world: &World, width: usize, height: usize) -> (Frame, Vec<UnitMark>) {
+    let (w, h) = (width.max(32), height.max(32));
+    let (sx, sz) = world.terrain.size_m();
+    let m_per_px = (sx / w as f32).max(sz / h as f32);
+    let centre = (0.5 * sx, 0.5 * sz);
+    let mut f = top_view(world, w, h, centre, m_per_px, false);
+    let to_px = |x: f32, z: f32| ((x - centre.0) / m_per_px + w as f32 * 0.5, (z - centre.1) / m_per_px + h as f32 * 0.5);
+    let mut marks = Vec::new();
+    let mut plate = |rgb: &mut Vec<u8>, id: u32, x: f32, z: f32, yaw: f32, fp: &crate::clear::Footprint, c: [u8; 3]| {
+        for (p, col) in std::iter::once((fp.hull(x, z, yaw), c)).chain(fp.tines(x, z, yaw).map(|t| (t.0, [64, 66, 72]))) {
+            let reach = p.half.0.hypot(p.half.1) / m_per_px + 1.0;
+            let (cx, cy) = to_px(p.c.0, p.c.1);
+            for j in (cy - reach) as i32..=(cy + reach) as i32 {
+                for i in (cx - reach) as i32..=(cx + reach) as i32 {
+                    let (dx, dz) = ((i as f32 + 0.5 - cx) * m_per_px, (j as f32 + 0.5 - cy) * m_per_px);
+                    let (along, across) = (dx * p.u.0 + dz * p.u.1, dz * p.u.0 - dx * p.u.1);
+                    if along.abs() <= p.half.0 && across.abs() <= p.half.1 {
+                        put(rgb, w, h, i, j, col);
+                    }
+                }
+            }
+        }
+        let (px, py) = to_px(x, z);
+        marks.push(UnitMark { id, u: px / w as f32, v: py / h as f32 });
+    };
+    plate(&mut f.rgb, 1, world.agent.x, world.agent.z, world.agent.yaw, &world.footprint(), [220, 40, 40]);
+    for c in &world.crew {
+        plate(&mut f.rgb, c.id, c.x, c.z, c.yaw, &c.footprint(), if c.form == crate::crew::Form::Forklift { [232, 192, 40] } else { [52, 170, 190] });
+    }
+    (f, marks)
+}
+
+/// Where a robot came out on a picture of the map.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct UnitMark {
+    pub id: u32,
+    pub u: f32,
+    pub v: f32,
+}
+
+fn top_view(world: &World, nw: usize, nh: usize, centre: (f32, f32), m_per_px: f32, robot: bool) -> Frame {
     let t = &world.terrain;
-    let m_per_px = span_m / n as f32;
-    let mut rgb = vec![0u8; n * n * 3];
-    for j in 0..n {
-        for i in 0..n {
-            let x = world.agent.x + (i as f32 + 0.5 - n as f32 * 0.5) * m_per_px;
-            let z = world.agent.z + (j as f32 + 0.5 - n as f32 * 0.5) * m_per_px;
+    let mut rgb = vec![0u8; nw * nh * 3];
+    for j in 0..nh {
+        for i in 0..nw {
+            let x = centre.0 + (i as f32 + 0.5 - nw as f32 * 0.5) * m_per_px;
+            let z = centre.1 + (j as f32 + 0.5 - nh as f32 * 0.5) * m_per_px;
             let c = match t.cell_of(x, z) {
                 None => [24, 24, 28],
                 Some((cx, cz)) => {
@@ -1411,13 +1446,13 @@ pub fn render_top(world: &World, size_px: usize, span_m: f32) -> Frame {
                     }
                 }
             };
-            put(&mut rgb, n, n, i as i32, j as i32, c);
+            put(&mut rgb, nw, nh, i as i32, j as i32, c);
         }
     }
     let to_px = |x: f32, z: f32| {
         (
-            ((x - world.agent.x) / m_per_px + n as f32 * 0.5) as i32,
-            ((z - world.agent.z) / m_per_px + n as f32 * 0.5) as i32,
+            ((x - centre.0) / m_per_px + nw as f32 * 0.5) as i32,
+            ((z - centre.1) / m_per_px + nh as f32 * 0.5) as i32,
         )
     };
     let dot = |rgb: &mut Vec<u8>, x: f32, z: f32, r: i32, c: [u8; 3]| {
@@ -1425,7 +1460,7 @@ pub fn render_top(world: &World, size_px: usize, span_m: f32) -> Frame {
         for dy in -r..=r {
             for dx in -r..=r {
                 if dx * dx + dy * dy <= r * r {
-                    put(rgb, n, n, px + dx, py + dy, c);
+                    put(rgb, nw, nh, px + dx, py + dy, c);
                 }
             }
         }
@@ -1451,7 +1486,7 @@ pub fn render_top(world: &World, size_px: usize, span_m: f32) -> Frame {
             let (px, py) = to_px(x, z);
             for dy in -r..=r {
                 for dx in -r..=r {
-                    put(&mut rgb, n, n, px + dx, py + dy, c);
+                    put(&mut rgb, nw, nh, px + dx, py + dy, c);
                 }
             }
         }
@@ -1468,7 +1503,7 @@ pub fn render_top(world: &World, size_px: usize, span_m: f32) -> Frame {
             let (px, py) = to_px(w.x - 0.45 - (i / 6) as f32 * 0.16, w.z - 0.4 + (i % 6) as f32 * 0.16);
             for dy in -r..=r {
                 for dx in -r..=r {
-                    put(&mut rgb, n, n, px + dx, py + dy, k.spec().color);
+                    put(&mut rgb, nw, nh, px + dx, py + dy, k.spec().color);
                 }
             }
         }
@@ -1478,10 +1513,12 @@ pub fn render_top(world: &World, size_px: usize, span_m: f32) -> Frame {
             world.agent.x + world.agent.yaw.cos() * s as f32 * m_per_px,
             world.agent.z + world.agent.yaw.sin() * s as f32 * m_per_px,
         );
-        put(&mut rgb, n, n, px, py, [255, 255, 255]);
+        put(&mut rgb, nw, nh, px, py, [255, 255, 255]);
     }
-    dot(&mut rgb, world.agent.x, world.agent.z, ((0.18 / m_per_px) as i32).max(3), [220, 40, 40]);
-    Frame { width: n, height: n, rgb, ids: vec![], depth: vec![], tick: world.tick }
+    if robot {
+        dot(&mut rgb, world.agent.x, world.agent.z, ((0.18 / m_per_px) as i32).max(3), [220, 40, 40]);
+    }
+    Frame { width: nw, height: nh, rgb, ids: vec![], depth: vec![], tick: world.tick }
 }
 
 pub fn ground_palette() -> [(Ground, [u8; 3]); 8] {
@@ -1834,7 +1871,7 @@ mod tests {
         let want: [(&str, u64); 7] = [
             ("rest", 0x7990_df86_dfb0_1581),
             ("turn", 0xfd98_ffbd_86cc_7c23),
-            ("walk", 0xb6f7_776f_22ad_0e99),
+            ("walk", 0x9ac8_58ae_59c9_3021),
             ("rugged", 0x5a2e_6f68_6ebe_e09b),
             ("chase", 0xbec5_dc45_4b5a_1b42),
             ("focus", 0xc52e_326a_aed5_f073),

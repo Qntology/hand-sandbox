@@ -1,0 +1,184 @@
+/* 무대 위의 뜨는 판 — 좌상단 브랜드·소환, 우상단 시점 알약, 월드 팝오버, 우측 유닛 HUD, 하단 허브(로그 · 퀘스트 · 명령),
+   Drop-up 두 장, 기록·분석 모달. 층 순서: 캔버스 < CCTV(5) < 보조(6) < 코너·HUD(8) < 허브(9) < 팝오버(20) < 모달(100). */
+
+/* ── 좌상단 · 우상단 ───────────────────────────────────────────── */
+.corner-tl { position: absolute; left: 12px; top: 10px; z-index: 8; display: flex; flex-direction: column; align-items: flex-start; gap: 6px; pointer-events: none; }
+.corner-tl > *, .corner-row > * { pointer-events: auto; }
+.corner-row { display: flex; align-items: center; gap: 10px; }
+.brand-mark { font-size: 0.82rem; font-weight: 700; letter-spacing: 0.02em; color: var(--text-bright); text-shadow: 0 1px 3px rgba(0, 0, 0, 0.75); white-space: nowrap; }
+.corner-tr { position: absolute; right: 12px; top: 10px; z-index: 8; }
+.ov-pill {
+  display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 12px;
+  background: var(--glass); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+  border: 1px solid var(--border-light); border-radius: 999px; color: var(--text);
+  font-size: 0.72rem; font-weight: 500; white-space: nowrap; cursor: pointer; transition: background 0.15s, border-color 0.15s;
+}
+button.ov-pill:hover, .ov-pill[aria-expanded="true"] { background: var(--glass-strong); border-color: var(--border-strong); color: var(--text-bright); }
+.ov-pill.dirty { border-color: var(--warning); }
+.view-pill { cursor: default; padding-right: 4px; }
+.view-pill select { field-sizing: content; min-height: 24px; border: none; background-color: transparent; color: var(--text-bright); font-size: 0.72rem; padding-left: 2px; }
+.view-pill select:focus { box-shadow: none; }
+.view-pill label { cursor: pointer; }
+.view-pill #orbit-range { width: 84px; flex: 0 0 84px; margin: 0 8px 0 0; }
+.ov-bar { display: inline-flex; align-items: center; gap: 6px; padding: 4px 8px; background: var(--glass); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); border: 1px solid var(--border-light); border-radius: var(--radius-card); }
+/* 탑뷰 맵의 왼쪽 여백 안에 들어가게 두 줄로 쌓는다: 맵 위에 올라가면 기지 근처의 로봇을 가려 누를 수 없다. */
+.spawn-bar { flex-wrap: wrap; row-gap: 2px; max-width: 262px; }
+.spawn-bar select { min-height: 26px; font-size: 0.7rem; }
+.bar-sep { width: 1px; height: 18px; background: var(--border-light); flex-shrink: 0; }
+.spawn-bar .bar-sep { flex-basis: 100%; width: 0; height: 0; }
+
+/* ── 뜨는 판 공통 ──────────────────────────────────────────────── */
+.ov-panel { padding: 10px 14px 12px; background: var(--glass-strong); overflow: auto; box-shadow: 0 14px 40px rgba(0, 0, 0, 0.5); }
+.ov-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; font-size: 0.74rem; color: var(--text-bright); }
+.ov-head > b { flex-shrink: 0; }
+.ov-head.ov-sec { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--border-light); }
+.ov-close { flex-shrink: 0; margin-left: auto; width: 24px; height: 24px; display: inline-flex; align-items: center; justify-content: center; background: transparent; border: 1px solid var(--border-light); border-radius: var(--radius-sm); color: var(--text-dim); font-size: 11px; cursor: pointer; }
+.ov-close:hover { background: var(--bg-hover); color: var(--text-bright); }
+.step-sum + .ov-close { margin-left: 0; }
+
+/* 월드 팝오버 */
+.world-popover { position: absolute; left: 12px; top: 124px; z-index: 20; width: min(460px, calc(100% - 24px)); max-height: calc(100% - 136px); }
+.world-info { margin-top: 8px; }
+.btn-row.btn-row-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.ov-toggles { display: flex; flex-wrap: wrap; gap: 6px; }
+.frame-row { margin: 10px 0 2px; }
+.frame-info { font-family: var(--font-mono); font-size: 0.6rem; word-break: break-word; margin-bottom: 0; }
+
+/* 탑뷰가 아닌 시점의 보조 */
+.left-stack { position: absolute; left: 12px; top: 126px; z-index: 6; display: flex; flex-direction: column; align-items: flex-start; gap: 8px; max-height: calc(100% - 142px); overflow-y: auto; pointer-events: none; }
+.left-stack > * { pointer-events: auto; }
+
+/* ── 우측 유닛 HUD ─────────────────────────────────────────────── */
+.unit-hud { position: absolute; right: 12px; top: 50px; bottom: 8px; z-index: 8; width: var(--hud-w); overflow-y: auto; background: var(--glass-strong); }
+.unit-tabs { padding: 4px 6px; border-top: 1px solid var(--border); }
+.unit-tabs .bottom-tab { flex: 1; padding: 4px 6px; font-size: 0.66rem; }
+.bh-unit { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 1px 8px; margin-bottom: 6px; font-size: 0.64rem; }
+.bh-unit:empty { display: none; }
+.bh-unit .k { color: var(--text-muted); }
+.bh-unit .v { color: var(--text-bright); text-align: right; overflow-wrap: anywhere; }
+
+/* ── 하단 허브 ─────────────────────────────────────────────────── */
+.hub { position: absolute; left: 50%; bottom: 8px; transform: translateX(-50%); z-index: 9; width: min(var(--hub-w), calc(100% - 32px)); display: flex; flex-direction: column; gap: 6px; }
+/* 유닛 HUD 가 뜨면 허브는 남은 폭의 가운데로 옮긴다 */
+.stage.has-unit .hub { left: calc((100% - var(--hud-w) - 12px) / 2); width: min(var(--hub-w), calc(100% - var(--hud-w) - 44px)); }
+
+/* 실시간 로그: 평소 3줄, 마우스를 올리면 도구줄과 전체 로그로 펼친다 */
+.log-feed { display: flex; flex-direction: column; background: rgba(9, 9, 11, 0.58); border: 1px solid transparent; border-radius: var(--radius-card); overflow: hidden; transition: background 0.15s, border-color 0.15s; }
+.log-feed.expanded { background: var(--glass-strong); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); border-color: var(--border-light); }
+.lf-tools { display: none; align-items: center; gap: 6px; padding: 6px 10px; border-bottom: 1px solid var(--border-light); }
+.log-feed.expanded .lf-tools { display: flex; flex-wrap: wrap; }
+.lf-chips { display: flex; gap: 4px; flex-wrap: wrap; }
+.lf-right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+.lf-count { font-family: var(--font-mono); font-size: 0.62rem; color: var(--text-muted); }
+.lf-right .vt-btn { min-height: 22px; }
+/* 접혔을 때는 아래 맞춤으로 언제나 마지막 줄이 보인다 */
+.log-feed .gcode-console { flex: none; height: 62px; padding: 3px 8px; display: flex; flex-direction: column; justify-content: flex-end; overflow: hidden; background: transparent; transition: height 0.14s ease-out; }
+.log-feed .gcode-console > * { flex-shrink: 0; }
+.log-feed.expanded .gcode-console { display: block; height: min(42vh, 340px); overflow-y: auto; }
+
+/* 명령 줄 + 퀘스트 고정 헤더 */
+.command-bar { position: relative; display: flex; flex-direction: column; background: var(--glass-strong); transition: border-color 0.15s; }
+.command-bar:focus-within { border-color: var(--border-hover); }
+.quest-row { display: flex; align-items: center; gap: 8px; padding-right: 10px; border-bottom: 1px solid var(--border-light); }
+.quest-bar { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; height: 32px; padding: 0 10px; background: none; border: none; border-radius: 8px 8px 0 0; color: var(--text); font-size: 0.7rem; text-align: left; cursor: pointer; }
+.quest-bar:hover { background: var(--bg-hover); }
+.qb-ico { flex-shrink: 0; }
+.qb-text { flex: 1 1 auto; min-width: 0; display: flex; align-items: baseline; gap: 8px; overflow: hidden; white-space: nowrap; }
+.qt-title { flex: 0 1 auto; min-width: 0; font-weight: 600; color: var(--text-bright); overflow: hidden; text-overflow: ellipsis; }
+.qt-step { flex: 0 1 auto; min-width: 0; font-size: 0.66rem; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; }
+.qb-bar { flex: 0 0 150px; }
+.qb-more { flex-shrink: 0; font-size: 0.64rem; color: var(--text-dim); white-space: nowrap; }
+.quest-bar:hover .qb-more { color: var(--text-bright); }
+.cmd-row { display: flex; align-items: center; gap: 6px; padding: 7px 8px; }
+.cmd-row select { min-height: 26px; font-size: 0.7rem; padding-right: 20px; }
+.cmd-row .vt-btn { min-height: 28px; }
+.cmd-prompt { color: var(--text-muted); font-family: var(--font-mono); font-size: 0.9rem; }
+.cmd-row input[type=text] { flex: 1; min-width: 0; min-height: 28px; font-size: 0.76rem; color: var(--text-bright); background: var(--bg-input); }
+.cmd-row .btn { flex-shrink: 0; min-height: 28px; }
+.unit-tools { display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.unit-tag { color: var(--text-bright); border-color: var(--warning); }
+.rec-toggle { gap: 4px; cursor: pointer; }
+.rec-toggle .rec-dot { filter: grayscale(1); opacity: 0.55; font-size: 0.6rem; }
+.rec-toggle:has(input:checked) { background: var(--bg-active); color: var(--text-bright); border-color: var(--border-strong); }
+.rec-toggle:has(input:checked) .rec-dot { filter: none; opacity: 1; }
+.rec-toggle:has(input:focus-visible) { outline: 2px solid var(--accent-strong); outline-offset: 1px; }
+.cmd-toast { position: absolute; left: 0; right: 0; bottom: calc(100% + 6px); padding: 6px 12px; font-size: 0.7rem; line-height: 1.45; color: var(--text); background: var(--glass-strong); border: 1px solid var(--border-light); border-left: 3px solid var(--accent-strong); border-radius: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cmd-toast.ok { border-left-color: var(--success); }
+.cmd-toast.err { border-left-color: var(--danger); color: #f0a5a5; }
+.cmd-toast.info { border-left-color: var(--warning); }
+
+/* ── Drop-up: 프롬프트 바로 위(허브 아래끝에서 88px)로 펼친다 ──────── */
+.dropup { position: absolute; left: 0; right: 0; bottom: 88px; z-index: 3; max-height: calc(100vh - var(--statusbar-h) - 208px); animation: dropup-in 0.16s ease-out; }
+@keyframes dropup-in { from { transform: translateY(10px); opacity: 0; } to { transform: none; opacity: 1; } }
+.qd-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0 18px; }
+.qd-col { min-width: 0; }
+.qd-sec { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.inv-load { margin-top: 8px; }
+.inv-bar { margin-top: 5px; }
+
+.dp-rows { display: flex; flex-direction: column; gap: 7px; }
+.dp-row { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: 10px; align-items: start; }
+.dp-k { padding-top: 6px; font-size: 0.68rem; font-weight: 500; color: var(--text-dim); white-space: nowrap; }
+.dp-v { min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; }
+.dp-v > select { min-width: 220px; }
+.dp-v.dp-stack { flex-direction: column; flex-wrap: nowrap; align-items: stretch; }
+.dp-v .step-sum { flex: 0 1 auto; margin-left: auto; }
+.dp-v.dp-stack .step-sum { margin-left: 0; text-align: left; }
+.dp-note { font-size: 0.62rem; color: var(--text-muted); }
+.dp-v .hint { margin: 0; }
+.dp-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px 8px; }
+.dp-grid .form-group { margin-bottom: 0; }
+.dp-checks { display: flex; flex-wrap: wrap; gap: 4px 16px; }
+.base-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px; flex: 1 1 100%; }
+.base-grid .tree-item { padding: 5px 7px; font-size: 0.7rem; }
+.dp-more { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border-light); }
+.dp-more summary { font-size: 0.7rem; color: var(--text-dim); cursor: pointer; }
+.dp-more summary:hover { color: var(--text-bright); }
+.dp-sim { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 12px; margin-top: 8px; }
+.dp-sim-canvas { position: relative; min-height: 240px; background: var(--bg-plot); border: 1px solid var(--border-cell); border-radius: var(--radius); }
+.dp-sim-canvas canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.dp-foot { display: flex; align-items: center; gap: 10px; margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border-light); }
+.dp-foot .pp-sum { flex: 1; min-width: 0; margin: 0; font-size: 0.68rem; color: var(--text); line-height: 1.5; }
+.dp-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+
+/* ── 기록·분석 모달과 CCTV 확대 ───────────────────────────────────── */
+.modal-back { position: fixed; inset: 0; z-index: 100; display: flex; align-items: center; justify-content: center; padding: 16px; background: rgba(5, 5, 7, 0.62); }
+.modal-card { display: flex; flex-direction: column; background: var(--bg-panel); border: 1px solid var(--border-strong); border-radius: var(--radius-card); box-shadow: 0 18px 60px rgba(0, 0, 0, 0.55); overflow: hidden; }
+.modal-head { display: flex; align-items: center; gap: 8px; padding-right: 10px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+.modal-head .bottom-tabs { flex: 1; min-width: 0; border: none; }
+.analysis-card { width: min(1320px, 100%); height: min(860px, 100%); }
+.apane { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.apane.ap-split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+.apane.ap-45 { grid-template-columns: minmax(0, 45fr) minmax(0, 55fr); }
+.apane.ap-55 { grid-template-columns: minmax(0, 55fr) minmax(0, 45fr); }
+.ap-split > .bottom-pane + .bottom-pane { border-left: 1px solid var(--border); }
+.pane-select { min-height: 26px; font-size: 0.7rem; }
+.pane-info { margin-left: auto; min-width: 0; font-family: var(--font-mono); font-size: 0.62rem; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pane-end { margin-left: auto; }
+.pane-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.ts-stage { flex: 1; min-height: 0; position: relative; background: var(--bg-plot); }
+.ts-stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+#scores { margin-top: 8px; }
+#use-top { margin-top: 8px; }
+
+/* 지금 화면 탐지 목록 */
+.lg-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.lg-list { list-style: none; display: flex; flex-direction: column; gap: 2px; font-size: 0.66rem; color: var(--text-dim); }
+.lg-list li { display: grid; grid-template-columns: 8px minmax(0, 1fr) auto auto; gap: 6px; align-items: center; }
+.lg-list .sw { width: 8px; height: 8px; border-radius: 2px; background: var(--success); }
+.lg-list li.hold .sw { background: transparent; border: 1px dashed var(--warning); }
+.lg-list .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.lg-list .sc { font-family: var(--font-mono); font-size: 0.6rem; color: var(--text-dim); }
+.lg-list li.lg-empty { display: block; color: var(--text-muted); white-space: nowrap; }
+
+@media (max-width: 1100px) {
+  .qb-bar { flex-basis: 90px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .dropup { animation: none; }
+  .log-feed .gcode-console { transition: none; }
+}
+
+/* 판이 스크롤돼도 머리글(닫기)과 바닥글(적용)은 보인다: 음수 여백으로 판의 안쪽 여백을 덮어 가장자리에 붙인다 */
+.dropup > .ov-head { position: sticky; top: 0; z-index: 1; margin: -10px -14px 8px; padding: 10px 14px 6px; background: var(--bg-panel); }
+.dropup > .dp-foot { position: sticky; bottom: 0; z-index: 1; margin: 10px -14px -12px; padding: 8px 14px 10px; background: var(--bg-panel); }

@@ -14,8 +14,16 @@ use crate::runtime::{label_ko, FrameView, Runtime, Submission};
 pub const MIN_CELLS: usize = 32;
 pub const MAX_CELLS: usize = 160;
 
-pub const COMMANDS: [&str; 45] = [
+pub const COMMANDS: [&str; 53] = [
     "act_status",
+    "units_list",
+    "unit_frame",
+    "unit_apply",
+    "rig_prompt",
+    "rig_edit",
+    "rig_params",
+    "rig_commit",
+    "crew_remove",
     "crew_add",
     "crew_clear",
     "crew_mode",
@@ -604,6 +612,11 @@ impl Runtime {
         let view_id = if view == FrameView::Agent { "agent" } else { "other" };
         let focus = matches!(view, FrameView::Focus(_)).then(|| serde_json::to_value(self.world.focus_frame()).unwrap_or(Value::Null));
         let f = self.frame_sized(view, width, height, quality).map_err(|e| e.to_string())?;
+        let units = f.marks.iter().map(|m| self.unit_json(m.id).map_or(Value::Null, |mut u| {
+            u["u"] = json!(r3(m.u));
+            u["v"] = json!(r3(m.v));
+            u
+        })).collect::<Vec<_>>();
         let dets: Vec<Value> = f
             .detections
             .iter()
@@ -627,7 +640,57 @@ impl Runtime {
             "camera": camera,
             "procedure": procedure,
             "light": crate::views::light_json(self.world()),
+            "units": units,
         }))
+    }
+
+    /// One robot for the screen: where it is, what it does, what it carries.
+    fn unit_json(&self, id: u32) -> Option<Value> {
+        let w = self.world();
+        let load = |list: &[world_sim::snapshot::CarryView]| list.iter().map(|c| json!({"item": c.item.id(), "label_ko": c.label_ko, "count": c.amount})).collect::<Vec<_>>();
+        let rig = |build: noto_core::dims::Build, base: BaseKind| self.rig_name_of(build, base);
+        let v = if id == 1 {
+            let s = w.snapshot();
+            let (rig_id, rig_name) = rig(self.cfg.body.build, self.cfg.noto.base);
+            json!({"id": 1, "first": true, "form": world_sim::crew::Form::of_base(self.cfg.noto.base).id(), "base": self.cfg.noto.base, "label_ko": world_sim::crew::Form::of_base(self.cfg.noto.base).label_ko(),
+                "x": r3(w.agent.x), "z": r3(w.agent.z), "yaw_deg": r3(w.agent.yaw.to_degrees()), "moving": w.agent.speed_mps > 0.01, "fallen": w.fallen_until.is_some_and(|t| w.time_s < t),
+                "status_ko": w.current_action().unwrap_or_else(|| "대기".to_string()), "carried_kg": r3(w.carried_kg()), "capacity_kg": r3(w.capacity_kg()), "battery_ratio": r3(w.battery_ratio()),
+                "load": load(&s.agent.carrying), "cameras": self.cameras(), "rig_id": rig_id, "rig_name_ko": rig_name})
+        } else {
+            let c = w.crew_worker(id)?;
+            let (rig_id, rig_name) = rig(c.body.plan.build, c.body.base);
+            json!({"id": id, "first": false, "form": c.form.id(), "base": c.body.base, "label_ko": c.form.label_ko(), "x": r3(c.x), "z": r3(c.z), "yaw_deg": r3(c.yaw.to_degrees()), "moving": c.speed_mps > 0.01,
+                "fallen": c.fallen_until.is_some_and(|t| w.time_s < t), "status_ko": c.status_ko(), "carried_kg": r3(c.carried_kg()), "capacity_kg": r3(c.capacity_kg), "battery_ratio": 1.0,
+                "load": load(&c.carry_views()), "cameras": c.cameras, "rig_id": rig_id, "rig_name_ko": rig_name})
+        };
+        Some(v)
+    }
+
+    pub fn api_units_list(&self) -> Result<Value, String> {
+        let ids: Vec<u32> = std::iter::once(1).chain(self.world().crew.iter().map(|c| c.id)).collect();
+        Ok(json!({"units": ids.into_iter().filter_map(|id| self.unit_json(id)).collect::<Vec<_>>()}))
+    }
+
+    /// What one robot's camera sees now: its picture, its depth, or a lift truck's fork camera. A sub-worker has no
+    /// models of its own, so its depth is the renderer's.
+    pub fn api_unit_frame(&mut self, args: &Value) -> Result<Value, String> {
+        let unit = num(args, "unit").unwrap_or(1.0) as u32;
+        let (width, height) = (num(args, "width").unwrap_or(160.0).clamp(32.0, 1024.0) as usize, num(args, "height").unwrap_or(120.0).clamp(32.0, 1024.0) as usize);
+        let quality = num(args, "quality").unwrap_or(60.0) as f32;
+        let mode = text(args, "mode").unwrap_or("rgb").to_string();
+        let cam = world_sim::Camera { width, height, ..*self.camera() };
+        let frame = self.world_mut().render_unit(unit, &cam, mode == "fork").ok_or_else(|| format!("유닛 {unit}가 없습니다"))?;
+        let (rgb, depth_name) = if mode == "depth" {
+            let map = noto_vision::DepthMap { width: frame.width as u32, height: frame.height as u32, kind: noto_vision::DepthKind::Metric, data: frame.depth.clone() };
+            let (lo, hi) = map.range();
+            (map.colorize_in(lo, hi).data, if unit == 1 { self.ml.depth_mode() } else { "렌더러 깊이".to_string() })
+        } else {
+            (frame.rgb.clone(), String::new())
+        };
+        let e = world_sim::encode_webp(&rgb, frame.width as u32, frame.height as u32, quality).map_err(|e| format!("WebP 인코딩 실패: {e}"))?;
+        let label = self.unit_json(unit).and_then(|u| u["label_ko"].as_str().map(str::to_string)).unwrap_or_default();
+        Ok(json!({"webp_base64": STANDARD.encode(&e.bytes), "width": frame.width, "height": frame.height, "unit": unit, "mode": mode, "label_ko": label, "depth_name": depth_name,
+            "procedure": if unit == 1 { self.procedure_json() } else { None }}))
     }
 
     /// The pick-up stage by stage, for the first-person HUD. Legs do it as a person does: walk up, bend the head to
@@ -954,7 +1017,20 @@ impl Runtime {
         if let Some(r) = self.rig_call(cmd, args) {
             return r;
         }
+        if let Some(r) = self.mcp_call(cmd, args) {
+            return r;
+        }
         match cmd {
+            "units_list" => self.api_units_list(),
+            "unit_frame" => self.api_unit_frame(args),
+            "crew_remove" => {
+                let id = num(args, "id").ok_or("id 가 필요합니다")? as u32;
+                if !self.world_mut().remove_worker(id) {
+                    return Err(format!("작업자 {id}가 없습니다"));
+                }
+                self.crew.lanes.remove(&id);
+                Ok(json!({"ok": true}))
+            }
             "world_body" => Ok(json!({"plan": self.cfg.body, "id": self.cfg.body.id(), "balance": self.world().balance_summary(), "limits": {
                 "capacity_kg": self.world().capacity_kg(), "battery_wh": self.world().battery_capacity_j() / 3600.0,
                 "max_speed_mps": self.world().drive_spec().max_speed_mps, "max_slope_deg": self.world().drive_spec().max_slope_deg, "max_step_m": self.world().drive_spec().max_step_m,
@@ -1234,7 +1310,9 @@ mod tests {
             assert!(d["label_id"].is_string() && d["reason"].is_string());
         }
         let top = rt.api_world_frame(300, 256, 70.0, "top").unwrap();
-        assert_eq!(top["width"], top["height"]);
+        assert_eq!((top["width"].as_u64(), top["height"].as_u64()), (Some(300), Some(256)));
+        assert_eq!(top["units"][0]["id"], 1, "{}", top["units"]);
+        assert!((0.0..=1.0).contains(&top["units"][0]["u"].as_f64().unwrap()));
     }
 
     #[test]

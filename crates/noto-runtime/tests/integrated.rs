@@ -36,7 +36,7 @@ fn three_passes_record_keyframes_ml_tracks_decisions_and_success_rates() {
     assert!((span / 10) as usize + 2 >= fixed.len(), "fixed 10-tick interval");
     assert!(st["game"]["video"].as_u64().unwrap() as usize > fixed.len(), "the video has more frames than keyframes");
     let m = moments(game);
-    assert!(m.contains(&"contact") && m.contains(&"arrive"), "the push's moments are keyframes: {m:?}");
+    assert!(m.contains(&"fork_in") && m.contains(&"fork_up"), "the lift's moments are keyframes: {m:?}");
     assert!(game.iter().all(|k| !k["ml"].is_null()), "every keyframe analysed");
     let tracked = game.iter().filter(|k| !k["ml"]["target"].is_null()).count();
     assert!(tracked > 0, "the target was tracked on some keyframes");

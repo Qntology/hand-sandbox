@@ -3,6 +3,7 @@
 // 포크 카메라 확인·교차 검증 → 포크 끼우기(포크 카메라 추적) → 포크 카메라 가림 → 탑승자 재확인 → 안착 → 들어올림".
 // world_frame 의 procedure(Rust 런타임 또는 모의 월드)를 그대로 그리며, 1인칭(머리·탑승자) 화면의 비전 확인에는
 // 대상에 조준점을 겹친다. 지게차 절차에서는 포크 카메라 화면을 작게 함께 보이고, 가려지면 그렇게 표시한다.
+// 탑뷰에서는 같은 절차를 unit_frame 의 procedure 로 받아 로봇 위 CCTV 말풍선에 줄여 그린다(renderProcedureBrief).
 import { $, clear, el, fmt } from './util.js';
 
 const STATE_KO = { done: '완료', active: '진행', pending: '대기', failed: '실패' };
@@ -131,7 +132,38 @@ function headCheck(p) {
   return p.stage === 'rider' ? x.rider ?? null : null;
 }
 
-/** world_frame 응답의 procedure 를 HUD 로 그린다. 없으면 숨긴다. */
+/** 두 시점 교차 검증의 한 줄 요약: 판정, 어긋난 거리, 포크 카메라 가림. */
+function crossBrief(x) {
+  if (!x?.verdict) return ['wait', '교차 검증 대기'];
+  const [cls, text] = VERDICT[x.verdict] ?? ['wait', x.verdict];
+  const gap = x.apart_m != null ? ` (오차 ${fmt.n(x.apart_m * 100, 0)} cm)` : '';
+  const blocked = (x.blocked_share ?? 0) > 0 ? ` · 가림 ${fmt.n(x.blocked_share * 100, 0)}%` : '';
+  return [cls, `${text}${gap}${blocked}`];
+}
+
+/** 비전 확인의 한 줄 요약 (사람 몸). */
+function checkBrief(p) {
+  const c = p.check;
+  if (!c) return ['wait', '비전 확인 대기'];
+  return c.ok ? ['ok', `비전 확인 ✓ ${sightText(c)}`] : ['fail', `비전 확인 실패 · ${c.reason ?? '대상이 보이지 않음'}`];
+}
+
+/** CCTV 말풍선의 절차 표시: 제목, 단계 막대, 지금 단계, 교차 검증(또는 비전 확인). 절차가 없으면 false. */
+export function renderProcedureBrief(box, p) {
+  clear(box);
+  if (!p || p.act == null) return false;
+  const stages = p.stages ?? [];
+  const at = stages.findIndex((s) => s.state === 'active' || s.state === 'failed');
+  const [cls, text] = p.mechanism === 'fork' ? crossBrief(p.cross) : checkBrief(p);
+  box.append(
+    el('div', { class: 'cp-title', text: title(p) }),
+    el('ol', { class: 'cp-steps', aria: { hidden: 'true' } }, ...stages.map((s) => el('li', { class: s.state, title: s.label_ko }))),
+    el('div', { class: 'cp-now', text: at >= 0 ? `${at + 1}/${stages.length} ${stages[at].label_ko}` : '' }),
+    el('div', { class: `cp-check ${cls}`, text }));
+  return true;
+}
+
+/** world_frame 응답의 procedure 를 HUD 로 그린다(1인칭 시점). 없으면 숨긴다. */
 export function renderPickHud(p) {
   const hud = $('pick-hud');
   if (!hud) return;

@@ -205,6 +205,7 @@ function crewStatus() {
 
 export function crewAdd({ count = 1, form = 'mixed', cameras = 1, mode } = {}) {
   const w = need();
+  if (w.crew.length >= 8) throw '서브 작업자는 8명까지입니다';
   const n = Math.max(1, Math.min(8 - w.crew.length, Math.floor(count)));
   for (let i = 0; i < n; i++) {
     const id = 2 + w.crew.length;
@@ -1207,6 +1208,10 @@ function tickOnce() {
   if (active && W.tick % 30 === 0) {
     const s = 0.5 + W.rng() * 0.4;
     log('sds', 'info', `SDS 갱신: vision|${W.rt.get(active.id).it.ko}|primary`, { n: W.tick, mean: Number(s.toFixed(3)), sd: 0.06, drift_z: Number(((W.rng() - 0.5) * 2).toFixed(2)) });
+  }
+  if (moving && W.tick % 60 === 0) {
+    const step = Number((0.02 + W.rng() * 0.08).toFixed(3));
+    log('physics', 'info', `전방 단차 스캔: ${(step * 100).toFixed(0)} cm — 무릎 굴곡 ${(Math.min(0.18, 0.8 * step) * 100).toFixed(0)} cm (모의)`, { step_m: step });
   }
   if (active && W.tick % 45 === 0) {
     const p50 = 0.55 + W.rng() * 0.3;

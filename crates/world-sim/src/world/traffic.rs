@@ -338,6 +338,37 @@ impl World {
         out
     }
 
+    /// The robots a body in the first worker's place has to miss: all but itself and its own rider.
+    pub(crate) fn other_robots(&self) -> Vec<RobotOutline> {
+        if self.crew_turn.is_some() {
+            return self.turn_others.clone();
+        }
+        self.robot_outlines().into_iter().filter(|o| o.id != 1 && o.id != RIDER_ID).collect()
+    }
+
+    /// The cells of the robots standing still that a body in the first worker's place has to go round, widened by `pad`.
+    pub(crate) fn still_others(&self, pad: f32) -> HashSet<(usize, usize)> {
+        let keep = self.terrain.cell_of(self.agent.x, self.agent.z);
+        let mut out = HashSet::new();
+        for o in self.other_robots().into_iter().filter(|o| !o.moving) {
+            let Some((cx, cz)) = self.terrain.cell_of(o.x, o.z) else { continue };
+            let span = ((o.reach_m() + pad) / CELL_M).ceil() as i32 + 1;
+            for dz in -span..=span {
+                for dx in -span..=span {
+                    let (x, z) = (cx as i32 + dx, cz as i32 + dz);
+                    if x < 0 || z < 0 || x as usize >= self.terrain.w || z as usize >= self.terrain.d {
+                        continue;
+                    }
+                    let c = (x as usize, z as usize);
+                    if o.near(crate::terrain::cell_center(c.0, c.1), pad) && Some(c) != keep {
+                        out.insert(c);
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// The first worker's way ahead: its heading, or backwards when it reverses.
     pub(crate) fn travel_dir(&self) -> f32 {
         let reversing = self.motion_view().is_some_and(|m| m.reversing);
@@ -351,7 +382,20 @@ impl World {
     /// A rider walking out to the node or back to the seat for `dt`, stopping for a robot it sees in its way and
     /// stepping round one that stays there. True once it has arrived.
     pub(crate) fn rider_walk(&self, id: u32, r: &mut Rider, dt: f32) -> bool {
-        let goal = if r.phase == RiderPhase::WalkOut { r.stand } else { r.seat };
+        let out = r.phase == RiderPhase::WalkOut;
+        let goal = if out { r.stand } else { r.seat };
+        // A person on foot goes round what stands in the way, not through it. Going out, anywhere it can swing from will
+        // do: the spot picked from the seat may have a rock on it.
+        if r.via.is_none() && !self.rider_line_clear((r.x, r.z), goal) {
+            if out && (r.x - r.node.0).hypot(r.z - r.node.1) <= MINE_REACH_M - 0.05 {
+                return true;
+            }
+            r.via = if out { self.rider_detour((r.x, r.z), r.node, MINE_REACH_M - 0.1) } else { self.rider_detour((r.x, r.z), goal, 0.35) };
+            if r.via.is_none() && out {
+                (r.phase, r.failed) = (RiderPhase::WalkBack, true);
+                return false;
+            }
+        }
         let to = r.via.unwrap_or(goal);
         let me = Looker { id, at: (r.x, r.z), dir: (to.1 - r.z).atan2(to.0 - r.x), half_w: RIDER_R_M, front: RIDER_R_M, speed: RIDER_WALK_MPS, eye_m: rider_eye_m(&self.body) };
         let path: Vec<(f32, f32)> = r.via.into_iter().chain(std::iter::once(goal)).collect();
@@ -379,6 +423,25 @@ impl World {
             return true;
         }
         false
+    }
+
+    fn rider_line_clear(&self, a: (f32, f32), b: (f32, f32)) -> bool {
+        self.clear_map().along(a, b) >= (RIDER_R_M + clear::TOUCH_GAP_M).min(self.clear_map().at(a.0, a.1))
+    }
+
+    /// The next point of a route on foot from `a` to within `reach_m` of `b`, fitted to the rider's shoulders.
+    fn rider_detour(&self, a: (f32, f32), b: (f32, f32), reach_m: f32) -> Option<(f32, f32)> {
+        let spec = noto_core::BaseKind::HumanFoot.spec();
+        let (map, blocked) = (self.clear_map(), self.blocked_cells());
+        let fp = crate::clear::Footprint::of(&rider_body(&self.body));
+        let room = nav::Room { map: &map, need_m: fp.half_w_m + clear::TIGHT_GAP_M, soft_m: fp.half_w_m + clear::COMFORT_GAP_M };
+        let start = self.terrain.cell_of(a.0, a.1)?;
+        let plan = nav::plan_room(&spec, &self.terrain, &|x, z| blocked.contains(&(x, z)), Some(&room), start, Goal::Within { x: b.0, z: b.1, reach_m }, None)?;
+        let mut path = vec![a];
+        // The cell it stands in only when that is all the route is: walked to every time, it would never leave it.
+        path.extend(plan.cells.iter().skip(usize::from(plan.cells.len() > 1)).map(|c| crate::terrain::cell_center(c.0, c.1)));
+        clear::fit_path(&map, &fp, &mut path, clear::TOUCH_GAP_M);
+        path.iter().skip(1).find(|p| (p.0 - a.0).hypot(p.1 - a.1) > 0.05).copied().or(Some(b))
     }
 
     /// The first worker's rider steps down, walks to the node, fells it, walks back and climbs on: one tick of it.
